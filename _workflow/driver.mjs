@@ -1590,6 +1590,9 @@ function cmdSweepFold(file) {
   writeJsonAtomic(abs(cfg.paths.ledger), ledger);
   writeReports(cfg, ledger, graph);
   cmdEscalationsSync(cfg, ledger, true);
+  // KI-E23 (P6c): a sweep run's usage event — same contract as cmdFold's (surfaced by the first
+  // live KI-E21-routed sweep, whose result carried usage that the fold silently dropped).
+  try { if (result && result.usage && typeof result.usage.outputTokens === 'number') temit({ source: 'driver', event: 'usage', cycle: result.cycle || ledger.cycle, attrs: { outputTokens: result.usage.outputTokens, file: basename(presolve(REPO_ROOT, file)) } }); } catch { /* observational only */ }
   console.log(`sweep-fold ${sw.index} [${sw.label || ''}]: gate ${sw.gateVerdict} -> CLOSED ${closed}, re-queued ${reverted}` + (nonconf ? `, ${nonconf} non-conforming (placeholder/empty)` : '') + (sw.findings && sw.findings.length ? ` · ${sw.findings.length} gate finding(s)` : ''));
   for (const f of (sw.findings || [])) console.log(`  [${f.severity}] ${f.file}: ${f.title}`);
 }
