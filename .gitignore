@@ -1,0 +1,17 @@
+# Transient factory runtime state — not committed. The durable, reviewable artifacts
+# (PLAN.md, config, schema, _workflow code, agents, verify, reports, findings-graph.json,
+# ledger.json, PROGRESS.md, queue) ARE committed; the churn below is regenerable.
+state/worktrees/
+state/run-args.json
+state/items/
+state/normalized/
+# Runtime markers/leases + --fresh backups (KI-C11 / KI-E6 / setup/init.mjs)
+state/controller.json
+state/STOP_REQUESTED.md
+state/*.pre-fresh-*
+# Host-local overrides (KI-E17 / SETUP.md § 6) — per-host, never committed
+config/factory.config.local.json
+verify/build-test.local.sh
+# Telemetry stream (KI-E7 / spine AD-8) — generated event data, never committed
+telemetry/data/*
+!telemetry/data/.gitkeep

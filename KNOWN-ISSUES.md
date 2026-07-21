@@ -1,0 +1,40 @@
+# Known Issues — engine registry
+
+This is the factory's **append-only** registry of known issues, limitations, accepted
+constraints, and by-design behaviours. Read it before changing the engine; add a `KI-*`
+row in the SAME change that introduces or fixes an issue. A change that adds a limitation
+without a row here is the silent-divergence failure mode this registry exists to prevent.
+
+The lib self-test (`node _workflow/lib/_selftest.mjs`) is the regression net for the
+correctness-class entries — keep it green.
+
+> This shipped registry documents the **engine invariants** only. Your own operational
+> findings (per-cycle issues, host-specific quirks) accumulate here as you run the factory.
+
+## Engine invariants & operational constraints (by design — not bugs, but must be known)
+
+| ID | Constraint |
+|----|-----------|
+| KI-E1 | **No mutating git, ever** — no `commit`/`add`/`checkout`/`restore`/`stash`/`reset`/`clean` by the factory or any subagent. Fixes land on `factory/<id>` worktree branches as UNSTAGED changes; **the human commits**. |
+| KI-E2 | **The Workflow runtime cannot touch the filesystem or git, cannot `require()`, and `Date.now()`/`Math.random()`/argless `new Date()` throw.** Hence the two-half split: `driver.mjs` (Node — fs/git/ledger) + `factory.js` (Workflow — agents only). Pure helpers used inside `factory.js` are inlined byte-for-byte from `_workflow/lib/`; change both copies together. |
+| KI-E3 | **The filesystem is the checkpoint** (`state/ledger.json` + worktree inspection) — resumable after a kill. The ledger has a **single writer** (the driver); hand-editing it risks corruption. The findings-graph is hand-editable. |
+| KI-E4 | **Scope red-lines are hard stops** — an item whose only fix would cross a scope boundary you have declared MUST `scope-stop` (→ the human queue), never be "fixed" by adding the forbidden surface. |
+| KI-E6 | **Graceful-stop drain guard** — a `state/STOP_REQUESTED.md` marker puts the factory in a graceful drain: `driver.mjs group` refuses while it exists (in-flight lanes finish, nothing new launches). `fold`/`reconstruct`/`escalations` stay unguarded so running work completes. Resuming is deliberate: delete the marker (or pass `group --stop-override`). |
+| KI-E7 | **Telemetry is observational, never evidentiary.** Every factory action lands as an event on the append-only stream `telemetry/data/events.jsonl` (`FACTORY_TELEMETRY=0` disables). An emitted event never feeds a fold verdict; the factory runs fine with the telemetry stack down. `driver.mjs telemetry-report` renders the evaluation report from the JSONL directly. |
+| KI-E17 | **Portable mounts** — the factory is mountable at any host path (submodule or plain clone). `_workflow/lib/rootfind.mjs` detects the host repo root (walk up from the mount's parent to the first `.git`; `FACTORY_REPO_ROOT` overrides) and rewrites the committed stock-prefixed config paths onto the real mount; an optional gitignored `config/factory.config.local.json` overlays per-host knobs. See `SETUP.md`. |
+
+## Verified design properties (recorded so they are not re-investigated)
+
+- The global agent limiter cannot deadlock — every `agent()` routes through one limiter; an
+  item never holds a slot while awaiting another.
+- Per-item results are isolated — a thrown item degrades to `FAILED`; siblings still
+  complete and fold (the batch never rejects as a whole).
+- A null/again-null gate result fails closed (`!== 'APPROVED'` → `FAILED`).
+- `foldResults` is idempotent and self-heals a partial application (it re-walks from the
+  current state rather than corrupting it).
+
+## How to add an entry
+
+Give it a stable `KI-<class><n>` id, one row stating the issue/constraint and its
+mitigation or status, and — if it is a correctness fix — a matching assertion in
+`_workflow/lib/_selftest.mjs`. Resolved entries stay (marked resolved), never deleted.

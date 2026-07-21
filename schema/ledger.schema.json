@@ -1,0 +1,71 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "impl-factory/ledger",
+  "title": "Ledger",
+  "description": "Authoritative, resumable state of every work item. The filesystem checkpoint. Single writer (driver.mjs) folds per-item Workflow results in atomically; agents never write this file directly (they write state/items/<id>/<stage>.json).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["version", "createdAt", "updatedAt", "cycle", "items"],
+  "properties": {
+    "version": { "type": "integer" },
+    "createdAt": { "type": "string" },
+    "updatedAt": { "type": "string" },
+    "cycle": { "type": "integer", "description": "Monotonic cycle counter; bumped each scheduling round." },
+    "graphSource": { "type": ["string", "null"] },
+    "folded": {
+      "type": "object",
+      "description": "Idempotency journal: resultId ('<itemId>#<cycle>') -> ISO timestamp it was folded. Guards against an accidental double-fold double-counting cost + attempts (KI-B4).",
+      "additionalProperties": { "type": "string" }
+    },
+    "items": {
+      "type": "object",
+      "description": "id -> ledger row",
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "state", "attempts", "history"],
+        "properties": {
+          "id": { "type": "string" },
+          "state": {
+            "type": "string",
+            "enum": ["READY", "CLAIMED", "RED", "GREEN", "BUILT", "TESTED", "GATED", "REFUTE_OK", "REAUDITED", "INTEGRATED", "CLOSED", "BLOCKED", "ESCALATED", "FAILED", "CONFLICT"]
+          },
+          "attempts": { "type": "integer", "description": "Number of fix attempts spent (bounded by config.maxItemRetries)." },
+          "worktree": { "type": ["string", "null"], "description": "Path of the git worktree holding this item's changes, if any." },
+          "branch": { "type": ["string", "null"] },
+          "artifacts": {
+            "type": "object",
+            "description": "stage -> path of the artifact the agent wrote (test plan, fix diff summary, gate verdicts, refute report, reaudit summary).",
+            "additionalProperties": { "type": ["string", "null"] }
+          },
+          "gates": {
+            "type": "object",
+            "description": "gate name -> APPROVED | CHANGES_REQUIRED | null",
+            "additionalProperties": { "type": ["string", "null"] }
+          },
+          "cost": {
+            "type": "object",
+            "description": "model id -> count of routed agent-calls on this item (the faithful 'who did the work' signal; exact token totals live in the per-cycle Workflow run summary).",
+            "additionalProperties": { "type": "number" }
+          },
+          "note": { "type": ["string", "null"] },
+          "history": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["to", "at"],
+              "properties": {
+                "from": { "type": ["string", "null"] },
+                "to": { "type": "string" },
+                "at": { "type": "string" },
+                "note": { "type": ["string", "null"] }
+              }
+            }
+          },
+          "updatedAt": { "type": "string" }
+        }
+      }
+    }
+  }
+}

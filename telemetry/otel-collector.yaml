@@ -1,0 +1,45 @@
+# OpenTelemetry Collector (contrib 0.156.0) — AI Factory traces pipeline (spine AD-5).
+# The factory-exporter pushes completed item/stage spans via OTLP/HTTP; the spanmetrics
+# connector derives RED metrics from those spans and exposes them on :8889 for Prometheus
+# (traces_span_metrics_* family — distinct from the exporter's factory_* series, no overlap).
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  batch: {}
+
+connectors:
+  spanmetrics:
+    histogram:
+      unit: s # review finding #7: default is ms — the dashboard queries traces_span_metrics_duration_SECONDS_bucket
+      explicit:
+        buckets: [30s, 60s, 120s, 300s, 600s, 1200s, 2400s, 3600s]
+    dimensions:
+      - name: factory.item
+      - name: factory.stage
+      - name: factory.outcome
+
+exporters:
+  debug:
+    verbosity: basic
+  prometheus:
+    endpoint: 0.0.0.0:8889
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [debug, spanmetrics]
+    metrics:
+      # otlp receiver added so Claude Code's built-in telemetry (claude_code.token.usage
+      # with type=cacheRead/cacheCreation/input/output) lands in Prometheus alongside
+      # the span-derived factory metrics.
+      receivers: [spanmetrics, otlp]
+      processors: [batch]
+      exporters: [prometheus]

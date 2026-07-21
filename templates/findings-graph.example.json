@@ -1,0 +1,58 @@
+{
+ "_comment": "Example findings-graph for a NEW host (schema: ../schema/work-item.schema.json). Copy the shape into state/findings-graph.json, replace the items with your own audit findings / stories, then run: node <mount>/_workflow/driver.mjs init. Every field below is real — ids must match ^[A-Z0-9]+(-[A-Z0-9]+)+$, dependsOn refers to other item ids, files[] is the file-lock set, acceptance is the checkable done-criterion the gates enforce, regressionTest describes the red->green proof the test-author must deliver.",
+ "generatedAt": "2026-07-21T00:00:00.000Z",
+ "source": "templates/findings-graph.example.json (hand-authored example)",
+ "count": 3,
+ "items": [
+  {
+   "id": "EXMPL-M1",
+   "target": "ExampleService",
+   "layer": "service",
+   "title": "Health endpoint doc claims /healthz but the service maps /health",
+   "severity": "MEDIUM",
+   "theme": "doc-drift",
+   "fixType": "mechanical",
+   "files": ["ExampleService/README.md"],
+   "dependsOn": [],
+   "acceptance": "README documents the actual mapped route (/health) and the probe example curls it successfully.",
+   "regressionTest": "Doc-claims lint: the phantom-path check fails on old README (references a route no code maps) and passes after the fix.",
+   "gateSet": ["developer", "po"],
+   "autonomyTier": "auto",
+   "source": "example-audit#doc-drift-1"
+  },
+  {
+   "id": "EXMPL-H1",
+   "target": "ExampleService",
+   "layer": "service",
+   "title": "Pagination skip overflows int for page >= ~21.5M (negative OFFSET -> 500)",
+   "severity": "HIGH",
+   "theme": "idempotency-dataflow",
+   "fixType": "non-trivial",
+   "files": ["ExampleService/src/Api/ItemsController.cs", "ExampleService/tests/ItemsPaginationTests.cs"],
+   "dependsOn": ["EXMPL-M1"],
+   "acceptance": "page/pageSize are clamped before Skip/Take; skip arithmetic is computed in a wider type; hostile page=2147483647 returns 200 with an empty page, never a 500.",
+   "regressionTest": "New test requests page=int.MaxValue: FAILS on old code (provider throw / 500), PASSES after the clamp.",
+   "gateSet": ["architect", "developer", "qa", "po"],
+   "autonomyTier": "auto",
+   "fixHint": "Clamp page >= 1, bound pageSize, compute skip in long and clamp into int range.",
+   "source": "example-audit#pagination-overflow"
+  },
+  {
+   "id": "EXMPL-SEC-C1",
+   "target": "ExampleService",
+   "layer": "service",
+   "title": "Order lookup trusts client-supplied tenant id (cross-tenant read)",
+   "severity": "CRITICAL",
+   "theme": "security-multitenancy",
+   "fixType": "non-trivial",
+   "files": ["ExampleService/src/Api/OrdersController.cs", "ExampleService/tests/OrdersAuthTests.cs"],
+   "dependsOn": [],
+   "acceptance": "Tenant id derives from the caller's claims only; a request for another tenant's order returns 403/404, proven against a REAL database (not an in-memory provider).",
+   "regressionTest": "Integration test authenticates as tenant A and requests tenant B's order id: FAILS (200 + foreign data) on old code, PASSES (403/404) after the fix; test prints FACTORY::REALINFRA::Testcontainers-postgres when its container is up.",
+   "realInfra": true,
+   "gateSet": ["architect", "developer", "qa", "security", "po"],
+   "autonomyTier": "escalate",
+   "source": "example-audit#cross-tenant-read"
+  }
+ ]
+}

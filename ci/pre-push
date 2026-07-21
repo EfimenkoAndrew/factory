@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+# Local build-time audit gate — runs the deterministic rules linter on what you're about to push, against
+# the upstream base, and BLOCKS the push on any new CRITICAL/HIGH anti-pattern. Install with
+# ci/install-hooks.sh. Bypass a known-false-positive once with `git push --no-verify` (then fix the rule).
+set -uo pipefail
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+# Self-locating (KI-E17): this hook is installed as a SYMLINK into .git/hooks — resolve the
+# factory's ci/ dir through the link so any mount path works; fall back to the stock mount.
+SELF="${BASH_SOURCE[0]:-$0}"
+RESOLVED="$(readlink -f "$SELF" 2>/dev/null || echo "$SELF")"
+SCRIPT="$(cd "$(dirname "$RESOLVED")" 2>/dev/null && pwd)/../_workflow/audit-diff.mjs"
+[ -f "$SCRIPT" ] || SCRIPT="$REPO_ROOT/_bmad-output/ai-factory/_workflow/audit-diff.mjs"
+[ -f "$SCRIPT" ] || exit 0   # factory not present in this checkout — nothing to enforce
+
+# Base to diff against: the tracking branch if set, else origin/master|main, else just working-tree vs HEAD.
+BASE="$(git rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null || true)"
+if [ -z "$BASE" ]; then
+  for b in origin/master origin/main; do git rev-parse --verify -q "$b" >/dev/null && BASE="$b" && break; done
+fi
+
+if [ -n "$BASE" ]; then
+  node "$SCRIPT" --base "$BASE"
+else
+  node "$SCRIPT"   # no upstream — scan working-tree changes vs HEAD
+fi
+code=$?
+if [ "$code" -ne 0 ]; then
+  echo ""
+  echo "pre-push BLOCKED: a new CRITICAL/HIGH rule anti-pattern is in this push (see above)."
+  echo "Fix it, or — if it is a genuine false positive — refine the rule in audit-diff.mjs, then re-push."
+  echo "(emergency bypass: git push --no-verify)"
+fi
+exit $code

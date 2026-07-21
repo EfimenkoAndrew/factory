@@ -1,0 +1,15 @@
+{
+  "_comment": "Factory orchestrator policy (spine AD-7). backend: interactive (default — emits the Workflow launch line for the controlling Claude Code session and watches checkpoints) | claude-headless (spawns the claude CLI in print mode; seam is smoke-tested, burn-in pending — see spine Deferred) | dry (plan only, launches nothing). autoApply stays false by design: applying CLOSED worktrees needs 3-way-merge judgment and the human authors every commit (KI-E1).",
+  "backend": "interactive",
+  "maxCyclesPerRun": 1,
+  "maxItemsPerLane": 3,
+  "includeRealinfra": false,
+  "watchIntervalMs": 60000,
+  "laneTimeoutMinutes": 240,
+  "autoApply": false,
+  "claudeHeadless": {
+    "bin": "claude",
+    "extraArgs": [],
+    "promptTemplate": "Operate as the AI-factory worker plane. Launch the Workflow tool on the script at {runScript} with NO args, wait for it to complete, then reply DONE. Do not run any git commands. Do not edit any file outside the per-item worktrees the script names."
+  }
+}

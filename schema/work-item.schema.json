@@ -1,0 +1,30 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "impl-factory/work-item",
+  "title": "Work item (findings-graph node)",
+  "description": "One spec'd unit of work: an audit finding, a BMAD story, or a change request with acceptance criteria. The normalizer emits these into state/findings-graph.json.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["id", "target", "title", "severity", "theme", "fixType", "files", "dependsOn", "acceptance", "regressionTest", "gateSet", "autonomyTier", "source"],
+  "properties": {
+    "id": { "type": "string", "pattern": "^[A-Z0-9]+(-[A-Z0-9]+)+$", "description": "Stable unique id, e.g. ITEM-FIND-C1 or ITEM-M1." },
+    "target": { "type": "string", "description": "Service / lib / portal the finding belongs to, e.g. ServiceA." },
+    "layer": { "type": "string", "enum": ["lib", "service", "portal", "infra", "platform"], "description": "Layer for DAG ordering (libs upstream of services upstream of portals)." },
+    "title": { "type": "string" },
+    "severity": { "type": "string", "enum": ["CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"] },
+    "theme": { "type": "string", "description": "Theme taxonomy, e.g. security-multitenancy | money-correctness | deployability-oncall | product-scope | idempotency-dataflow | doc-drift | test-coverage." },
+    "fixType": { "type": "string", "enum": ["mechanical", "non-trivial", "owner-decision", "scope-stop"], "description": "mechanical = doc/health-check/tag/token/invariant; non-trivial = real logic/correctness; owner-decision = needs a human ruling; scope-stop = a product-scope red-line, NOT to be 'fixed' by adding the forbidden thing." },
+    "files": { "type": "array", "items": { "type": "string" }, "description": "Repo-relative file paths the fix is expected to touch (the file-lock set)." },
+    "dependsOn": { "type": "array", "items": { "type": "string" }, "description": "Work-item ids that must be CLOSED before this one is schedulable." },
+    "ownerDecision": { "type": ["string", "null"], "description": "If non-null, the question the owner must answer before this can proceed; the item starts BLOCKED." },
+    "acceptance": { "type": "string", "description": "The concrete, checkable acceptance criterion that defines 'fixed'." },
+    "regressionTest": { "type": "string", "description": "Description of the red->green test that proves the fix: what must fail on old code and pass on new." },
+    "realInfra": { "type": "boolean", "description": "True if a green EF-in-memory test does NOT close it (money/security/concurrency -> Testcontainers required)." },
+    "gateSet": { "type": "array", "items": { "type": "string", "enum": ["architect", "developer", "qa", "security", "po"] }, "description": "Band A of the review stage — the 5 BMAD role gates (dataflow.md § BMAD Review Gates)." },
+    "reviewFlows": { "type": "array", "items": { "type": "string", "enum": ["bmad-code-review", "bmad-review-adversarial-general", "bmad-review-edge-case-hunter", "bmad-testarch-test-review", "bmad-editorial-review-structure", "bmad-editorial-review-prose"] }, "description": "Band B/C of the review stage — BMAD review-named flows. Optional/informational: the driver (cmdSelect -> applicableReviewFlows) derives the LIVE applicable set from files[] against config/factory.config.json reviewFlows.appliesWhen at select time; the normalizer need not populate this." },
+    "autonomyTier": { "type": "string", "enum": ["auto", "escalate", "blocked"], "description": "auto = drive to CLOSED autonomously; escalate = auto-draft then human sign-off before integrate (auth/money/crypto/cross-service); blocked = owner decision required first." },
+    "source": { "type": "string", "description": "Provenance: the audit doc + anchor this was normalized from." },
+    "fixHint": { "type": "string", "description": "The audit's suggested fix, carried verbatim where given." },
+    "cascade": { "type": "array", "items": { "type": "string" }, "description": "For event-contract changes: producer + every consumer that must change together (dataflow.md cascade rule)." }
+  }
+}

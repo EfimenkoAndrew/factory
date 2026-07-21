@@ -1,0 +1,84 @@
+# AI Factory observability stack (ai-factory-observability spine AD-5/AD-6).
+# Self-contained under telemetry/ — part of the factory deliverable (AD-8).
+#
+#   docker compose up -d          # from _bmad-output/ai-factory/telemetry/
+#   Grafana    http://localhost:${FACTORY_GRAFANA_PORT:-3000}   (anonymous viewer)
+#   Prometheus http://localhost:${FACTORY_PROM_PORT:-9090}
+#   Exporter   http://localhost:${FACTORY_EXPORTER_PORT:-9464}/metrics
+#
+# Permanent state (AD-6): named volumes prometheus-data / grafana-data survive
+# `compose down` (only `down -v` destroys them). The event stream itself lives on the
+# HOST at ./data/events.jsonl (bind-mounted read-only) — the factory keeps running when
+# this whole stack is down (AD-1).
+# Images are pinned tags — never :latest (deploy-verification.md posture).
+
+name: ai-factory-telemetry
+
+services:
+  exporter:
+    build: ./exporter
+    container_name: factory-exporter
+    restart: unless-stopped
+    environment:
+      EVENTS_FILE: /data/events.jsonl
+      OTLP_URL: http://otel-collector:4318/v1/traces
+      PORT: "9464"
+      POLL_MS: "2000"
+    volumes:
+      - ./data:/data:ro   # the event stream (host-owned, factory-written; exporter is a pure derived view — AD-1)
+    ports:
+      - "${FACTORY_EXPORTER_PORT:-9464}:9464"
+    depends_on:
+      - otel-collector
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.156.0
+    container_name: factory-otel-collector
+    restart: unless-stopped
+    command: ["--config=/etc/otelcol/config.yaml"]
+    volumes:
+      - ./otel-collector.yaml:/etc/otelcol/config.yaml:ro
+    ports:
+      - "${FACTORY_OTLP_GRPC_PORT:-4317}:4317"   # OTLP gRPC
+      - "${FACTORY_OTLP_HTTP_PORT:-4318}:4318"   # OTLP HTTP (exporter pushes here)
+      - "${FACTORY_SPANMETRICS_PORT:-8889}:8889" # span-derived metrics for Prometheus (AD-5 spanmetrics)
+
+  prometheus:
+    image: prom/prometheus:v3.13.1
+    container_name: factory-prometheus
+    restart: unless-stopped
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=180d"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus          # AD-6 permanent named volume
+    ports:
+      - "${FACTORY_PROM_PORT:-9090}:9090"
+    depends_on:
+      - exporter
+      - otel-collector
+
+  grafana:
+    image: grafana/grafana:12.4.5
+    container_name: factory-grafana
+    restart: unless-stopped
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"      # local operator tool (spine: auth hardening deferred)
+      GF_AUTH_ANONYMOUS_ORG_ROLE: "Viewer"
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: "${FACTORY_GRAFANA_ADMIN_PASSWORD:-factory-local-admin}"
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /etc/grafana/dashboards/ai-factory.json
+    volumes:
+      - grafana-data:/var/lib/grafana        # AD-6 permanent named volume
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/etc/grafana/dashboards:ro
+    ports:
+      - "${FACTORY_GRAFANA_PORT:-3000}:3000"
+    depends_on:
+      - prometheus
+
+volumes:
+  prometheus-data:
+  grafana-data:

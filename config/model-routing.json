@@ -1,0 +1,31 @@
+{
+  "_comment": "Task-type -> {model, effort} routing for the AI Implementation Factory. Human-readable rationale in PLAN.md §4. Models: claude-opus-4-8 (hard reasoning), claude-sonnet-5 (mid), claude-haiku-4-5 (cheap/fast), claude-fable-5 (top, budget-gated). effort: low|medium|high|xhigh|max. Driver reads this and passes opts {model, effort} per agent() call. Tune from real cost data after Phase 5. REVIEW STAGE = role gates (gate.*) + every BMAD review-named flow (review.*: code/adversarial/edgecase/testreview/editorial_structure/editorial_prose), each a separate adversarial subagent; 'when' = applicability (see config/factory.config.json reviewFlows); 'skill' = the bmad-* skill the agent invokes.",
+  "defaults": { "model": "claude-sonnet-5", "effort": "medium" },
+  "routes": {
+    "normalizer":            { "model": "claude-haiku-4-5",  "effort": "low" },
+    "planner":               { "model": "claude-fable-5",    "effort": "high",   "when": "tier=critical|cross-service", "fallback": { "model": "claude-opus-4-8", "effort": "high" }, "_ki_d11": "fable-5 experiment 2026-07-19 (FABLE-PROBE-OK re-verified access, reversing KI-C8). Sets each non-trivial item's whole approach; opus/high fallback (KI-D10) preserves prior routing on a fable outage." },
+    "fixer.mechanical":      { "model": "claude-sonnet-5", "effort": "medium" },
+    "fixer.critical":        { "model": "claude-opus-4-8",   "effort": "high",   "escalate_effort": "xhigh" },
+    "test_author.mechanical":{ "model": "claude-sonnet-5", "effort": "medium" },
+    "test_author.critical":  { "model": "claude-opus-4-8",   "effort": "high" },
+    "runner":                { "model": "claude-sonnet-5",   "effort": "low", "_ki_l64": "pinned haiku->sonnet 2026-07-16: haiku 200k ceiling dies 'Prompt is too long' on big-solution verify (ITEM-H7/ITEM-H5 cycle 35); KI-L56 class, KI-L58 pin precedent" },
+    "gate.architect":        { "model": "claude-opus-4-8",   "effort": "high" },
+    "gate.security":         { "model": "claude-opus-4-8",   "effort": "high" },
+    "gate.developer":        { "model": "claude-sonnet-5", "effort": "medium" },
+    "gate.qa":               { "model": "claude-sonnet-5", "effort": "medium" },
+    "gate.po":               { "model": "claude-opus-4-8",   "effort": "medium" },
+    "review.code":           { "model": "claude-opus-4-8",   "effort": "high",   "when": "code-touching",      "skill": "bmad-code-review" },
+    "review.adversarial":    { "model": "claude-opus-4-8",   "effort": "high",   "when": "all-items",          "skill": "bmad-review-adversarial-general" },
+    "review.edgecase":       { "model": "claude-sonnet-5", "effort": "medium", "escalate_effort": "high", "when": "code-touching", "skill": "bmad-review-edge-case-hunter" },
+    "review.testreview":     { "model": "claude-sonnet-5", "effort": "medium", "when": "has-regression-test", "skill": "bmad-testarch-test-review" },
+    "review.editorial_structure": { "model": "claude-sonnet-5", "effort": "low", "when": "doc-touching", "skill": "bmad-editorial-review-structure" },
+    "review.editorial_prose":     { "model": "claude-sonnet-5", "effort": "low", "when": "doc-touching", "skill": "bmad-editorial-review-prose", "_note": "KI-L58 (2026-07-15): pinned haiku->sonnet — haiku's 200k ceiling dies terminal ('Prompt is too long') on doc-heavy items (ITEM-H9 cycle 33 runbook+dashboard); KI-L56 context-ceiling class, KI-L49 pin precedent." },
+    "refuter":               { "model": "claude-opus-4-8",   "effort": "high" },
+    "reauditor":             { "model": "claude-sonnet-5", "effort": "medium" },
+    "integrator":            { "model": "claude-sonnet-5", "effort": "medium", "on_conflict": "claude-opus-4-8" },
+    "decision_framer":       { "model": "claude-opus-4-8",   "effort": "medium" },
+    "adjudicator":           { "model": "claude-fable-5",    "effort": "max",    "when": "gates-deadlocked|disputed-critical", "budget_gated": true, "fallback": { "model": "claude-opus-4-8", "effort": "max" }, "_note": "KI-D11 (2026-07-19): routed to its DESIGNED model fable-5/max — access re-verified (FABLE-PROBE-OK), reversing the cycle-6 access-gate that had forced opus/max. opus/max fallback (KI-D10) restores the prior behaviour on a fable outage. The hardest call in the factory (a disputed FULL-band split) — the strongest fable candidate." }
+  },
+  "concurrency": { "throttled": 2, "normal": 6, "max": 8, "note": "ONE workflow at a time; opus throttles harder than sonnet; per-agent retry>=3" },
+  "budget": { "per_cycle_output_tokens": null, "reserve": 50000, "note": "KI-C2 (2026-07-12): there is NO default cap (owner ruling 2026-06-27 — observability, not a governor). Enforcement engages ONLY when the operator sets a token budget on the LAUNCH TURN (a '+500k'-style directive): the Workflow runtime's `budget` global then hard-throws once spent >= total, and factory.js's graceful half refuses to START a new item when remaining() < reserve (item stays CLAIMED, no attempt burned, `resume` prints its relaunch line). `reserve` here is injected into runArgs at group/sweep emit." }
+}

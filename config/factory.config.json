@@ -1,0 +1,143 @@
+{
+  "_comment": "Control-plane config for the AI Implementation Factory. Human-readable rationale in PLAN.md. Paths are relative to repoRoot unless noted. The driver (driver.mjs) reads this; factory.js (the Workflow) receives the relevant slice via args.",
+  "root": "_bmad-output/ai-factory",
+  "auditRoot": "PATH/TO/YOUR/AUDIT",
+  "repoRoot": ".",
+  "concurrency": {
+    "throttled": 2,
+    "normal": 6,
+    "max": 8,
+    "default": 3,
+    "note": "ONE workflow at a time. 2-3 under active throttle, 5-8 when quiet. opus throttles harder than sonnet; per-agent retry >= attempts."
+  },
+  "attempts": 3,
+  "controller": {
+    "ttlMinutes": 240,
+    "note": "KI-C11 session-controller lease: every mutating driver command requires state/controller.json's token (--controller / FACTORY_CONTROLLER); free or TTL-stale lease auto-claims, FRESH foreign lease refuses. TTL must outlast the longest group->fold gap (a full Workflow band). Advisory anti-footgun, not a security boundary."
+  },
+  "maxItemRetries": 2,
+  "retryBonusOnConvergence": true,
+  "maxBonusRounds": 1,
+  "maxInfraRetries": 3,
+  "_infraRetryNote": "KI-L53 (2026-07-12): fold AUTO-applies the KI-L50 attempt-not-counted treatment when a result is infraSuspect (a stage agent returned null after retries — outage/credit/skip, never a quality verdict), capped at maxInfraRetries per item (tracked as row.infraRetries) so a persistently-dying stage cannot re-run an item forever. Manual --infra-retry is operator judgment and never capped.",
+  "_retryNote": "KI-L41 (2026-07-03): maxItemRetries reverted 4->2 (the 4 was the cycle-25 recovery-era setting); a FAILED round whose blocking findings are STRICTLY narrower than the prior round's (fewer findings, max severity not worse — from structured gateDetails, at fold, deterministic) earns +1 bonus attempt, at most maxBonusRounds per item. Worst case per item = maxItemRetries + maxBonusRounds bands.",
+  "budget": {
+    "perCycleOutputTokens": null,
+    "reserve": 50000,
+    "note": "null = no cap. Set to govern a cycle; the driver/factory loop while budget.remaining() > reserve."
+  },
+  "gateSet": [
+    "architect",
+    "developer",
+    "qa",
+    "security",
+    "po"
+  ],
+  "hardGates": [
+    "architect",
+    "security",
+    "po"
+  ],
+  "gateSetNote": "Band A of the review stage — the 5 BMAD role gates from dataflow.md § BMAD Review Gates (acceptance/sign-off). hardGates block merge. Band B/C are the BMAD review-named flows in reviewFlows below.",
+  "reviewFlows": {
+    "_comment": "Review stage Band B/C — every BMAD flow with 'review' in the name, each run as a SEPARATE adversarial subagent (PLAN.md §6). Band A is the 5 role gates above (gateSet). routeKey -> config/model-routing.json. appliesWhen keeps cost bounded (PLAN.md §4): code-touching = files[] has non-doc source; doc-touching = files[] has .md/docs; has-regression-test ~ all CLOSED items.",
+    "method": [
+      {
+        "skill": "bmad-code-review",
+        "routeKey": "review.code",
+        "appliesWhen": "code-touching",
+        "blocking": true,
+        "note": "3 hunters: Blind / Edge Case / Acceptance Auditor + triage."
+      },
+      {
+        "skill": "bmad-review-adversarial-general",
+        "routeKey": "review.adversarial",
+        "appliesWhen": "all-items",
+        "blocking": true,
+        "note": "Cynical Review; realizes the PLAN.md §6.5 refute pass."
+      },
+      {
+        "skill": "bmad-review-edge-case-hunter",
+        "routeKey": "review.edgecase",
+        "appliesWhen": "code-touching",
+        "blocking": true,
+        "note": "Pure path-tracer over the diff hunks; realizes the §6.5 refute pass."
+      },
+      {
+        "skill": "bmad-testarch-test-review",
+        "routeKey": "review.testreview",
+        "appliesWhen": "has-regression-test",
+        "blocking": true,
+        "note": "Quality of the red->green regression test the item adds."
+      }
+    ],
+    "editorial": [
+      {
+        "skill": "bmad-editorial-review-structure",
+        "routeKey": "review.editorial_structure",
+        "appliesWhen": "doc-touching",
+        "blocking": false,
+        "order": 1,
+        "note": "Doc-touching items only; run BEFORE prose."
+      },
+      {
+        "skill": "bmad-editorial-review-prose",
+        "routeKey": "review.editorial_prose",
+        "appliesWhen": "doc-touching",
+        "blocking": false,
+        "order": 2,
+        "note": "Copy-edit pass after structure."
+      }
+    ],
+    "humanCheckpoint": {
+      "skill": "bmad-checkpoint-preview",
+      "appliesWhen": "escalate|integrate-handoff",
+      "automated": false,
+      "note": "The one 'review'-named flow that is NOT an automated subagent: it drives the HUMAN through the change at the ESCALATED off-ramp / PR handoff (hard rule: the human commits)."
+    },
+    "blockingNote": "A blocking review flow returning CHANGES_REQUIRED (or a CRITICAL/HIGH finding) sends the item back to the fixer (FAILED), exactly like a failed role gate. Editorial flows are advisory: their doc fixes are applied in the worktree but never block a code item's merge."
+  },
+  "layerOrder": [
+    "lib",
+    "service",
+    "portal"
+  ],
+  "blastRadius": {
+    "escalateThemes": [
+      "auth",
+      "money",
+      "crypto",
+      "cross-service"
+    ],
+    "note": "Items whose theme/fixType touch these are ESCALATED for human sign-off even when auto-drafted (PLAN.md 7)."
+  },
+  "realInfraThemes": [
+    "money-correctness",
+    "idempotency-dataflow",
+    "concurrency",
+    "security-multitenancy"
+  ],
+  "realInfraNote": "A green EF-in-memory test does NOT close these. Phase 3 Testcontainers verification is a hard gate for them.",
+  "pilot": {
+    "target": "ExampleService",
+    "solution": "ExampleService/ExampleService.sln",
+    "mechanical": "EXMPL-M1",
+    "nonTrivial": "EXMPL-H1",
+    "note": "Replace with a target in YOUR repo that builds clean + has a green suite, so red->green is unambiguous."
+  },
+  "paths": {
+    "ledger": "_bmad-output/ai-factory/state/ledger.json",
+    "graph": "_bmad-output/ai-factory/state/findings-graph.json",
+    "progress": "_bmad-output/ai-factory/state/PROGRESS.md",
+    "items": "_bmad-output/ai-factory/state/items",
+    "worktreesState": "_bmad-output/ai-factory/state/worktrees",
+    "reports": "_bmad-output/ai-factory/reports",
+    "burndown": "_bmad-output/ai-factory/reports/burndown.md",
+    "queue": "_bmad-output/ai-factory/queue/decisions.md",
+    "agents": "_bmad-output/ai-factory/agents",
+    "modelRouting": "_bmad-output/ai-factory/config/model-routing.json",
+    "runArgs": "_bmad-output/ai-factory/state/run-args.json",
+    "runScript": "_bmad-output/ai-factory/state/run-script.js",
+    "controller": "_bmad-output/ai-factory/state/controller.json"
+  }
+}

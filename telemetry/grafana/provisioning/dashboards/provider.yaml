@@ -1,0 +1,14 @@
+# Grafana file-provisioned dashboards (spine AD-6 — dashboards-as-code).
+apiVersion: 1
+
+providers:
+  - name: ai-factory
+    orgId: 1
+    folder: "AI Factory"
+    type: file
+    disableDeletion: true
+    updateIntervalSeconds: 30
+    allowUiUpdates: false
+    options:
+      path: /etc/grafana/dashboards
+      foldersFromFilesStructure: false

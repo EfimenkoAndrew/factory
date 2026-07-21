@@ -1,0 +1,29 @@
+# Build-time audit gate (deterministic, no-LLM, no-cost). Catches NEW .claude/rules anti-patterns on a PR's
+# ADDED lines so the audit backlog cannot grow back. Copy to .github/workflows/audit-diff.yml to activate
+# (it is shipped here, under the untracked factory dir, so it does not alter the team's shared CI until an
+# operator deliberately installs it — see ci/README.md).
+name: audit-diff (build-time rules gate)
+
+on:
+  pull_request:
+    branches: [master, main]
+
+jobs:
+  audit-diff:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # need the base branch history for the merge-base diff
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Scan the PR's added lines for rule anti-patterns
+        run: |
+          SCRIPT=_bmad-output/ai-factory/_workflow/audit-diff.mjs
+          if [ ! -f "$SCRIPT" ]; then
+            echo "audit-diff script not present in this checkout; skipping (factory not tracked here)."
+            exit 0
+          fi
+          # Diff only the PR's net changes (merge-base of the base branch .. HEAD).
+          node "$SCRIPT" --base "origin/${{ github.base_ref }}"
