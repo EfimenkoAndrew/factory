@@ -1,10 +1,13 @@
 # AI Implementation Factory
 
 An in-project, agentic **implement-and-auto-evaluate** engine. Feed it a spec'd work
-item (audit finding / BMAD story / change request with acceptance criteria); it
-implements it, proves it with a red→green test + the BMAD review stage (5 role gates + every bmad-*-review flow) + a scoped re-audit,
-and hands verified changes off **for the human to commit**. See `PLAN.md` for the
-architecture.
+item (audit finding / story / change request with acceptance criteria); it implements
+the item, proves it with a red→green test + an adversarial review stage (5 role gates +
+independent review flows) + a scoped re-audit, and hands the verified change off
+**for the human to commit**. See `PLAN.md` for the architecture.
+
+It runs on **Claude Code**: the worker plane is a Claude Code Workflow script; the
+control plane is zero-dependency Node (>= 20.11). Nothing to `npm install`.
 
 > **Every known issue, limitation, accepted constraint, and residual lives in
 > [`KNOWN-ISSUES.md`](./KNOWN-ISSUES.md)** — the canonical, append-only registry. Read it
@@ -13,18 +16,18 @@ architecture.
 > **Cost too high / backlog too big?** [`EFFECTIVENESS.md`](./EFFECTIVENESS.md) is the operator guide:
 > root-cause clustering (`cluster.mjs` → most findings are ~6 systemic patterns), cost-band triage, the
 > LIGHT review band (~4× cheaper long tail), and the build-time audit gate (`audit-diff.mjs`) that stops new
-> findings at PR time. Run `node _workflow/cluster.mjs` first — it reframes "617 problems" as "~6 sweeps."
+> findings at PR time. Run `node _workflow/cluster.mjs` first — it reframes "N problems" as "a few sweeps."
 
 ## Use it in YOUR repo (clone & set up)
 
 The factory is repo-agnostic and ships as its own repository —
-`git@github.com:EfimenkoAndrew/fucktory.git`. Mount it in any host repo (submodule
+<https://github.com/EfimenkoAndrew/factory>. Mount it in any host repo (submodule
 recommended, any path), initialize, feed it a findings-graph:
 
 ```bash
-git submodule add git@github.com:EfimenkoAndrew/fucktory.git _bmad-output/ai-factory
+git submodule add https://github.com/EfimenkoAndrew/factory.git _bmad-output/ai-factory
 node _bmad-output/ai-factory/setup/init.mjs --fresh --yes --hooks   # new host (scaffolds state, installs the skill + pre-push gate)
-node _bmad-output/ai-factory/setup/init.mjs                         # this repo / keep shipped state
+node _bmad-output/ai-factory/setup/init.mjs                         # existing host / keep current state
 ```
 
 [`SETUP.md`](./SETUP.md) is the full onboarding guide (prerequisites, mount shapes, host
@@ -42,7 +45,7 @@ The factory is split because the Workflow runtime cannot touch the filesystem or
 | **Control plane (persistence + scheduling)** | `driver.mjs` — owns `ledger.json` (single writer), selects READY items, emits `run-args.json`, folds Workflow results back, regenerates reports. Run via `node` between Workflow invocations. | `_workflow/driver.mjs` + `_workflow/lib/*.mjs` |
 | **Worker plane (agents)** | `factory.js` — a **Workflow script**. Receives a batch + agent templates + model routing via `args`, drives each item through the lifecycle with model-routed, worktree-isolated, low-concurrency subagents, writes each artifact to disk, returns compact per-item results. | `_workflow/factory.js`, `agents/*.md` |
 
-You supply `state/findings-graph.json` — hand-authored or generated from your backlog; see `SETUP.md` � 4 and `templates/findings-graph.example.json`.
+You supply `state/findings-graph.json` — hand-authored or generated from your backlog; see `SETUP.md` § 4 and `templates/findings-graph.example.json`.
 
 ## Work-item lifecycle (the resumable state machine)
 
@@ -64,43 +67,48 @@ from disk + worktree inspection; nothing restarts from zero.
 - **Throttle discipline:** one Workflow at a time; concurrency 2–3 under throttle; per-agent
   retry ≥3; opus throttled harder than sonnet.
 - **Green build ≠ done.** A fix needs a red→green regression test; money/security/concurrency
-  items additionally need real-infra (Testcontainers) verification (Phase 3).
+  items additionally need real-infra (Testcontainers) verification.
 - **The review stage is separate adversarial subagents** — never nested in the doing agent. Band A:
-  the 5 role gates (Architect/Developer/QA/Security/PO). Band B/C: every BMAD review-named flow
-  (`bmad-code-review`, `bmad-review-adversarial-general`, `bmad-review-edge-case-hunter`,
-  `bmad-testarch-test-review`, `bmad-editorial-review-structure`, `bmad-editorial-review-prose`),
-  applied per item by what it touches. See `PLAN.md §6` / `config/factory.config.json` reviewFlows.
+  the 5 role gates (Architect/Developer/QA/Security/PO). Band B/C: independent review flows —
+  a code review, an adversarial "cynical" review, an edge-case path-tracer, a test-quality
+  review, and editorial structure/prose passes for doc-touching items — applied per item by
+  what it touches. The methods ship embedded in `agents/*.md`; nothing external to install.
+  See `PLAN.md` (the review stage) + `reviewFlows` in `config/factory.config.json`.
 - **Model routing** per `config/model-routing.json` — opus reserved for hard reasoning + the
   three hard gates + refute; sonnet for mid; haiku for cheap.
-- **`product-scope.md` red-lines are hard stops** — never "fix" by adding a fee/tax/SAR/shipping
-  surface; such an item is `scope-stop` and goes to the human queue.
+- **Declared product red-lines are hard stops** — an item whose only fix would add a surface
+  your project forbids is `scope-stop` and goes to the human queue, never "fixed".
 
 ## Driver commands
 
 ```
-node _bmad-output/ai-factory/_workflow/driver.mjs <cmd>
+node <mount>/_workflow/driver.mjs <cmd>       # <mount> = your factory path, e.g. _bmad-output/ai-factory
   init [--force]        build/refresh ledger from findings-graph (resume-safe)
   status               counts, waiting-on-deps, escalations, in-flight
   select [--max N --target T --themes a,b --include-escalate --posture P --worktree PATH:BRANCH]
   claim <id...>        READY/FAILED/CONFLICT → CLAIMED (track in-flight)
   reset <id...>        re-queue CLAIMED/active/FAILED → READY (un-claim / recover a stranded item)
   fold <results.json>  apply Workflow per-item results to the ledger
+  reconstruct          rebuild a results file from per-item checkpoints (killed-run recovery), then fold it
   resume [--reset-stale]   report in-flight; --reset-stale re-queues ACTIVE → READY (checked + honest)
+  suggest              read-only batch planner — clusters schedulable items into similar batches, prints `group --ids` lines
   group [--target T --layer L --ids a,b --max N --include-escalate --include-realinfra]
-                       Phase-4 scale-out: pick a batch, per-item worktrees + compact run-args (parallel)
+                       pick a parallel batch: per-item worktrees + compact run-args
   cycle [--until critical|high|dry --target T --max N ...]
                        closed-loop step: emit next batch + a RUN/STOP signal (drive from /loop or a routine)
-  sweep <N> [--max-sites K]   root-cause sweep — design once + apply across a cluster's sites
+  sweep <N|slug> [--max-sites K]   root-cause sweep — design once + apply across a cluster's sites
                        (run `cluster.mjs --emit N --pattern <kw>` first to write the spec)
   sweep-fold <results.json>   close the chunk's findings if the pattern gate APPROVED
+  controller <status|claim|release|heartbeat>   advisory single-controller lease
   gc [--yes]           list (or --yes remove) worktrees for CLOSED items; prunes dead refs
   preflight            environment readiness (docker → realInfra closability; dotnet → build/test)
-  progress | burndown | cost | escalations | report-cycle
+  graph-audit [--fix] | realinfra-lint   lint the findings-graph (stale files[], over-flagged realInfra)
+  progress | burndown | cost | escalations | report-cycle | telemetry-report
   merge-graph          merge state/normalized/*.json → findings-graph.json (validates + detects dep cycles)
   worktree-add <id> | worktree-remove <path> | worktree-list
 ```
 
-A ledger-mutating command (`init/claim/reset/fold/group/cycle/merge-graph/gc`) takes an advisory
+A ledger-mutating command (`init/claim/reset/fold/group/cycle/sweep/sweep-fold/merge-graph/gc/controller`, plus `resume --reset-stale`) takes an advisory
 `ledger.json.lock` — a second concurrent driver fails fast rather than racing the ledger.
 
 ## Layout

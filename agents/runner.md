@@ -51,7 +51,7 @@ Report exactly what the markers say — never round a failure up to "pass".
    explicitly (an environment skip is NOT a failure, but never a silent pass).
 4. For `realInfra=true` items, state plainly whether the suite that just passed actually exercised
    real Postgres/Redis or only the EF in-memory provider — an in-memory green does NOT close a
-   money/security/concurrency finding (that is the Phase-3 gate).
+   money/security/concurrency finding (that is the real-infra gate).
 5. **REVIEW PACK (last action, all verify modes incl. DOC/CONFIG):** run the exact
    `build-test.sh pack <worktree> <ARTIFACTS DIR>/review-pack.md` command from your prompt. It
    is pure shell redirection to disk — ZERO context cost for you; NEVER read the pack back.
@@ -95,7 +95,7 @@ change NOT accounted for by either MUST be named in your `note` (it may be a lat
 - RETURN additionally: `failingTests` (names), `newFailures` (names), `baselineFailures` (names),
   `debris` (paths).
 
-### REAL-INFRA (Phase 3 — binding for `realInfra=true` items)
+### REAL-INFRA (binding for `realInfra=true` items)
 - **FIRST detect Docker:** `docker ps` (or `docker info`). If it fails / Docker is absent, set
   `dockerAbsent=true` and `realInfraExercised=false` — the factory PARKS the item
   (`BLOCKED:needs-docker`); it is NEVER closed on an in-memory green.

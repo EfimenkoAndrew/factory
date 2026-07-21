@@ -8,7 +8,7 @@ Adversarial **separate-session** review of test adequacy for THIS change. Routed
   thing it must integrate (`trust-and-monetisation.md` AP#10: seed real rows, don't mock the metric).
 - Coverage of the change's risk paths: the happy path PLUS the key negative/edge/concurrency case
   the finding was about. For `realInfra=true`, flag if the green came only from the EF in-memory
-  provider (then it is NOT closed — Phase-3 Testcontainers required).
+  provider (then it is NOT closed — Testcontainers required).
 - No regression to existing tests; determinism (no wall-clock/random).
 
 ### Return

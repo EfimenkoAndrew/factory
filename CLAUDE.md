@@ -16,7 +16,7 @@ script — the agent pipeline) + `agents/*.md` (role briefs). `README.md` explai
   `Date.now()`/`Math.random()`/argless `new Date()`. Pure helpers used there are INLINED
   byte-for-byte from `_workflow/lib/` — change both copies together.
 - **The state files are machine-owned.** `state/ledger.json` has a single writer (the driver);
-  never hand-edit it. The findings-graph IS hand-editable (KI-L54), schema:
+  never hand-edit it. The findings-graph IS hand-editable — schema:
   `schema/work-item.schema.json`.
 
 ## Hard behavioural rules (apply to any session, host or standalone)

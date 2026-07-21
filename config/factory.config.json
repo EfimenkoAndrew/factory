@@ -13,7 +13,7 @@
   "attempts": 3,
   "controller": {
     "ttlMinutes": 240,
-    "note": "KI-C11 session-controller lease: every mutating driver command requires state/controller.json's token (--controller / FACTORY_CONTROLLER); free or TTL-stale lease auto-claims, FRESH foreign lease refuses. TTL must outlast the longest group->fold gap (a full Workflow band). Advisory anti-footgun, not a security boundary."
+    "note": "Session-controller lease: every mutating driver command requires state/controller.json's token (--controller / FACTORY_CONTROLLER); free or TTL-stale lease auto-claims, FRESH foreign lease refuses. TTL must outlast the longest group->fold gap (a full Workflow band). Advisory anti-footgun, not a security boundary."
   },
   "maxItemRetries": 2,
   "retryBonusOnConvergence": true,
@@ -117,7 +117,7 @@
     "concurrency",
     "security-multitenancy"
   ],
-  "realInfraNote": "A green EF-in-memory test does NOT close these. Phase 3 Testcontainers verification is a hard gate for them.",
+  "realInfraNote": "A green EF-in-memory test does NOT close these. Testcontainers verification is a hard gate for them.",
   "pilot": {
     "target": "ExampleService",
     "solution": "ExampleService/ExampleService.sln",

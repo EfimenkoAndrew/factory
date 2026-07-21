@@ -3,7 +3,7 @@
 // cost) that scans only the ADDED lines of a diff for the anti-patterns the .claude/rules/*.md codify, so a
 // NEW violation is caught at PR/build time instead of accumulating into the next audit. Exits non-zero on
 // any CRITICAL/HIGH so a CI step or pre-push hook can block. The factory's LLM review band is the deep,
-// expensive net; this is the cheap, fast, every-PR net that keeps the 617 from growing back.
+// expensive net; this is the cheap, fast, every-PR net that keeps the backlog from growing back.
 //
 //   node _bmad-output/ai-factory/_workflow/audit-diff.mjs [--base <ref>] [--staged]
 //     --base <ref>   diff against <ref> (e.g. origin/master). Default: working-tree changes vs HEAD.

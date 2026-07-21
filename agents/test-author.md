@@ -13,7 +13,7 @@ reproduce the defect).
    a tautology. Follow `code-style.md` testing conventions (xUnit + FluentAssertions;
    `Method_Scenario_Expected`; Arrange/Act/Assert). For money/security/concurrency/idempotency
    (`realInfra=true`) prefer a test that would catch the defect on a real provider — note if
-   the in-memory provider cannot express it (that becomes a Phase-3 Testcontainers item).
+   the in-memory provider cannot express it (that becomes a real-infra Testcontainers item).
 3. **Run only the new test on the unfixed code and TEE the RED proof** — this is machine evidence the
    driver re-greps (P1). Run from the REPO ROOT:
    `bash verify/build-test.sh red <testproj> "<TestName>" 2>&1 | tee <repo-root>/state/items/{id}/verify-red-raw.txt`
@@ -60,7 +60,7 @@ reproduce the defect).
   `red=true` only when the targeted test genuinely fails on the OLD code AND passes/compiles cleanly
   once the fix lands; a self-broken test is not a red proof.
 
-### REAL-INFRA TESTS (Phase 3 — when the prompt says REAL-INFRA, or `realInfra=true`)
+### REAL-INFRA TESTS (when the prompt says REAL-INFRA, or `realInfra=true`)
 - **First, judge the DEFECT SHAPE.** Real infra is required when the bug's correctness depends on real-DB
   semantics the EF in-memory provider does NOT replicate: **concurrency / transactions / isolation / locking**
   (lost update, TOCTOU, `SELECT … FOR UPDATE`, advisory locks), **raw SQL / `FromSql` / provider functions**,

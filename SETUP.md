@@ -25,14 +25,14 @@ generated per host at runtime and is gitignored, so no project data ever enters 
 **A — submodule (recommended; any path works):**
 
 ```bash
-git submodule add git@github.com:EfimenkoAndrew/fucktory.git _bmad-output/ai-factory
+git submodule add https://github.com/EfimenkoAndrew/factory.git _bmad-output/ai-factory
 # consumers of your repo then need: git submodule update --init _bmad-output/ai-factory
 ```
 
 **B — plain clone inside the host repo** (keep it out of the host's index):
 
 ```bash
-git clone git@github.com:EfimenkoAndrew/fucktory.git tools/ai-factory
+git clone https://github.com/EfimenkoAndrew/factory.git tools/ai-factory
 echo "tools/ai-factory/" >> .gitignore
 ```
 
@@ -75,11 +75,12 @@ is a working 3-item example.
 Ways to produce it:
 
 - **Hand-author** items (the graph is deliberately hand-editable) — start from the template.
-- **Generate from an audit/backlog**: emit items per the schema any way you like (a small
-  full-audit reports into the graph; adapt its target table + `auditRoot` to your audit
-  `driver.mjs merge-graph` — or author `state/findings-graph.json` directly.
-- Generate from any backlog (stories, CRs) — anything that can state acceptance + a
-  regression-test idea can be an item.
+- **Generate from an audit or backlog**: write a small adapter that emits schema-valid items
+  into `state/normalized/*.json`, then run `driver.mjs merge-graph` to combine them into the
+  findings-graph (it validates and detects dependency cycles) — or emit
+  `state/findings-graph.json` directly. No adapter ships (§ 6): the schema is the only
+  interface. Anything that can state an acceptance criterion plus a regression-test idea
+  (audit finding, story, change request) can be an item.
 
 Then build the ledger: `node <mount>/_workflow/driver.mjs init`
 
@@ -110,7 +111,7 @@ Outputs land in: `state/PROGRESS.md`, `reports/burndown.md`, `reports/cost-lates
 
 | Seam | Default | Adapt by |
 |---|---|---|
-| **Build/test runner** | `verify/build-test.sh` (dotnet; emits `FACTORY::` markers) | drop an executable `verify/build-test.local.sh` implementing the SAME subcommands + markers — it takes over automatically (`FACTORY_BT_NO_LOCAL=1` bypasses; gitignored) |
+| **Build/test runner** | `verify/build-test.sh` (dotnet; emits `FACTORY::` markers) | drop an executable `verify/build-test.local.sh` implementing the same subcommands (`build`/`red`/`filter`/`suite`/`claims`/`leftovers`/`pack`) + `FACTORY::` markers — it takes over automatically (`FACTORY_BT_NO_LOCAL=1` bypasses; gitignored) |
 | **Config knobs** | `config/factory.config.json` (gates, escalate/realInfra themes, retries, concurrency) | gitignored `config/factory.config.local.json` overlay |
 | **Model routing** | `config/model-routing.json` (opus = hard gates/refute, sonnet = mid, haiku = cheap) | edit (committed) or overlay |
 | **Review-gate house rules** | several `agents/*.md` briefs cite `.claude/rules/*.md` checklists (the host project's engineering rules) | give your host repo its own `.claude/rules/`, or trim those citations in the briefs — gates degrade gracefully when a cited file is absent |
