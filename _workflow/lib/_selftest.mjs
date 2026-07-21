@@ -18,13 +18,15 @@ import { parseVerifyRaw, verdictFromParse, debrisFiles, parseRedRaw, hasRealInfr
 import { acquireLock, releaseLock } from './lock.mjs';
 import { checkRoutingDrift, buildFactoryRouting } from './routing-drift.mjs';
 import { changedFiles } from './worktree.mjs';
-import { classifyFilesEntry, buildBasenameIndex } from './graphaudit.mjs';
+import { classifyFilesEntry, buildBasenameIndex, acceptanceSurfaceGaps } from './graphaudit.mjs';
 import { renderFeedback } from './feedback.mjs';
 import { gateFindingsSummary, isStrictlyNarrower, applyConvergenceBonus, effectiveRetryBound } from './convergence.mjs';
 import { sig, jaccard, similarSigs, clusterBySimilarity, batchPatternFor } from './similarity.mjs';
 import { loadController, isStale as controllerStale, claimController, verifyController, releaseController } from './controller.mjs';
 import { execSmoke, smokeBatch } from './_execsmoke.mjs';
 import { classifyLine as loClassify, firstLexeme as loLexeme, findLeftovers } from './leftover-scan.mjs';
+import { splitAcceptanceClauses } from './acceptance.mjs';
+import { dissentersFrom, roleForGateKey, recoveryTransitions, recoveryFoldSkeleton, priorCycleOf } from './recover.mjs';
 import { extractHeadings, buildDocMap, readRoleBriefs } from './promptpack.mjs';
 import { fileURLToPath } from 'node:url';
 
@@ -1090,6 +1092,132 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
   const dsrc17 = readFileSync(new URL('../driver.mjs', import.meta.url), 'utf8');
   ok(dsrc17.includes('resolveRepoRoot(FACTORY_ROOT, process.env)') && dsrc17.includes('swapMountPrefix(cfg, STOCK_MOUNT, MOUNT_REL)')
     && dsrc17.includes('factory.config.local.json'), 'KI-E17: driver wires root detection + local overlay + mount rewrite');
+}
+
+// KI-E18: AcceptanceScan clause splitter — semicolons, sentence boundaries, abbreviation guard,
+// fragment filter, cap-merge; plus the factory.js inline-copy parity pin.
+{
+  eq(splitAcceptanceClauses('page/pageSize are clamped before Skip/Take; skip arithmetic is computed in a wider type; hostile page=2147483647 returns 200 with an empty page, never a 500.').length, 3, 'KI-E18: semicolon acceptance splits into 3 clauses');
+  eq(splitAcceptanceClauses('Clamped before Skip/Take. Hostile page=2147483647 returns 200 with an empty page.').length, 2, 'KI-E18: sentence boundary splits (path dots do not)');
+  eq(splitAcceptanceClauses('Use the pattern e.g. HMACSHA256 for the token hash. The guard throws on a placeholder value.').length, 2, 'KI-E18: e.g. does not split; a real boundary does');
+  ok(splitAcceptanceClauses('Use the pattern e.g. HMACSHA256 for the token hash. The guard throws on a placeholder value.')[0].includes('e.g. HMACSHA256'), 'KI-E18: abbreviation guard restores the space');
+  eq(splitAcceptanceClauses('a; b; tiny').length, 0, 'KI-E18: sub-20-char fragments are dropped');
+  eq(splitAcceptanceClauses(''), [], 'KI-E18: empty acceptance -> no clauses');
+  const many = Array.from({ length: 12 }, (_, i) => `Clause number ${i} is long enough to count here`).join('; ');
+  const capped = splitAcceptanceClauses(many, 8);
+  eq(capped.length, 8, 'KI-E18: cap bounds the clause count');
+  ok(capped[7].includes('Clause number 11'), 'KI-E18: the tail merges into the last clause (never dropped)');
+  // Inline parity: factory.js carries a byte-identical copy (the Workflow runtime cannot import).
+  const fsrcAcc = readFileSync(join(import.meta.dirname, '..', 'factory.js'), 'utf8');
+  const asrcAcc = readFileSync(join(import.meta.dirname, 'acceptance.mjs'), 'utf8');
+  const bodyOf = (s) => { const m = s.match(/function splitAcceptanceClauses[\s\S]*?\n\}/); return m ? m[0] : null; };
+  eq(bodyOf(fsrcAcc), bodyOf(asrcAcc.replace('export function splitAcceptanceClauses', 'function splitAcceptanceClauses')), 'KI-E18: factory.js inline splitter is byte-identical to lib/acceptance.mjs');
+  ok(fsrcAcc.includes('const ACCEPT_SCHEMA') && fsrcAcc.includes("'probe:acceptance-scan'") && fsrcAcc.includes('acceptance-probe'), 'KI-E18: factory wires ACCEPT_SCHEMA + the acceptance-probe stage + the gates key');
+}
+
+// KI-E19: evidence-manifest markers — keyed FACTORY::SUMMARY lines override the heuristic parses;
+// the suite's counts survive a later filter append (the recovery-transcript near-miss); legacy
+// transcripts parse exactly as before.
+{
+  const legacy = 'FACTORY::BUILD::RESULT exit=0 errors=0\nPassed!  - Failed: 0, Passed: 10, Skipped: 1, Total: 11\nFACTORY::TEST::SUITE::RESULT exit=0\n';
+  eq(parseVerifyRaw(legacy).suite, { failed: 0, passed: 10, skipped: 1 }, 'KI-E19: legacy transcript (no SUMMARY markers) parses as before');
+  const manifest = 'FACTORY::BUILD::RESULT exit=0 errors=0\nFACTORY::SUMMARY::build exit=0 errors=0\n'
+    + 'Failed!  - Failed: 2, Passed: 8, Skipped: 0, Total: 10\nFACTORY::TEST::SUITE::RESULT exit=1\nFACTORY::SUMMARY::suite exit=1 failed=2 passed=8 skipped=0\n'
+    + 'Passed!  - Failed: 0, Passed: 1, Skipped: 0, Total: 1\nFACTORY::TEST::FILTER::RESULT exit=0\nFACTORY::SUMMARY::filter exit=0\n';
+  const pm = parseVerifyRaw(manifest);
+  eq(pm.suite, { failed: 2, passed: 8, skipped: 0 }, 'KI-E19: suite counts come from the KEYED marker — a later filter append cannot shadow them');
+  eq(pm.suiteExit, 1, 'KI-E19: suite exit from the keyed marker');
+  ok(pm.build && pm.build.exit === 0 && pm.targetedFail === false, 'KI-E19: build + filter keyed markers parsed');
+  ok(!verdictFromParse(pm, 0).pass, 'KI-E19: the manifest-parsed suite failure FAILS the verdict (the ambient last dotnet line would have passed it)');
+  const noCounts = parseVerifyRaw('FACTORY::SUMMARY::suite exit=1 failed=-1 passed=-1 skipped=-1\n');
+  ok(noCounts.suiteExit === 1 && noCounts.suite === null, 'KI-E19: failed=-1 (no dotnet summary line) sets exit only, never fake counts');
+  const dsrc19 = readFileSync(join(import.meta.dirname, '..', 'driver.mjs'), 'utf8');
+  ok(dsrc19.includes('KI-E19') && dsrc19.includes('build+suite green PAIR'), 'KI-E19: driver enforces the FULL-band build+suite pair rule');
+  ok(dsrc19.includes("event: 'usage'") && dsrc19.includes('band: r.band || undefined'), 'KI-E23: fold emits the usage event + stamps band on item_folded');
+  const bt19 = readFileSync(join(import.meta.dirname, '..', '..', 'verify', 'build-test.sh'), 'utf8');
+  ok(bt19.includes('FACTORY::SUMMARY::build') && bt19.includes('FACTORY::SUMMARY::filter') && bt19.includes('FACTORY::SUMMARY::suite') && bt19.includes('FACTORY::SUMMARY::red'), 'KI-E19: build-test.sh trails every subcommand with a keyed SUMMARY marker');
+}
+
+// KI-E20: recover scaffold — pure helpers (dissent digest, role mapping, transition shapes, skeleton).
+{
+  const gd = {
+    'gate:qa': { verdict: 'CHANGES_REQUIRED', headline: 'h', findings: [{ severity: 'HIGH', title: 't' }] },
+    'gate:po': { verdict: 'APPROVED', headline: 'ok', findings: [] },
+    'gate:qa:re-gate': { verdict: 'CHANGES_REQUIRED', headline: 'dup', findings: [] },
+    'probe:acceptance-scan': { verdict: 'CHANGES_REQUIRED', headline: 'probe', findings: [] },
+    'review:review-adversarial-general': { verdict: 'CHANGES_REQUIRED', headline: 'adv', findings: [] },
+    'adjudicator': { verdict: 'UPHELD', headline: 'a' },
+  };
+  eq(dissentersFrom(gd).map((d) => d.key), ['gate:qa', 'review:review-adversarial-general'], 'KI-E20: dissenters = CHANGES_REQUIRED only; re-gate + probe rows excluded');
+  eq(roleForGateKey('gate:security'), 'gate-security', 'KI-E20: gate key -> role');
+  eq(roleForGateKey('review:review-adversarial-general'), 'review-adversarial', 'KI-E20: adversarial review key -> brief role');
+  eq(roleForGateKey('review:code-review'), 'review-code', 'KI-E20: code-review key -> brief role');
+  eq(roleForGateKey('probe:leftover-scan'), null, 'KI-E20: probe keys have no re-gate role');
+  eq(recoveryTransitions('FAILED')[0], 'CLAIMED', 'KI-E20: FAILED recovery walks the full chain from CLAIMED');
+  eq(recoveryTransitions('ESCALATED'), ['CLOSED'], 'KI-E20: ESCALATED recovery is the single CLOSED hop (KI-L62)');
+  eq(priorCycleOf({ resultId: 'X-1#46' }, 9), 46, 'KI-E20: recovery cycle parsed from the prior checkpoint');
+  eq(priorCycleOf(null, 9), 9, 'KI-E20: no checkpoint -> fallback cycle');
+  const sk = recoveryFoldSkeleton('X-1', { state: 'FAILED', worktree: 'wt', branch: 'b' }, { codeChange: true, needsRealInfra: false, rootCauseFiles: ['a.cs'], integrateRaw: true, resultId: 'X-1#46' }, 46);
+  eq(sk.resultId, 'X-1#46r', 'KI-E20: skeleton resultId is #<cycle>r');
+  eq(sk.attemptsDelta, 0, 'KI-E20: a recovery consumes no retry budget');
+  ok(sk.codeChange === true && sk.integrateRaw === true && sk.transitions.length === 10, 'KI-E20: machine-evidence flags carry over; the FAILED chain has 10 hops');
+  const dsrc20 = readFileSync(join(import.meta.dirname, '..', 'driver.mjs'), 'utf8');
+  ok(dsrc20.includes("case 'recover'") && dsrc20.includes('recovery_prepared') && dsrc20.includes('mutation-proof.txt'), 'KI-E20: driver wires recover + telemetry + the evidence contract');
+  ok(dsrc20.includes("case 'decisions-digest'") && dsrc20.includes('Rule-together bundles'), 'KI-E24: driver wires the ranked owner-decision digest');
+}
+
+// KI-E22: acceptance-surface lint (the KI-E16 generalization) — pure heuristic over injected IO.
+{
+  const idx22 = buildBasenameIndex(['SvcA/src/Api/ItemsController.cs', 'SvcA/src/Api/OrdersController.cs', 'SvcB/src/Api/OrdersController.cs', 'doc/data-flows/SvcA.md']);
+  const io22 = { existsOnDisk: (p) => ['doc/data-flows/SvcA.md', 'SvcA'].includes(p), byBasename: idx22, targetDir: 'SvcA' };
+  eq(acceptanceSurfaceGaps({ target: 'SvcA', acceptance: 'ItemsController clamps page and pageSize before querying.', files: ['SvcA/src/Clients/ItemsClient.cs'] }, io22).map((g) => g.resolved), ['SvcA/src/Api/ItemsController.cs'], 'KI-E22: uniquely-resolving PascalCase type -> gap when files[] lacks it');
+  eq(acceptanceSurfaceGaps({ target: 'SvcA', acceptance: 'ItemsController clamps input.', files: ['SvcA/src/Api/ItemsController.cs'] }, io22).length, 0, 'KI-E22: no gap when files[] carries the surface');
+  eq(acceptanceSurfaceGaps({ target: 'SvcA', acceptance: 'ItemsController clamps input.', files: ['x/ItemsController.cs'] }, io22).length, 0, 'KI-E22: a basename match in files[] suffices');
+  eq(acceptanceSurfaceGaps({ target: 'SvcA', acceptance: 'OrdersController clamps as well.', files: [] }, io22).map((g) => g.resolved), ['SvcA/src/Api/OrdersController.cs'], 'KI-E22: target-dir-unique wins over a cross-service basename collision');
+  eq(acceptanceSurfaceGaps({ target: null, acceptance: 'OrdersController clamps.', files: [] }, { ...io22, targetDir: null }).length, 0, 'KI-E22: a globally-ambiguous token is silently skipped (advisory lint, no noise)');
+  eq(acceptanceSurfaceGaps({ target: 'SvcA', acceptance: 'doc/data-flows/SvcA.md documents the mapped route.', files: ['SvcA/README.md'] }, io22).map((g) => g.resolved), ['doc/data-flows/SvcA.md'], 'KI-E22: an existing path-like token -> gap');
+  const dsrc22 = readFileSync(join(import.meta.dirname, '..', 'driver.mjs'), 'utf8');
+  ok(dsrc22.includes('ACCEPT-SURFACE') && dsrc22.includes('KI-E22 WARN'), 'KI-E22: graph-audit reports + group-time advisory warn wired');
+  ok(dsrc22.includes('ledger-path append(s) (KI-E16)'), 'KI-E16: graph-audit --fix appends the ledger path for shared-file gaps');
+  ok(dsrc22.includes('SWEEP CANDIDATE (KI-E21)'), 'KI-E21: suggest recommends the sweep channel for large homogeneous clusters');
+}
+
+// KI-E18/KI-E23 exec-smoke: the acceptance-scan stage runs pre-band — a gap triggers ONE bounded
+// amend + re-probe (lane closes); a persistent gap FAILS pre-band with clause-level feedback;
+// editorial verdicts land in the gates map; the run returns a usage counter.
+{
+  const src = readFileSync(join(import.meta.dirname, '..', 'factory.js'), 'utf8');
+  const twoClause = 'The README documents the actual mapped route for the probe; the probe example curls the mapped route successfully.';
+  const b1 = smokeBatch(); b1.items = b1.items.filter((it) => it.id === 'SMOKE-DOC'); b1.items[0].acceptance = twoClause;
+  let probeCalls = 0;
+  const r1 = await execSmoke(src, b1, {
+    agentOverride: (prompt, opts) => {
+      if ((opts && opts.label) === 'SMOKE-DOC:acceptance-probe') {
+        probeCalls++;
+        return probeCalls === 1 ? { covered: false, gaps: [{ clause: 'the probe example curls the mapped route successfully', why: 'no curl evidence in the diff' }] } : { covered: true, gaps: [] };
+      }
+      return undefined;
+    },
+  });
+  const d1 = (r1.result.results || [])[0];
+  eq(probeCalls, 2, 'KI-E18 smoke: gap -> amend -> re-probe (exactly two probe calls)');
+  eq(d1 && d1.toState, 'CLOSED', 'KI-E18 smoke: the amended item proceeds to CLOSED');
+  eq(d1 && d1.gates && d1.gates['probe:acceptance-scan'], 'APPROVED', 'KI-E18 smoke: the final probe verdict is recorded');
+  ok(r1.calls.filter((c) => c.label === 'SMOKE-DOC:fixer').length >= 2, 'KI-E18 smoke: the bounded amend ran the fixer');
+  eq(d1 && d1.gates && d1.gates['editorial:structure'], 'APPROVED', 'KI-E23 smoke: the advisory editorial verdict is recorded in the gates map');
+  eq(d1 && d1.band, 'LIGHT', 'KI-E23 smoke: the result carries its band');
+  ok(r1.result && r1.result.usage && typeof r1.result.usage.outputTokens === 'number', 'KI-E23 smoke: the run returns a usage counter');
+  const b2 = smokeBatch(); b2.items = b2.items.filter((it) => it.id === 'SMOKE-DOC'); b2.items[0].acceptance = twoClause;
+  const r2 = await execSmoke(src, b2, {
+    agentOverride: (prompt, opts) => {
+      if ((opts && opts.label) === 'SMOKE-DOC:acceptance-probe') return { covered: false, gaps: [{ clause: 'the probe example curls the mapped route successfully', why: 'still no evidence' }] };
+      return undefined;
+    },
+  });
+  const d2 = (r2.result.results || [])[0];
+  eq(d2 && d2.toState, 'FAILED', 'KI-E18 smoke: a persistent gap FAILS pre-band');
+  ok(String((d2 && d2.note) || '').startsWith('acceptance-scan (KI-E18)'), 'KI-E18 smoke: the fail note carries the clause-level feedback');
+  ok(d2 && d2.gateDetails && d2.gateDetails['probe:acceptance-scan'] && d2.gateDetails['probe:acceptance-scan'].findings.length === 1, 'KI-E18 smoke: gateDetails carry the gap findings for feedback.md');
 }
 
 console.log(`\nself-test: ${pass} passed, ${fail} failed`);

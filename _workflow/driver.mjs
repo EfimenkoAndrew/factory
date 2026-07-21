@@ -37,8 +37,9 @@ import { addWorktree, removeWorktree, listWorktrees, changedFiles, pruneWorktree
 import { acquireLock, releaseLock } from './lib/lock.mjs';
 import { parseVerifyRaw, verdictFromParse, debrisFiles, parseRedRaw, hasRealInfraMarker, touchedRootCause } from './lib/verify.mjs';
 import { preflight, dockerAvailable } from './lib/preflight.mjs';
-import { classifyFilesEntry, buildBasenameIndex } from './lib/graphaudit.mjs';
+import { classifyFilesEntry, buildBasenameIndex, acceptanceSurfaceGaps } from './lib/graphaudit.mjs';
 import { renderFeedback } from './lib/feedback.mjs';
+import { dissentersFrom, roleForGateKey, recoveryFoldSkeleton, priorCycleOf } from './lib/recover.mjs'; // KI-E20 — the direct-recovery scaffold
 import { applyConvergenceBonus, effectiveRetryBound } from './lib/convergence.mjs';
 import { clusterBySimilarity, sharedLabel, batchPatternFor, sig as simSig, similarSigs } from './lib/similarity.mjs';
 import { loadController, isStale as controllerStale, claimController, verifyController, releaseController, DEFAULT_TTL_MINUTES } from './lib/controller.mjs';
@@ -459,6 +460,24 @@ function deterministicVerifyOverride(cfg, ledger, wi, r) {
     return fail('code item produced no machine build/test evidence (neither verify-raw.txt nor integrate-raw.txt carries FACTORY:: markers) — agent self-report cannot CLOSE a .cs change');
   }
 
+  // KI-E19 (improvement-analysis P5) — evidence-manifest PAIR rule: a FULL-band code item must show
+  // BOTH a green build marker AND a green suite signal (keyed FACTORY::SUMMARY marker or the dotnet
+  // summary) in at least ONE transcript — single-marker evidence alone cannot CLOSE it. Motivating
+  // near-miss: a recovery transcript where a `filter` run appended AFTER `suite` left the ambient
+  // (type-agnostic) dotnet summary line describing the 1-test filter, shadowing the suite's real
+  // counts under last-match parsing; the keyed markers + this pair requirement close that hole.
+  // Results without r.band (pre-KI-E23 factories, hand-authored recovery folds) skip the rule —
+  // backward-compatible by construction.
+  if (codeChange && r.band === 'FULL') {
+    const pairOk = [rawText, intText].some((t) => {
+      if (!t) return false;
+      const p = parseVerifyRaw(t);
+      return p.build && p.build.exit === 0 && p.build.errors === 0
+        && ((p.suite && (p.suite.failed - baseline) <= 0) || p.suiteExit === 0);
+    });
+    if (!pairOk) return fail('FULL-band code item lacks a build+suite green PAIR in any transcript (KI-E19 manifest rule) — build-only or filter-only evidence cannot CLOSE it');
+  }
+
   // P1 — RED proof: a code item's regression test must have FAILED on old code (non-vacuous).
   // KI-L55 inversion: a verificationOnly result (stale finding / pure coverage — factory.js sets the
   // flag only when the test-author attested it AND the full gate band then approved) has the OPPOSITE
@@ -730,9 +749,12 @@ function cmdFold(file, flags) {
         temit({ source: 'derived', event: 'stage_end', item: r.id, cycle: cyc, lane: row.runLabel || undefined, stage: s.stage, ts: s.ts, durMs, attrs: at });
         prevMs = s.mtimeMs;
       }
-      temit({ source: 'driver', event: 'item_folded', item: r.id, cycle: cyc, lane: row.runLabel || undefined, outcome: row.state || r.toState, attempts: row.attempts, attrs: { toState: r.toState, transitions: (r.transitions || []).slice(0, 12), gates: r.gates || {}, cost: r.cost || {}, infraSuspect: !!r.infraSuspect, verificationOnly: !!r.verificationOnly, note: String(r.note || '').slice(0, 240) } });
+      temit({ source: 'driver', event: 'item_folded', item: r.id, cycle: cyc, lane: row.runLabel || undefined, outcome: row.state || r.toState, attempts: row.attempts, attrs: { toState: r.toState, band: r.band || undefined, transitions: (r.transitions || []).slice(0, 12), gates: r.gates || {}, cost: r.cost || {}, infraSuspect: !!r.infraSuspect, verificationOnly: !!r.verificationOnly, note: String(r.note || '').slice(0, 240) } }); // KI-E23: band stamped so gate-value/cost split LIGHT vs FULL
     }
     temit({ source: 'driver', event: 'fold_summary', cycle: cyc, attrs: { file: basename(foldPath), applied: applied.length, rejected: rejected.length, skipped: skipped.length, overrides: overrides.length, infraRetries: infraApplied.length, escalated: escalated.length } });
+    // KI-E23 (P6c): the run's token usage, returned by factory.js from the runtime budget counter —
+    // cost analyses stop extrapolating from call counts. Observational only.
+    if (results && results.usage && typeof results.usage.outputTokens === 'number') temit({ source: 'driver', event: 'usage', cycle: cyc, attrs: { outputTokens: results.usage.outputTokens, file: basename(foldPath) } });
   } catch { /* observational only — a telemetry defect must never block a fold */ }
   console.log(`fold: applied ${applied.length}, rejected ${rejected.length}, skipped ${skipped.length}`
     + (overrides.length ? `, deterministic-overrides ${overrides.length}` : '')
@@ -1054,9 +1076,32 @@ function cmdSuggest(flags) {
     say(`\n#${n} [${c[0].theme || '?'}] ${sharedLabel(c)} — ${c.length} item(s) across ${[...new Set(c.map((w) => w.target))].length} target(s)`);
     for (const wi of batch) say(`  ${wi.id} (${wi.severity}/${wi.fixType}) @ ${wi.target}`);
     if (collided.length) say(`  next-wave (file-collision, >max, or outside the clique — stay READY): ${collided.join(', ')}`);
-    const pattern = batchPatternFor(batch);
-    say(`  batch-pattern: ${pattern ? 'AUTO (stamped by group)' : 'none (mixed shapes — group will not stamp)'}`);
-    say(`  -> node _bmad-output/ai-factory/_workflow/driver.mjs group --ids ${batch.map((w) => w.id).join(',')} --conc 3`);
+    // KI-E21 (improvement-analysis P3): a LARGE homogeneous cluster is a SWEEP, not pair lanes —
+    // the sweep band (design once + cheap applies + one pattern gate) closes measured ~4-10x
+    // cheaper per finding than pair-lane actuals. Union-find clusters are CHAINED (A~B~C with
+    // A!~C), so strict all-pairs cliqueness would never fire on the big clusters this lever
+    // exists for; the proven sweep flow selects by DOMINANT KEYWORD instead (`cluster.mjs
+    // --emit-pattern <kw>` — the homogeneous-family channel that ran the live doc sweep).
+    // Recommend it when one signature keyword spans >= sweepMin members (default 6; --sweep-min
+    // overrides) — emit-pattern then picks exactly that homogeneous family repo-wide.
+    const sweepMin = flags['sweep-min'] ? parseInt(flags['sweep-min'], 10) : 6;
+    let sweepKw = null, sweepKwN = 0;
+    if (c.length >= sweepMin) {
+      const kwCount = {};
+      for (const it of c) for (const w of simSig(it)) kwCount[w] = (kwCount[w] || 0) + 1;
+      const top = Object.entries(kwCount).filter(([, cnt]) => cnt >= sweepMin).sort((a, b) => b[1] - a[1])[0];
+      if (top) { sweepKw = top[0]; sweepKwN = top[1]; }
+    }
+    if (sweepKw) {
+      const slug = sweepKw.replace(/[^A-Za-z0-9-]/g, '').toLowerCase().slice(0, 24) || 'sweep';
+      say(`  ** SWEEP CANDIDATE (KI-E21): keyword "${sweepKw}" spans ${sweepKwN}/${c.length} member(s) — route through the sweep band (~4-10x cheaper than pair lanes):`);
+      say(`  -> node ${MOUNT_REL}/_workflow/cluster.mjs --emit-pattern "${sweepKw}" --slug ${slug}`);
+      say(`  -> node ${MOUNT_REL}/_workflow/driver.mjs sweep ${slug} --max-sites 10   (then Workflow the emitted launcher; then: driver sweep-fold <results.json>)`);
+    } else {
+      const pattern = batchPatternFor(batch);
+      say(`  batch-pattern: ${pattern ? 'AUTO (stamped by group)' : 'none (mixed shapes — group will not stamp)'}`);
+      say(`  -> node ${MOUNT_REL}/_workflow/driver.mjs group --ids ${batch.map((w) => w.id).join(',')} --conc 3`);
+    }
   }
   try {
     const rp = abs(join(dirname(cfg.paths.ledger), '..', 'reports', 'similar-batches.md'));
@@ -1166,6 +1211,19 @@ function cmdGroup(flags) {
   });
   if (deferred.length) console.log('group: deferred (same-file collision within batch — stay READY for a later batch):', deferred.join(', '));
   if (!picked.length) { console.log('group: no schedulable items for the filter'); return; }
+  // KI-E22 (improvement-analysis P4) — advisory acceptance-surface check on the picked batch: warn
+  // when an item's acceptance names a real repo file its files[] (the lock set) does not carry —
+  // the fixer would be lock-forbidden from meeting acceptance (the ITEM-M7 controller-clause
+  // class, cycle 46). Advisory only; costs one git ls-files per group.
+  try {
+    const tracked22 = execFileSync('git', ['-C', REPO_ROOT, 'ls-files'], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 }).trimEnd().split('\n');
+    const byBase22 = buildBasenameIndex(tracked22);
+    const exists22 = (p) => existsSync(presolve(REPO_ROOT, p));
+    for (const wi of picked) {
+      const gaps22 = acceptanceSurfaceGaps(wi, { existsOnDisk: exists22, byBasename: byBase22, targetDir: wi.target && exists22(wi.target) ? wi.target : null });
+      if (gaps22.length) console.log('  KI-E22 WARN ' + wi.id + ': acceptance names repo file(s) absent from files[] (the lock set) — ' + gaps22.map((g) => g.token + ' -> ' + g.resolved).join(', ') + '. Hand-append to files[] before grouping if the fix must touch them.');
+    }
+  } catch { /* advisory only */ }
   // Similarity-batch stamp (owner directive 2026-07-04): when the whole batch is ONE similarity
   // cluster (strict all-pairs, same rule as cluster.mjs/suggest), stamp the shared pattern into every
   // item — factory.js briefs each agent to keep its change structurally IDENTICAL to its siblings'.
@@ -1341,7 +1399,7 @@ function cmdGraphAudit(flags) {
   const tracked = execFileSync('git', ['-C', REPO_ROOT, 'ls-files'], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 }).trimEnd().split('\n');
   const byBasename = buildBasenameIndex(tracked);
   const existsOnDisk = (p) => existsSync(presolve(REPO_ROOT, p));
-  const report = { ok: 0, creation: [], stale: [], ambiguous: [], sharedFileGap: [] };
+  const report = { ok: 0, creation: [], stale: [], ambiguous: [], sharedFileGap: [], surfaceGap: [] };
   const LEDGER_PATH = '_bmad-output/tech-debt/STANDARDS-LEDGER.md';
   for (const wi of graph.items) {
     const st = ledger && ledger.items[wi.id] ? ledger.items[wi.id].state : 'READY';
@@ -1358,6 +1416,12 @@ function cmdGraphAudit(flags) {
       report.sharedFileGap.push({ id: wi.id, state: st });
     }
     const targetDir = wi.target && existsOnDisk(wi.target) ? wi.target : null;
+    // KI-E22 (improvement-analysis P4) — the KI-E16 generalization: tokens the acceptance names
+    // that resolve to real tracked files absent from files[] (the lock set silently forbids the
+    // fixer from meeting acceptance — the ITEM-M7 controller-clause class). Advisory WARN only.
+    for (const g of acceptanceSurfaceGaps(wi, { existsOnDisk, byBasename, targetDir })) {
+      report.surfaceGap.push({ id: wi.id, state: st, token: g.token, resolved: g.resolved });
+    }
     (wi.files || []).forEach((f, idx) => {
       const c = classifyFilesEntry(f, { existsOnDisk, byBasename, targetDir });
       if (c.status === 'ok') report.ok++;
@@ -1368,13 +1432,25 @@ function cmdGraphAudit(flags) {
       } else if (c.status === 'ambiguous') report.ambiguous.push({ id: wi.id, state: st, file: f, candidates: c.candidates });
     });
   }
-  console.log(`graph-audit: ${report.ok} ok · ${report.stale.length} stale${flags.fix ? ' (REWRITTEN)' : ' (rewrite proposed — pass --fix)'} · ${report.ambiguous.length} ambiguous (hand-triage) · ${report.creation.length} creation-target (fine) · ${report.sharedFileGap.length} shared-file gap (KI-E16)`);
+  console.log(`graph-audit: ${report.ok} ok · ${report.stale.length} stale${flags.fix ? ' (REWRITTEN)' : ' (rewrite proposed — pass --fix)'} · ${report.ambiguous.length} ambiguous (hand-triage) · ${report.creation.length} creation-target (fine) · ${report.sharedFileGap.length} shared-file gap (KI-E16${flags.fix ? ', APPENDED' : ''}) · ${report.surfaceGap.length} acceptance-surface gap (KI-E22, advisory)`);
   for (const s of report.stale) console.log(`  STALE ${s.id} (${s.state}): ${s.file}\n    -> ${s.rewrite}`);
   for (const a of report.ambiguous) console.log(`  AMBIG ${a.id} (${a.state}): ${a.file}\n    ?  ${a.candidates.join(' | ')}`);
-  for (const g of report.sharedFileGap) console.log(`  SHARED-FILE-GAP ${g.id} (${g.state}): acceptance names the standards-divergence ledger but files[] lacks ${LEDGER_PATH} — hand-append it so the batch file-lock can serialize sibling items (KI-E16; the ITEM-H-A6 staged-not-appended class)`);
-  if (flags.fix && report.stale.length) {
+  for (const g of report.sharedFileGap) console.log(`  SHARED-FILE-GAP ${g.id} (${g.state}): acceptance names the standards-divergence ledger but files[] lacks ${LEDGER_PATH} — ${flags.fix ? 'APPENDED by --fix' : 'hand-append it (or pass --fix)'} so the batch file-lock can serialize sibling items (KI-E16; the ITEM-H-A6 staged-not-appended class)`);
+  for (const g of report.surfaceGap) console.log(`  ACCEPT-SURFACE ${g.id} (${g.state}): acceptance names \`${g.token}\` -> ${g.resolved} but files[] lacks it — the file-lock cannot serialize it and the fixer may be lock-forbidden from meeting acceptance (KI-E22, advisory; hand-append if the fix must touch it)`);
+  // KI-E22/KI-E16 --fix: the ledger-path append IS the prescribed mechanical triage (KI-L54: the
+  // graph is hand-editable; this automates exactly the hand-append the lint prescribes so the
+  // flagged class stops re-surfacing at every audit). Acceptance-surface gaps stay report-only —
+  // whether the fix must actually TOUCH a named surface is a judgment call, not mechanical.
+  if (flags.fix && report.sharedFileGap.length) {
+    const byIdWi = Object.fromEntries(graph.items.map((w) => [w.id, w]));
+    for (const g of report.sharedFileGap) {
+      const wi = byIdWi[g.id];
+      if (wi && !(wi.files || []).includes(LEDGER_PATH)) { wi.files = wi.files || []; wi.files.push(LEDGER_PATH); }
+    }
+  }
+  if (flags.fix && (report.stale.length || report.sharedFileGap.length)) {
     writeJsonAtomic(graphPath, graph);
-    console.log(`graph-audit: ${report.stale.length} stale path(s) rewritten -> ${cfg.paths.graph}`);
+    console.log(`graph-audit: ${report.stale.length} stale path(s) rewritten + ${report.sharedFileGap.length} ledger-path append(s) (KI-E16) -> ${cfg.paths.graph}`);
   }
   // durable report for the session record
   const day = new Date().toISOString().slice(0, 10);
@@ -1383,7 +1459,8 @@ function cmdGraphAudit(flags) {
     `ok: ${report.ok} · stale: ${report.stale.length}${flags.fix ? ' (rewritten)' : ''} · ambiguous: ${report.ambiguous.length} · creation-target: ${report.creation.length}`, '',
     '## Stale (auto-rewritable)', ...report.stale.map((s) => `- \`${s.id}\` (${s.state}): \`${s.file}\` -> \`${s.rewrite}\``), '',
     '## Ambiguous (hand-triage — NOT auto-rewritten)', ...report.ambiguous.map((a) => `- \`${a.id}\` (${a.state}): \`${a.file}\` — candidates: ${a.candidates.map((c) => '`' + c + '`').join(', ')}`), '',
-    '## Shared-file gaps (KI-E16 — acceptance names the ledger, files[] lacks it; hand-append before grouping)', ...report.sharedFileGap.map((g) => `- \`${g.id}\` (${g.state})`), '',
+    '## Shared-file gaps (KI-E16 — acceptance names the ledger, files[] lacks it; --fix appends)', ...report.sharedFileGap.map((g) => `- \`${g.id}\` (${g.state})`), '',
+    '## Acceptance-surface gaps (KI-E22, advisory — acceptance names a repo file files[] lacks)', ...report.surfaceGap.map((g) => `- \`${g.id}\` (${g.state}): \`${g.token}\` -> \`${g.resolved}\``), '',
     '## Creation targets (no action — the fix creates them)', ...report.creation.map((c) => `- \`${c.id}\` (${c.state}): \`${c.file}\``), ''].join('\n');
   writeFileSync(rp, md);
   console.log(`graph-audit: report -> ${rp}`);
@@ -1515,6 +1592,167 @@ function cmdSweepFold(file) {
   cmdEscalationsSync(cfg, ledger, true);
   console.log(`sweep-fold ${sw.index} [${sw.label || ''}]: gate ${sw.gateVerdict} -> CLOSED ${closed}, re-queued ${reverted}` + (nonconf ? `, ${nonconf} non-conforming (placeholder/empty)` : '') + (sw.findings && sw.findings.length ? ` · ${sw.findings.length} gate finding(s)` : ''));
   for (const f of (sw.findings || [])) console.log(`  [${f.severity}] ${f.file}: ${f.title}`);
+}
+
+// KI-E20 (improvement-analysis P2) — `recover <id>`: first-class scaffold for the DOMINANT close
+// path. Evidence (07-18 + 07-20 analyses): 8 of the last 9 FAILED-item closes were §4
+// direct-recoveries hand-rolled by the controller session (parse feedback by eye -> apply the
+// reviewer-converged remedy -> hand-assemble delta re-gate prompts from agents/*.md -> hand-type
+// the recovery fold), with live near-misses on the evidence contract (the
+// mutation-proof-vs-integrate-raw footgun). This command PREPARES the whole path
+// deterministically: (a) the dissent digest from the prior checkpoint's structured gateDetails
+// (KI-L31 — returned verdicts, never prose), (b) one ready delta re-gate prompt per dissenting
+// role with its agents/*.md brief inlined, (c) the evidence contract with exact tee targets,
+// (d) the recovery-fold JSON skeleton (#<cycle>r, attemptsDelta:0, the KI-L47/L62 transition
+// shape, machine-evidence flags carried from the prior checkpoint), and (e) a telemetry record so
+// recoveries stop being invisible in the stream. The OPERATOR stays in the loop: this prepares;
+// the operator applies the remedy in the worktree, runs the re-gate agents, fills the skeleton,
+// folds. Ledger READ-ONLY (writes only item artifacts — no lock, no lease).
+function cmdRecover(flags, rest) {
+  const id = rest[0];
+  if (!id) { console.log('usage: driver.mjs recover <id>'); return; }
+  const cfg = loadConfig();
+  const graph = loadGraph(abs(cfg.paths.graph));
+  const ledger = loadLedger(abs(cfg.paths.ledger));
+  if (!ledger || !ledger.items[id]) { console.error('recover: unknown item ' + id); process.exitCode = 1; return; }
+  const row = ledger.items[id];
+  const wi = byId(graph)[id] || {};
+  if (!['FAILED', 'ESCALATED'].includes(row.state)) {
+    console.log(`recover: ${id} is ${row.state} — recovery targets FAILED (apply the converged remedy) or ESCALATED (record the human sign-off). Nothing prepared.`);
+    return;
+  }
+  const itemDir = abs(join(cfg.paths.items, id));
+  let prior = null; try { prior = readJson(join(itemDir, 'result.json')); } catch { /* no checkpoint */ }
+  if (prior && prior.id !== id) prior = null;
+  const dissent = dissentersFrom((prior && prior.gateDetails) || {});
+  const cyc = priorCycleOf(prior, ledger.cycle);
+  const recDir = join(itemDir, 'recovery');
+  mkdirSync(recDir, { recursive: true });
+  const wtAbs = row.worktree ? presolve(REPO_ROOT, row.worktree) : null;
+  const btAbs = join(FACTORY_ROOT, 'verify', 'build-test.sh');
+  const briefs = readRoleBriefs(abs(cfg.paths.agents));
+  const foldFile = join(recDir, 'recovery-fold.json');
+  writeJsonAtomic(foldFile, { mode: 'recovery', cycle: cyc, results: [recoveryFoldSkeleton(id, row, prior, cyc)] });
+  const prompts = [];
+  for (const d of dissent) {
+    const role = roleForGateKey(d.key);
+    if (!role) continue;
+    const pfile = join(recDir, `regate-${role}.md`);
+    writeFileSync(pfile, [
+      `# DELTA RE-GATE — ${d.key} — work item ${id}`,
+      '',
+      `Run this prompt as ONE separate agent (Agent tool); save its verdict prose to ${join(itemDir, role + '.md')}.`,
+      '',
+      '---',
+      '',
+      `TARGET: ${wi.target || '?'}   WORK ITEM: ${id}  (${wi.severity || '?'} / ${wi.fixType || '?'})`,
+      `WORKTREE (judge THIS tree; NEVER run mutating git): ${wtAbs || '<worktree missing — set it before running>'}`,
+      `ARTIFACTS DIR (absolute): ${itemDir}`,
+      `REVIEW PACK: Read ${join(itemDir, 'review-pack.md')} FIRST; if missing or stale vs \`git -C <worktree> status\`, regenerate: \`bash ${btAbs} pack ${wtAbs || '<worktree>'} ${join(itemDir, 'review-pack.md')}\``,
+      '',
+      'WORK-ITEM SPEC:',
+      `  title: ${wi.title || ''}`,
+      `  acceptance: ${wi.acceptance || ''}`,
+      `  regression-test: ${wi.regressionTest || ''}`,
+      '',
+      `YOUR PRIOR DISSENT (${d.key})${d.headline ? ' — ' + d.headline : ''}. A recovery has since applied a remedy. Your prior findings are HYPOTHESES to RE-VERIFY against the CURRENT worktree (KI-L35), never conclusions to copy forward:`,
+      '```json',
+      JSON.stringify(d.findings, null, 1),
+      '```',
+      '',
+      'DELTA RE-GATE: verdict APPROVED only if EVERY prior finding is genuinely resolved in the current worktree (cite file:line evidence per finding); CHANGES_REQUIRED with exact findings otherwise.',
+      '',
+      `TELEMETRY (best-effort, never evidence): first Bash action \`node ${join(FACTORY_ROOT, '_workflow', 'telemetry-emit.mjs')} --event stage_start --item ${id} --role ${role}\`; last \`node ${join(FACTORY_ROOT, '_workflow', 'telemetry-emit.mjs')} --event stage_end --item ${id} --role ${role} --outcome ok --verdict <APPROVED|CHANGES_REQUIRED>\`. If either errors, ignore and continue.`,
+      '',
+      briefs[role] ? 'YOUR ROLE BRIEF (inlined — authoritative):\n\n' + briefs[role] : `YOUR ROLE BRIEF: read ${join(abs(cfg.paths.agents), role + '.md')}`,
+      '',
+    ].join('\n'));
+    prompts.push({ key: d.key, role, file: pfile, findings: d.findings.length });
+  }
+  writeFileSync(join(recDir, 'README.md'), [
+    `# Direct-recovery protocol — ${id} (from ${row.state}, fold as #${cyc}r)`,
+    '',
+    `1. READ the prior round: ${join(itemDir, 'feedback.md')} (the AUTHORITATIVE digest) + last-failure.md + the regate-*.md prompts here${dissent.length ? '' : ' (no structured dissent found — read last-failure.md for the fail reason)'}.`,
+    `2. APPLY the reviewer-converged remedy IN THE WORKTREE (${wtAbs || '<none recorded>'}) — never the main tree; NO mutating git.`,
+    '3. EVIDENCE CONTRACT (KI-E20 — the fold re-derives the verdict from these files, never from prose):',
+    `   - machine green (code items): \`bash ${btAbs} build <solution> 2>&1 | tee -a ${join(itemDir, 'integrate-raw.txt')}\` then \`bash ${btAbs} suite <solution> 2>&1 | tee -a ${join(itemDir, 'integrate-raw.txt')}\` — the keyed FACTORY::SUMMARY markers (KI-E19) make append order safe.`,
+    `   - probes / mutation evidence: tee to ${join(itemDir, 'mutation-proof.txt')} — NEVER into integrate-raw.txt or verify-raw.txt (keyed markers or not, keep transcripts clean).`,
+    `   - a NEW red proof (only if a new regression test is part of the remedy): tee to ${join(itemDir, 'verify-red-raw.txt')} with its FACTORY::RED::<exit> marker; otherwise leave the prior round's red transcript untouched.`,
+    '4. RE-GATE: run each regate-*.md as a SEPARATE agent; require APPROVED; save each verdict prose to state/items/<id>/<role>.md.',
+    `5. FOLD: fill ${foldFile} (gates map = the re-gate verdicts; note = remedy + evidence pointers), then:`,
+    `   node ${MOUNT_REL}/_workflow/driver.mjs fold ${foldFile}`,
+    '   (attemptsDelta:0 — a recovery consumes no retry budget; resultId #' + cyc + 'r keeps fold idempotency; the deterministic fold override re-checks ALL machine evidence exactly as for a live run.)',
+    '',
+    row.state === 'ESCALATED' ? '_ESCALATED item: steps 2-4 may reduce to recording the human sign-off; the fold is the single CLOSED hop (KI-L62)._' : '',
+  ].join('\n'));
+  temit({ source: 'driver', event: 'recovery_prepared', item: id, cycle: cyc, attrs: { fromState: row.state, dissenters: prompts.map((p) => p.key), hasFeedback: existsSync(join(itemDir, 'feedback.md')), hasCheckpoint: !!prior } });
+  console.log(`recover ${id} (${row.state}, cycle #${cyc}r): scaffold -> ${recDir}`);
+  console.log(`  dissent digest: ${dissent.length ? dissent.map((d) => d.key + ' (' + d.findings.length + ' finding(s))').join(', ') : '(none in the checkpoint — verify/fold-stage fail; read last-failure.md)'}`);
+  for (const p of prompts) console.log(`  re-gate prompt: ${p.file}`);
+  console.log(`  fold skeleton:  ${foldFile}`);
+  console.log(`  protocol:       ${join(recDir, 'README.md')}`);
+}
+
+// KI-E24 (improvement-analysis P7) — the owner-decision digest: ONE ranked page for the parked
+// queue. Evidence: 30+ parked decisions at median age ~24 days with thorough per-item framings
+// buried in a 500-line queue wall — rulings arrive only when a session hand-surfaces one. Ranking
+// severity x age + a one-line reply format turns the queue into a five-minute sitting; bundles
+// group same-target items so a related cluster is ruled in one pass. Read-only.
+function cmdDecisionsDigest() {
+  const cfg = loadConfig();
+  const graph = loadGraph(abs(cfg.paths.graph));
+  const ledger = loadLedger(abs(cfg.paths.ledger));
+  if (!ledger) { console.log('no ledger — run init'); return; }
+  const items = byId(graph);
+  const sevRank = { CRITICAL: 3, HIGH: 2, MEDIUM: 1, LOW: 0 };
+  const nowMs = Date.parse(now());
+  const rows = [];
+  for (const [id, r] of Object.entries(ledger.items)) {
+    if (!['BLOCKED', 'ESCALATED'].includes(r.state)) continue;
+    const wi = items[id] || {};
+    const hist = (r.history || []).filter((h) => h.to === r.state);
+    const enteredAt = hist.length ? hist[hist.length - 1].at : r.updatedAt;
+    const ageDays = enteredAt ? Math.max(0, Math.round((nowMs - Date.parse(enteredAt)) / 86400000)) : 0;
+    const decPath = abs(join(cfg.paths.items, id, 'decision.md'));
+    let options = [];
+    let question = wi.ownerDecision || '';
+    if (existsSync(decPath)) {
+      const txt = readFileSync(decPath, 'utf8');
+      options = [...new Set([...txt.matchAll(/\bOption ([A-Z])\b/g)].map((m) => m[1]))];
+      if (!question) { const line = txt.split('\n').map((l) => l.trim()).find((l) => l && !l.startsWith('#')); if (line) question = line; }
+    }
+    if (!question) question = (r.note || '').slice(0, 160);
+    rows.push({ id, state: r.state, severity: wi.severity || '?', target: wi.target || '?', ageDays, question: String(question).replace(/\|/g, '/').replace(/\s+/g, ' ').slice(0, 160), options });
+  }
+  rows.sort((a, b) => (sevRank[b.severity] || 0) - (sevRank[a.severity] || 0) || b.ageDays - a.ageDays || a.id.localeCompare(b.id));
+  const bySev = rows.reduce((acc, r) => { acc[r.severity] = (acc[r.severity] || 0) + 1; return acc; }, {});
+  const ages = rows.map((r) => r.ageDays).sort((a, b) => a - b);
+  const median = ages.length ? ages[Math.floor(ages.length / 2)] : 0;
+  const byTarget = {};
+  for (const r of rows) (byTarget[r.target] ||= []).push(r.id);
+  const bundles = Object.entries(byTarget).filter(([, ids]) => ids.length >= 2).sort((a, b) => b[1].length - a[1].length);
+  const md = [
+    '# Owner-decision digest — ranked (severity x age)',
+    '',
+    `_Generated ${now()} · ${rows.length} parked decision(s) (${Object.entries(bySev).map(([s, n]) => n + ' ' + s).join(', ') || 'none'}) · median age ${median}d_`,
+    '',
+    '**Reply format — one line per ruling, paste several at once:** `<ID>: <option letter or short ruling>`' + (rows[0] ? ' (e.g. `' + rows[0].id + ': b`)' : '') + '. Full framings live in `queue/decisions.md` + `state/items/<id>/decision.md`.',
+    '',
+    '| # | id | sev | state | age d | target | decision (one line) | options |',
+    '|---|---|---|---|---|---|---|---|',
+    ...rows.map((r, i) => `| ${i + 1} | \`${r.id}\` | ${r.severity} | ${r.state} | ${r.ageDays} | ${r.target} | ${r.question} | ${r.options.join('/') || '—'} |`),
+    '',
+    '## Rule-together bundles (same target — one sitting)',
+    '',
+    bundles.length ? bundles.map(([t, ids]) => `- **${t}** (${ids.length}): ${ids.map((i) => '`' + i + '`').join(', ')}`).join('\n') : '_none_',
+    '',
+  ].join('\n');
+  const out = abs(join(cfg.paths.reports, 'decisions-digest.md'));
+  mkdirSync(dirname(out), { recursive: true });
+  writeFileSync(out, md);
+  console.log(`decisions-digest: ${rows.length} parked decision(s) (${Object.entries(bySev).map(([s, n]) => n + ' ' + s).join(', ') || 'none'}), median age ${median}d -> ${out}`);
+  for (const r of rows.slice(0, 10)) console.log(`  ${r.severity} ${r.id} (${r.state}, ${r.ageDays}d, ${r.target})${r.options.length ? ' options ' + r.options.join('/') : ''}`);
+  if (rows.length > 10) console.log(`  ... +${rows.length - 10} more in the digest`);
 }
 
 const SEV_OK = ['CRITICAL', 'HIGH', 'MEDIUM', 'LOW', 'INFO'];
@@ -1698,6 +1936,8 @@ function dispatch(cmd, flags, rest) {
     case 'reset': return cmdReset(rest);
     case 'fold': return cmdFold(rest[0], flags);
     case 'reconstruct': return cmdReconstruct(flags); // KI-L40 — rebuild results-cycle-<N>.json from per-item checkpoints after a kill
+    case 'recover': return cmdRecover(flags, rest); // KI-E20 — direct-recovery scaffold (dissent digest + re-gate prompts + evidence contract + fold skeleton)
+    case 'decisions-digest': return cmdDecisionsDigest(); // KI-E24 — ranked owner-decision digest (severity x age + one-line reply format)
     case 'realinfra-lint': return cmdRealinfraLint(); // KI-L42 — report realInfra=true items with no .cs (KI-L38 false-fail shape)
     case 'resume': return cmdResume(flags);
     case 'progress': return cmdReport('progress');
@@ -1718,7 +1958,7 @@ function dispatch(cmd, flags, rest) {
     case 'controller': return cmdController(flags, rest); // KI-C11 — lease management: status | claim | release | heartbeat
     case 'telemetry-report': return cmdTelemetryReport(flags); // KI-E7 / spine AD-9 — evaluation report from events.jsonl
     default:
-      console.log('commands: init | status | select | claim | reset | fold | reconstruct | resume | progress | burndown | cost | escalations | group | suggest | cycle | sweep | sweep-fold | gc | preflight | graph-audit | realinfra-lint | report-cycle | merge-graph | controller | telemetry-report | worktree-add|remove|list');
+      console.log('commands: init | status | select | claim | reset | fold | reconstruct | recover | resume | progress | burndown | cost | escalations | decisions-digest | group | suggest | cycle | sweep | sweep-fold | gc | preflight | graph-audit | realinfra-lint | report-cycle | merge-graph | controller | telemetry-report | worktree-add|remove|list');
   }
 }
 

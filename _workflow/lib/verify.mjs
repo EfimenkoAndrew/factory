@@ -30,6 +30,23 @@ export function parseVerifyRaw(text) {
   if (sm) { out.hasData = true; out.suite = { failed: +sm[1], passed: +sm[2], skipped: sm[3] ? +sm[3] : 0 }; }
   const srm = lastMatch(text, 'FACTORY::TEST::SUITE::RESULT\\s+exit=(-?\\d+)');
   if (srm) { out.hasData = true; out.suiteExit = parseInt(srm[1], 10); }
+  // KI-E19 (improvement-analysis P5) — evidence-manifest markers. build-test.sh now trails every
+  // subcommand with a KEYED `FACTORY::SUMMARY::<sub> ...` line; when present these OVERRIDE the
+  // heuristic parses above. The load-bearing case: the ambient dotnet "Passed!/Failed!" summary
+  // line is TYPE-AGNOSTIC — a `filter` run appended AFTER `suite` in the same transcript leaves
+  // the LAST dotnet line describing the 1-test filter, silently shadowing the suite's real counts
+  // (the near-miss on a live recovery transcript that motivated this). The suite's own keyed
+  // marker carries its counts, so append order can no longer misattribute them. Legacy
+  // transcripts (no SUMMARY lines) parse exactly as before.
+  const kb = lastMatch(text, 'FACTORY::SUMMARY::build\\s+exit=(-?\\d+)\\s+errors=(\\d+)');
+  if (kb) { out.hasData = true; out.build = { exit: parseInt(kb[1], 10), errors: parseInt(kb[2], 10) }; }
+  const kf = lastMatch(text, 'FACTORY::SUMMARY::filter\\s+exit=(-?\\d+)');
+  if (kf) { out.hasData = true; out.targetedFail = parseInt(kf[1], 10) !== 0; }
+  const ks = lastMatch(text, 'FACTORY::SUMMARY::suite\\s+exit=(-?\\d+)\\s+failed=(-?\\d+)\\s+passed=(-?\\d+)(?:\\s+skipped=(-?\\d+))?');
+  if (ks) {
+    out.hasData = true; out.suiteExit = parseInt(ks[1], 10);
+    if (parseInt(ks[2], 10) >= 0) out.suite = { failed: parseInt(ks[2], 10), passed: Math.max(0, parseInt(ks[3], 10)), skipped: ks[4] ? Math.max(0, parseInt(ks[4], 10)) : 0 };
+  }
   return out;
 }
 

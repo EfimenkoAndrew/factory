@@ -74,11 +74,18 @@ CLOSED / FAILED / ESCALATED / BLOCKED deltas, cost if asked (`DRV cost`).
   sanctioned recovery, gates re-adjudicate the worktree.
 - An item stuck CLAIMED/ACTIVE with no live run → `DRV reset <id>` re-queues it.
 - After a PARTIAL fold, re-`group` — never Workflow-`resume`.
+- A FAILED/ESCALATED item with a reviewer-converged remedy → `DRV recover <id>` scaffolds the
+  direct-recovery (dissent digest, delta re-gate prompts, evidence contract, `#Nr` fold
+  skeleton) — the dominant close path, first-class (KI-E20). You apply the remedy in the
+  worktree, run the re-gate prompts as separate agents, fill the skeleton, fold it.
 
 ## What goes to the human
 
 - `DRV escalations` syncs `<mount>/queue/decisions.md` — BLOCKED (owner ruling) and
   ESCALATED (auth/money/crypto/cross-service sign-off) items. Surface them; never rule.
+- `DRV decisions-digest` renders `reports/decisions-digest.md` — the parked queue ranked
+  severity x age with a one-line reply format (`<ID>: <letter>`) + rule-together bundles
+  (KI-E24). Hand the digest to the owner instead of the raw queue wall.
 - CLOSED items: hand off worktree branches (`git -C <worktree> diff` to preview). The
   human applies/commits; you may summarize per-item changes and the verification evidence.
 

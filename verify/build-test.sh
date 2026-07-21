@@ -45,6 +45,7 @@ case "$cmd" in
     errs=$(printf '%s\n' "$out" | grep -cE ': error ' || true)
     printf '%s\n' "$out" | tail -40
     echo "FACTORY::BUILD::RESULT exit=$code errors=$errs"
+    echo "FACTORY::SUMMARY::build exit=$code errors=$errs"  # KI-E19 evidence manifest (keyed; append-order-proof)
     exit $code
     ;;
   red)
@@ -55,6 +56,7 @@ case "$cmd" in
     code=$?
     printf '%s\n' "$out" | grep -iE 'Passed!|Failed!|Passed:|Failed:|error|No test matches' | tail -20
     echo "FACTORY::RED::$code"
+    echo "FACTORY::SUMMARY::red exit=$code"  # KI-E19 evidence manifest
     exit $code
     ;;
   filter)
@@ -72,6 +74,7 @@ case "$cmd" in
     printf '%s\n' "$out" | grep -iE 'Passed!|Failed!|Passed:|Failed:|error|No test matches' | tail -20
     emit_realinfra "$out"
     echo "FACTORY::TEST::FILTER::RESULT exit=$code"
+    echo "FACTORY::SUMMARY::filter exit=$code"  # KI-E19 evidence manifest
     exit $code
     ;;
   suite)
@@ -80,6 +83,15 @@ case "$cmd" in
     code=$?
     printf '%s\n' "$out" | grep -iE 'Passed!|Failed!|Passed:|Failed:|Skipped:|error' | tail -30
     echo "FACTORY::TEST::SUITE::RESULT exit=$code"
+    # KI-E19 evidence manifest: the suite's OWN counts on a keyed marker, so a later `filter` append
+    # in the same teed transcript can never shadow them (the ambient dotnet Passed!/Failed! line is
+    # type-agnostic and last-match-parsed). Counts read from the LAST dotnet summary line (same
+    # per-project caveat as the legacy parse); -1 = no summary line found (build error before tests).
+    sum=$(printf '%s\n' "$out" | grep -E 'Passed!|Failed!' | tail -1)
+    sf=$(printf '%s' "$sum" | sed -nE 's/.*Failed:[[:space:]]*([0-9]+).*/\1/p')
+    sp=$(printf '%s' "$sum" | sed -nE 's/.*Passed:[[:space:]]*([0-9]+).*/\1/p')
+    ss=$(printf '%s' "$sum" | sed -nE 's/.*Skipped:[[:space:]]*([0-9]+).*/\1/p')
+    echo "FACTORY::SUMMARY::suite exit=$code failed=${sf:--1} passed=${sp:--1} skipped=${ss:--1}"
     exit $code
     ;;
   claims)

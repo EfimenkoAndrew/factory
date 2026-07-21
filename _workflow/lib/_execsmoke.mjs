@@ -22,6 +22,7 @@ export function defaultAgentStub(opts, blockedGate) {
   const req = s.required || [];
   const label = (opts && opts.label) || '';
   if (p.written) return { written: true };
+  if (p.covered !== undefined) return { covered: true, gaps: [] }; // KI-E18 AcceptanceScan probe (happy path)
   if (p.red) return { red: true, testFiles: ['X/src/X.Tests/SomeTests.cs'], runCmd: 'stub', evidence: 'stub', note: 'stub' };
   if (p.applied) return { applied: true, filesChanged: ['X/src/Some.cs'], summary: 'stub', scopeStop: false, divergence: null, note: 'stub' };
   if (p.build) return { build: 'pass', targetedTest: 'pass', suite: { passed: 2, failed: 0, skipped: 0 }, realInfraExercised: false, debris: [], evidence: 'FACTORY::BUILD::RESULT exit=0 (stub)', note: 'stub' };

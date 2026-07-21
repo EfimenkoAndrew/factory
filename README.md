@@ -90,8 +90,11 @@ node <mount>/_workflow/driver.mjs <cmd>       # <mount> = your factory path, e.g
   reset <id...>        re-queue CLAIMED/active/FAILED → READY (un-claim / recover a stranded item)
   fold <results.json>  apply Workflow per-item results to the ledger
   reconstruct          rebuild a results file from per-item checkpoints (killed-run recovery), then fold it
+  recover <id>         direct-recovery scaffold for a FAILED/ESCALATED item: dissent digest + delta
+                       re-gate prompts + evidence contract + #Nr fold skeleton (KI-E20)
   resume [--reset-stale]   report in-flight; --reset-stale re-queues ACTIVE → READY (checked + honest)
-  suggest              read-only batch planner — clusters schedulable items into similar batches, prints `group --ids` lines
+  suggest [--sweep-min N]  read-only batch planner — clusters schedulable items; big homogeneous
+                       clusters route to the SWEEP band (KI-E21), the rest get `group --ids` lines
   group [--target T --layer L --ids a,b --max N --include-escalate --include-realinfra]
                        pick a parallel batch: per-item worktrees + compact run-args
   cycle [--until critical|high|dry --target T --max N ...]
@@ -102,8 +105,10 @@ node <mount>/_workflow/driver.mjs <cmd>       # <mount> = your factory path, e.g
   controller <status|claim|release|heartbeat>   advisory single-controller lease
   gc [--yes]           list (or --yes remove) worktrees for CLOSED items; prunes dead refs
   preflight            environment readiness (docker → realInfra closability; dotnet → build/test)
-  graph-audit [--fix] | realinfra-lint   lint the findings-graph (stale files[], over-flagged realInfra)
+  graph-audit [--fix] | realinfra-lint   lint the findings-graph (stale files[], KI-E16 ledger gaps
+                       — --fix appends, KI-E22 acceptance-surface gaps, over-flagged realInfra)
   progress | burndown | cost | escalations | report-cycle | telemetry-report
+  decisions-digest     ranked owner-decision digest: severity x age + one-line reply format (KI-E24)
   merge-graph          merge state/normalized/*.json → findings-graph.json (validates + detects dep cycles)
   worktree-add <id> | worktree-remove <path> | worktree-list
 ```

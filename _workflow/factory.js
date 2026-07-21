@@ -1,6 +1,6 @@
 export const meta = {
   name: 'impl-factory',
-  description: 'AI Implementation Factory control plane. Receives a batch of READY work items (audit findings / stories) + agent templates + per-item model routing via args (emitted by driver.mjs select), then drives each item through the implement-and-auto-evaluate lifecycle: (plan) -> test-author(red) -> fixer -> verify(build+test) -> early edge-scan (pre-band edge-case hunt + one bounded amend, every code item) -> cheap haiku leftover-scan (pre-band deferral/tech-debt lint, KI-D12) -> the review stage (5 role gates + applicable BMAD review-named flows: code/adversarial/testreview + editorial) as separate adversarial subagents -> refuter -> scoped re-audit -> integrate. Worktree-isolated, model-routed, low-concurrency under throttle. Each agent writes its artifact to disk; the factory returns compact per-item results (a transition path) the driver folds into the ledger (single writer, resumable). NEVER runs mutating git — fixes stay on a factory/<id> branch in a worktree for the human to commit.',
+  description: 'AI Implementation Factory control plane. Receives a batch of READY work items (audit findings / stories) + agent templates + per-item model routing via args (emitted by driver.mjs select), then drives each item through the implement-and-auto-evaluate lifecycle: (plan) -> test-author(red) -> fixer -> verify(build+test) -> early edge-scan (pre-band edge-case hunt + one bounded amend, every code item) -> acceptance-scan (pre-band clause-coverage probe + one bounded amend, KI-E18) -> cheap haiku leftover-scan (pre-band deferral/tech-debt lint, KI-D12) -> the review stage (5 role gates + applicable BMAD review-named flows: code/adversarial/testreview + editorial) as separate adversarial subagents -> refuter -> scoped re-audit -> integrate. Worktree-isolated, model-routed, low-concurrency under throttle. Each agent writes its artifact to disk; the factory returns compact per-item results (a transition path) the driver folds into the ledger (single writer, resumable). NEVER runs mutating git — fixes stay on a factory/<id> branch in a worktree for the human to commit.',
   phases: [
     { title: 'Plan' }, { title: 'Test' }, { title: 'Fix' }, { title: 'Verify' },
     { title: 'EdgeScan' }, // KI-E12: the edge-case hunter runs EARLY (pre-band) for every code item; findings feed one bounded amend
@@ -42,6 +42,21 @@ function makeLimiter(max) {
 
 const limit = makeLimiter(CONC)  // global agent-concurrency cap shared by ALL items + stages (Phase-4 parallel-safe)
 
+// ---- inlined pure helper (byte-equivalent to _workflow/lib/acceptance.mjs — the runtime cannot import;
+//      change both copies together, the selftest pins their parity) ----
+function splitAcceptanceClauses(text, cap) {
+  if (cap === undefined) cap = 8
+  const t = String(text || '').replace(/\s+/g, ' ').trim()
+  if (!t) return []
+  // Abbreviation guard: swap the abbreviation's ". " for ".\u0001" (a non-whitespace placeholder
+  // the sentence-boundary lookbehind cannot match), restore after splitting.
+  const marked = t.replace(/\b(e\.g|i\.e|etc|vs|cf)\.\s/gi, function (m) { return m.replace('. ', '.\u0001') })
+  const rough = marked.split(/;\s*|(?<=[.!?])\s+(?=[A-Z0-9`"'(])/)
+  const clauses = rough.map(function (c) { return c.replace(/\u0001/g, ' ').trim() }).filter(function (c) { return c.length >= 20 })
+  if (clauses.length <= cap) return clauses
+  return clauses.slice(0, cap - 1).concat(clauses.slice(cap - 1).join('; '))
+}
+
 // ---- schemas (compact structured returns; the full artifact is written to disk) ----
 const FINDING = { type: 'object', additionalProperties: false, required: ['severity', 'title'], properties: { severity: { type: 'string' }, title: { type: 'string' }, file: { type: 'string' }, fix: { type: 'string' } } }
 const PLAN_SCHEMA = { type: 'object', additionalProperties: false, required: ['rootCause', 'approach', 'recommendScopeStop', 'recommendEscalate'], properties: { rootCause: { type: 'string' }, approach: { type: 'string' }, files: { type: 'array', items: { type: 'string' } }, testStrategy: { type: 'string' }, blastRadius: { type: 'string' }, ruleRisks: { type: 'string' }, recommendEscalate: { type: 'boolean' }, recommendScopeStop: { type: 'boolean' } } }
@@ -77,6 +92,11 @@ const PROBE_SCHEMA = { type: 'object', additionalProperties: false, required: ['
 // execution-policy.md §4) vs LEGIT (UI placeholder attr, a test asserting the behaviour, a
 // constraint-explaining comment, prose). `clean=false` fails the item PRE-BAND (cheap, before the opus gates).
 const LEFTOVER_SCHEMA = { type: 'object', additionalProperties: false, required: ['clean'], properties: { clean: { type: 'boolean' }, punts: { type: 'array', items: { type: 'object', additionalProperties: false, required: ['file', 'why'], properties: { file: { type: 'string' }, line: { type: 'string' }, why: { type: 'string' } } } } } }
+// KI-E18 — AcceptanceScan probe: pre-band acceptance-clause coverage (the KI-D12 pattern applied to
+// the #1 recent FAIL cause: 4/4 last band FAILs were acceptance-clause gaps the opus band found at
+// full price). A haiku probe answers per deterministic clause "does the diff carry evidence?";
+// gaps feed ONE bounded fixer amend; a malformed/unavailable probe never sinks the item.
+const ACCEPT_SCHEMA = { type: 'object', additionalProperties: false, required: ['covered'], properties: { covered: { type: 'boolean' }, gaps: { type: 'array', items: { type: 'object', additionalProperties: false, required: ['clause', 'why'], properties: { clause: { type: 'string' }, why: { type: 'string' } } } } } }
 // Sweep-designer: the canonical fix pattern for a whole root-cause cluster (designed once, applied N times).
 const SWEEP_DESIGN_SCHEMA = { type: 'object', additionalProperties: false, required: ['pattern', 'headline'], properties: { pattern: { type: 'string' }, applicationNotes: { type: 'string' }, conformanceCheck: { type: 'string' }, headline: { type: 'string' } } }
 
@@ -295,7 +315,10 @@ function compose(role, item, extra) {
       briefText,
       'Follow that brief exactly. Read audit docs from the REPO ROOT; make ALL code edits/builds in the WORKTREE.',
     )
-  } else {
+  } else if (!/-probe$/.test(role)) {
+    // KI-E18: *-probe roles (marker/leftover/acceptance) are self-contained one-command agents with
+    // NO agents/<role>.md brief on disk — a dangling read pointer only wastes a tool call on a
+    // file-not-found. Non-probe roles keep the read-it-yourself fallback.
     lines.push(
       '',
       'YOUR ROLE BRIEF — read it NOW from the REPO ROOT (it is NOT in the worktree, which is a clean checkout of committed code): ' + REPO + '/' + TPLDIR + '/' + role + '.md',
@@ -373,7 +396,7 @@ async function runItem(item) {
   if (budget && budget.total && budget.remaining() < BUDGET_RESERVE) {
     return { id: id, attemptsDelta: 0, transitions: [], toState: 'CLAIMED', artifacts: {}, gates: {}, cost: {}, worktree: wtPath, branch: (item.worktree && item.worktree.branch) || (WT && WT.branch), budgetStopped: true, note: 'BUDGET-STOPPED before start: remaining ' + budget.remaining() + ' tokens < reserve ' + BUDGET_RESERVE + ' — item NOT attempted (still CLAIMED, no attempt burned; relaunch or re-group it next cycle)' }
   }
-  const res = { id: id, resultId: id + '#' + (A.cycle || 0), attemptsDelta: 1, transitions: [], toState: 'FAILED', artifacts: {}, gates: {}, cost: {}, worktree: wtPath, branch: (item.worktree && item.worktree.branch) || (WT && WT.branch), note: '' } // attemptsDelta:1 — every run counts one attempt so the maxItemRetries bound fires; resultId = id#cycle for fold idempotency (KI-B4)
+  const res = { id: id, resultId: id + '#' + (A.cycle || 0), attemptsDelta: 1, transitions: [], toState: 'FAILED', band: band, artifacts: {}, gates: {}, cost: {}, worktree: wtPath, branch: (item.worktree && item.worktree.branch) || (WT && WT.branch), note: '' } // attemptsDelta:1 — every run counts one attempt so the maxItemRetries bound fires; resultId = id#cycle for fold idempotency (KI-B4); band rides for the fold's telemetry stamp + KI-E19 manifest rule (KI-E23)
   const cost = function (route) { const m = (route && route.model) || 'inherit'; res.cost[m] = (res.cost[m] || 0) + 1 }
   // Shared command constants (hoisted 2026-07-19 so the fixer/editorial claims self-check can cite them).
   const BT = 'bash ' + FDIR + '/verify/build-test.sh'
@@ -586,8 +609,17 @@ async function runItem(item) {
   // "Cannot access 'RF' before initialization" in cycle 24).
   const RF = R.reviewFlows || {}
   for (const f of flowsFor(item).filter(function (x) { return x.band === 'editorial' })) {
-    await call(SKILL_ROLE[f.skill], RF[f.routeKey], GATE_SCHEMA, 'Advisory editorial pass; apply doc fixes in the worktree but NEVER block the item. Do NOT break the delivered regression test (re-run it if you change anything it asserts on). If you changed ANY .md prose, run the claims lint `' + BT + ' claims ' + wtPath + '` and fix any FACTORY::CLAIMS-MISS your edits introduced (KI-E11). If you changed ANY file, REGENERATE the review pack as your LAST Bash action so the gate band reviews the FINAL diff (KI-L34): `' + PACKCMD + '`.', 'Verify')
+    const er = await call(SKILL_ROLE[f.skill], RF[f.routeKey], GATE_SCHEMA, 'Advisory editorial pass; apply doc fixes in the worktree but NEVER block the item. Do NOT break the delivered regression test (re-run it if you change anything it asserts on). If you changed ANY .md prose, run the claims lint `' + BT + ' claims ' + wtPath + '` and fix any FACTORY::CLAIMS-MISS your edits introduced (KI-E11). If you changed ANY file, REGENERATE the review pack as your LAST Bash action so the gate band reviews the FINAL diff (KI-L34): `' + PACKCMD + '`.', 'Verify')
     res.artifacts['review:' + f.skill.replace('bmad-', '')] = 'state/items/' + id + '/' + SKILL_ROLE[f.skill] + '.md'
+    // KI-E23 (improvement-analysis P6a): record the ADVISORY editorial verdict in the gates map +
+    // gateDetails so the fold's item_folded event and feedback.md carry it — 23 instrumented runs
+    // had ZERO recorded editorial outcomes, leaving the lens's value unmeasurable (the next ~20
+    // runs decide whether the double editorial pass earns its spend). Advisory stays advisory:
+    // nothing here blocks the item.
+    const ek = 'editorial:' + f.skill.replace('bmad-editorial-review-', '')
+    res.gates[ek] = er ? er.verdict : 'NULL'
+    res.gateDetails = res.gateDetails || {}
+    res.gateDetails[ek] = er ? { verdict: er.verdict, headline: er.headline, findings: (er.findings || []).slice(0, 6), advisory: true } : null
   }
 
   // KI-L35: on a reFix round a reviewer that anchors on the PRIOR round's findings (its own old
@@ -628,7 +660,52 @@ async function runItem(item) {
     }
   }
 
-  // 4c. LEFTOVER SCAN (KI-D12, owner directive 2026-07-19) — a CHEAP haiku pass that enforces
+  // 4c. ACCEPTANCE SCAN (KI-E18, improvement-analysis P1 2026-07-20) — a CHEAP haiku probe that
+  //     answers "which acceptance clause has NO corresponding evidence in the diff?" BEFORE the
+  //     expensive gate band. Evidence: the last four band FAILs were ALL acceptance-clause coverage
+  //     gaps (a clause delivered in letter not behaviour; a clause read narrowly; a clause whose
+  //     surface the lock set forbade) — each discovered by opus reviewers at full price. The clause
+  //     split is deterministic (inlined splitAcceptanceClauses, lib/acceptance.mjs); the probe
+  //     judges COVERAGE only (the band judges quality); gaps feed ONE bounded fixer amend + one
+  //     re-probe; still-uncovered clauses FAIL the item pre-band, cheap, with exact clause-level
+  //     feedback for the reFix (gateDetails -> feedback.md). Runs AFTER the edge-scan amend (it
+  //     probes the final diff shape) and BEFORE the leftover scan (whose lint must see any amend
+  //     this stage lands). Skipped for verificationOnly (no fix diff by design — the gate band
+  //     adjudicates the stale-claim instead) and for single-clause acceptances (the band already
+  //     checks those wholesale). Fail-open: a null/malformed probe never sinks an item.
+  if (!verificationOnly) {
+    const clauses = splitAcceptanceClauses(item.acceptance, 8)
+    if (clauses.length >= 2) {
+      phase('EdgeScan')
+      const clauseList = clauses.map(function (c, i) { return '  ' + (i + 1) + '. ' + c }).join('\n')
+      const acceptPrompt = 'ACCEPTANCE SCAN (KI-E18 — pre-band clause-coverage probe). The acceptance criterion splits into the numbered clauses below. STEP 1: Read ' + itemsDir(id) + '/review-pack.md (the machine snapshot of this change). STEP 2: for EACH clause, decide whether the CHANGE (the diff / new files; for a clause about pre-existing behaviour, the worktree state) contains CONCRETE evidence the clause is satisfied — a specific hunk, file, or test. Judge COVERAGE, not quality (the review band judges quality). Return covered=true ONLY if EVERY clause is evidenced; otherwise covered=false with each un-evidenced clause in gaps (quote the clause + why no evidence). Do NOT edit anything.\nCLAUSES:\n' + clauseList
+      let ac = await call('acceptance-probe', { model: 'claude-haiku-4-5', effort: 'low' }, ACCEPT_SCHEMA, acceptPrompt, 'EdgeScan')
+      if (ac && ac.covered === false && Array.isArray(ac.gaps) && ac.gaps.length) {
+        // ONE bounded amend (mirrors the edge-scan amend), then ONE re-probe; the re-probe's verdict is final.
+        const amend = await call('fixer', R.fixer, FIX_SCHEMA, 'ACCEPTANCE-GAP AMEND (KI-E18): a pre-band probe found acceptance clause(s) with NO evidence in your diff — the gate band would FAIL the item at full price for exactly this (the #1 recent FAIL cause). Address EVERY gap below with the minimal correct change (or state in note precisely why a clause is already satisfied or out of this item\'s scope). Then re-verify the touched surface (code: `' + BT + ' build <touched .csproj> 2>&1 | tee -a ' + RAW + '` + `' + BT + ' filter <test .csproj> "<TestClassName>" 2>&1 | tee -a ' + RAW + '`; doc/config: the spec\'s grep) and REGENERATE the review pack: `' + PACKCMD + '`. GAPS: ' + JSON.stringify(ac.gaps.slice(0, 8)) + claimsHint, 'EdgeScan')
+        if (amend && amend.scopeStop) return await frameAndBlock('fixer scope-stop during acceptance amend — ' + (amend.summary || ''))
+        if (amend && amend.applied) {
+          const re = await call('acceptance-probe', { model: 'claude-haiku-4-5', effort: 'low' }, ACCEPT_SCHEMA, acceptPrompt + '\nRE-SCAN: an amend just addressed the prior gaps — judge the AMENDED diff fresh; prior gaps are hypotheses to re-verify, never conclusions to copy forward.', 'EdgeScan')
+          if (re && typeof re.covered === 'boolean') ac = re
+        }
+      }
+      if (ac && typeof ac.covered === 'boolean') {
+        res.gates['probe:acceptance-scan'] = ac.covered ? 'APPROVED' : 'CHANGES_REQUIRED'
+        res.gateDetails = res.gateDetails || {}
+        res.gateDetails['probe:acceptance-scan'] = {
+          verdict: ac.covered ? 'APPROVED' : 'CHANGES_REQUIRED',
+          headline: ac.covered ? 'every acceptance clause evidenced in the diff' : ((ac.gaps || []).length + ' acceptance clause(s) with NO evidence in the diff'),
+          findings: (ac.gaps || []).slice(0, 12).map(function (g) { return { severity: 'HIGH', title: 'un-evidenced acceptance clause: ' + String(g.clause || '').slice(0, 140), fix: String(g.why || '') } }),
+        }
+        if (!ac.covered) {
+          const gapNote = (ac.gaps || []).slice(0, 6).map(function (g) { return String(g.clause || '').slice(0, 90) }).join(' | ')
+          return finish('FAILED', 'acceptance-scan (KI-E18): acceptance clause(s) with NO evidence in the diff after one bounded amend — ' + (gapNote || 'see gateDetails') + '. Pre-band fail (cheap — no gate band was spent); the fix must address EVERY acceptance clause.')
+        }
+      }
+    }
+  }
+
+  // 4d. LEFTOVER SCAN (KI-D12, owner directive 2026-07-19) — a CHEAP haiku pass that enforces
   //     execution-policy.md §4 ("no leftovers") on the fixer's OWN diff BEFORE the expensive gate band.
   //     A deterministic linter (build-test.sh leftovers) greps the FINAL pre-band diff's ADDED lines for
   //     the deferral/tech-debt lexicon (TODO/FIXME/HACK/XXX, NotImplementedException, "for now",
@@ -938,7 +1015,7 @@ if (A.sweep) {
   if (DRY) return { mode: 'dry-run-sweep', sweep: { index: A.sweep.index, label: A.sweep.label, theme: A.sweep.theme, sites: (A.sweep.sites || []).length } }
   log('sweep: ' + A.sweep.label + ' — design once + apply ' + (A.sweep.sites || []).length + ' sites')
   const sres = await runSweep(A.sweep)
-  return { mode: 'sweep', cycle: A.cycle, sweep: sres }
+  return { mode: 'sweep', cycle: A.cycle, usage: (typeof budget !== 'undefined' && budget && typeof budget.spent === 'function') ? { outputTokens: budget.spent() } : undefined, sweep: sres } // KI-E23 (P6c)
 }
 
 if (DRY || !items.length) {
@@ -990,4 +1067,7 @@ const results = await Promise.all(items.map(function (it) {
     })
     .then(checkpointResult) // KI-L40 — persist BOTH outcomes (resolved AND crashed) the moment they exist
 }))
-return { mode: 'run', cycle: A.cycle, plan, results: results }
+// KI-E23 (P6c): per-run token usage — budget.spent() is the runtime's output-token counter for this
+// turn; the driver's fold emits it as a `usage` telemetry event so cost analyses stop extrapolating
+// from call counts. Observational only (never fold evidence).
+return { mode: 'run', cycle: A.cycle, plan, usage: (typeof budget !== 'undefined' && budget && typeof budget.spent === 'function') ? { outputTokens: budget.spent() } : undefined, results: results }

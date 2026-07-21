@@ -52,3 +52,45 @@ export function buildBasenameIndex(trackedPaths) {
   }
   return m;
 }
+
+// KI-E22 (2026-07-21, improvement-analysis P4) — acceptance-surface lint: the KI-E16 ledger check
+// generalized. The general defect shape (the ITEM-M7 controller-clause class, cycle 46): the
+// `acceptance` NAMES surfaces the fix must touch while `files[]` omits them — the within-batch
+// file-lock then has nothing to serialize on, a sibling holds the real lock, and the fixer
+// (correctly honouring the lock set) is structurally FORBIDDEN from meeting the acceptance; the
+// opus band discovers it at full price. Heuristic: extract path-like tokens + PascalCase type
+// names from `acceptance`; when a token resolves to a real tracked repo file (target-dir-unique
+// wins, mirroring classifyFilesEntry) that files[] does not carry (by path or basename), report a
+// gap. ADVISORY only (a WARN at graph-audit + group time, never a gate) — imprecision is
+// acceptable by design. Pure: all IO injected, selftest-covered.
+export function acceptanceSurfaceGaps(wi, opts) {
+  const acceptance = String((wi && wi.acceptance) || '');
+  const files = (wi && wi.files) || [];
+  const norm = (f) => String(f || '').replace(/^\.\//, '');
+  const havePaths = new Set(files.map(norm));
+  const haveBases = new Set(files.map((f) => norm(f).split('/').pop()));
+  const gaps = [];
+  const seen = new Set();
+  const consider = (token, resolved) => {
+    if (havePaths.has(resolved) || haveBases.has(resolved.split('/').pop())) return;
+    if (seen.has(resolved)) return;
+    seen.add(resolved);
+    gaps.push({ token, resolved });
+  };
+  // 1. explicit path-like tokens (slash + extension) that exist on disk
+  for (const m of acceptance.matchAll(/[A-Za-z0-9_.-]+(?:\/[A-Za-z0-9_.-]+)+\.[A-Za-z0-9]{1,6}/g)) {
+    const p = norm(m[0]);
+    if (opts.existsOnDisk(p)) consider(m[0], p);
+  }
+  // 2. PascalCase type names (>=2 humps) resolving to a unique tracked .cs file — a
+  //    target-dir-unique match wins; a globally-unique match is accepted; anything ambiguous is
+  //    silently skipped (too noisy for an advisory lint).
+  for (const m of acceptance.matchAll(/\b[A-Z][a-z0-9]+(?:[A-Z][a-z0-9]+)+\b/g)) {
+    const cand = opts.byBasename.get(m[0] + '.cs') || [];
+    const t = opts.targetDir;
+    const inTarget = t ? cand.filter((c) => c.startsWith(t + '/')) : [];
+    const hit = inTarget.length === 1 ? inTarget[0] : (cand.length === 1 ? cand[0] : null);
+    if (hit) consider(m[0], hit);
+  }
+  return gaps;
+}
