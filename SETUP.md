@@ -74,13 +74,30 @@ is a working 3-item example.
 
 Ways to produce it:
 
-- **Hand-author** items (the graph is deliberately hand-editable) — start from the template.
-- **Generate from an audit or backlog**: write a small adapter that emits schema-valid items
-  into `state/normalized/*.json`, then run `driver.mjs merge-graph` to combine them into the
-  findings-graph (it validates and detects dependency cycles) — or emit
-  `state/findings-graph.json` directly. No adapter ships (§ 6): the schema is the only
-  interface. Anything that can state an acceptance criterion plus a regression-test idea
-  (audit finding, story, change request) can be an item.
+- **`driver ingest` from a source (KI-E27)** — the built-in adapters pull issues into
+  `state/normalized/<source>.json`, which `merge-graph` folds:
+
+  ```bash
+  DRV="node <mount>/_workflow/driver.mjs"
+  $DRV ingest --github owner/repo --issues 1716,1718        # named issues (needs gh, authenticated)
+  $DRV ingest --github owner/repo --label bug --state open  # a label query, up to --limit N (default 30)
+  $DRV ingest --json  path/to/items.json                    # gh-issue array OR ready work-item array (passthrough)
+  $DRV ingest --markdown path/to/backlog.md                 # "- [ ] task" checklist -> triage items
+  $DRV merge-graph                                           # the guarded step: fold every normalized/*.json into the graph
+  #   ingest options: --out NAME / --id-prefix P / --target T / --theme X / --severity S
+  ```
+
+  **The honest-acceptance rule:** an ingested item is **never auto-runnable**. A raw issue rarely
+  states a *checkable* `acceptance` + `regressionTest` — the factory's contract — so ingestion lands
+  each item as `blocked` triage (no parseable section) or at most `escalate` (an "Expected behaviour"
+  section was lifted, but a human still confirms it). You (or `bmad-spec`) then author the acceptance,
+  set `files[]`, and flip `autonomyTier` to `auto`. Ingestion seeds the queue; it never fabricates a
+  green light. Add a source type by extending the pure mappers in `_workflow/lib/ingest.mjs`.
+
+- **Hand-author** items (the graph is deliberately hand-editable) — start from the template. This is
+  the shortest path to a fully-spec'd, immediately-schedulable item (as the shipped example is).
+- **Generate from your own audit**: emit schema-valid items into `state/normalized/*.json` however you
+  like, then `merge-graph`. The schema (`schema/work-item.schema.json`) is the only interface.
 
 Then build the ledger: `node <mount>/_workflow/driver.mjs init`
 
@@ -116,7 +133,8 @@ Outputs land in: `state/PROGRESS.md`, `reports/burndown.md`, `reports/cost-lates
 | **Model routing** | `config/model-routing.json` (opus = hard gates/refute, sonnet = mid, haiku = cheap) | edit (committed) or overlay |
 | **Review-gate house rules** | several `agents/*.md` briefs cite `.claude/rules/*.md` checklists (the host project's engineering rules) | give your host repo its own `.claude/rules/`, or trim those citations in the briefs — gates degrade gracefully when a cited file is absent |
 | **Doc conventions** | prompt enrichment looks for `doc/data-flows/<target>.md`, `<target>/CONTEXT.md`, `<target>/AGENTS.md`; graph-audit lints a `STANDARDS-LEDGER.md` path | all best-effort — absent files just yield no enrichment |
-| **Audit ingestion** | write your own (none shipped) | the graph contract (`schema/work-item.schema.json`) is the only interface; emit items however you like |
+| **Audit ingestion** | `driver ingest` ships github / json / markdown adapters (KI-E27) | extend the pure mappers in `_workflow/lib/ingest.mjs` for a new source; the graph contract (`schema/work-item.schema.json`) is the only interface, so you can also emit items however you like |
+| **Cost telemetry** | dashboard cost panels need session OTLP (KI-E28) | source `telemetry/claude-code-telemetry.env.example` in the session shell; see `telemetry/README.md` |
 
 ## 7. Invariants you must not break (see `KNOWN-ISSUES.md` § E)
 

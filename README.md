@@ -109,6 +109,11 @@ node <mount>/_workflow/driver.mjs <cmd>       # <mount> = your factory path, e.g
                        — --fix appends, KI-E22 acceptance-surface gaps, over-flagged realInfra)
   progress | burndown | cost | escalations | report-cycle | telemetry-report
   decisions-digest     ranked owner-decision digest: severity x age + one-line reply format (KI-E24)
+  ingest               pull issues into state/normalized/ from a source (KI-E27):
+                       --github owner/repo [--issues 1,2 | --label X --state open --limit N] | --json <f> | --markdown <f>
+                       [--out NAME --id-prefix P --target T --theme X --severity S]. Non-mutating (writes normalized/
+                       only; run merge-graph next). Ingested items are blocked/escalate (never auto) — a human
+                       authors the acceptance before they schedule.
   merge-graph          merge state/normalized/*.json → findings-graph.json (validates + detects dep cycles)
   worktree-add <id> | worktree-remove <path> | worktree-list
 ```

@@ -44,6 +44,7 @@ import { applyConvergenceBonus, effectiveRetryBound } from './lib/convergence.mj
 import { clusterBySimilarity, sharedLabel, batchPatternFor, sig as simSig, similarSigs } from './lib/similarity.mjs';
 import { loadController, isStale as controllerStale, claimController, verifyController, releaseController, DEFAULT_TTL_MINUTES } from './lib/controller.mjs';
 import { buildFactoryRouting } from './lib/routing-drift.mjs';
+import { githubIssueToItem, markdownChecklistToItems, ingestReport } from './lib/ingest.mjs'; // KI-E27 — multi-source issue ingestion
 import { snapshotMainFiles, driftAgainstSnapshot, dirtyMainPaths, filesOverlapDirty } from './lib/mainguard.mjs';
 import { buildDocMap, readRoleBriefs } from './lib/promptpack.mjs';
 // KI-E7 — telemetry is OBSERVATIONAL ONLY (ai-factory-observability spine AD-1..3/AD-11): emit()
@@ -1763,6 +1764,78 @@ const FIXTYPE_OK = ['mechanical', 'non-trivial', 'owner-decision', 'scope-stop']
 const TIER_OK = ['auto', 'escalate', 'blocked'];
 const ID_RE = /^[A-Z0-9]+(-[A-Z0-9]+)+$/;
 
+// KI-E27: pull work-items from an external source into state/normalized/<out>.json, which
+// merge-graph then folds. Sources: --github <repo> (--issues csv | --label X [--state] [--limit]),
+// --json <file> (gh-issue array OR ready work-item array, passthrough), --markdown <file> (checklist).
+// I/O only — the mapping is the pure lib (ingest.mjs). Deliberately NON-mutating to the ledger: it
+// writes only normalized/ (like producing a source file), so it needs no controller lease; the
+// ledger-writing step stays the separately-guarded `merge-graph`. Ingested items are blocked/escalate,
+// never auto (honest-acceptance invariant): ingestion seeds the queue, a human/bmad-spec authors the acceptance.
+function cmdIngest(flags) {
+  const cfg = loadConfig();
+  const normDir = join(dirname(abs(cfg.paths.graph)), 'normalized');
+  if (!existsSync(normDir)) mkdirSync(normDir, { recursive: true });
+
+  const opts = {
+    idPrefix: flags['id-prefix'] || undefined,
+    target: flags.target || '',
+    layer: flags.layer || undefined,
+    theme: flags.theme || undefined,
+    severity: flags.severity || undefined,
+  };
+  let items = [];
+  let outName = flags.out || null;
+
+  if (flags.github) {
+    const repo = String(flags.github);
+    opts.repo = repo;
+    if (!opts.idPrefix) opts.idPrefix = 'GH';
+    let issues = [];
+    try {
+      if (flags.issues) {
+        for (const n of String(flags.issues).split(',').map((s) => s.trim()).filter(Boolean)) {
+          const raw = execFileSync('gh', ['issue', 'view', n, '--repo', repo, '--json', 'number,title,body,labels,state'], { encoding: 'utf8' });
+          issues.push(JSON.parse(raw));
+        }
+      } else {
+        const args = ['issue', 'list', '--repo', repo, '--json', 'number,title,body,labels,state',
+          '--state', String(flags.state || 'open'), '--limit', String(flags.limit || 30)];
+        if (flags.label) args.push('--label', String(flags.label));
+        issues = JSON.parse(execFileSync('gh', args, { encoding: 'utf8' }));
+      }
+    } catch (e) {
+      console.log(`ingest: gh failed — ${String(e.message || e).split('\n')[0]}. Is the GitHub CLI installed and authenticated (gh auth status)?`);
+      return;
+    }
+    items = issues.map((iss) => githubIssueToItem(iss, opts));
+    if (!outName) outName = 'github-' + repo.replace(/[^a-z0-9]+/gi, '-').toLowerCase();
+  } else if (flags.json) {
+    let arr;
+    try { arr = readJson(abs(String(flags.json))); } catch (e) { console.log(`ingest: cannot read --json ${flags.json}: ${e.message}`); return; }
+    if (!Array.isArray(arr)) { console.log('ingest: --json file must be a JSON array.'); return; }
+    // Passthrough if the objects already carry an acceptance (ready work-items); else treat as gh issues.
+    items = arr.map((o) => (o && o.acceptance ? o : githubIssueToItem(o, opts)));
+    if (!outName) outName = basename(String(flags.json)).replace(/\.json$/i, '') || 'json';
+  } else if (flags.markdown) {
+    let md;
+    try { md = readFileSync(abs(String(flags.markdown)), 'utf8'); } catch (e) { console.log(`ingest: cannot read --markdown ${flags.markdown}: ${e.message}`); return; }
+    items = markdownChecklistToItems(md, { ...opts, sourceName: basename(String(flags.markdown)) });
+    if (!outName) outName = basename(String(flags.markdown)).replace(/\.(md|markdown)$/i, '') || 'markdown';
+  } else {
+    console.log('ingest: pick a source — --github <owner/repo> [--issues 1,2 | --label bug --state open --limit N], --json <file>, or --markdown <file>. Optional: --out <name> --id-prefix P --target T --theme X --severity S.');
+    return;
+  }
+
+  if (!items.length) { console.log('ingest: 0 item(s) produced (nothing matched the source).'); return; }
+  const outPath = join(normDir, `${outName}.json`);
+  writeJsonAtomic(outPath, items);
+  const rep = ingestReport(items);
+  console.log(`ingest: ${rep.total} item(s) -> ${toPosix(relative(REPO_ROOT, outPath))}`);
+  console.log(`  by severity: ${JSON.stringify(rep.bySeverity)}`);
+  console.log(`  ${rep.escalate} escalate (acceptance section found — review + confirm), ${rep.blocked} blocked-triage (author acceptance + regressionTest + files[] first). None are auto-runnable by design.`);
+  console.log(`  next: node <mount>/_workflow/driver.mjs merge-graph   (the guarded, ledger-writing step — folds every normalized/*.json into the findings-graph)`);
+}
+
 // Merge state/normalized/*.json into findings-graph.json with validation + dedup.
 function cmdMergeGraph(flags) {
   const cfg = loadConfig();
@@ -1947,6 +2020,7 @@ function dispatch(cmd, flags, rest) {
     case 'burndown': return cmdReport('burndown');
     case 'cost': return cmdReport('cost');
     case 'escalations': { const cfg = loadConfig(); return cmdEscalationsSync(cfg, loadLedger(abs(cfg.paths.ledger))); }
+    case 'ingest': return cmdIngest(flags); // KI-E27 — pull issues from github/json/markdown into state/normalized/
     case 'merge-graph': return cmdMergeGraph(flags);
     case 'group': return cmdGroup(flags);
     case 'suggest': return cmdSuggest(flags); // similar-batch planning (read-only; owner directive 2026-07-04)
@@ -1961,7 +2035,7 @@ function dispatch(cmd, flags, rest) {
     case 'controller': return cmdController(flags, rest); // KI-C11 — lease management: status | claim | release | heartbeat
     case 'telemetry-report': return cmdTelemetryReport(flags); // KI-E7 / spine AD-9 — evaluation report from events.jsonl
     default:
-      console.log('commands: init | status | select | claim | reset | fold | reconstruct | recover | resume | progress | burndown | cost | escalations | decisions-digest | group | suggest | cycle | sweep | sweep-fold | gc | preflight | graph-audit | realinfra-lint | report-cycle | merge-graph | controller | telemetry-report | worktree-add|remove|list');
+      console.log('commands: init | status | select | claim | reset | fold | reconstruct | recover | resume | progress | burndown | cost | escalations | decisions-digest | group | suggest | cycle | sweep | sweep-fold | gc | preflight | graph-audit | realinfra-lint | report-cycle | ingest | merge-graph | controller | telemetry-report | worktree-add|remove|list');
   }
 }
 
