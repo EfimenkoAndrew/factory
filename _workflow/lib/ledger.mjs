@@ -55,6 +55,15 @@ export function canTransition(from, to) {
 export function readJson(path) {
   return JSON.parse(readFileSync(path, 'utf8'));
 }
+// KI-E31: unwrap the Workflow harness envelope so `fold <task-output>` works without hand-extraction.
+// The runtime wraps the factory's return as {summary, agentCount, logs, result:{mode,cycle,results}}, so a
+// raw task-output file carries the fold payload under .result. Unwrap ONLY that shape (a .result that is a
+// results-object) — a direct results file (array, or an object already carrying .results) passes through.
+export function unwrapResultEnvelope(obj) {
+  if (obj && !Array.isArray(obj) && !obj.results && obj.result &&
+      (Array.isArray(obj.result.results) || obj.result.mode || obj.result.cycle)) return obj.result;
+  return obj;
+}
 export function writeJsonAtomic(path, obj) {
   mkdirSync(dirname(path), { recursive: true });
   // KI-B3 (closed 2026-07-12): pid-unique temp name — two processes writing the same target no longer

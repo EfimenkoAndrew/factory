@@ -29,7 +29,7 @@ import { fileURLToPath } from 'node:url';
 import { resolveRepoRoot, swapMountPrefix, toPosix, STOCK_MOUNT } from './lib/rootfind.mjs';
 import {
   emptyLedger, loadLedger, syncFromGraph, transition, foldResults,
-  countByState, writeJsonAtomic, readJson, ACTIVE, OFFRAMPS, FORWARD,
+  countByState, writeJsonAtomic, readJson, unwrapResultEnvelope, ACTIVE, OFFRAMPS, FORWARD,
 } from './lib/ledger.mjs';
 import { loadGraph, computeReady, waitingOnDeps, byId } from './lib/graph.mjs';
 import { loadRouting, resolve as routeResolve, concurrencyFor } from './lib/router.mjs';
@@ -568,7 +568,9 @@ function cmdFold(file, flags) {
     process.exitCode = 1;
     return;
   }
-  const results = readJson(foldPath);
+  // KI-E31: accept the Workflow harness envelope directly (unwrap {…,result:{…}} → the fold payload), so
+  // `fold <task-output>` no longer needs hand-extraction. A direct results file passes through unchanged.
+  const results = unwrapResultEnvelope(readJson(foldPath));
   const arr = Array.isArray(results) ? results : results.results || [];
   if (results.cycle) ledger.cycle = Math.max(ledger.cycle, results.cycle);
   // KI-L50 — infra-failure recovery. An agent that returns null after exhausting retries on a TERMINAL
