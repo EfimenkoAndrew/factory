@@ -28,6 +28,7 @@ import { classifyLine as loClassify, firstLexeme as loLexeme, findLeftovers } fr
 import { splitAcceptanceClauses } from './acceptance.mjs';
 import { dissentersFrom, roleForGateKey, recoveryTransitions, recoveryFoldSkeleton, priorCycleOf } from './recover.mjs';
 import { extractHeadings, buildDocMap, readRoleBriefs } from './promptpack.mjs';
+import { githubIssueToItem, markdownChecklistToItems, extractSection, severityFromLabels, themeFromLabels, ingestReport } from './ingest.mjs';
 import { fileURLToPath } from 'node:url';
 
 let pass = 0, fail = 0;
@@ -1218,6 +1219,54 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
   eq(d2 && d2.toState, 'FAILED', 'KI-E18 smoke: a persistent gap FAILS pre-band');
   ok(String((d2 && d2.note) || '').startsWith('acceptance-scan (KI-E18)'), 'KI-E18 smoke: the fail note carries the clause-level feedback');
   ok(d2 && d2.gateDetails && d2.gateDetails['probe:acceptance-scan'] && d2.gateDetails['probe:acceptance-scan'].findings.length === 1, 'KI-E18 smoke: gateDetails carry the gap findings for feedback.md');
+}
+
+// ---- KI-E27: multi-source ingestion mappers -------------------------------------------------
+{
+  // severity + theme from labels
+  eq(severityFromLabels([{ name: 'bug' }, { name: 'P1' }]), 'HIGH', 'ingest: P1 label -> HIGH');
+  eq(severityFromLabels(['critical']), 'CRITICAL', 'ingest: critical label -> CRITICAL');
+  eq(severityFromLabels([], 'LOW'), 'LOW', 'ingest: no label -> fallback severity');
+  eq(severityFromLabels([]), 'MEDIUM', 'ingest: no label, no fallback -> MEDIUM');
+  eq(themeFromLabels([{ name: 'security' }]), 'security', 'ingest: security label -> security theme (escalate routing)');
+  eq(themeFromLabels([{ name: 'CRM' }]), 'crm-link-integrity', 'ingest: CRM label -> crm-link-integrity theme');
+  eq(themeFromLabels([]), 'triage', 'ingest: unmatched label -> triage theme');
+
+  // extractSection pulls a markdown section, stops at the next same-or-shallower heading
+  const body = '## Summary\nx\n## Expected behavior\nClicking opens the record.\nSecond line.\n## Impact\ny';
+  eq(extractSection(body, ['expected behaviou?r']), 'Clicking opens the record.\nSecond line.', 'ingest: extractSection lifts the section body and stops at the next heading');
+  eq(extractSection(body, ['nonexistent']), null, 'ingest: extractSection returns null when the heading is absent');
+
+  // an issue WITH an acceptance section -> escalate/non-trivial, files[] empty, source stamped, never auto
+  const withAcc = githubIssueToItem(
+    { number: 1716, title: 'Open in CRM opens the activity', body, labels: [{ name: 'bug' }, { name: 'CRM' }] },
+    { repo: 'jooooel/seqaro', idPrefix: 'GH' });
+  eq(withAcc.id, 'GH-1716', 'ingest: github id is prefix + issue number');
+  eq(withAcc.autonomyTier, 'escalate', 'ingest: acceptance section found -> escalate (human confirms), never auto');
+  eq(withAcc.fixType, 'non-trivial', 'ingest: acceptance section found -> non-trivial');
+  eq(withAcc.theme, 'crm-link-integrity', 'ingest: theme routed from labels');
+  eq(withAcc.source, 'jooooel/seqaro#1716', 'ingest: source stamps repo#number');
+  eq(withAcc.files, [], 'ingest: files[] starts empty — the human authors the lock set');
+  ok(/^[A-Z0-9]+(-[A-Z0-9]+)+$/.test(withAcc.id), 'ingest: generated id is schema-valid');
+
+  // an issue WITHOUT an acceptance section -> blocked triage / owner-decision, with a triage ownerDecision
+  const noAcc = githubIssueToItem({ number: 42, title: 'Vague thing', body: 'no structure here', labels: [] }, { repo: 'o/r' });
+  eq(noAcc.autonomyTier, 'blocked', 'ingest: no acceptance section -> blocked triage (never auto-runs)');
+  eq(noAcc.fixType, 'owner-decision', 'ingest: no acceptance section -> owner-decision');
+  ok(!!noAcc.ownerDecision, 'ingest: triage item carries an ownerDecision prompt');
+  ok(!!noAcc.acceptance && !!noAcc.regressionTest, 'ingest: triage item still fills acceptance/regressionTest so merge-graph validation passes (as triage text)');
+
+  // markdown checklist -> one blocked item per unchecked box
+  const items = markdownChecklistToItems('- [ ] First task\n- [x] done already\nnot a task\n* [ ] Second task', { idPrefix: 'BL' });
+  eq(items.length, 3, 'ingest: markdown picks up every checklist line (checked or not)');
+  eq(items[0].id, 'BL-1', 'ingest: markdown id is prefix + 1-based index');
+  eq(items.every((i) => i.autonomyTier === 'blocked'), true, 'ingest: markdown items are all blocked triage');
+
+  // report split
+  const rep = ingestReport([withAcc, noAcc, ...items]);
+  eq(rep.total, 5, 'ingest: report totals every item');
+  eq(rep.escalate, 1, 'ingest: report counts the one escalate item');
+  eq(rep.blocked, 4, 'ingest: report counts the blocked-triage items');
 }
 
 console.log(`\nself-test: ${pass} passed, ${fail} failed`);
