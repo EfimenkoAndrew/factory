@@ -275,6 +275,7 @@ function compose(role, item, extra) {
     '  - Honour code-style / service-design / dataflow / security / trust-and-monetisation / deploy-verification.',
     '  - The FULL .claude/rules/*.md set is ALREADY in your system context (auto-loaded) — do NOT spend tool calls re-Reading those rule files; cite them from context.',
     '  - product-scope.md red-lines are HARD STOPS: never "fix" by adding a tax/purchase-fee/SAR/gov-report/shipping surface. If the only fix crosses one, STOP and report scope-stop.',
+    '  - `scopeViolation:true` means EXACTLY a product-scope.md red-line was crossed (above) — the one hard-stop. A diff that merely touches a file OUTSIDE the item\'s declared files[] touch-set is NOT a scopeViolation: report it as a normal finding (note whether the extra file is justified) and set the verdict on its merits. Do not conflate "outside the lock-set" with "crossed a product red-line" (KI-E30).',
     '  - A real divergence from a pattern requires a standards-evolution.md ledger entry + call-site tag in the SAME change.',
     '  - No false "production-ready" (execution-policy.md §4): leave no TODO/FIXME/HACK/stub.',
   )
