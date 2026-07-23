@@ -1198,6 +1198,24 @@ function cmdGroup(flags) {
     });
     if (overlapped.length) console.log('  KI-E14: UNCOMMITTED main-tree overlap — item(s) EXCLUDED (a worktree snapshots HEAD without the pending fix; apply-back would clobber it). Commit the pending surface first, or pass --force-dirty-overlap to accept the snapshot: ' + overlapped.join('; '));
   }
+  // KI-E29: a picked item whose CLOSED dependency still has an unmerged factory/<dep> worktree will
+  // build from HEAD WITHOUT that dependency's code — fixes are uncommitted on the dep's branch (KI-E1),
+  // so a "CLOSED" dep in the ledger does not put its code in HEAD. The worktree then silently lacks work
+  // it depends on (live: SF-LINK-1720-BF depended on CLOSED-but-uncommitted SF-LINK-1718 and the fixer
+  // re-derived its fix outside the lock-set, tripping a false scope block). WARN, don't exclude — nothing
+  // is clobbered; the owner decides whether to commit the dependency first for a clean base.
+  if (picked.length) {
+    // A dependency's worktree dir still present is the cwd-independent proxy for "its fix isn't in HEAD
+    // yet" — a committed dependency is gc'd (driver gc). Checking the dir (not `git worktree list`) avoids
+    // the nested-factory-repo cwd trap and needs no git, mirroring how KI-E14 passes REPO_ROOT explicitly.
+    const wtDir = abs(cfg.paths.worktreesState);
+    const depWarn = [];
+    for (const wi of picked) for (const d of wi.dependsOn || []) {
+      const dep = ledger.items[d];
+      if (dep && dep.state === 'CLOSED' && existsSync(join(wtDir, d))) depWarn.push(wi.id + ' <- ' + d);
+    }
+    if (depWarn.length) console.log('  KI-E29: picked item(s) depend on a CLOSED item whose fix is still on an unmerged factory/<dep> worktree (uncommitted per KI-E1) — the new worktree branches from HEAD WITHOUT that code, so the fixer may re-derive it or build against a missing dependency. Commit the dependency first for a clean base: ' + depWarn.join('; '));
+  }
   // Within-batch file-lock: computeReady only locks against ALREADY-active items, not against
   // siblings in THIS batch. Two un-started items touching the same file would both be claimed,
   // edit it in separate worktrees, and serial integration would copy one over the other —
