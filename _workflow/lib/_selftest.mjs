@@ -7,7 +7,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   emptyLedger, syncFromGraph, transition, foldResults, canTransition,
-  countByState, writeJsonAtomic, readJson, FORWARD,
+  countByState, writeJsonAtomic, readJson, unwrapResultEnvelope, FORWARD,
 } from './ledger.mjs';
 import { computeReady, waitingOnDeps } from './graph.mjs';
 import { isFactoryWorktreePath } from './worktree.mjs';
@@ -1181,6 +1181,26 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
   ok(dsrc22.includes('ACCEPT-SURFACE') && dsrc22.includes('KI-E22 WARN'), 'KI-E22: graph-audit reports + group-time advisory warn wired');
   ok(dsrc22.includes('ledger-path append(s) (KI-E16)'), 'KI-E16: graph-audit --fix appends the ledger path for shared-file gaps');
   ok(dsrc22.includes('SWEEP CANDIDATE (KI-E21)'), 'KI-E21: suggest recommends the sweep channel for large homogeneous clusters');
+
+  // KI-E32: a token in a reference / citation / exclusion context is NOT flagged as a missing edit target
+  eq(acceptanceSurfaceGaps({ target: 'SvcA', acceptance: 'A new endpoint modeled on the existing ItemsController for parity.', files: [] }, io22).length, 0, 'KI-E32: "modeled on X" is a reference, not a gap');
+  eq(acceptanceSurfaceGaps({ target: 'SvcA', acceptance: 'Uses the same chain OrdersController uses today.', files: [] }, io22).length, 0, 'KI-E32: trailing "X uses" reads as a reference, not a gap');
+  eq(acceptanceSurfaceGaps({ target: 'SvcA', acceptance: 'ResolveThing at doc/data-flows/SvcA.md:42 explains it.', files: ['SvcA/README.md'] }, io22).length, 0, 'KI-E32: a File:line citation is a reference, not a gap');
+  eq(acceptanceSurfaceGaps({ target: 'SvcA', acceptance: 'Do NOT touch OrdersController; leave it alone.', files: [] }, io22).length, 0, 'KI-E32: "do NOT touch X" exclusion is not a gap');
+  // …but an ACTIVELY-named edit target still surfaces (the heuristic stays conservative)
+  eq(acceptanceSurfaceGaps({ target: 'SvcA', acceptance: 'ItemsController clamps page before querying.', files: [] }, io22).map((g) => g.resolved), ['SvcA/src/Api/ItemsController.cs'], 'KI-E32: an actively-named surface is still a gap (no over-suppression)');
+}
+
+// KI-E31: the fold path accepts the Workflow harness envelope directly
+{
+  const payload = { mode: 'run', cycle: 3, results: [{ id: 'WI-A', toState: 'CLOSED' }] };
+  eq(unwrapResultEnvelope({ summary: 's', agentCount: 4, logs: [], result: payload }), payload, 'KI-E31: {…,result:{…}} envelope unwraps to the fold payload');
+  eq(unwrapResultEnvelope(payload), payload, 'KI-E31: a direct results object passes through unchanged');
+  const arr = [{ id: 'WI-A', toState: 'CLOSED' }];
+  eq(unwrapResultEnvelope(arr), arr, 'KI-E31: a bare results array passes through unchanged');
+  // a business object that merely has a `.result` field (not the Workflow envelope) is NOT unwrapped
+  const notEnv = { result: { verdict: 'ok' }, results: [{ id: 'X' }] };
+  eq(unwrapResultEnvelope(notEnv), notEnv, 'KI-E31: an object already carrying .results is not unwrapped (backward-compatible)');
 }
 
 // KI-E18/KI-E23 exec-smoke: the acceptance-scan stage runs pre-band — a gap triggers ONE bounded

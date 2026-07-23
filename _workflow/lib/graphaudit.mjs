@@ -77,15 +77,29 @@ export function acceptanceSurfaceGaps(wi, opts) {
     seen.add(resolved);
     gaps.push({ token, resolved });
   };
+  // KI-E32: skip a token that reads as a REFERENCE/citation/exclusion, not an edit target — the
+  // acceptance-surface lint should only nudge files the fix must TOUCH. A file-lock cannot serialize a
+  // file the item names to model on, cite, or exclude, so flagging those is pure noise (seen on every run:
+  // "modeled on BackfillSalesforceContactAccountsEndpoint", "(GetDealScoringEndpoint.cs:739)", "do NOT
+  // touch PipedriveHelper"). Conservative — only strong, unambiguous cues, so genuine "you forgot file X"
+  // gaps (phrased actively: "modify X", "in X", "X must") still surface.
+  const BEFORE = /(model(?:l?ed)?\s+(?:on|after|exactly)|based on|same\b[^.]{0,40}\b(?:as|uses?|chain)|mirror|sibling|reference|existing|like the|similar to|rules out|instead of|rather than|do ?n['o]?t touch|never touch|not touch|non-?goals?|\bsee\b|\bper\b)[^.]{0,40}$/i;
+  const AFTER = /^(?::\d+|\s*(?:uses|does|pattern|convention|already)\b)/i; // line-number citation, or a trailing reference verb
+  const isReference = (idx, len) => {
+    const before = acceptance.slice(Math.max(0, idx - 55), idx);
+    const after = acceptance.slice(idx + len, idx + len + 22);
+    return BEFORE.test(before) || AFTER.test(after);
+  };
   // 1. explicit path-like tokens (slash + extension) that exist on disk
   for (const m of acceptance.matchAll(/[A-Za-z0-9_.-]+(?:\/[A-Za-z0-9_.-]+)+\.[A-Za-z0-9]{1,6}/g)) {
     const p = norm(m[0]);
-    if (opts.existsOnDisk(p)) consider(m[0], p);
+    if (opts.existsOnDisk(p) && !isReference(m.index, m[0].length)) consider(m[0], p);
   }
   // 2. PascalCase type names (>=2 humps) resolving to a unique tracked .cs file — a
   //    target-dir-unique match wins; a globally-unique match is accepted; anything ambiguous is
   //    silently skipped (too noisy for an advisory lint).
   for (const m of acceptance.matchAll(/\b[A-Z][a-z0-9]+(?:[A-Z][a-z0-9]+)+\b/g)) {
+    if (isReference(m.index, m[0].length)) continue;
     const cand = opts.byBasename.get(m[0] + '.cs') || [];
     const t = opts.targetDir;
     const inTarget = t ? cand.filter((c) => c.startsWith(t + '/')) : [];
