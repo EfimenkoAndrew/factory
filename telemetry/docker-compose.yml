@@ -6,18 +6,23 @@
 #   Prometheus http://localhost:${FACTORY_PROM_PORT:-9090}
 #   Exporter   http://localhost:${FACTORY_EXPORTER_PORT:-9464}/metrics
 #
+# Running the factory in TWO host repos on one machine (KI-E25): set FACTORY_COMPOSE_PROJECT
+# and FACTORY_CONTAINER_PREFIX per host as well as the ports — `docker compose -p` cannot
+# override container_name, and the project name scopes the named volumes. Defaults below
+# reproduce the historical single-host names exactly.
+#
 # Permanent state (AD-6): named volumes prometheus-data / grafana-data survive
 # `compose down` (only `down -v` destroys them). The event stream itself lives on the
 # HOST at ./data/events.jsonl (bind-mounted read-only) — the factory keeps running when
 # this whole stack is down (AD-1).
 # Images are pinned tags — never :latest (deploy-verification.md posture).
 
-name: ai-factory-telemetry
+name: ${FACTORY_COMPOSE_PROJECT:-ai-factory-telemetry}
 
 services:
   exporter:
     build: ./exporter
-    container_name: factory-exporter
+    container_name: ${FACTORY_CONTAINER_PREFIX:-factory}-exporter
     restart: unless-stopped
     environment:
       EVENTS_FILE: /data/events.jsonl
@@ -33,7 +38,7 @@ services:
 
   otel-collector:
     image: otel/opentelemetry-collector-contrib:0.156.0
-    container_name: factory-otel-collector
+    container_name: ${FACTORY_CONTAINER_PREFIX:-factory}-otel-collector
     restart: unless-stopped
     command: ["--config=/etc/otelcol/config.yaml"]
     volumes:
@@ -45,7 +50,7 @@ services:
 
   prometheus:
     image: prom/prometheus:v3.13.1
-    container_name: factory-prometheus
+    container_name: ${FACTORY_CONTAINER_PREFIX:-factory}-prometheus
     restart: unless-stopped
     command:
       - "--config.file=/etc/prometheus/prometheus.yml"
@@ -62,7 +67,7 @@ services:
 
   grafana:
     image: grafana/grafana:12.4.5
-    container_name: factory-grafana
+    container_name: ${FACTORY_CONTAINER_PREFIX:-factory}-grafana
     restart: unless-stopped
     environment:
       GF_AUTH_ANONYMOUS_ENABLED: "true"      # local operator tool (spine: auth hardening deferred)

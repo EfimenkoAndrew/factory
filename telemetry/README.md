@@ -20,6 +20,24 @@ docker compose up -d --build
 
 Port clashes: `cp .env.example .env` and edit.
 
+### A second host repo on the same machine (KI-E25)
+
+The factory is mountable in any number of host repos, but the telemetry stack is per-host.
+Ports are not the whole story: `container_name` is fixed in the compose file and **`docker
+compose -p` cannot override it**, while the compose project name scopes the `prometheus-data`
+/ `grafana-data` volumes. So host B must set the stack's *identity* as well as its ports —
+otherwise it fails outright on duplicate container names, and (once renamed) would silently
+share host A's volumes:
+
+```bash
+cp .env.example .env      # then, in host B's .env:
+FACTORY_COMPOSE_PROJECT=<hostB>-factory-telemetry
+FACTORY_CONTAINER_PREFIX=<hostB>-factory
+FACTORY_GRAFANA_PORT=3100     # ...and every other port
+```
+
+Defaults reproduce the historical single-host names exactly, so an existing stack is unaffected.
+
 ## Permanence
 
 - `prometheus-data` / `grafana-data` are **named volumes** — they survive `docker compose down`
