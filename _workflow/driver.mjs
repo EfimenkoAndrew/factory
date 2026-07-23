@@ -10,17 +10,11 @@
 //
 // Usage (run from repo root):
 //   node _bmad-output/ai-factory/_workflow/driver.mjs <command> [args]
-// Commands:
-//   init [--force]                 build/refresh ledger from findings-graph (resume-safe)
-//   status                         counts by state, waiting-on-deps, escalations
-//   select [--max N --target T --themes a,b --include-escalate --posture P --worktree PATH:BRANCH]
-//                                  compute schedulable items -> write run-args.json
-//   claim <id...>                  READY/FAILED/CONFLICT -> CLAIMED (track in-flight for resume)
-//   fold <results.json>            apply Workflow per-item results to the ledger
-//   resume [--reset-stale]         report in-flight items; optionally reset ACTIVE->READY
-//   progress | burndown | cost     regenerate the respective report
-//   escalations                    list BLOCKED/ESCALATED; sync queue/decisions.md
-//   worktree-add <id> | worktree-remove <path> | worktree-list
+// Commands: ~30 — the canonical, always-current list lives in README.md § Driver commands
+//   (core loop: init -> status -> cycle|group -> launch the emitted run-script via the
+//   Workflow tool -> fold -> progress/burndown/escalations; plus recovery, sweeps, reports,
+//   graph tooling, the controller lease, and worktree management). The dispatch table in
+//   main() at the bottom of this file is the source of truth.
 
 import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync, statSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';

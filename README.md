@@ -95,11 +95,11 @@ node <mount>/_workflow/driver.mjs <cmd>       # <mount> = your factory path, e.g
   resume [--reset-stale]   report in-flight; --reset-stale re-queues ACTIVE → READY (checked + honest)
   suggest [--sweep-min N]  read-only batch planner — clusters schedulable items; big homogeneous
                        clusters route to the SWEEP band (KI-E21), the rest get `group --ids` lines
-  group [--target T --layer L --ids a,b --max N --include-escalate --include-realinfra]
+  group [--target T --layer L --ids a,b --max N --conc N --include-escalate --include-realinfra]
                        pick a parallel batch: per-item worktrees + compact run-args
   cycle [--until critical|high|dry --target T --max N ...]
                        closed-loop step: emit next batch + a RUN/STOP signal (drive from /loop or a routine)
-  sweep <N|slug> [--max-sites K]   root-cause sweep — design once + apply across a cluster's sites
+  sweep <N|slug> [--max-sites K --conc N]   root-cause sweep — design once + apply across a cluster's sites
                        (run `cluster.mjs --emit N --pattern <kw>` first to write the spec)
   sweep-fold <results.json>   close the chunk's findings if the pattern gate APPROVED
   controller <status|claim|release|heartbeat>   advisory single-controller lease

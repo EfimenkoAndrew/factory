@@ -9,7 +9,7 @@ script — the agent pipeline) + `agents/*.md` (role briefs). `README.md` explai
 
 - **Read `KNOWN-ISSUES.md` first.** It is the append-only KI registry. Any change that adds a
   limitation, constraint, or fix MUST append/update a `KI-*` row in the SAME change.
-- **Keep the selftest green**: `node _workflow/lib/_selftest.mjs` (currently 370+ asserts) after
+- **Keep the selftest green**: `node _workflow/lib/_selftest.mjs` (currently 431 asserts) after
   every change to `_workflow/`, `verify/`, or `agents/` contracts it pins.
 - **Zero npm dependencies** — Node built-ins only, everywhere (driver, orchestrator, setup, libs).
 - **`factory.js` runs in the Workflow runtime**: no filesystem, no `require()`, no
