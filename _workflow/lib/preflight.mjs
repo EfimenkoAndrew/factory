@@ -18,10 +18,20 @@ export function dotnetAvailable() { return probe('dotnet', ['--version']); }
 // `env` is injected for testability; defaults to process.env.
 export function costTelemetryReady(env) {
   const e = env || process.env;
-  if (e.FACTORY_TELEMETRY === '0') return { ready: false, reason: 'FACTORY_TELEMETRY=0 (telemetry disabled)' };
-  if (e.CLAUDE_CODE_ENABLE_TELEMETRY !== '1') return { ready: false, reason: 'CLAUDE_CODE_ENABLE_TELEMETRY is not "1" — the session emits no token telemetry (cost panels stay empty)' };
-  if (!e.OTEL_EXPORTER_OTLP_ENDPOINT) return { ready: false, reason: 'OTEL_EXPORTER_OTLP_ENDPOINT is unset — nowhere to send token telemetry' };
-  return { ready: true, endpoint: e.OTEL_EXPORTER_OTLP_ENDPOINT };
+  // Review fix: FACTORY_TELEMETRY gates only the factory's own events.jsonl (telemetry.mjs) — the
+  // session's token telemetry is an INDEPENDENT plane, so it is deliberately NOT consulted here.
+  // Review fix: OTEL_METRICS_EXPORTER has NO default in Claude Code — enable+endpoint alone export
+  // nothing, so "ready" requires the exporter too; every missing piece is named. The endpoint may be
+  // the generic OTEL_EXPORTER_OTLP_ENDPOINT or the metrics-specific OTEL_EXPORTER_OTLP_METRICS_ENDPOINT.
+  const missing = [];
+  if (e.CLAUDE_CODE_ENABLE_TELEMETRY !== '1') missing.push('CLAUDE_CODE_ENABLE_TELEMETRY must be "1"' + (e.CLAUDE_CODE_ENABLE_TELEMETRY ? ` (is "${e.CLAUDE_CODE_ENABLE_TELEMETRY}")` : ' (unset)'));
+  if (!String(e.OTEL_METRICS_EXPORTER || '').split(',').map((s) => s.trim()).includes('otlp')) missing.push('OTEL_METRICS_EXPORTER must include "otlp"' + (e.OTEL_METRICS_EXPORTER ? ` (is "${e.OTEL_METRICS_EXPORTER}")` : ' (unset — Claude Code has NO default metrics exporter)'));
+  const endpoint = e.OTEL_EXPORTER_OTLP_METRICS_ENDPOINT || e.OTEL_EXPORTER_OTLP_ENDPOINT;
+  if (!endpoint) missing.push('OTEL_EXPORTER_OTLP_ENDPOINT (or _METRICS_ENDPOINT) is unset — nowhere to send token telemetry');
+  if (missing.length) return { ready: false, reason: missing.join('; ') + ' — the session emits no token telemetry (cost panels stay empty; see telemetry/claude-code-telemetry.env.example)' };
+  const out = { ready: true, endpoint };
+  if (!e.OTEL_EXPORTER_OTLP_PROTOCOL) out.note = 'OTEL_EXPORTER_OTLP_PROTOCOL unset — defaults to grpc; set http/protobuf for the collector\'s :4318 HTTP endpoint';
+  return out;
 }
 
 export function preflight() {

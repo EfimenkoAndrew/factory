@@ -79,7 +79,7 @@ Ways to produce it:
 
   ```bash
   DRV="node <mount>/_workflow/driver.mjs"
-  $DRV ingest --github owner/repo --issues 1716,1718        # named issues (needs gh, authenticated)
+  $DRV ingest --github owner/repo --issues 101,102          # named issues (needs gh, authenticated)
   $DRV ingest --github owner/repo --label bug --state open  # a label query, up to --limit N (default 30)
   $DRV ingest --json  path/to/items.json                    # gh-issue array OR ready work-item array (passthrough)
   $DRV ingest --markdown path/to/backlog.md                 # "- [ ] task" checklist -> triage items

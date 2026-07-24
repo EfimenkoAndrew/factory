@@ -79,7 +79,7 @@ CLOSED / FAILED / ESCALATED / BLOCKED deltas, cost if asked (`DRV cost`).
   sanctioned recovery, gates re-adjudicate the worktree.
 - An item stuck CLAIMED/ACTIVE with no live run → `DRV reset <id>` re-queues it.
 - After a PARTIAL fold, re-`group` — never Workflow-`resume`.
-- A FAILED/ESCALATED item with a reviewer-converged remedy → `DRV recover <id>` scaffolds the
+- A FAILED/ESCALATED/BLOCKED item with a reviewer-converged remedy or owner ruling (KI-E34) → `DRV recover <id>` scaffolds the
   direct-recovery (dissent digest, delta re-gate prompts, evidence contract, `#Nr` fold
   skeleton) — the dominant close path, first-class (KI-E20). You apply the remedy in the
   worktree, run the re-gate prompts as separate agents, fill the skeleton, fold it.

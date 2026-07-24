@@ -83,8 +83,15 @@ export function acceptanceSurfaceGaps(wi, opts) {
   // "modeled on SomeExistingEndpoint", "(SomeEndpoint.cs:739)", "do NOT
   // touch SomeHelper"). Conservative — only strong, unambiguous cues, so genuine "you forgot file X"
   // gaps (phrased actively: "modify X", "in X", "X must") still surface.
-  const BEFORE = /(model(?:l?ed)?\s+(?:on|after|exactly)|based on|same\b[^.]{0,40}\b(?:as|uses?|chain)|mirror|sibling|reference|existing|like the|similar to|rules out|instead of|rather than|do ?n['o]?t touch|never touch|not touch|non-?goals?|\bsee\b|\bper\b)[^.]{0,40}$/i;
-  const AFTER = /^(?::\d+|\s*(?:uses|does|pattern|convention|already)\b)/i; // line-number citation, or a trailing reference verb
+  // Review fix: the cue set is tightened to STRONG reference phrasings only — bare `existing`, `see`,
+  // `per`, and trailing `uses|does|already` suppressed everyday ACTIVE phrasings ("the existing X must
+  // clamp", "X does not clamp", "X uses raw Skip; fix it"), hiding exactly the forgotten-lock-set gaps
+  // the lint exists for. Clause stops now include ;:!? and newline (a cue in a PREVIOUS clause no
+  // longer suppresses the next clause's edit target), and a bare `TypeName.cs:NN` citation is
+  // recognized by the AFTER branch (the KI-E32 row's own example previously only worked for pathed
+  // citations).
+  const BEFORE = /(model(?:l?ed)?\s+(?:on|after|exactly)|based on|same\b[^.;:!?\n]{0,40}\b(?:as|uses?|chain)|mirror(?:s|ing|ed)?\s+(?:of|the)|sibling|reference|like the|similar to|rules out|instead of|rather than|do ?n['o]?t touch|never touch|not touch|non-?goals?)[^.;:!?\n]{0,40}$/i;
+  const AFTER = /^(?::\d+|\.[a-z0-9]{1,6}:\d+|\s*(?:pattern|convention)\b)/i; // line-number / File.cs:NN citation, or a trailing reference noun
   const isReference = (idx, len) => {
     const before = acceptance.slice(Math.max(0, idx - 55), idx);
     const after = acceptance.slice(idx + len, idx + len + 22);

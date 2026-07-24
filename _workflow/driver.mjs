@@ -24,7 +24,7 @@ import { resolveRepoRoot, swapMountPrefix, toPosix, STOCK_MOUNT } from './lib/ro
 import {
   emptyLedger, loadLedger, syncFromGraph, transition, foldResults,
   countByState, writeJsonAtomic, readJson, unwrapResultEnvelope, ACTIVE, OFFRAMPS, FORWARD,
-  parkedAtMs, allCommittedAfter,
+  parkedAtMs, allCommittedAfter, closedDepsWithLiveWorktree,
 } from './lib/ledger.mjs';
 import { loadGraph, computeReady, waitingOnDeps, byId } from './lib/graph.mjs';
 import { loadRouting, resolve as routeResolve, concurrencyFor } from './lib/router.mjs';
@@ -39,7 +39,7 @@ import { applyConvergenceBonus, effectiveRetryBound } from './lib/convergence.mj
 import { clusterBySimilarity, sharedLabel, batchPatternFor, sig as simSig, similarSigs } from './lib/similarity.mjs';
 import { loadController, isStale as controllerStale, claimController, verifyController, releaseController, DEFAULT_TTL_MINUTES } from './lib/controller.mjs';
 import { buildFactoryRouting } from './lib/routing-drift.mjs';
-import { githubIssueToItem, markdownChecklistToItems, ingestReport } from './lib/ingest.mjs'; // KI-E27 — multi-source issue ingestion
+import { githubIssueToItem, markdownChecklistToItems, ingestReport, enforceIngestTier, countCheckedBoxes } from './lib/ingest.mjs'; // KI-E27 — multi-source issue ingestion
 import { snapshotMainFiles, driftAgainstSnapshot, dirtyMainPaths, filesOverlapDirty, splitDriftByStatus } from './lib/mainguard.mjs';
 import { buildDocMap, readRoleBriefs } from './lib/promptpack.mjs';
 // KI-E7 — telemetry is OBSERVATIONAL ONLY (ai-factory-observability spine AD-1..3/AD-11): emit()
@@ -511,7 +511,10 @@ function deterministicVerifyOverride(cfg, ledger, wi, r) {
   const wtRel = r.worktree || (ledger.items[id] && ledger.items[id].worktree);
   if (wtRel) {
     const wtAbs = presolve(REPO_ROOT, wtRel);
-    if (existsSync(wtAbs)) { try { changed = changedFiles(wtAbs); debris = debrisFiles(changed, (wi && wi.files) || []); } catch { /* worktree unreadable -> skip diff checks */ } }
+    if (existsSync(wtAbs)) { try { changed = changedFiles(wtAbs); debris = debrisFiles(changed, (wi && wi.files) || []); } catch { console.log(`  KI-E20 ${id}: worktree unreadable — debris/P9 diff checks SKIPPED (transcripts remain the only evidence)`); } }
+    // KI-E20 (review fix): a gone worktree (post-gc recovery) skips the debris/P9 diff checks by
+    // construction — announce it so transcript-only evidence is a VISIBLE state, never a silent one.
+    else if (codeChange) console.log(`  KI-E20 ${id}: worktree GONE (${wtRel}) — debris/P9 diff checks SKIPPED (transcripts remain the only evidence)`);
   }
   if (debris.length) return fail('worktree debris: ' + debris.join(', '));
   // P9 — the fix must change real (non-test) code; a diff that touched ONLY tests greened the test, not the bug.
@@ -565,8 +568,15 @@ function cmdFold(file, flags) {
   }
   // KI-E31: accept the Workflow harness envelope directly (unwrap {…,result:{…}} → the fold payload), so
   // `fold <task-output>` no longer needs hand-extraction. A direct results file passes through unchanged.
-  const results = unwrapResultEnvelope(readJson(foldPath));
-  const arr = Array.isArray(results) ? results : results.results || [];
+  const results = unwrapResultEnvelope(readJson(foldPath)) || {};
+  const arr = Array.isArray(results) ? results : (Array.isArray(results.results) ? results.results : []);
+  // Review fix (KI-E31 follow-up): a crashed/empty run's envelope must NOT fold 0 items with full
+  // success affect (cycle bump + ledger rewrite + reports + exit 0). Zero results = loud stop.
+  if (!arr.length) {
+    console.error('fold: payload carried ZERO results — crashed/empty run or unexpected envelope shape (KI-E31)? Nothing folded; ledger untouched. If per-item checkpoints exist, use `driver reconstruct`.');
+    process.exitCode = 1;
+    return;
+  }
   if (results.cycle) ledger.cycle = Math.max(ledger.cycle, results.cycle);
   // KI-L50 — infra-failure recovery. An agent that returns null after exhausting retries on a TERMINAL
   // infra error (out-of-credits, connection-closed, overloaded, rate-limit) makes the item finish
@@ -1225,16 +1235,12 @@ function cmdGroup(flags) {
   // re-derived its fix outside the lock-set, tripping a false scope block). WARN, don't exclude — nothing
   // is clobbered; the owner decides whether to commit the dependency first for a clean base.
   if (picked.length) {
-    // A dependency's worktree dir still present is the cwd-independent proxy for "its fix isn't in HEAD
-    // yet" — a committed dependency is gc'd (driver gc). Checking the dir (not `git worktree list`) avoids
-    // the nested-factory-repo cwd trap and needs no git, mirroring how KI-E14 passes REPO_ROOT explicitly.
-    const wtDir = abs(cfg.paths.worktreesState);
-    const depWarn = [];
-    for (const wi of picked) for (const d of wi.dependsOn || []) {
-      const dep = ledger.items[d];
-      if (dep && dep.state === 'CLOSED' && existsSync(join(wtDir, d))) depWarn.push(wi.id + ' <- ' + d);
-    }
-    if (depWarn.length) console.log('  KI-E29: picked item(s) depend on a CLOSED item whose fix is still on an unmerged factory/<dep> worktree (uncommitted per KI-E1) — the new worktree branches from HEAD WITHOUT that code, so the fixer may re-derive it or build against a missing dependency. Commit the dependency first for a clean base: ' + depWarn.join('; '));
+    // Review fix: the check reads the LEDGER ROW's own worktree path (pure lib closedDepsWithLiveWorktree)
+    // instead of assuming state/worktrees/<depId> — that covers SWEEP-closed deps (worktree = sweep-<n>)
+    // and dies correctly at gc, which nulls row.worktree. Existence probing stays here (KI-E2 split),
+    // cwd-independent via presolve(REPO_ROOT, …).
+    const depWarn = closedDepsWithLiveWorktree(picked, ledger.items, (w) => existsSync(presolve(REPO_ROOT, w)));
+    if (depWarn.length) console.log('  KI-E29: picked item(s) depend on a CLOSED item whose fix is still on an unmerged factory worktree (uncommitted per KI-E1) — the new worktree branches from HEAD WITHOUT that code, so the fixer may re-derive it or build against a missing dependency. Commit the dependency first for a clean base: ' + depWarn.map((w) => w.id + ' <- ' + w.dep).join('; '));
   }
   // Within-batch file-lock: computeReady only locks against ALREADY-active items, not against
   // siblings in THIS batch. Two un-started items touching the same file would both be claimed,
@@ -1412,8 +1418,8 @@ function cmdPreflight() {
   // KI-E33: warn up front when a run's token/cost telemetry will NOT be gathered (the dashboard cost
   // panels feed off the SESSION's OTLP telemetry, not the factory's events.jsonl).
   const ct = env.costTelemetry || { ready: false, reason: 'unknown' };
-  console.log(`  cost telemetry: ${ct.ready ? 'ready → ' + ct.endpoint : 'NOT gathered — ' + ct.reason}`);
-  if (!ct.ready) console.log('  -> set CLAUDE_CODE_ENABLE_TELEMETRY=1 + OTEL_EXPORTER_OTLP_ENDPOINT before launching the session (telemetry/claude-code-telemetry.env.example / KI-E28). factory_* metrics still land; only the token/cache panels are affected.');
+  console.log(`  cost telemetry: ${ct.ready ? 'ready → ' + ct.endpoint + (ct.note ? ' (' + ct.note + ')' : '') : 'NOT gathered — ' + ct.reason}`);
+  if (!ct.ready) console.log('  -> source telemetry/claude-code-telemetry.env.example (ALL of CLAUDE_CODE_ENABLE_TELEMETRY=1, OTEL_METRICS_EXPORTER=otlp, OTEL_EXPORTER_OTLP_PROTOCOL, OTEL_EXPORTER_OTLP_ENDPOINT) before launching the session (KI-E28/KI-E33). factory_* metrics still land; only the token/cache panels are affected.');
   if (!env.docker) console.log('  -> run realInfra items only on a Docker-capable host (CI); a non-realInfra cycle is fine here.');
 }
 
@@ -1858,56 +1864,104 @@ function cmdIngest(flags) {
     theme: flags.theme || undefined,
     severity: flags.severity || undefined,
   };
+  // Review fix: validate operator flags UP FRONT and loudly — a lowercase --severity was silently
+  // coerced to MEDIUM on the github path and passed raw on the markdown path (merge-graph then
+  // dropped the whole batch); a lowercase --id-prefix minted ids that failed ID_RE one command later.
+  if (opts.severity !== undefined) {
+    const sv = String(opts.severity).toUpperCase();
+    if (!SEV_OK.includes(sv)) { console.error(`ingest: --severity "${opts.severity}" is not one of ${SEV_OK.join('/')}`); process.exitCode = 1; return; }
+    opts.severity = sv;
+  }
+  if (opts.idPrefix !== undefined) {
+    const pfx = String(opts.idPrefix).toUpperCase();
+    if (!/^[A-Z][A-Z0-9]*$/.test(pfx)) { console.error(`ingest: --id-prefix must be alphanumeric starting with a letter (got "${flags['id-prefix']}") — ids must match ${String(ID_RE)}`); process.exitCode = 1; return; }
+    opts.idPrefix = pfx;
+  }
   let items = [];
   let outName = flags.out || null;
+  let checkedSkipped = 0;
 
   if (flags.github) {
     const repo = String(flags.github);
     opts.repo = repo;
-    if (!opts.idPrefix) opts.idPrefix = 'GH';
+    // Review fix: the default id prefix derives from the repo NAME ('GH' only as last resort), so
+    // ingesting two repos without --id-prefix no longer mints colliding GH-<n> ids that merge-graph
+    // dedup would silently weld together.
+    if (!opts.idPrefix) opts.idPrefix = (repo.split('/')[1] || '').toUpperCase().replace(/[^A-Z0-9]/g, '') || 'GH';
     let issues = [];
+    const limit = Number(flags.limit || 30);
     try {
       if (flags.issues) {
-        for (const n of String(flags.issues).split(',').map((s) => s.trim()).filter(Boolean)) {
+        const ids = String(flags.issues).split(',').map((s) => s.trim()).filter(Boolean);
+        const bad = ids.filter((n) => !/^\d+$/.test(n));
+        if (bad.length) { console.error(`ingest: --issues must be a comma-separated list of issue numbers (got "${bad.join('", "')}")`); process.exitCode = 1; return; }
+        for (const n of ids) {
           const raw = execFileSync('gh', ['issue', 'view', n, '--repo', repo, '--json', 'number,title,body,labels,state'], { encoding: 'utf8' });
           issues.push(JSON.parse(raw));
         }
       } else {
         const args = ['issue', 'list', '--repo', repo, '--json', 'number,title,body,labels,state',
-          '--state', String(flags.state || 'open'), '--limit', String(flags.limit || 30)];
+          '--state', String(flags.state || 'open'), '--limit', String(limit)];
         if (flags.label) args.push('--label', String(flags.label));
         issues = JSON.parse(execFileSync('gh', args, { encoding: 'utf8' }));
+        // Review fix: a result count equal to --limit is indistinguishable from a truncated page —
+        // say so instead of letting a capped backlog read as complete.
+        if (issues.length === limit) console.log(`  WARN: result count equals --limit (${limit}) — likely truncated; raise --limit to confirm the full set.`);
       }
     } catch (e) {
-      console.log(`ingest: gh failed — ${String(e.message || e).split('\n')[0]}. Is the GitHub CLI installed and authenticated (gh auth status)?`);
+      // Review fix: gh's real reason lives on stderr (rate limit, repo not found, auth) — surface it,
+      // exit non-zero, and scope the auth hint to the shapes it actually diagnoses.
+      const errLine = String((e && e.stderr) || '').trim().split('\n')[0] || String((e && e.message) || e).split('\n')[0];
+      const authish = (e && e.code === 'ENOENT') || /auth|login|credentials/i.test(errLine);
+      console.error(`ingest: gh failed — ${errLine}` + (authish ? ' Is the GitHub CLI installed and authenticated (gh auth status)?' : ''));
+      process.exitCode = 1;
       return;
     }
     items = issues.map((iss) => githubIssueToItem(iss, opts));
     if (!outName) outName = 'github-' + repo.replace(/[^a-z0-9]+/gi, '-').toLowerCase();
   } else if (flags.json) {
     let arr;
-    try { arr = readJson(abs(String(flags.json))); } catch (e) { console.log(`ingest: cannot read --json ${flags.json}: ${e.message}`); return; }
-    if (!Array.isArray(arr)) { console.log('ingest: --json file must be a JSON array.'); return; }
-    // Passthrough if the objects already carry an acceptance (ready work-items); else treat as gh issues.
-    items = arr.map((o) => (o && o.acceptance ? o : githubIssueToItem(o, opts)));
+    try { arr = readJson(abs(String(flags.json))); } catch (e) { console.error(`ingest: cannot read --json ${flags.json}: ${e.message}`); process.exitCode = 1; return; }
+    if (!Array.isArray(arr)) { console.error('ingest: --json file must be a JSON array.'); process.exitCode = 1; return; }
+    // Passthrough if the objects already carry an acceptance (ready work-items); else treat as gh
+    // issues. Review fix: malformed elements (neither shape) are counted + skipped LOUDLY instead of
+    // crashing on null or minting schema-invalid GH-undefined ids the merge rejects a command later.
+    const malformed = [];
+    items = arr.map((o, i) => {
+      if (!o || typeof o !== 'object' || (!o.acceptance && (o.number == null || !/^\d+$/.test(String(o.number))))) { malformed.push(i); return null; }
+      return o.acceptance ? o : githubIssueToItem(o, opts);
+    }).filter(Boolean);
+    if (malformed.length) console.error(`ingest: skipped ${malformed.length} malformed element(s) at index ${malformed.slice(0, 5).join(', ')}${malformed.length > 5 ? ', …' : ''} — neither a ready work-item (acceptance) nor a gh issue (numeric number).`);
     if (!outName) outName = basename(String(flags.json)).replace(/\.json$/i, '') || 'json';
   } else if (flags.markdown) {
     let md;
-    try { md = readFileSync(abs(String(flags.markdown)), 'utf8'); } catch (e) { console.log(`ingest: cannot read --markdown ${flags.markdown}: ${e.message}`); return; }
+    try { md = readFileSync(abs(String(flags.markdown)), 'utf8'); } catch (e) { console.error(`ingest: cannot read --markdown ${flags.markdown}: ${e.message}`); process.exitCode = 1; return; }
     items = markdownChecklistToItems(md, { ...opts, sourceName: basename(String(flags.markdown)) });
+    checkedSkipped = countCheckedBoxes(md);
     if (!outName) outName = basename(String(flags.markdown)).replace(/\.(md|markdown)$/i, '') || 'markdown';
   } else {
-    console.log('ingest: pick a source — --github <owner/repo> [--issues 1,2 | --label bug --state open --limit N], --json <file>, or --markdown <file>. Optional: --out <name> --id-prefix P --target T --theme X --severity S.');
+    console.error('ingest: pick a source — --github <owner/repo> [--issues 1,2 | --label bug --state open --limit N], --json <file>, or --markdown <file>. Optional: --out <name> --id-prefix P --target T --theme X --severity S.');
+    process.exitCode = 1;
     return;
   }
 
-  if (!items.length) { console.log('ingest: 0 item(s) produced (nothing matched the source).'); return; }
-  const outPath = join(normDir, `${outName}.json`);
+  // Review fix: the honest-acceptance invariant is ENFORCED for every source path — a passthrough
+  // 'auto' (or missing) tier clamps to escalate/blocked here, so nothing ingest writes can be
+  // schedulable, and merge-graph's tier default never sees an ingested item without a tier.
+  items = items.map(enforceIngestTier);
+
+  if (!items.length) { console.log('ingest: 0 item(s) produced (nothing matched the source).' + (checkedSkipped ? ` ${checkedSkipped} checked [x] box(es) skipped — already done.` : '')); return; }
+  // Review fix: --out is a NAME, not a path — sanitize so `--out ../x` / `--out sub/x` cannot write
+  // outside normalized/ (where merge-graph would silently never fold it); warn on overwrite.
+  const safeOut = String(outName).replace(/[^A-Za-z0-9_-]+/g, '-').replace(/^-+|-+$/g, '') || 'ingest';
+  if (safeOut !== String(outName)) console.log(`  note: --out sanitized to "${safeOut}" (a plain name inside state/normalized/).`);
+  const outPath = join(normDir, `${safeOut}.json`);
+  if (existsSync(outPath)) console.log(`  note: overwriting existing ${toPosix(relative(REPO_ROOT, outPath))} (same source name).`);
   writeJsonAtomic(outPath, items);
   const rep = ingestReport(items);
-  console.log(`ingest: ${rep.total} item(s) -> ${toPosix(relative(REPO_ROOT, outPath))}`);
+  console.log(`ingest: ${rep.total} item(s) -> ${toPosix(relative(REPO_ROOT, outPath))}` + (checkedSkipped ? ` (+${checkedSkipped} checked [x] box(es) skipped — already done)` : ''));
   console.log(`  by severity: ${JSON.stringify(rep.bySeverity)}`);
-  console.log(`  ${rep.escalate} escalate (acceptance section found — review + confirm), ${rep.blocked} blocked-triage (author acceptance + regressionTest + files[] first). None are auto-runnable by design.`);
+  console.log(`  ${rep.escalate} escalate (acceptance section found — review + confirm), ${rep.blocked} blocked-triage (author acceptance + regressionTest + files[] first).` + (rep.other ? ` WARN: ${rep.other} item(s) carry an unexpected tier — VERIFY before merge-graph.` : ' None are auto-runnable by design.'));
   console.log(`  next: node <mount>/_workflow/driver.mjs merge-graph   (the guarded, ledger-writing step — folds every normalized/*.json into the findings-graph)`);
 }
 
@@ -1934,6 +1988,9 @@ function cmdMergeGraph(flags) {
       if (!wi.acceptance) errs.push('no acceptance');
       if (!wi.regressionTest) errs.push('no regressionTest');
       if (errs.length) { problems.push(`${f}:${wi.id || '?'} — ${errs.join(', ')}`); continue; }
+      // Review fix: the tier default fails OPEN to 'auto' (schedulable). Ingested files always carry a
+      // valid tier (enforceIngestTier), so this fires only for hand-authored files — make it loud.
+      if (!TIER_OK.includes(wi.autonomyTier)) problems.push(`${f}:${wi.id} — missing/invalid autonomyTier "${wi.autonomyTier ?? ''}" -> defaulted 'auto' (VERIFY: this makes it schedulable)`);
       seen.add(wi.id);
       items.push({
         id: wi.id, target: wi.target || f.replace(/\.json$/, ''), layer: wi.layer || 'service',

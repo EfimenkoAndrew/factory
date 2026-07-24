@@ -28,7 +28,7 @@ import { classifyLine as loClassify, firstLexeme as loLexeme, findLeftovers } fr
 import { splitAcceptanceClauses } from './acceptance.mjs';
 import { dissentersFrom, roleForGateKey, recoveryTransitions, recoveryFoldSkeleton, priorCycleOf } from './recover.mjs';
 import { extractHeadings, buildDocMap, readRoleBriefs } from './promptpack.mjs';
-import { githubIssueToItem, markdownChecklistToItems, extractSection, severityFromLabels, themeFromLabels, ingestReport } from './ingest.mjs';
+import { githubIssueToItem, markdownChecklistToItems, extractSection, severityFromLabels, themeFromLabels, ingestReport, enforceIngestTier, countCheckedBoxes } from './ingest.mjs';
 import { costTelemetryReady } from './preflight.mjs';
 import { fileURLToPath } from 'node:url';
 
@@ -1214,6 +1214,7 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
   eq(sk.attemptsDelta, 0, 'KI-E20: a recovery consumes no retry budget');
   ok(sk.codeChange === true && sk.integrateRaw === true && sk.transitions.length === 10, 'KI-E20: machine-evidence flags carry over; the FAILED chain has 10 hops');
   ok(String(recoveryFoldSkeleton('X-0', { state: 'BLOCKED' }, null, 3).codeChange).startsWith('<FILL'), 'KI-E34 (review fix): a prior-less skeleton FILL-prompts codeChange — never silently the no-evidence doc/config path');
+  eq(recoveryFoldSkeleton('X-2', { state: 'FAILED' }, { band: 'FULL', codeChange: true, resultId: 'X-2#7' }, 7).band, 'FULL', 'KI-E20 (review fix): band carries onto the recovery skeleton — the KI-E19 pair rule arms on recovery folds');
   const dsrc20 = readFileSync(join(import.meta.dirname, '..', 'driver.mjs'), 'utf8');
   ok(dsrc20.includes("case 'recover'") && dsrc20.includes('recovery_prepared') && dsrc20.includes('mutation-proof.txt'), 'KI-E20: driver wires recover + telemetry + the evidence contract');
   ok(dsrc20.includes("case 'decisions-digest'") && dsrc20.includes('Rule-together bundles'), 'KI-E24: driver wires the ranked owner-decision digest');
@@ -1222,6 +1223,14 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
   ok(dsrc20.includes('possibly DELIVERED in HEAD (KI-E36)'), 'KI-E36: escalations queue carries the delivered-in-HEAD hint');
   ok((dsrc20.match(/deliveredInHeadHint\(/g) || []).length >= 3, 'KI-E36 (review fix): the delivered-in-HEAD hint renders in BOTH the queue and the decisions-digest');
   ok(dsrc20.includes("['compose', '-p', p.Name, 'down', '-v', '--remove-orphans']") && dsrc20.includes('strayComposeProjects(parseComposeLs(raw), wtRoot)') && dsrc20.includes('abs(cfg.paths.worktreesState)'), 'KI-E37: gc downs only compose projects under the CONFIGURED worktrees root (review fix)');
+  ok(dsrc20.includes('debris/P9 diff checks SKIPPED'), 'KI-E20 (review fix): the override announces a gone/unreadable worktree instead of silently skipping diff checks');
+  const { closedDepsWithLiveWorktree } = await import('./ledger.mjs');
+  eq(closedDepsWithLiveWorktree([{ id: 'B', dependsOn: ['A'] }], { A: { state: 'CLOSED', worktree: 'state/worktrees/A' } }, () => true), [{ id: 'B', dep: 'A', worktree: 'state/worktrees/A' }], 'KI-E29 (review fix): a CLOSED dep with a live ledger-recorded worktree -> warn');
+  eq(closedDepsWithLiveWorktree([{ id: 'B', dependsOn: ['A'] }], { A: { state: 'CLOSED', worktree: null } }, () => true).length, 0, 'KI-E29 (review fix): gc nulls row.worktree -> no warn (dep committed + collected)');
+  eq(closedDepsWithLiveWorktree([{ id: 'B', dependsOn: ['A'] }], { A: { state: 'CLOSED', worktree: 'state/worktrees/sweep-3' } }, (w) => w.includes('sweep')), [{ id: 'B', dep: 'A', worktree: 'state/worktrees/sweep-3' }], 'KI-E29 (review fix): a SWEEP-closed dep is covered — the row path, not an assumed <id> dir');
+  ok(dsrc20.includes('closedDepsWithLiveWorktree(picked, ledger.items'), 'KI-E29 (review fix): cmdGroup wires the pure warn core');
+  ok(dsrc20.includes('unwrapResultEnvelope(readJson(foldPath)') && dsrc20.includes('payload carried ZERO results'), 'KI-E31 (review fix): cmdFold wires the unwrap AND stops loudly on a zero-result payload (no success affect)');
+  ok(readFileSync(join(import.meta.dirname, '..', 'factory.js'), 'utf8').includes('means EXACTLY a product-scope.md red-line'), 'KI-E30: the shared gate prompt carries the scopeViolation clarification');
 }
 
 // KI-E37 (review fix): compose-ls parsing + the stray filter — behavioral (pure, no docker).
@@ -1261,11 +1270,19 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
 
   // KI-E32: a token in a reference / citation / exclusion context is NOT flagged as a missing edit target
   eq(acceptanceSurfaceGaps({ target: 'SvcA', acceptance: 'A new endpoint modeled on the existing ItemsController for parity.', files: [] }, io22).length, 0, 'KI-E32: "modeled on X" is a reference, not a gap');
-  eq(acceptanceSurfaceGaps({ target: 'SvcA', acceptance: 'Uses the same chain OrdersController uses today.', files: [] }, io22).length, 0, 'KI-E32: trailing "X uses" reads as a reference, not a gap');
+  eq(acceptanceSurfaceGaps({ target: 'SvcA', acceptance: 'Uses the same chain OrdersController uses today.', files: [] }, io22).length, 0, 'KI-E32: "same … chain X" reads as a reference, not a gap');
   eq(acceptanceSurfaceGaps({ target: 'SvcA', acceptance: 'ResolveThing at doc/data-flows/SvcA.md:42 explains it.', files: ['SvcA/README.md'] }, io22).length, 0, 'KI-E32: a File:line citation is a reference, not a gap');
   eq(acceptanceSurfaceGaps({ target: 'SvcA', acceptance: 'Do NOT touch OrdersController; leave it alone.', files: [] }, io22).length, 0, 'KI-E32: "do NOT touch X" exclusion is not a gap');
   // …but an ACTIVELY-named edit target still surfaces (the heuristic stays conservative)
   eq(acceptanceSurfaceGaps({ target: 'SvcA', acceptance: 'ItemsController clamps page before querying.', files: [] }, io22).map((g) => g.resolved), ['SvcA/src/Api/ItemsController.cs'], 'KI-E32: an actively-named surface is still a gap (no over-suppression)');
+  // Review-fix pins: cue tightening — everyday ACTIVE phrasings flag; strong references stay suppressed.
+  eq(acceptanceSurfaceGaps({ target: 'SvcA', acceptance: 'Update the existing ItemsController to clamp page.', files: [] }, io22).length, 1, 'KI-E32 (review fix): "the existing X" is an ACTIVE edit target — no longer suppressed');
+  eq(acceptanceSurfaceGaps({ target: 'SvcA', acceptance: 'ItemsController uses a raw Skip; fix it.', files: [] }, io22).length, 1, 'KI-E32 (review fix): "X uses <bad thing>" is the canonical defect phrasing — no longer suppressed');
+  eq(acceptanceSurfaceGaps({ target: 'SvcA', acceptance: 'ItemsController does not clamp pageSize.', files: [] }, io22).length, 1, 'KI-E32 (review fix): "X does not …" flags');
+  eq(acceptanceSurfaceGaps({ target: 'SvcA', acceptance: 'See ItemsController and fix the off-by-one there.', files: [] }, io22).length, 1, 'KI-E32 (review fix): bare "see X" no longer suppresses an edit directive');
+  eq(acceptanceSurfaceGaps({ target: 'SvcA', acceptance: 'Never touch OrdersController; ItemsController must clamp page.', files: [] }, io22).map((g) => g.resolved), ['SvcA/src/Api/ItemsController.cs'], 'KI-E32 (review fix): a cue in the PREVIOUS clause does not suppress the next clause (clause stops)');
+  eq(acceptanceSurfaceGaps({ target: 'SvcA', acceptance: 'Score is resolved (ItemsController.cs:739) and cached.', files: [] }, io22).length, 0, 'KI-E32 (review fix): a bare TypeName.cs:NN citation is recognized (the row\'s own example shape)');
+  eq(acceptanceSurfaceGaps({ target: 'SvcA', acceptance: 'Follows the ItemsController pattern for paging.', files: [] }, io22).length, 0, 'KI-E32: "X pattern" stays a reference');
 }
 
 // KI-E31: the fold path accepts the Workflow harness envelope directly
@@ -1278,6 +1295,13 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
   // a business object that merely has a `.result` field (not the Workflow envelope) is NOT unwrapped
   const notEnv = { result: { verdict: 'ok' }, results: [{ id: 'X' }] };
   eq(unwrapResultEnvelope(notEnv), notEnv, 'KI-E31: an object already carrying .results is not unwrapped (backward-compatible)');
+  // Review-fix pins: the sniff boundaries are a deliberate contract.
+  const env31e = { summary: 's', result: { mode: 'run', cycle: 9, results: [] } };
+  eq(unwrapResultEnvelope(env31e), env31e.result, 'KI-E31 (review fix): an EMPTY-results envelope still unwraps — cmdFold then stops LOUDLY on zero results');
+  const mode31 = { result: { mode: 'x' } };
+  eq(unwrapResultEnvelope(mode31), mode31.result, 'KI-E31: the mode cue alone unwraps (sniff pinned so widening stays deliberate)');
+  const inert31 = { result: { verdict: 'ok' } };
+  eq(unwrapResultEnvelope(inert31), inert31, 'KI-E31: a cue-less .result passes through untouched');
 }
 
 // KI-E18/KI-E23 exec-smoke: the acceptance-scan stage runs pre-band — a gap triggers ONE bounded
@@ -1336,13 +1360,13 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
 
   // an issue WITH an acceptance section -> escalate/non-trivial, files[] empty, source stamped, never auto
   const withAcc = githubIssueToItem(
-    { number: 1716, title: 'Open in CRM opens the activity', body, labels: [{ name: 'bug' }, { name: 'CRM' }] },
-    { repo: 'jooooel/seqaro', idPrefix: 'GH' });
-  eq(withAcc.id, 'GH-1716', 'ingest: github id is prefix + issue number');
+    { number: 4242, title: 'Example: the link opens the right record', body, labels: [{ name: 'bug' }, { name: 'CRM' }] },
+    { repo: 'example-org/example-repo', idPrefix: 'GH' });
+  eq(withAcc.id, 'GH-4242', 'ingest: github id is prefix + issue number');
   eq(withAcc.autonomyTier, 'escalate', 'ingest: acceptance section found -> escalate (human confirms), never auto');
   eq(withAcc.fixType, 'non-trivial', 'ingest: acceptance section found -> non-trivial');
   eq(withAcc.theme, 'crm-link-integrity', 'ingest: theme routed from labels');
-  eq(withAcc.source, 'jooooel/seqaro#1716', 'ingest: source stamps repo#number');
+  eq(withAcc.source, 'example-org/example-repo#4242', 'ingest: source stamps repo#number');
   eq(withAcc.files, [], 'ingest: files[] starts empty — the human authors the lock set');
   ok(/^[A-Z0-9]+(-[A-Z0-9]+)+$/.test(withAcc.id), 'ingest: generated id is schema-valid');
 
@@ -1353,25 +1377,55 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
   ok(!!noAcc.ownerDecision, 'ingest: triage item carries an ownerDecision prompt');
   ok(!!noAcc.acceptance && !!noAcc.regressionTest, 'ingest: triage item still fills acceptance/regressionTest so merge-graph validation passes (as triage text)');
 
-  // markdown checklist -> one blocked item per unchecked box
+  // markdown checklist -> one blocked item per UNCHECKED box (checked [x] = done work, skipped —
+  // review fix); ids are content-hashed so backlog edits/reorders never re-attach ledger state.
   const items = markdownChecklistToItems('- [ ] First task\n- [x] done already\nnot a task\n* [ ] Second task', { idPrefix: 'BL' });
-  eq(items.length, 3, 'ingest: markdown picks up every checklist line (checked or not)');
-  eq(items[0].id, 'BL-1', 'ingest: markdown id is prefix + 1-based index');
+  eq(items.length, 2, 'ingest (review fix): markdown picks up UNCHECKED boxes only — a checked [x] box is done work, not a fresh item');
+  ok(/^BL-[0-9A-F]{8}$/.test(items[0].id), 'ingest (review fix): markdown id is prefix + content hash (stable under reorder/insertion)');
+  eq(markdownChecklistToItems('- [ ] Zeroth\n- [ ] First task', { idPrefix: 'BL' })[1].id, items[0].id, 'ingest (review fix): the same title keeps the same id when lines shift');
+  eq(countCheckedBoxes('- [ ] a\n- [x] b\n- [X] c'), 2, 'ingest (review fix): countCheckedBoxes reports what the unchecked-only rule skipped');
   eq(items.every((i) => i.autonomyTier === 'blocked'), true, 'ingest: markdown items are all blocked triage');
 
-  // report split
+  // report split (+ the review-fix `other` bucket: an unexpected tier is never silently uncounted)
   const rep = ingestReport([withAcc, noAcc, ...items]);
-  eq(rep.total, 5, 'ingest: report totals every item');
+  eq(rep.total, 4, 'ingest: report totals every item');
   eq(rep.escalate, 1, 'ingest: report counts the one escalate item');
-  eq(rep.blocked, 4, 'ingest: report counts the blocked-triage items');
+  eq(rep.blocked, 3, 'ingest: report counts the blocked-triage items');
+  eq(ingestReport([{ autonomyTier: 'auto', severity: 'LOW' }]).other, 1, 'ingest (review fix): an unexpected tier lands in `other` — the "none are auto-runnable" line must never print over it');
+
+  // Review fix — the honest-acceptance invariant is ENFORCED, not just mapped: passthrough clamps.
+  eq(enforceIngestTier({ acceptance: 'x', autonomyTier: 'auto' }).autonomyTier, 'escalate', 'KI-E27 (review fix): a passthrough auto tier clamps to escalate — ingest NEVER emits schedulable items');
+  eq(enforceIngestTier({ acceptance: 'x' }).autonomyTier, 'escalate', 'KI-E27 (review fix): a MISSING tier with acceptance clamps to escalate (merge-graph would default it to auto)');
+  eq(enforceIngestTier({}).autonomyTier, 'blocked', 'KI-E27 (review fix): a missing tier without acceptance clamps to blocked');
+  eq(enforceIngestTier({ autonomyTier: 'blocked' }).autonomyTier, 'blocked', 'KI-E27: blocked stays blocked through the clamp');
+
+  // Review-fix pins: secondary mapper paths + boundary hardening.
+  const repro27 = githubIssueToItem({ number: 7, title: 't', body: '## Expected behaviour\nok\n## Steps to reproduce\n1. click\n2. boom', labels: [] }, {});
+  ok(repro27.regressionTest.includes('1. click'), 'ingest: a repro section lifts into regressionTest');
+  const dod27 = githubIssueToItem({ number: 8, title: 't', body: '## Definition of done\nall green', labels: [] }, {});
+  eq(dod27.autonomyTier, 'escalate', 'ingest: alternate acceptance headings (Definition of done) escalate too');
+  ok(dod27.acceptance.includes('"Definition of done"'), 'ingest (review fix): provenance cites the ACTUAL matched heading, not a hardcoded one');
+  const fenced27 = extractSection('## Expected behaviour\nline one\n```bash\n# a comment, not a heading\necho hi\n```\nline two\n## Next\nz', ['expected behaviou?r']);
+  ok(fenced27.includes('# a comment') && fenced27.includes('line two'), 'ingest (review fix): fenced code inside a section neither stops nor truncates the lift');
+  eq(severityFromLabels(['not-critical']), 'MEDIUM', 'ingest (review fix): "not-critical" is not CRITICAL (hyphen boundary)');
+  eq(severityFromLabels(['P10']), 'MEDIUM', 'ingest (review fix): P10 is not the p1 of HIGH (alnum boundary)');
+  eq(severityFromLabels(['high', 'critical']), 'CRITICAL', 'ingest: CRITICAL beats HIGH on multi-label (order pin)');
+  eq(themeFromLabels(['docker']), 'triage', 'ingest (review fix): a docker label is not doc-drift (word boundary)');
+  eq(themeFromLabels([{ name: 'payment' }]), 'money', 'ingest: money labels route the money theme');
+  eq(themeFromLabels(['race-condition']), 'concurrency', 'ingest: concurrency labels route');
 }
 
 // KI-E33: cost-telemetry readiness probe (pure over injected env)
 {
-  eq(costTelemetryReady({ CLAUDE_CODE_ENABLE_TELEMETRY: '1', OTEL_EXPORTER_OTLP_ENDPOINT: 'http://localhost:4318' }).ready, true, 'KI-E33: enable=1 + endpoint set -> ready');
-  eq(costTelemetryReady({ OTEL_EXPORTER_OTLP_ENDPOINT: 'http://localhost:4318' }).ready, false, 'KI-E33: no CLAUDE_CODE_ENABLE_TELEMETRY -> not gathered');
-  eq(costTelemetryReady({ CLAUDE_CODE_ENABLE_TELEMETRY: '1' }).ready, false, 'KI-E33: no OTLP endpoint -> not gathered');
-  eq(costTelemetryReady({ FACTORY_TELEMETRY: '0', CLAUDE_CODE_ENABLE_TELEMETRY: '1', OTEL_EXPORTER_OTLP_ENDPOINT: 'x' }).ready, false, 'KI-E33: FACTORY_TELEMETRY=0 disables regardless');
+  eq(costTelemetryReady({ CLAUDE_CODE_ENABLE_TELEMETRY: '1', OTEL_METRICS_EXPORTER: 'otlp', OTEL_EXPORTER_OTLP_ENDPOINT: 'http://localhost:4318' }).ready, true, 'KI-E33: enable + otlp exporter + endpoint -> ready');
+  eq(costTelemetryReady({ OTEL_METRICS_EXPORTER: 'otlp', OTEL_EXPORTER_OTLP_ENDPOINT: 'http://localhost:4318' }).ready, false, 'KI-E33: no CLAUDE_CODE_ENABLE_TELEMETRY -> not gathered');
+  eq(costTelemetryReady({ CLAUDE_CODE_ENABLE_TELEMETRY: 'true', OTEL_METRICS_EXPORTER: 'otlp', OTEL_EXPORTER_OTLP_ENDPOINT: 'x' }).ready, false, 'KI-E33 (review fix): "true" is not "1" — the likeliest real misconfig is caught and named');
+  ok(/OTEL_METRICS_EXPORTER/.test(costTelemetryReady({ CLAUDE_CODE_ENABLE_TELEMETRY: '1', OTEL_EXPORTER_OTLP_ENDPOINT: 'x' }).reason), 'KI-E33 (review fix): enable+endpoint alone export NOTHING — the missing metrics exporter is named, never a false ready');
+  eq(costTelemetryReady({ CLAUDE_CODE_ENABLE_TELEMETRY: '1', OTEL_METRICS_EXPORTER: 'console', OTEL_EXPORTER_OTLP_ENDPOINT: 'x' }).ready, false, 'KI-E33 (review fix): a non-otlp metrics exporter is not ready');
+  eq(costTelemetryReady({ CLAUDE_CODE_ENABLE_TELEMETRY: '1', OTEL_METRICS_EXPORTER: 'otlp' }).ready, false, 'KI-E33: no OTLP endpoint -> not gathered');
+  eq(costTelemetryReady({ CLAUDE_CODE_ENABLE_TELEMETRY: '1', OTEL_METRICS_EXPORTER: 'otlp', OTEL_EXPORTER_OTLP_METRICS_ENDPOINT: 'http://m:4318' }).endpoint, 'http://m:4318', 'KI-E33 (review fix): the metrics-specific endpoint counts — no false NOT-gathered');
+  eq(costTelemetryReady({ FACTORY_TELEMETRY: '0', CLAUDE_CODE_ENABLE_TELEMETRY: '1', OTEL_METRICS_EXPORTER: 'otlp', OTEL_EXPORTER_OTLP_ENDPOINT: 'x' }).ready, true, 'KI-E33 (review fix): FACTORY_TELEMETRY mutes only factory events — session cost telemetry is an independent plane');
+  ok(/http\/protobuf/.test(costTelemetryReady({ CLAUDE_CODE_ENABLE_TELEMETRY: '1', OTEL_METRICS_EXPORTER: 'otlp', OTEL_EXPORTER_OTLP_ENDPOINT: 'x' }).note || ''), 'KI-E33 (review fix): the protocol-unset caution rides on ready (grpc default vs the :4318 HTTP collector)');
   ok(/telemetry\/claude-code-telemetry\.env\.example|CLAUDE_CODE_ENABLE_TELEMETRY/.test(readFileSync(join(import.meta.dirname, '..', 'driver.mjs'), 'utf8')), 'KI-E33: driver preflight surfaces the cost-telemetry cue');
 }
 

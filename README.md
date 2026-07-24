@@ -90,8 +90,9 @@ node <mount>/_workflow/driver.mjs <cmd>       # <mount> = your factory path, e.g
   reset <id...>        re-queue CLAIMED/active/FAILED → READY (un-claim / recover a stranded item)
   fold <results.json>  apply Workflow per-item results to the ledger
   reconstruct          rebuild a results file from per-item checkpoints (killed-run recovery), then fold it
-  recover <id>         direct-recovery scaffold for a FAILED/ESCALATED item: dissent digest + delta
-                       re-gate prompts + evidence contract + #Nr fold skeleton (KI-E20)
+  recover <id>         direct-recovery scaffold for a FAILED/ESCALATED/BLOCKED item: dissent digest + delta
+                       re-gate prompts + evidence contract + #Nr fold skeleton (KI-E20; BLOCKED owner-ruling
+                       protocol KI-E34 — record ruling, reset → READY, fold re-enters via CLAIMED)
   resume [--reset-stale]   report in-flight; --reset-stale re-queues ACTIVE → READY (checked + honest)
   suggest [--sweep-min N]  read-only batch planner — clusters schedulable items; big homogeneous
                        clusters route to the SWEEP band (KI-E21), the rest get `group --ids` lines
