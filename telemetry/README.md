@@ -61,8 +61,10 @@ piece is the session-side env. Until you set it, those two panels are **empty, n
 `factory_*` panel populates without it.
 
 ```bash
+# once per host: copy the example (the .env copy is gitignored, per-host), edit the endpoint if remapped
+cp telemetry/claude-code-telemetry.env.example telemetry/claude-code-telemetry.env
 # in the shell that launches the factory's Claude Code session:
-set -a; . telemetry/claude-code-telemetry.env; set +a   # from claude-code-telemetry.env.example
+set -a; . telemetry/claude-code-telemetry.env; set +a
 ```
 
 Point `OTEL_EXPORTER_OTLP_ENDPOINT` at this host's collector HTTP port — `http://localhost:4318`

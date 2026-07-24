@@ -14,6 +14,7 @@ state/*.pre-fresh-*
 # Host-local overrides (KI-E17 / SETUP.md § 6) — per-host, never committed
 config/factory.config.local.json
 verify/build-test.local.sh
+telemetry/claude-code-telemetry.env
 # Telemetry stream (KI-E7 / spine AD-8) — generated event data, never committed
 telemetry/data/*
 !telemetry/data/.gitkeep
