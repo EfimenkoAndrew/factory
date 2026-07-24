@@ -73,6 +73,31 @@ export function isFactoryWorktreePath(p) {
   return /[\\/]state[\\/]worktrees[\\/][^\\/]+[\\/]/.test(String(p) + '/');
 }
 
+// KI-E37 (review fix) — `docker compose ls --format json` output normalization: docker versions emit
+// a JSON array OR NDJSON (one object per line); a lone object is wrapped. Blank input -> [].
+export function parseComposeLs(raw) {
+  const t = String(raw || '').trim();
+  if (!t) return [];
+  let out;
+  try { out = JSON.parse(t); } catch { out = t.split('\n').filter(Boolean).map((l) => JSON.parse(l)); }
+  return Array.isArray(out) ? out : [out];
+}
+
+// KI-E37 (review fix) — the gc sweep filter: a compose project is a stray ONLY when EVERY config file
+// in its comma-joined ConfigFiles sits UNDER the worktrees root, separator-anchored. `every` (not
+// `some`) keeps hybrid projects (host compose + a worktree override -f) out of the destructive
+// `down -v` path, and the anchor keeps sibling dirs (`state/worktrees-archive/…`) structurally out.
+export function strayComposeProjects(projects, wtRoot) {
+  const list = Array.isArray(projects) ? projects : (projects ? [projects] : []);
+  const root = String(wtRoot || '').replace(/[\\/]+$/, '');
+  if (!root) return [];
+  const under = (f) => f.startsWith(root + '/') || f.startsWith(root + '\\');
+  return list.filter((p) => {
+    const files = String((p && p.ConfigFiles) || '').split(',').map((s) => s.trim()).filter(Boolean);
+    return files.length > 0 && files.every(under);
+  });
+}
+
 export function removeWorktree(path, force) {
   const args = ['worktree', 'remove'];
   if (force) args.push('--force');

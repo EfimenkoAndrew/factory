@@ -602,6 +602,7 @@ try {
   eq(by['SMOKE-SCOPEFLAG'] && by['SMOKE-SCOPEFLAG'].toState, 'CLOSED', 'KI-L57: an APPROVED gate with a stray scopeViolation flag does NOT hard-stop the item');
   ok(by['SMOKE-SCOPEFLAG'] && by['SMOKE-SCOPEFLAG'].gateDetails && by['SMOKE-SCOPEFLAG'].gateDetails['gate:developer'] && by['SMOKE-SCOPEFLAG'].gateDetails['gate:developer'].scopeViolationIgnored === true, 'KI-L57: the inconsistent flag is preserved on gateDetails for the audit trail');
   eq(by['SMOKE-SCOPESTOP'] && by['SMOKE-SCOPESTOP'].toState, 'BLOCKED', 'KI-L57: a CHANGES_REQUIRED gate with scopeViolation still hard-stops (genuine scope-stop path intact)');
+  ok(String((by['SMOKE-SCOPESTOP'] && by['SMOKE-SCOPESTOP'].note) || '').includes('gate headline: stub genuine red-line'), 'KI-E30 (review fix): the flagging gate headline reaches the queue-visible block note');
   eq(calls.filter((c) => c.label.endsWith(':checkpoint')).length, 6, 'exec-smoke: every item result checkpointed via a haiku write agent (KI-L40)');
 }
 
@@ -696,6 +697,45 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
   // driver wiring pin: group carries the guard + the escape flag
   const dsrc = readFileSync(new URL('../driver.mjs', import.meta.url), 'utf8');
   ok(dsrc.includes('force-dirty-overlap') && dsrc.includes('dirtyMainPaths(REPO_ROOT)'), 'KI-E14: cmdGroup wires the dirty-overlap guard with a --force-dirty-overlap escape');
+}
+
+// KI-E35 (review fix): splitDriftByStatus — behavioral, throwaway real-git repo: only COMMITTED drift
+// reads as human delivery; an uncommitted edit AND an untracked stray (the live ITEM-H5 shape,
+// invisible to `git diff HEAD`) both stay in the contamination bucket.
+{
+  const { splitDriftByStatus } = await import('./mainguard.mjs');
+  const { mkdtempSync: mk35, writeFileSync: wf35, rmSync: rm35 } = await import('node:fs');
+  const root35 = mk35(join(tmpdir(), 'e35split-'));
+  const g35 = (...a) => execFileSync('git', ['-C', root35, ...a], { encoding: 'utf8' });
+  g35('init', '-q');
+  wf35(join(root35, 'committed.txt'), 'v1');
+  wf35(join(root35, 'modified.txt'), 'v1');
+  g35('add', '.');
+  g35('-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-q', '-m', 'base', '--no-gpg-sign', '--no-verify');
+  wf35(join(root35, 'committed.txt'), 'v2');
+  g35('add', 'committed.txt');
+  g35('-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-q', '-m', 'human delivery', '--no-gpg-sign', '--no-verify');
+  wf35(join(root35, 'modified.txt'), 'v2');
+  wf35(join(root35, 'untracked-new.txt'), 'stray');
+  const s35 = splitDriftByStatus(root35, [{ file: 'committed.txt' }, { file: 'modified.txt' }, { file: 'untracked-new.txt' }]);
+  eq(s35.committed.map((d) => d.file), ['committed.txt'], 'KI-E35: committed drift classifies as human delivery');
+  eq(s35.dirty.map((d) => d.file), ['modified.txt', 'untracked-new.txt'], 'KI-E35: an uncommitted edit AND an untracked stray both classify as contamination (review fix)');
+  rm35(root35, { recursive: true, force: true });
+}
+
+// KI-E36 (review fix): parkedAtMs + allCommittedAfter — the delivered-in-HEAD date logic, pure.
+{
+  const { parkedAtMs, allCommittedAfter } = await import('./ledger.mjs');
+  const rowP = { state: 'BLOCKED', updatedAt: '2026-07-24T12:00:00Z', history: [{ from: null, to: 'READY', at: '2026-07-01T00:00:00Z' }, { from: 'READY', to: 'BLOCKED', at: '2026-07-10T00:00:00Z' }] };
+  eq(parkedAtMs(rowP), Date.parse('2026-07-10T00:00:00Z'), 'KI-E36: park baseline = the history entry that ENTERED the current state, not updatedAt');
+  eq(parkedAtMs({ state: 'ESCALATED', updatedAt: '2026-07-24T12:00:00Z' }), Date.parse('2026-07-24T12:00:00Z'), 'KI-E36: no matching history -> updatedAt fallback');
+  eq(parkedAtMs({ state: 'BLOCKED' }), null, 'KI-E36: no usable timestamp -> null (hint suppressed)');
+  const iso36 = { 'a.cs': '2026-07-11T00:00:00Z', 'b.cs': '2026-07-12T00:00:00Z', 'never.cs': '' };
+  const lk36 = (f) => iso36[f];
+  ok(allCommittedAfter(['a.cs', 'b.cs'], Date.parse('2026-07-10T00:00:00Z'), lk36) === true, 'KI-E36: every touch-set file newer than the park -> hint fires');
+  ok(allCommittedAfter(['a.cs', 'never.cs'], Date.parse('2026-07-10T00:00:00Z'), lk36) === false, 'KI-E36: a never-committed file suppresses the hint');
+  ok(allCommittedAfter([], Date.parse('2026-07-10T00:00:00Z'), lk36) === false, 'KI-E36: an empty touch-set never hints');
+  ok(allCommittedAfter(['a.cs'], null, lk36) === false, 'KI-E36: an unknown park time never hints');
 }
 
 // KI-D12 refinement (2026-07-20): `placeholder`-lexeme hits are pruned from files whose OWN added
@@ -1022,6 +1062,14 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
   ok(readFileSync(new URL('../../agents/review-edgecase.md', import.meta.url), 'utf8').includes('EARLY POSITION (KI-E12'), 'KI-E12: edge-case brief carries the early-position contract');
   ok(readFileSync(new URL('../../agents/marker-probe.md', import.meta.url), 'utf8').includes('marker-probe (KI-E10)'), 'KI-E10: marker-probe brief exists');
   ok(readFileSync(new URL('../../agents/fixer.md', import.meta.url), 'utf8').includes('DOC-CLAIM SELF-CHECK (KI-E11)'), 'KI-E11: fixer card carries the claims self-check');
+  ok(readFileSync(new URL('../../agents/test-author.md', import.meta.url), 'utf8').includes('REAL-SHAPE SEEDING (KI-E38'), 'KI-E38: test-author brief carries the real-shape seeding rule');
+  ok(readFileSync(new URL('../../agents/review-testreview.md', import.meta.url), 'utf8').includes('Seed-shape completeness (KI-E38'), 'KI-E38: test-review brief carries the seed-shape completeness lens');
+  const ta38 = readFileSync(new URL('../../agents/test-author.md', import.meta.url), 'utf8');
+  ok(ta38.indexOf('REAL-SHAPE SEEDING (KI-E38') < ta38.indexOf('### REAL-INFRA TESTS'), 'KI-E38 (review fix): the seeding rule is UNCONDITIONAL — it lives before/outside the REAL-INFRA-only section');
+  const compose39 = readFileSync(new URL('../../telemetry/compose-profile.example.yaml', import.meta.url), 'utf8');
+  ok(!/^\s*container_name\s*:/m.test(compose39), 'KI-E39: the host-compose profile carries NO container_name key (the KI-E25 collision class stays dead)');
+  ok(compose39.includes('- exporter') && compose39.includes('- otel-collector') && compose39.includes('- prometheus'), 'KI-E39: the three aliases the stock configs resolve are declared');
+  ok((compose39.match(/profiles:/g) || []).length === 4, 'KI-E39: all four services are gated behind the factory profile');
 }
 
 // KI-D12: LeftoverScan — the deterministic detector + the factory-side probe wiring.
@@ -1157,15 +1205,43 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
   eq(roleForGateKey('probe:leftover-scan'), null, 'KI-E20: probe keys have no re-gate role');
   eq(recoveryTransitions('FAILED')[0], 'CLAIMED', 'KI-E20: FAILED recovery walks the full chain from CLAIMED');
   eq(recoveryTransitions('ESCALATED'), ['CLOSED'], 'KI-E20: ESCALATED recovery is the single CLOSED hop (KI-L62)');
+  eq(recoveryTransitions('BLOCKED')[0], 'CLAIMED', 'KI-E34: BLOCKED recovery (post-reset, from READY) walks the full chain from CLAIMED');
+  eq(recoveryTransitions('BLOCKED').length, 10, 'KI-E34: the BLOCKED recovery chain is the full 10-hop re-entry');
   eq(priorCycleOf({ resultId: 'X-1#46' }, 9), 46, 'KI-E20: recovery cycle parsed from the prior checkpoint');
   eq(priorCycleOf(null, 9), 9, 'KI-E20: no checkpoint -> fallback cycle');
   const sk = recoveryFoldSkeleton('X-1', { state: 'FAILED', worktree: 'wt', branch: 'b' }, { codeChange: true, needsRealInfra: false, rootCauseFiles: ['a.cs'], integrateRaw: true, resultId: 'X-1#46' }, 46);
   eq(sk.resultId, 'X-1#46r', 'KI-E20: skeleton resultId is #<cycle>r');
   eq(sk.attemptsDelta, 0, 'KI-E20: a recovery consumes no retry budget');
   ok(sk.codeChange === true && sk.integrateRaw === true && sk.transitions.length === 10, 'KI-E20: machine-evidence flags carry over; the FAILED chain has 10 hops');
+  ok(String(recoveryFoldSkeleton('X-0', { state: 'BLOCKED' }, null, 3).codeChange).startsWith('<FILL'), 'KI-E34 (review fix): a prior-less skeleton FILL-prompts codeChange — never silently the no-evidence doc/config path');
   const dsrc20 = readFileSync(join(import.meta.dirname, '..', 'driver.mjs'), 'utf8');
   ok(dsrc20.includes("case 'recover'") && dsrc20.includes('recovery_prepared') && dsrc20.includes('mutation-proof.txt'), 'KI-E20: driver wires recover + telemetry + the evidence contract');
   ok(dsrc20.includes("case 'decisions-digest'") && dsrc20.includes('Rule-together bundles'), 'KI-E24: driver wires the ranked owner-decision digest');
+  ok(dsrc20.includes("'FAILED', 'ESCALATED', 'BLOCKED'"), 'KI-E34: cmdRecover accepts BLOCKED (owner-ruling recovery)');
+  ok(dsrc20.includes('COMMITTED DELIVERY') && dsrc20.includes('MAIN-TREE CONTAMINATION'), 'KI-E35: fold splits human-committed delivery from agent contamination');
+  ok(dsrc20.includes('possibly DELIVERED in HEAD (KI-E36)'), 'KI-E36: escalations queue carries the delivered-in-HEAD hint');
+  ok((dsrc20.match(/deliveredInHeadHint\(/g) || []).length >= 3, 'KI-E36 (review fix): the delivered-in-HEAD hint renders in BOTH the queue and the decisions-digest');
+  ok(dsrc20.includes("['compose', '-p', p.Name, 'down', '-v', '--remove-orphans']") && dsrc20.includes('strayComposeProjects(parseComposeLs(raw), wtRoot)') && dsrc20.includes('abs(cfg.paths.worktreesState)'), 'KI-E37: gc downs only compose projects under the CONFIGURED worktrees root (review fix)');
+}
+
+// KI-E37 (review fix): compose-ls parsing + the stray filter — behavioral (pure, no docker).
+{
+  const { parseComposeLs, strayComposeProjects } = await import('./worktree.mjs');
+  eq(parseComposeLs(''), [], 'KI-E37: blank compose-ls output -> no projects');
+  eq(parseComposeLs('[{"Name":"a","ConfigFiles":"/x/a.yml"}]').length, 1, 'KI-E37: JSON-array shape parses');
+  eq(parseComposeLs('{"Name":"a"}\n{"Name":"b"}').length, 2, 'KI-E37: NDJSON shape parses');
+  eq(parseComposeLs('{"Name":"solo"}').length, 1, 'KI-E37: a lone object is wrapped');
+  const WT37 = '/repo/_f/state/worktrees';
+  const strays37 = strayComposeProjects([
+    { Name: 'wt', ConfigFiles: WT37 + '/ID-1/docker-compose.yml' },
+    { Name: 'sibling', ConfigFiles: WT37 + '-archive/x/docker-compose.yml' },
+    { Name: 'hybrid', ConfigFiles: '/host/docker-compose.yml,' + WT37 + '/ID-2/override.yml' },
+    { Name: 'host', ConfigFiles: '/host/docker-compose.yml' },
+    { Name: 'multiwt', ConfigFiles: WT37 + '/ID-3/a.yml, ' + WT37 + '/ID-3/b.yml' },
+  ], WT37);
+  eq(strays37.map((p) => p.Name), ['wt', 'multiwt'], 'KI-E37: EVERY config must sit under the ANCHORED worktrees root — sibling dirs + hybrid host projects never match (review fix)');
+  eq(strayComposeProjects([{ Name: 'w', ConfigFiles: WT37 + '/ID/x.yml' }], WT37 + '/').length, 1, 'KI-E37: trailing-separator root normalizes');
+  eq(strayComposeProjects(null, WT37).length, 0, 'KI-E37: null projects -> empty');
 }
 
 // KI-E22: acceptance-surface lint (the KI-E16 generalization) — pure heuristic over injected IO.

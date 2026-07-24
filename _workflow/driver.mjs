@@ -24,10 +24,11 @@ import { resolveRepoRoot, swapMountPrefix, toPosix, STOCK_MOUNT } from './lib/ro
 import {
   emptyLedger, loadLedger, syncFromGraph, transition, foldResults,
   countByState, writeJsonAtomic, readJson, unwrapResultEnvelope, ACTIVE, OFFRAMPS, FORWARD,
+  parkedAtMs, allCommittedAfter,
 } from './lib/ledger.mjs';
 import { loadGraph, computeReady, waitingOnDeps, byId } from './lib/graph.mjs';
 import { loadRouting, resolve as routeResolve, concurrencyFor } from './lib/router.mjs';
-import { addWorktree, removeWorktree, listWorktrees, changedFiles, pruneWorktrees, isFactoryWorktreePath } from './lib/worktree.mjs';
+import { addWorktree, removeWorktree, listWorktrees, changedFiles, pruneWorktrees, isFactoryWorktreePath, parseComposeLs, strayComposeProjects } from './lib/worktree.mjs';
 import { acquireLock, releaseLock } from './lib/lock.mjs';
 import { parseVerifyRaw, verdictFromParse, debrisFiles, parseRedRaw, hasRealInfraMarker, touchedRootCause } from './lib/verify.mjs';
 import { preflight, dockerAvailable } from './lib/preflight.mjs';
@@ -39,7 +40,7 @@ import { clusterBySimilarity, sharedLabel, batchPatternFor, sig as simSig, simil
 import { loadController, isStale as controllerStale, claimController, verifyController, releaseController, DEFAULT_TTL_MINUTES } from './lib/controller.mjs';
 import { buildFactoryRouting } from './lib/routing-drift.mjs';
 import { githubIssueToItem, markdownChecklistToItems, ingestReport } from './lib/ingest.mjs'; // KI-E27 — multi-source issue ingestion
-import { snapshotMainFiles, driftAgainstSnapshot, dirtyMainPaths, filesOverlapDirty } from './lib/mainguard.mjs';
+import { snapshotMainFiles, driftAgainstSnapshot, dirtyMainPaths, filesOverlapDirty, splitDriftByStatus } from './lib/mainguard.mjs';
 import { buildDocMap, readRoleBriefs } from './lib/promptpack.mjs';
 // KI-E7 — telemetry is OBSERVATIONAL ONLY (ai-factory-observability spine AD-1..3/AD-11): emit()
 // never throws, never blocks a command, and never feeds a fold verdict. FACTORY_TELEMETRY=0 disables.
@@ -698,7 +699,13 @@ function cmdFold(file, flags) {
       const snapPath = abs(join(cfg.paths.items, r.id, 'main-snapshot.json'));
       if (!existsSync(snapPath)) continue;
       const drifted = driftAgainstSnapshot(REPO_ROOT, (readJson(snapPath) || {}).files || {});
-      if (drifted.length) console.log(`  ⚠ MAIN-TREE CONTAMINATION ${r.id} (KI-L65): item files changed in the MAIN working tree during the run window — an agent likely wrote outside its worktree. Inspect + repair BEFORE applying:\n` + drifted.map((d) => `      ${d.file} (${d.was} -> ${d.now})`).join('\n'));
+      // KI-E35: the factory never commits, so drift on a path `git status --porcelain` reports CLEAN
+      // (no uncommitted edit, NOT untracked) can only have arrived via HUMAN commits (operator delivery).
+      // Anything still dirty — including an UNTRACKED new file, which `git diff HEAD` cannot see (the
+      // live ITEM-H5 stray shape; review fix) — keeps the wrote-outside-worktree contamination wording.
+      const { committed: committedDrift, dirty: dirtyDrift } = splitDriftByStatus(REPO_ROOT, drifted);
+      if (dirtyDrift.length) console.log(`  ⚠ MAIN-TREE CONTAMINATION ${r.id} (KI-L65): item files changed in the MAIN working tree during the run window — an agent likely wrote outside its worktree. Inspect + repair BEFORE applying:\n` + dirtyDrift.map((d) => `      ${d.file} (${d.was} -> ${d.now})`).join('\n'));
+      if (committedDrift.length) console.log(`  ℹ COMMITTED DELIVERY ${r.id} (KI-E35): item files changed in main via HUMAN commits during the run window (clean per git status) — likely the operator committed this item's output; verify intent, no repair needed:\n` + committedDrift.map((d) => `      ${d.file} (${d.was} -> ${d.now})`).join('\n'));
     } catch { /* detection aid only */ }
   }
   const { applied, rejected, skipped } = foldResults(ledger, arr);
@@ -921,9 +928,25 @@ function cmdRealinfraLint() {
   for (const s of suspects) console.log(`  ${s.id} (${s.severity}/${s.theme}, ${s.state})`);
 }
 
+// KI-E36: a parked item whose ENTIRE touch-set was committed after it parked was likely delivered
+// out-of-band by the operator. Rendered in the queue AND the decisions-digest (review fix). The park
+// baseline is the history entry that ENTERED the current state (ledger.parkedAtMs — review fix:
+// updatedAt moves on any later row write); a never-committed file or unknown park time suppresses the
+// hint. The git edge lives here; the date logic is the pure, selftest-pinned ledger.allCommittedAfter.
+function deliveredInHeadHint(graphItems, id, r) {
+  try {
+    const files = (graphItems[id] && graphItems[id].files) || [];
+    const lookup = (f) => { try { return execFileSync('git', ['-C', REPO_ROOT, 'log', '-1', '--format=%cI', '--', f], { encoding: 'utf8' }).trim(); } catch { return ''; } };
+    return allCommittedAfter(files, parkedAtMs(r), lookup) ? `⚠ possibly DELIVERED in HEAD (KI-E36): every touch-set file has a commit newer than this item parked — verify, then \`driver recover ${id}\`` : '';
+  } catch { return ''; }
+}
+
 function cmdEscalationsSync(cfg, ledger, silent) {
   const queuePath = abs(cfg.paths.queue);
   const esc = Object.entries(ledger.items).filter(([, r]) => ['ESCALATED', 'BLOCKED'].includes(r.state));
+  // KI-E36: the delivered-in-HEAD hint renders per parked item (deliveredInHeadHint above). A corrupt
+  // graph disables hints with a stderr notice — silence must not read as "no deliveries" (review fix).
+  const graphItems = (() => { try { return byId(loadGraph(abs(cfg.paths.graph))); } catch (e) { console.error('escalations: graph unreadable — delivered-in-HEAD hints disabled (KI-E36): ' + String((e && e.message) || e).split('\n')[0]); return {}; } })();
   // KI-C6 defensive net (2026-07-12): escalateExhausted() already flips bound-exhausted FAILED ->
   // ESCALATED at every fold (the KI-C6 fix), so exhausted items normally appear above as ESCALATED.
   // This section catches the rows that MISS that hook — a sweep-fold writes FAILED via its own path,
@@ -943,7 +966,8 @@ function cmdEscalationsSync(cfg, ledger, silent) {
       // KI-C9: embed the decision-framer's framed choice (options + consequences + recommendation) when present.
       const decPath = abs(join(cfg.paths.items, id, 'decision.md'));
       const framed = existsSync(decPath) ? ('\n\n' + readFileSync(decPath, 'utf8').trim() + '\n') : '';
-      return `## ${id} — ${r.state}\n\n- ${r.note || '(no note)'}${framed}\n`;
+      const hint = deliveredInHeadHint(graphItems, id, r);
+      return `## ${id} — ${r.state}\n\n- ${r.note || '(no note)'}${hint ? '\n- ' + hint : ''}${framed}\n`;
     }).join('\n') : '_No items awaiting a human decision._',
     '',
     ...(exhausted.length ? [
@@ -1197,7 +1221,7 @@ function cmdGroup(flags) {
   // KI-E29: a picked item whose CLOSED dependency still has an unmerged factory/<dep> worktree will
   // build from HEAD WITHOUT that dependency's code — fixes are uncommitted on the dep's branch (KI-E1),
   // so a "CLOSED" dep in the ledger does not put its code in HEAD. The worktree then silently lacks work
-  // it depends on (live: SF-LINK-1720-BF depended on CLOSED-but-uncommitted SF-LINK-1718 and the fixer
+  // it depends on (live: HOST-ITEM-A depended on CLOSED-but-uncommitted HOST-ITEM-B and the fixer
   // re-derived its fix outside the lock-set, tripping a false scope block). WARN, don't exclude — nothing
   // is clobbered; the owner decides whether to commit the dependency first for a clean base.
   if (picked.length) {
@@ -1509,6 +1533,29 @@ function cmdGc(flags) {
   } else {
     try { pruneWorktrees(); console.log('gc: pruned dead worktree admin refs (safe)'); } catch { /* ignore */ }
   }
+  // KI-E37: agent/verify runs can leave docker-compose projects whose config lives in a (possibly
+  // already-removed) worktree. Sweep them; ONLY projects whose EVERY config file sits under the
+  // CONFIGURED worktrees root (abs(cfg.paths.worktreesState), separator-anchored — review fix) are
+  // ever touched, so host stacks — including hybrid host+override projects — stay out of reach.
+  try {
+    const wtRoot = abs(cfg.paths.worktreesState);
+    const raw = execFileSync('docker', ['compose', 'ls', '--all', '--format', 'json'], { encoding: 'utf8' });
+    const stray = strayComposeProjects(parseComposeLs(raw), wtRoot);
+    if (stray.length) {
+      console.log(`gc: ${stray.length} worktree-scoped docker-compose project(s)` + (flags.yes ? '' : ' (dry-run — pass --yes to `compose down -v` them)'));
+      for (const p of stray) {
+        console.log(`  ${p.Name} @ ${p.ConfigFiles}`);
+        if (flags.yes) {
+          try { execFileSync('docker', ['compose', '-p', p.Name, 'down', '-v', '--remove-orphans'], { encoding: 'utf8' }); console.log(`    downed ${p.Name} (containers + volumes removed)`); }
+          catch (e) { console.log(`    ! could not down ${p.Name}: ${String((e && e.message) || e)}`); }
+        }
+      }
+    }
+  } catch (e) {
+    // ENOENT = docker binary absent — the KI-E37-ratified silent skip. Anything ELSE (daemon down,
+    // permissions, output drift) prints one line: silence must not read as "no strays" (review fix).
+    if (!(e && e.code === 'ENOENT')) console.log('gc: compose sweep SKIPPED (could not enumerate projects): ' + String((e && e.message) || e).split('\n')[0]);
+  }
 }
 
 // Sweep mode (root-cause fan-out): one factory run designs the canonical fix once + applies it to every
@@ -1640,8 +1687,8 @@ function cmdRecover(flags, rest) {
   if (!ledger || !ledger.items[id]) { console.error('recover: unknown item ' + id); process.exitCode = 1; return; }
   const row = ledger.items[id];
   const wi = byId(graph)[id] || {};
-  if (!['FAILED', 'ESCALATED'].includes(row.state)) {
-    console.log(`recover: ${id} is ${row.state} — recovery targets FAILED (apply the converged remedy) or ESCALATED (record the human sign-off). Nothing prepared.`);
+  if (!['FAILED', 'ESCALATED', 'BLOCKED'].includes(row.state)) {
+    console.log(`recover: ${id} is ${row.state} — recovery targets FAILED (apply the converged remedy), ESCALATED (record the human sign-off), or BLOCKED (record the owner ruling, KI-E34). Nothing prepared. (recover runs while the item is still PARKED — if a BLOCKED item was already reset to READY, re-run recover after it parks again, or hand-author from the KNOWN-ISSUES KI-E34 protocol.)`);
     return;
   }
   const itemDir = abs(join(cfg.paths.items, id));
@@ -1707,6 +1754,7 @@ function cmdRecover(flags, rest) {
     '   (attemptsDelta:0 — a recovery consumes no retry budget; resultId #' + cyc + 'r keeps fold idempotency; the deterministic fold override re-checks ALL machine evidence exactly as for a live run.)',
     '',
     row.state === 'ESCALATED' ? '_ESCALATED item: steps 2-4 may reduce to recording the human sign-off; the fold is the single CLOSED hop (KI-L62)._' : '',
+    row.state === 'BLOCKED' ? `_BLOCKED item (KI-E34): record the owner ruling on the GRAPH item first (\`ownerDecision\` + \`ownerDecisionResolved: true\`; fold ratified out-of-set files into \`files[]\`), then run \`node ${MOUNT_REL}/_workflow/driver.mjs reset ${id}\` BEFORE the fold — BLOCKED's only legal ledger edge is -> READY, and the fold re-enters via CLAIMED. If the ruling ratifies work already delivered by human commits, steps 2-3 need no new evidence: the prior round's transcripts stand — say so in the fold note. If the item NEVER RAN (seed-BLOCKED — no prior result/transcripts), do NOT fold a recovery from nothing: either run it live after the reset (group/run), or produce the full machine evidence first — the skeleton's FILLed codeChange keeps the fold override honest either way (review fix)._` : '',
   ].join('\n'));
   temit({ source: 'driver', event: 'recovery_prepared', item: id, cycle: cyc, attrs: { fromState: row.state, dissenters: prompts.map((p) => p.key), hasFeedback: existsSync(join(itemDir, 'feedback.md')), hasCheckpoint: !!prior } });
   console.log(`recover ${id} (${row.state}, cycle #${cyc}r): scaffold -> ${recDir}`);
@@ -1745,7 +1793,7 @@ function cmdDecisionsDigest() {
       if (!question) { const line = txt.split('\n').map((l) => l.trim()).find((l) => l && !l.startsWith('#')); if (line) question = line; }
     }
     if (!question) question = (r.note || '').slice(0, 160);
-    rows.push({ id, state: r.state, severity: wi.severity || '?', target: wi.target || '?', ageDays, question: String(question).replace(/\|/g, '/').replace(/\s+/g, ' ').slice(0, 160), options });
+    rows.push({ id, state: r.state, severity: wi.severity || '?', target: wi.target || '?', ageDays, question: String(question).replace(/\|/g, '/').replace(/\s+/g, ' ').slice(0, 160), options, delivered: !!deliveredInHeadHint(items, id, r) });
   }
   rows.sort((a, b) => (sevRank[b.severity] || 0) - (sevRank[a.severity] || 0) || b.ageDays - a.ageDays || a.id.localeCompare(b.id));
   const bySev = rows.reduce((acc, r) => { acc[r.severity] = (acc[r.severity] || 0) + 1; return acc; }, {});
@@ -1765,6 +1813,14 @@ function cmdDecisionsDigest() {
     '|---|---|---|---|---|---|---|---|',
     ...rows.map((r, i) => `| ${i + 1} | \`${r.id}\` | ${r.severity} | ${r.state} | ${r.ageDays} | ${r.target} | ${r.question} | ${r.options.join('/') || '—'} |`),
     '',
+    // KI-E36 (review fix): the delivered-in-HEAD hint must reach the digest-driven owner too — the
+    // digest is the surface KI-E24 tells them to read INSTEAD of the raw queue.
+    ...(rows.some((row) => row.delivered) ? [
+      '## Possibly already DELIVERED in HEAD (KI-E36) — verify, then `driver recover <id>`',
+      '',
+      ...rows.filter((row) => row.delivered).map((row) => `- \`${row.id}\` — every touch-set file has a commit newer than the park`),
+      '',
+    ] : []),
     '## Rule-together bundles (same target — one sitting)',
     '',
     bundles.length ? bundles.map(([t, ids]) => `- **${t}** (${ids.length}): ${ids.map((i) => '`' + i + '`').join(', ')}`).join('\n') : '_none_',

@@ -64,6 +64,24 @@ export function unwrapResultEnvelope(obj) {
       (Array.isArray(obj.result.results) || obj.result.mode || obj.result.cycle)) return obj.result;
   return obj;
 }
+// KI-E36 (review fix): the PARK baseline — when the row last ENTERED its current state, from the row
+// history (`updatedAt` moves on ANY later write: note merges, sweeps — it is only >= the park time).
+// Falls back to updatedAt; null when no usable timestamp exists (callers suppress the hint).
+export function parkedAtMs(row) {
+  const h = (row && Array.isArray(row.history)) ? row.history : [];
+  for (let i = h.length - 1; i >= 0; i--) {
+    if (h[i] && h[i].to === row.state && h[i].at) { const t = Date.parse(h[i].at); if (!Number.isNaN(t)) return t; }
+  }
+  const t = Date.parse((row && row.updatedAt) || '');
+  return Number.isNaN(t) ? null : t;
+}
+// KI-E36 (review fix): TRUE when EVERY file has a commit strictly newer than sinceMs. lastCommitIso is
+// an injected lookup (file -> ISO committer date, '' when never committed) so the git edge stays in
+// the driver (KI-E2) while this date logic is pure + selftest-pinned. Empty/unknown inputs -> false.
+export function allCommittedAfter(files, sinceMs, lastCommitIso) {
+  if (!Array.isArray(files) || !files.length || sinceMs == null) return false;
+  return files.every((f) => { const iso = lastCommitIso(f); const t = iso ? Date.parse(iso) : NaN; return !Number.isNaN(t) && t > sinceMs; });
+}
 export function writeJsonAtomic(path, obj) {
   mkdirSync(dirname(path), { recursive: true });
   // KI-B3 (closed 2026-07-12): pid-unique temp name — two processes writing the same target no longer

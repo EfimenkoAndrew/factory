@@ -80,8 +80,8 @@ export function acceptanceSurfaceGaps(wi, opts) {
   // KI-E32: skip a token that reads as a REFERENCE/citation/exclusion, not an edit target — the
   // acceptance-surface lint should only nudge files the fix must TOUCH. A file-lock cannot serialize a
   // file the item names to model on, cite, or exclude, so flagging those is pure noise (seen on every run:
-  // "modeled on BackfillSalesforceContactAccountsEndpoint", "(GetDealScoringEndpoint.cs:739)", "do NOT
-  // touch PipedriveHelper"). Conservative — only strong, unambiguous cues, so genuine "you forgot file X"
+  // "modeled on SomeExistingEndpoint", "(SomeEndpoint.cs:739)", "do NOT
+  // touch SomeHelper"). Conservative — only strong, unambiguous cues, so genuine "you forgot file X"
   // gaps (phrased actively: "modify X", "in X", "X must") still surface.
   const BEFORE = /(model(?:l?ed)?\s+(?:on|after|exactly)|based on|same\b[^.]{0,40}\b(?:as|uses?|chain)|mirror|sibling|reference|existing|like the|similar to|rules out|instead of|rather than|do ?n['o]?t touch|never touch|not touch|non-?goals?|\bsee\b|\bper\b)[^.]{0,40}$/i;
   const AFTER = /^(?::\d+|\s*(?:uses|does|pattern|convention|already)\b)/i; // line-number citation, or a trailing reference verb
