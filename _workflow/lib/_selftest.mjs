@@ -602,6 +602,7 @@ try {
   eq(by['SMOKE-SCOPEFLAG'] && by['SMOKE-SCOPEFLAG'].toState, 'CLOSED', 'KI-L57: an APPROVED gate with a stray scopeViolation flag does NOT hard-stop the item');
   ok(by['SMOKE-SCOPEFLAG'] && by['SMOKE-SCOPEFLAG'].gateDetails && by['SMOKE-SCOPEFLAG'].gateDetails['gate:developer'] && by['SMOKE-SCOPEFLAG'].gateDetails['gate:developer'].scopeViolationIgnored === true, 'KI-L57: the inconsistent flag is preserved on gateDetails for the audit trail');
   eq(by['SMOKE-SCOPESTOP'] && by['SMOKE-SCOPESTOP'].toState, 'BLOCKED', 'KI-L57: a CHANGES_REQUIRED gate with scopeViolation still hard-stops (genuine scope-stop path intact)');
+  ok(String((by['SMOKE-SCOPESTOP'] && by['SMOKE-SCOPESTOP'].note) || '').includes('gate headline: stub genuine red-line'), 'KI-E30 (review fix): the flagging gate headline reaches the queue-visible block note');
   eq(calls.filter((c) => c.label.endsWith(':checkpoint')).length, 6, 'exec-smoke: every item result checkpointed via a haiku write agent (KI-L40)');
 }
 
@@ -720,6 +721,21 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
   eq(s35.committed.map((d) => d.file), ['committed.txt'], 'KI-E35: committed drift classifies as human delivery');
   eq(s35.dirty.map((d) => d.file), ['modified.txt', 'untracked-new.txt'], 'KI-E35: an uncommitted edit AND an untracked stray both classify as contamination (review fix)');
   rm35(root35, { recursive: true, force: true });
+}
+
+// KI-E36 (review fix): parkedAtMs + allCommittedAfter — the delivered-in-HEAD date logic, pure.
+{
+  const { parkedAtMs, allCommittedAfter } = await import('./ledger.mjs');
+  const rowP = { state: 'BLOCKED', updatedAt: '2026-07-24T12:00:00Z', history: [{ from: null, to: 'READY', at: '2026-07-01T00:00:00Z' }, { from: 'READY', to: 'BLOCKED', at: '2026-07-10T00:00:00Z' }] };
+  eq(parkedAtMs(rowP), Date.parse('2026-07-10T00:00:00Z'), 'KI-E36: park baseline = the history entry that ENTERED the current state, not updatedAt');
+  eq(parkedAtMs({ state: 'ESCALATED', updatedAt: '2026-07-24T12:00:00Z' }), Date.parse('2026-07-24T12:00:00Z'), 'KI-E36: no matching history -> updatedAt fallback');
+  eq(parkedAtMs({ state: 'BLOCKED' }), null, 'KI-E36: no usable timestamp -> null (hint suppressed)');
+  const iso36 = { 'a.cs': '2026-07-11T00:00:00Z', 'b.cs': '2026-07-12T00:00:00Z', 'never.cs': '' };
+  const lk36 = (f) => iso36[f];
+  ok(allCommittedAfter(['a.cs', 'b.cs'], Date.parse('2026-07-10T00:00:00Z'), lk36) === true, 'KI-E36: every touch-set file newer than the park -> hint fires');
+  ok(allCommittedAfter(['a.cs', 'never.cs'], Date.parse('2026-07-10T00:00:00Z'), lk36) === false, 'KI-E36: a never-committed file suppresses the hint');
+  ok(allCommittedAfter([], Date.parse('2026-07-10T00:00:00Z'), lk36) === false, 'KI-E36: an empty touch-set never hints');
+  ok(allCommittedAfter(['a.cs'], null, lk36) === false, 'KI-E36: an unknown park time never hints');
 }
 
 // KI-D12 refinement (2026-07-20): `placeholder`-lexeme hits are pruned from files whose OWN added
@@ -1048,6 +1064,12 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
   ok(readFileSync(new URL('../../agents/fixer.md', import.meta.url), 'utf8').includes('DOC-CLAIM SELF-CHECK (KI-E11)'), 'KI-E11: fixer card carries the claims self-check');
   ok(readFileSync(new URL('../../agents/test-author.md', import.meta.url), 'utf8').includes('REAL-SHAPE SEEDING (KI-E38'), 'KI-E38: test-author brief carries the real-shape seeding rule');
   ok(readFileSync(new URL('../../agents/review-testreview.md', import.meta.url), 'utf8').includes('Seed-shape completeness (KI-E38'), 'KI-E38: test-review brief carries the seed-shape completeness lens');
+  const ta38 = readFileSync(new URL('../../agents/test-author.md', import.meta.url), 'utf8');
+  ok(ta38.indexOf('REAL-SHAPE SEEDING (KI-E38') < ta38.indexOf('### REAL-INFRA TESTS'), 'KI-E38 (review fix): the seeding rule is UNCONDITIONAL — it lives before/outside the REAL-INFRA-only section');
+  const compose39 = readFileSync(new URL('../../telemetry/compose-profile.example.yaml', import.meta.url), 'utf8');
+  ok(!/^\s*container_name\s*:/m.test(compose39), 'KI-E39: the host-compose profile carries NO container_name key (the KI-E25 collision class stays dead)');
+  ok(compose39.includes('- exporter') && compose39.includes('- otel-collector') && compose39.includes('- prometheus'), 'KI-E39: the three aliases the stock configs resolve are declared');
+  ok((compose39.match(/profiles:/g) || []).length === 4, 'KI-E39: all four services are gated behind the factory profile');
 }
 
 // KI-D12: LeftoverScan — the deterministic detector + the factory-side probe wiring.
@@ -1191,12 +1213,14 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
   eq(sk.resultId, 'X-1#46r', 'KI-E20: skeleton resultId is #<cycle>r');
   eq(sk.attemptsDelta, 0, 'KI-E20: a recovery consumes no retry budget');
   ok(sk.codeChange === true && sk.integrateRaw === true && sk.transitions.length === 10, 'KI-E20: machine-evidence flags carry over; the FAILED chain has 10 hops');
+  ok(String(recoveryFoldSkeleton('X-0', { state: 'BLOCKED' }, null, 3).codeChange).startsWith('<FILL'), 'KI-E34 (review fix): a prior-less skeleton FILL-prompts codeChange — never silently the no-evidence doc/config path');
   const dsrc20 = readFileSync(join(import.meta.dirname, '..', 'driver.mjs'), 'utf8');
   ok(dsrc20.includes("case 'recover'") && dsrc20.includes('recovery_prepared') && dsrc20.includes('mutation-proof.txt'), 'KI-E20: driver wires recover + telemetry + the evidence contract');
   ok(dsrc20.includes("case 'decisions-digest'") && dsrc20.includes('Rule-together bundles'), 'KI-E24: driver wires the ranked owner-decision digest');
   ok(dsrc20.includes("'FAILED', 'ESCALATED', 'BLOCKED'"), 'KI-E34: cmdRecover accepts BLOCKED (owner-ruling recovery)');
   ok(dsrc20.includes('COMMITTED DELIVERY') && dsrc20.includes('MAIN-TREE CONTAMINATION'), 'KI-E35: fold splits human-committed delivery from agent contamination');
   ok(dsrc20.includes('possibly DELIVERED in HEAD (KI-E36)'), 'KI-E36: escalations queue carries the delivered-in-HEAD hint');
+  ok((dsrc20.match(/deliveredInHeadHint\(/g) || []).length >= 3, 'KI-E36 (review fix): the delivered-in-HEAD hint renders in BOTH the queue and the decisions-digest');
   ok(dsrc20.includes("['compose', '-p', p.Name, 'down', '-v', '--remove-orphans']") && dsrc20.includes('strayComposeProjects(parseComposeLs(raw), wtRoot)') && dsrc20.includes('abs(cfg.paths.worktreesState)'), 'KI-E37: gc downs only compose projects under the CONFIGURED worktrees root (review fix)');
 }
 

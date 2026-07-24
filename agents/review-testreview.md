@@ -30,9 +30,10 @@ intrinsic quality.
    test it replaces is accounted for.
 8. **Seed-shape completeness (KI-E38)**: for any test that WRITES through a seeded entity/aggregate
    (especially JSON-mapped/owned aggregates), compare the seed against the entity model — flag every
-   optional collection/nullable member production populates that the seed omits. A minimal seed can
-   green a write path that throws or corrupts on real rows; the omission is a finding unless the
-   test-author's note justifies it.
+   optional collection/nullable member the model declares that the seed omits (production-populated
+   members first; this mirrors the author-side REAL-SHAPE SEEDING rule, which is unconditional — not
+   real-infra-only). A minimal seed can green a write path that throws or corrupts on real rows; the
+   omission is a finding unless the test-author's note justifies it.
 
 ### Verdict
 - `APPROVED` when the test is a genuine, deterministic red→green proof of the `acceptance`.

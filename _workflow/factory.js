@@ -440,7 +440,10 @@ async function runItem(item) {
   const frameAndBlock = async function (reason) {
     const fr = await call('decision-framer', R.decisionFramer, DECISION_SCHEMA, 'This item is BLOCKED (cannot be auto-resolved without an owner ruling): ' + reason + '. Frame the decision for the human queue: the specific question, 2-4 options each with its consequence, and a recommendation. WRITE state/items/' + id + '/decision.md.', 'Plan')
     res.artifacts.decision = 'state/items/' + id + '/decision.md'
-    return finish('BLOCKED', (fr && fr.headline) ? fr.headline : reason)
+    // KI-E30 follow-up (review fix): the queue note keeps the RAW reason (incl. the flagging gate's
+    // own headline) even when the framer answers — bracketed after the framer's headline, so a
+    // mislabelled block stays self-evident from the queue instead of living only in the framer prompt.
+    return finish('BLOCKED', (fr && fr.headline) ? (String(fr.headline) + ' [' + reason + ']') : reason)
   }
   // Phase-6 re-fix convergence: when re-running a previously-FAILED item, feed the prior gate/review feedback
   // to the test-author + fixer so the re-attempt COMPLETES the fix instead of repeating the same omission

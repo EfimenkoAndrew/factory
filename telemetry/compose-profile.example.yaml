@@ -43,6 +43,7 @@ services:
     volumes:
       - <mount>/telemetry/data:/data:ro
     ports:
+      # debug-only publish (Prometheus scrapes the exporter in-network) — drop/remap if the host owns 9464
       - 9464:9464
     depends_on:
       - factory-otel-collector
@@ -60,9 +61,9 @@ services:
     volumes:
       - <mount>/telemetry/otel-collector.yaml:/etc/otelcol/config.yaml:ro
     ports:
-      - 4417:4317
-      - 4418:4318
-      - 8889:8889
+      - 4417:4317 # remapped host OTLP gRPC (example: the host stack owned 4317)
+      - 4418:4318 # remapped host OTLP HTTP — point the session cost-telemetry env HERE (claude-code-telemetry.env.example)
+      - 8889:8889 # collector self-metrics; in-network scrape — debug-only publish, drop/remap if the host owns 8889
     profiles:
       - factory
 
@@ -81,6 +82,7 @@ services:
       - <mount>/telemetry/prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - factory-prometheus-data:/prometheus
     ports:
+      # in-network consumers (Grafana) don't need this publish — drop/remap if the host runs its own Prometheus on 9090
       - 9090:9090
     depends_on:
       - factory-exporter
@@ -96,6 +98,7 @@ services:
     environment:
       GF_AUTH_ANONYMOUS_ENABLED: "true"
       GF_AUTH_ANONYMOUS_ORG_ROLE: "Viewer"
+      # local-dev defaults (same as the standalone stack) — change if this host is not loopback-only
       GF_SECURITY_ADMIN_USER: admin
       GF_SECURITY_ADMIN_PASSWORD: factory-local-admin
       GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /etc/grafana/dashboards/ai-factory.json

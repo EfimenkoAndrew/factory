@@ -76,5 +76,9 @@ export function recoveryFoldSkeleton(id, row, prior, cycle) {
   for (const k of ['codeChange', 'needsRealInfra', 'rootCauseFiles', 'verificationOnly', 'integrateRaw']) {
     if (prior && prior[k] !== undefined) r[k] = prior[k];
   }
+  // KI-E34 (review fix): a prior-less recovery (a seed-BLOCKED item that never ran) must not silently
+  // take the codeChange=false no-machine-evidence path at the fold override. FILL-prompt the flag —
+  // and an UNFILLED marker is a truthy string, so the override demands full code evidence: fails closed.
+  if (!prior || prior.codeChange === undefined) r.codeChange = '<FILL: true|false — REQUIRED: true demands RED proof + machine green at the fold override>';
   return r;
 }
