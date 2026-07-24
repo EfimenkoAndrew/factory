@@ -75,6 +75,20 @@ export function parkedAtMs(row) {
   const t = Date.parse((row && row.updatedAt) || '');
   return Number.isNaN(t) ? null : t;
 }
+// KI-E29 (review fix): the pure core of the group-time WARN — picked items depending on a CLOSED item
+// whose LEDGER-RECORDED worktree still exists (proxy: its fix is not yet committed to HEAD). Reading
+// row.worktree (not an assumed state/worktrees/<id> path) covers sweep-closed deps and dies correctly
+// at gc, which nulls the field. hasWorktree is the injected fs probe (KI-E2 split).
+export function closedDepsWithLiveWorktree(picked, rows, hasWorktree) {
+  const out = [];
+  for (const wi of picked || []) {
+    for (const d of (wi.dependsOn || [])) {
+      const dep = rows && rows[d];
+      if (dep && dep.state === 'CLOSED' && dep.worktree && hasWorktree(dep.worktree)) out.push({ id: wi.id, dep: d, worktree: dep.worktree });
+    }
+  }
+  return out;
+}
 // KI-E36 (review fix): TRUE when EVERY file has a commit strictly newer than sinceMs. lastCommitIso is
 // an injected lookup (file -> ISO committer date, '' when never committed) so the git edge stays in
 // the driver (KI-E2) while this date logic is pure + selftest-pinned. Empty/unknown inputs -> false.

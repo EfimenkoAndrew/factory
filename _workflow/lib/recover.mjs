@@ -73,7 +73,9 @@ export function recoveryFoldSkeleton(id, row, prior, cycle) {
     gates: { '<FILL: gate:role / review:flow>': 'APPROVED' },
     note: '<FILL: direct-recovery — the applied remedy, the delta re-gate verdicts, and where the machine evidence lives>',
   };
-  for (const k of ['codeChange', 'needsRealInfra', 'rootCauseFiles', 'verificationOnly', 'integrateRaw']) {
+  // KI-E20 (review fix): `band` is a carried machine-evidence flag too — a FULL-band prior arms the
+  // KI-E19 build+suite PAIR rule on the recovery fold as well (recovery is never a lighter path).
+  for (const k of ['codeChange', 'needsRealInfra', 'rootCauseFiles', 'verificationOnly', 'integrateRaw', 'band']) {
     if (prior && prior[k] !== undefined) r[k] = prior[k];
   }
   // KI-E34 (review fix): a prior-less recovery (a seed-BLOCKED item that never ran) must not silently
