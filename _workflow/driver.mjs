@@ -1391,6 +1391,11 @@ function cmdPreflight() {
   console.log('preflight (environment readiness):');
   console.log(`  docker: ${env.docker ? 'available' : 'ABSENT'}` + (env.docker ? '' : ' — realInfra items (money/security/concurrency) cannot close; they park BLOCKED:needs-docker'));
   console.log(`  dotnet: ${env.dotnet ? 'available' : 'ABSENT'}` + (env.dotnet ? '' : ' — build/test verify cannot run on this host'));
+  // KI-E33: warn up front when a run's token/cost telemetry will NOT be gathered (the dashboard cost
+  // panels feed off the SESSION's OTLP telemetry, not the factory's events.jsonl).
+  const ct = env.costTelemetry || { ready: false, reason: 'unknown' };
+  console.log(`  cost telemetry: ${ct.ready ? 'ready → ' + ct.endpoint : 'NOT gathered — ' + ct.reason}`);
+  if (!ct.ready) console.log('  -> set CLAUDE_CODE_ENABLE_TELEMETRY=1 + OTEL_EXPORTER_OTLP_ENDPOINT before launching the session (telemetry/claude-code-telemetry.env.example / KI-E28). factory_* metrics still land; only the token/cache panels are affected.');
   if (!env.docker) console.log('  -> run realInfra items only on a Docker-capable host (CI); a non-realInfra cycle is fine here.');
 }
 

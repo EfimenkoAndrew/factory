@@ -11,6 +11,19 @@ function probe(cmd, args) {
 export function dockerAvailable() { return probe('docker', ['info']); }
 export function dotnetAvailable() { return probe('dotnet', ['--version']); }
 
+// KI-E33: the dashboard's cost panels (claude_code_token_usage) are fed by the Claude Code SESSION's
+// OTLP telemetry, not by the factory — so if the session was launched without CLAUDE_CODE_ENABLE_TELEMETRY
+// + an OTLP endpoint, an entire run's token/cost telemetry is silently NOT gathered (factory_* metrics
+// still land; the two cost panels stay empty). This was missable with no cue — surface it at preflight.
+// `env` is injected for testability; defaults to process.env.
+export function costTelemetryReady(env) {
+  const e = env || process.env;
+  if (e.FACTORY_TELEMETRY === '0') return { ready: false, reason: 'FACTORY_TELEMETRY=0 (telemetry disabled)' };
+  if (e.CLAUDE_CODE_ENABLE_TELEMETRY !== '1') return { ready: false, reason: 'CLAUDE_CODE_ENABLE_TELEMETRY is not "1" — the session emits no token telemetry (cost panels stay empty)' };
+  if (!e.OTEL_EXPORTER_OTLP_ENDPOINT) return { ready: false, reason: 'OTEL_EXPORTER_OTLP_ENDPOINT is unset — nowhere to send token telemetry' };
+  return { ready: true, endpoint: e.OTEL_EXPORTER_OTLP_ENDPOINT };
+}
+
 export function preflight() {
-  return { docker: dockerAvailable(), dotnet: dotnetAvailable() };
+  return { docker: dockerAvailable(), dotnet: dotnetAvailable(), costTelemetry: costTelemetryReady() };
 }

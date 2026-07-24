@@ -47,7 +47,12 @@ DRV = node <mount>/_workflow/driver.mjs
 1. Read any host resume/handoff notes if present (e.g. a `CONTINUE_PROMPT_*.md` you keep in the host repo).
 2. `DRV status` — counts, in-flight, escalations. `DRV resume` — stranded ACTIVE items
    (`--reset-stale` re-queues them; checked + honest).
-3. `DRV preflight` — docker/dotnet readiness (decides realInfra closability).
+3. `DRV preflight` — docker/dotnet readiness (decides realInfra closability) **and cost-telemetry
+   readiness (KI-E33)**. If it reports `cost telemetry: NOT gathered`, the session was launched without
+   the Claude Code OTLP env, so the run's token/cost telemetry (the two dashboard cost panels) will be
+   lost — `factory_*` metrics still land. Fix before running: set `CLAUDE_CODE_ENABLE_TELEMETRY=1` +
+   `OTEL_EXPORTER_OTLP_ENDPOINT` (see `telemetry/claude-code-telemetry.env.example`) and restart the
+   session, or put them in the host's `.claude/settings.local.json` `env` so every session has them.
 
 ## The cycle loop
 
