@@ -1221,7 +1221,7 @@ function cmdGroup(flags) {
   // KI-E29: a picked item whose CLOSED dependency still has an unmerged factory/<dep> worktree will
   // build from HEAD WITHOUT that dependency's code — fixes are uncommitted on the dep's branch (KI-E1),
   // so a "CLOSED" dep in the ledger does not put its code in HEAD. The worktree then silently lacks work
-  // it depends on (live: SF-LINK-1720-BF depended on CLOSED-but-uncommitted SF-LINK-1718 and the fixer
+  // it depends on (live: HOST-ITEM-A depended on CLOSED-but-uncommitted HOST-ITEM-B and the fixer
   // re-derived its fix outside the lock-set, tripping a false scope block). WARN, don't exclude — nothing
   // is clobbered; the owner decides whether to commit the dependency first for a clean base.
   if (picked.length) {
