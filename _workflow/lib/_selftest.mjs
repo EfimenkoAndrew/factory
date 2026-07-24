@@ -29,6 +29,7 @@ import { splitAcceptanceClauses } from './acceptance.mjs';
 import { dissentersFrom, roleForGateKey, recoveryTransitions, recoveryFoldSkeleton, priorCycleOf } from './recover.mjs';
 import { extractHeadings, buildDocMap, readRoleBriefs } from './promptpack.mjs';
 import { githubIssueToItem, markdownChecklistToItems, extractSection, severityFromLabels, themeFromLabels, ingestReport } from './ingest.mjs';
+import { costTelemetryReady } from './preflight.mjs';
 import { fileURLToPath } from 'node:url';
 
 let pass = 0, fail = 0;
@@ -1287,6 +1288,15 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
   eq(rep.total, 5, 'ingest: report totals every item');
   eq(rep.escalate, 1, 'ingest: report counts the one escalate item');
   eq(rep.blocked, 4, 'ingest: report counts the blocked-triage items');
+}
+
+// KI-E33: cost-telemetry readiness probe (pure over injected env)
+{
+  eq(costTelemetryReady({ CLAUDE_CODE_ENABLE_TELEMETRY: '1', OTEL_EXPORTER_OTLP_ENDPOINT: 'http://localhost:4318' }).ready, true, 'KI-E33: enable=1 + endpoint set -> ready');
+  eq(costTelemetryReady({ OTEL_EXPORTER_OTLP_ENDPOINT: 'http://localhost:4318' }).ready, false, 'KI-E33: no CLAUDE_CODE_ENABLE_TELEMETRY -> not gathered');
+  eq(costTelemetryReady({ CLAUDE_CODE_ENABLE_TELEMETRY: '1' }).ready, false, 'KI-E33: no OTLP endpoint -> not gathered');
+  eq(costTelemetryReady({ FACTORY_TELEMETRY: '0', CLAUDE_CODE_ENABLE_TELEMETRY: '1', OTEL_EXPORTER_OTLP_ENDPOINT: 'x' }).ready, false, 'KI-E33: FACTORY_TELEMETRY=0 disables regardless');
+  ok(/telemetry\/claude-code-telemetry\.env\.example|CLAUDE_CODE_ENABLE_TELEMETRY/.test(readFileSync(join(import.meta.dirname, '..', 'driver.mjs'), 'utf8')), 'KI-E33: driver preflight surfaces the cost-telemetry cue');
 }
 
 console.log(`\nself-test: ${pass} passed, ${fail} failed`);
