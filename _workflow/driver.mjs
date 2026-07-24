@@ -698,7 +698,12 @@ function cmdFold(file, flags) {
       const snapPath = abs(join(cfg.paths.items, r.id, 'main-snapshot.json'));
       if (!existsSync(snapPath)) continue;
       const drifted = driftAgainstSnapshot(REPO_ROOT, (readJson(snapPath) || {}).files || {});
-      if (drifted.length) console.log(`  ⚠ MAIN-TREE CONTAMINATION ${r.id} (KI-L65): item files changed in the MAIN working tree during the run window — an agent likely wrote outside its worktree. Inspect + repair BEFORE applying:\n` + drifted.map((d) => `      ${d.file} (${d.was} -> ${d.now})`).join('\n'));
+      // KI-E35: the factory never commits, so drift that is CLEAN vs HEAD arrived via HUMAN commits
+      // (operator delivery) — only a file left DIRTY vs HEAD matches the wrote-outside-worktree signature.
+      const committedDrift = [], dirtyDrift = [];
+      for (const d of drifted) { let clean = false; try { execFileSync('git', ['-C', REPO_ROOT, 'diff', '--quiet', 'HEAD', '--', d.file]); clean = true; } catch { /* dirty vs HEAD */ } (clean ? committedDrift : dirtyDrift).push(d); }
+      if (dirtyDrift.length) console.log(`  ⚠ MAIN-TREE CONTAMINATION ${r.id} (KI-L65): item files changed in the MAIN working tree during the run window — an agent likely wrote outside its worktree. Inspect + repair BEFORE applying:\n` + dirtyDrift.map((d) => `      ${d.file} (${d.was} -> ${d.now})`).join('\n'));
+      if (committedDrift.length) console.log(`  ℹ COMMITTED DELIVERY ${r.id} (KI-E35): item files changed in main via HUMAN commits during the run window (clean vs HEAD) — likely the operator committed this item's output; verify intent, no repair needed:\n` + committedDrift.map((d) => `      ${d.file} (${d.was} -> ${d.now})`).join('\n'));
     } catch { /* detection aid only */ }
   }
   const { applied, rejected, skipped } = foldResults(ledger, arr);
@@ -924,6 +929,21 @@ function cmdRealinfraLint() {
 function cmdEscalationsSync(cfg, ledger, silent) {
   const queuePath = abs(cfg.paths.queue);
   const esc = Object.entries(ledger.items).filter(([, r]) => ['ESCALATED', 'BLOCKED'].includes(r.state));
+  // KI-E36: a parked item whose ENTIRE touch-set was committed after it parked was likely delivered
+  // out-of-band by the operator — hint it in the queue so ruled-and-delivered items never sit parked.
+  const graphItems = (() => { try { return byId(loadGraph(abs(cfg.paths.graph))); } catch { return {}; } })();
+  const deliveredHint = (id, r) => {
+    try {
+      const files = (graphItems[id] && graphItems[id].files) || [];
+      if (!files.length || !r.updatedAt) return '';
+      const since = Date.parse(r.updatedAt);
+      const allNewer = files.every((f) => {
+        const out = execFileSync('git', ['-C', REPO_ROOT, 'log', '-1', '--format=%cI', '--', f], { encoding: 'utf8' }).trim();
+        return out && Date.parse(out) > since;
+      });
+      return allNewer ? `\n- ⚠ possibly DELIVERED in HEAD (KI-E36): every touch-set file has a commit newer than this item parked — verify, then \`driver recover ${id}\`` : '';
+    } catch { return ''; }
+  };
   // KI-C6 defensive net (2026-07-12): escalateExhausted() already flips bound-exhausted FAILED ->
   // ESCALATED at every fold (the KI-C6 fix), so exhausted items normally appear above as ESCALATED.
   // This section catches the rows that MISS that hook — a sweep-fold writes FAILED via its own path,
@@ -943,7 +963,7 @@ function cmdEscalationsSync(cfg, ledger, silent) {
       // KI-C9: embed the decision-framer's framed choice (options + consequences + recommendation) when present.
       const decPath = abs(join(cfg.paths.items, id, 'decision.md'));
       const framed = existsSync(decPath) ? ('\n\n' + readFileSync(decPath, 'utf8').trim() + '\n') : '';
-      return `## ${id} — ${r.state}\n\n- ${r.note || '(no note)'}${framed}\n`;
+      return `## ${id} — ${r.state}\n\n- ${r.note || '(no note)'}${deliveredHint(id, r)}${framed}\n`;
     }).join('\n') : '_No items awaiting a human decision._',
     '',
     ...(exhausted.length ? [
@@ -1509,6 +1529,27 @@ function cmdGc(flags) {
   } else {
     try { pruneWorktrees(); console.log('gc: pruned dead worktree admin refs (safe)'); } catch { /* ignore */ }
   }
+  // KI-E37: agent/verify runs can leave docker-compose projects whose config lives in a (possibly
+  // already-removed) worktree. Sweep them; ONLY projects whose config path sits under the factory's
+  // worktrees root are ever touched — host stacks are structurally out of reach.
+  try {
+    const wtRoot = join(FACTORY_ROOT, 'state', 'worktrees');
+    const raw = execFileSync('docker', ['compose', 'ls', '--all', '--format', 'json'], { encoding: 'utf8' }).trim();
+    let projects = [];
+    if (raw) { try { projects = JSON.parse(raw); } catch { projects = raw.split('\n').filter(Boolean).map((l) => JSON.parse(l)); } }
+    if (!Array.isArray(projects)) projects = [projects];
+    const stray = projects.filter((p) => String(p.ConfigFiles || '').includes(wtRoot));
+    if (stray.length) {
+      console.log(`gc: ${stray.length} worktree-scoped docker-compose project(s)` + (flags.yes ? '' : ' (dry-run — pass --yes to `compose down -v` them)'));
+      for (const p of stray) {
+        console.log(`  ${p.Name} @ ${p.ConfigFiles}`);
+        if (flags.yes) {
+          try { execFileSync('docker', ['compose', '-p', p.Name, 'down', '-v', '--remove-orphans'], { encoding: 'utf8' }); console.log(`    downed ${p.Name} (containers + volumes removed)`); }
+          catch (e) { console.log(`    ! could not down ${p.Name}: ${String((e && e.message) || e)}`); }
+        }
+      }
+    }
+  } catch { /* docker absent — the sweep is best-effort (KI-E37) */ }
 }
 
 // Sweep mode (root-cause fan-out): one factory run designs the canonical fix once + applies it to every
@@ -1640,8 +1681,8 @@ function cmdRecover(flags, rest) {
   if (!ledger || !ledger.items[id]) { console.error('recover: unknown item ' + id); process.exitCode = 1; return; }
   const row = ledger.items[id];
   const wi = byId(graph)[id] || {};
-  if (!['FAILED', 'ESCALATED'].includes(row.state)) {
-    console.log(`recover: ${id} is ${row.state} — recovery targets FAILED (apply the converged remedy) or ESCALATED (record the human sign-off). Nothing prepared.`);
+  if (!['FAILED', 'ESCALATED', 'BLOCKED'].includes(row.state)) {
+    console.log(`recover: ${id} is ${row.state} — recovery targets FAILED (apply the converged remedy), ESCALATED (record the human sign-off), or BLOCKED (record the owner ruling, KI-E34). Nothing prepared.`);
     return;
   }
   const itemDir = abs(join(cfg.paths.items, id));
@@ -1707,6 +1748,7 @@ function cmdRecover(flags, rest) {
     '   (attemptsDelta:0 — a recovery consumes no retry budget; resultId #' + cyc + 'r keeps fold idempotency; the deterministic fold override re-checks ALL machine evidence exactly as for a live run.)',
     '',
     row.state === 'ESCALATED' ? '_ESCALATED item: steps 2-4 may reduce to recording the human sign-off; the fold is the single CLOSED hop (KI-L62)._' : '',
+    row.state === 'BLOCKED' ? `_BLOCKED item (KI-E34): record the owner ruling on the GRAPH item first (\`ownerDecision\` + \`ownerDecisionResolved: true\`; fold ratified out-of-set files into \`files[]\`), then run \`node ${MOUNT_REL}/_workflow/driver.mjs reset ${id}\` BEFORE the fold — BLOCKED's only legal ledger edge is -> READY, and the fold re-enters via CLAIMED. If the ruling ratifies work already delivered by human commits, steps 2-3 need no new evidence: the prior round's transcripts stand — say so in the fold note._` : '',
   ].join('\n'));
   temit({ source: 'driver', event: 'recovery_prepared', item: id, cycle: cyc, attrs: { fromState: row.state, dissenters: prompts.map((p) => p.key), hasFeedback: existsSync(join(itemDir, 'feedback.md')), hasCheckpoint: !!prior } });
   console.log(`recover ${id} (${row.state}, cycle #${cyc}r): scaffold -> ${recDir}`);

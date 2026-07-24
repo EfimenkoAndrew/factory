@@ -41,6 +41,8 @@ export function roleForGateKey(key) {
 // The fold transitions for a recovery result (the KI-L47/KI-L61/KI-L62 pinned shapes): from FAILED
 // the FULL re-entry chain (fold auto-claims from CLAIMED); from ESCALATED a single CLOSED hop (the
 // item was already fully verified — recovery only records the human-approved sign-off).
+// From BLOCKED (KI-E34) the same FULL chain applies: the owner ruling is recorded, the operator runs
+// `driver reset <id>` (BLOCKED's only legal ledger edge is -> READY), and the fold re-enters via CLAIMED.
 export function recoveryTransitions(fromState) {
   return fromState === 'ESCALATED'
     ? ['CLOSED']

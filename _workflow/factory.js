@@ -779,7 +779,7 @@ async function runItem(item) {
     // item into the owner queue on a false premise). The inconsistent flag is preserved on
     // gateDetails for the audit trail instead of blocking.
     if (gr && gr.scopeViolation) {
-      if (gr.verdict !== 'APPROVED') return await frameAndBlock(b.key + ': product-scope violation (hard stop)')
+      if (gr.verdict !== 'APPROVED') return await frameAndBlock(b.key + ': product-scope violation (hard stop)' + (gr.headline ? ' — gate headline: ' + String(gr.headline).slice(0, 200) : ''))
       if (res.gateDetails[b.key]) res.gateDetails[b.key].scopeViolationIgnored = true
     }
   }

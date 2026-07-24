@@ -1022,6 +1022,8 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
   ok(readFileSync(new URL('../../agents/review-edgecase.md', import.meta.url), 'utf8').includes('EARLY POSITION (KI-E12'), 'KI-E12: edge-case brief carries the early-position contract');
   ok(readFileSync(new URL('../../agents/marker-probe.md', import.meta.url), 'utf8').includes('marker-probe (KI-E10)'), 'KI-E10: marker-probe brief exists');
   ok(readFileSync(new URL('../../agents/fixer.md', import.meta.url), 'utf8').includes('DOC-CLAIM SELF-CHECK (KI-E11)'), 'KI-E11: fixer card carries the claims self-check');
+  ok(readFileSync(new URL('../../agents/test-author.md', import.meta.url), 'utf8').includes('REAL-SHAPE SEEDING (KI-E38'), 'KI-E38: test-author brief carries the real-shape seeding rule');
+  ok(readFileSync(new URL('../../agents/review-testreview.md', import.meta.url), 'utf8').includes('Seed-shape completeness (KI-E38'), 'KI-E38: test-review brief carries the seed-shape completeness lens');
 }
 
 // KI-D12: LeftoverScan — the deterministic detector + the factory-side probe wiring.
@@ -1157,6 +1159,8 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
   eq(roleForGateKey('probe:leftover-scan'), null, 'KI-E20: probe keys have no re-gate role');
   eq(recoveryTransitions('FAILED')[0], 'CLAIMED', 'KI-E20: FAILED recovery walks the full chain from CLAIMED');
   eq(recoveryTransitions('ESCALATED'), ['CLOSED'], 'KI-E20: ESCALATED recovery is the single CLOSED hop (KI-L62)');
+  eq(recoveryTransitions('BLOCKED')[0], 'CLAIMED', 'KI-E34: BLOCKED recovery (post-reset, from READY) walks the full chain from CLAIMED');
+  eq(recoveryTransitions('BLOCKED').length, 10, 'KI-E34: the BLOCKED recovery chain is the full 10-hop re-entry');
   eq(priorCycleOf({ resultId: 'X-1#46' }, 9), 46, 'KI-E20: recovery cycle parsed from the prior checkpoint');
   eq(priorCycleOf(null, 9), 9, 'KI-E20: no checkpoint -> fallback cycle');
   const sk = recoveryFoldSkeleton('X-1', { state: 'FAILED', worktree: 'wt', branch: 'b' }, { codeChange: true, needsRealInfra: false, rootCauseFiles: ['a.cs'], integrateRaw: true, resultId: 'X-1#46' }, 46);
@@ -1166,6 +1170,10 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
   const dsrc20 = readFileSync(join(import.meta.dirname, '..', 'driver.mjs'), 'utf8');
   ok(dsrc20.includes("case 'recover'") && dsrc20.includes('recovery_prepared') && dsrc20.includes('mutation-proof.txt'), 'KI-E20: driver wires recover + telemetry + the evidence contract');
   ok(dsrc20.includes("case 'decisions-digest'") && dsrc20.includes('Rule-together bundles'), 'KI-E24: driver wires the ranked owner-decision digest');
+  ok(dsrc20.includes("'FAILED', 'ESCALATED', 'BLOCKED'"), 'KI-E34: cmdRecover accepts BLOCKED (owner-ruling recovery)');
+  ok(dsrc20.includes('COMMITTED DELIVERY') && dsrc20.includes('MAIN-TREE CONTAMINATION'), 'KI-E35: fold splits human-committed delivery from agent contamination');
+  ok(dsrc20.includes('possibly DELIVERED in HEAD (KI-E36)'), 'KI-E36: escalations queue carries the delivered-in-HEAD hint');
+  ok(dsrc20.includes("['compose', '-p', p.Name, 'down', '-v', '--remove-orphans']") && dsrc20.includes("join(FACTORY_ROOT, 'state', 'worktrees')"), 'KI-E37: gc sweeps only worktree-scoped compose projects');
 }
 
 // KI-E22: acceptance-surface lint (the KI-E16 generalization) — pure heuristic over injected IO.

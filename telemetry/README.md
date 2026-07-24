@@ -38,6 +38,18 @@ FACTORY_GRAFANA_PORT=3100     # ...and every other port
 
 Defaults reproduce the historical single-host names exactly, so an existing stack is unaffected.
 
+### Alternative: fold the stack into the host repo's compose (KI-E39)
+
+Instead of running this standalone project, the four services can live in the HOST repo's own
+`docker-compose.yaml` under an opt-in `factory` profile — one command brings up dev infra and factory
+telemetry together, and the identity/port collisions KI-E25 exists for disappear (compose project
+scoping replaces `container_name`). The load-bearing details, proven in a live host integration: put
+the services on a DEDICATED network with aliases `exporter` / `otel-collector` / `prometheus` (this
+stack's configs resolve those names and stay byte-for-byte unmodified), drop `container_name`, remap
+only host ports the host stack already owns, and bind-mount configs/data from the mount path.
+`compose-profile.example.yaml` is a copy-paste template. The session env for the cost panels then
+points at the REMAPPED OTLP port (see `claude-code-telemetry.env.example`).
+
 ## Claude Code cost telemetry (the two token/cache panels) — KI-E28
 
 The dashboard ships two cost panels — **Claude Code token rate by type** and **Prompt-cache hit

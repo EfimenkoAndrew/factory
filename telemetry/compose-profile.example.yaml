@@ -1,0 +1,111 @@
+# KI-E39 — the telemetry stack as a HOST-COMPOSE PROFILE (alternative to the standalone project).
+#
+# Paste the service blocks into the HOST repo's docker-compose.yaml, replace every <mount> with the
+# factory mount path (stock: ./_bmad-output/ai-factory), and adjust only the HOST-side ports that
+# collide with the host stack (left side of "host:container"; the example remaps OTLP 4317/4318 ->
+# 4417/4418 and Grafana 3000 -> 3100, which a live host integration needed). Then:
+#
+#   docker compose --profile factory up -d --build
+#
+# Load-bearing details (proven live — see KNOWN-ISSUES KI-E39):
+#   - DEDICATED network with aliases `exporter` / `otel-collector` / `prometheus`: this stack's
+#     read-only configs (prometheus.yml, otel-collector.yaml, grafana datasource) resolve those
+#     hostnames and stay byte-for-byte unmodified. A dedicated network also avoids DNS collision
+#     with a host service that is itself named `otel-collector`.
+#   - NO container_name: compose project scoping isolates a second host repo — the KI-E25
+#     duplicate-name collision class disappears.
+#   - The factory services never join the host's app network; they need only each other.
+#   - Point the session's cost-telemetry env at the REMAPPED OTLP HTTP port (e.g. 4418) —
+#     see claude-code-telemetry.env.example (KI-E28/KI-E33).
+#
+# Merge into the host's top-level keys:
+#
+# networks:
+#   factory:
+#
+# volumes:
+#   factory-prometheus-data:
+#   factory-grafana-data:
+
+services:
+  factory-exporter:
+    build: <mount>/telemetry/exporter
+    networks:
+      factory:
+        aliases:
+          - exporter
+    restart: unless-stopped
+    environment:
+      EVENTS_FILE: /data/events.jsonl
+      OTLP_URL: http://otel-collector:4318/v1/traces
+      PORT: "9464"
+      POLL_MS: "2000"
+    volumes:
+      - <mount>/telemetry/data:/data:ro
+    ports:
+      - 9464:9464
+    depends_on:
+      - factory-otel-collector
+    profiles:
+      - factory
+
+  factory-otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.156.0
+    networks:
+      factory:
+        aliases:
+          - otel-collector
+    restart: unless-stopped
+    command: ["--config=/etc/otelcol/config.yaml"]
+    volumes:
+      - <mount>/telemetry/otel-collector.yaml:/etc/otelcol/config.yaml:ro
+    ports:
+      - 4417:4317
+      - 4418:4318
+      - 8889:8889
+    profiles:
+      - factory
+
+  factory-prometheus:
+    image: prom/prometheus:v3.13.1
+    networks:
+      factory:
+        aliases:
+          - prometheus
+    restart: unless-stopped
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=180d"
+    volumes:
+      - <mount>/telemetry/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - factory-prometheus-data:/prometheus
+    ports:
+      - 9090:9090
+    depends_on:
+      - factory-exporter
+      - factory-otel-collector
+    profiles:
+      - factory
+
+  factory-grafana:
+    image: grafana/grafana:12.4.5
+    networks:
+      - factory
+    restart: unless-stopped
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: "Viewer"
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: factory-local-admin
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /etc/grafana/dashboards/ai-factory.json
+    volumes:
+      - factory-grafana-data:/var/lib/grafana
+      - <mount>/telemetry/grafana/provisioning:/etc/grafana/provisioning:ro
+      - <mount>/telemetry/grafana/dashboards:/etc/grafana/dashboards:ro
+    ports:
+      - 3100:3000
+    depends_on:
+      - factory-prometheus
+    profiles:
+      - factory
