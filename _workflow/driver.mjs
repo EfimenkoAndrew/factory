@@ -27,7 +27,7 @@ import {
 } from './lib/ledger.mjs';
 import { loadGraph, computeReady, waitingOnDeps, byId } from './lib/graph.mjs';
 import { loadRouting, resolve as routeResolve, concurrencyFor } from './lib/router.mjs';
-import { addWorktree, removeWorktree, listWorktrees, changedFiles, pruneWorktrees, isFactoryWorktreePath } from './lib/worktree.mjs';
+import { addWorktree, removeWorktree, listWorktrees, changedFiles, pruneWorktrees, isFactoryWorktreePath, parseComposeLs, strayComposeProjects } from './lib/worktree.mjs';
 import { acquireLock, releaseLock } from './lib/lock.mjs';
 import { parseVerifyRaw, verdictFromParse, debrisFiles, parseRedRaw, hasRealInfraMarker, touchedRootCause } from './lib/verify.mjs';
 import { preflight, dockerAvailable } from './lib/preflight.mjs';
@@ -39,7 +39,7 @@ import { clusterBySimilarity, sharedLabel, batchPatternFor, sig as simSig, simil
 import { loadController, isStale as controllerStale, claimController, verifyController, releaseController, DEFAULT_TTL_MINUTES } from './lib/controller.mjs';
 import { buildFactoryRouting } from './lib/routing-drift.mjs';
 import { githubIssueToItem, markdownChecklistToItems, ingestReport } from './lib/ingest.mjs'; // KI-E27 — multi-source issue ingestion
-import { snapshotMainFiles, driftAgainstSnapshot, dirtyMainPaths, filesOverlapDirty } from './lib/mainguard.mjs';
+import { snapshotMainFiles, driftAgainstSnapshot, dirtyMainPaths, filesOverlapDirty, splitDriftByStatus } from './lib/mainguard.mjs';
 import { buildDocMap, readRoleBriefs } from './lib/promptpack.mjs';
 // KI-E7 — telemetry is OBSERVATIONAL ONLY (ai-factory-observability spine AD-1..3/AD-11): emit()
 // never throws, never blocks a command, and never feeds a fold verdict. FACTORY_TELEMETRY=0 disables.
@@ -698,12 +698,13 @@ function cmdFold(file, flags) {
       const snapPath = abs(join(cfg.paths.items, r.id, 'main-snapshot.json'));
       if (!existsSync(snapPath)) continue;
       const drifted = driftAgainstSnapshot(REPO_ROOT, (readJson(snapPath) || {}).files || {});
-      // KI-E35: the factory never commits, so drift that is CLEAN vs HEAD arrived via HUMAN commits
-      // (operator delivery) — only a file left DIRTY vs HEAD matches the wrote-outside-worktree signature.
-      const committedDrift = [], dirtyDrift = [];
-      for (const d of drifted) { let clean = false; try { execFileSync('git', ['-C', REPO_ROOT, 'diff', '--quiet', 'HEAD', '--', d.file]); clean = true; } catch { /* dirty vs HEAD */ } (clean ? committedDrift : dirtyDrift).push(d); }
+      // KI-E35: the factory never commits, so drift on a path `git status --porcelain` reports CLEAN
+      // (no uncommitted edit, NOT untracked) can only have arrived via HUMAN commits (operator delivery).
+      // Anything still dirty — including an UNTRACKED new file, which `git diff HEAD` cannot see (the
+      // live ITEM-H5 stray shape; review fix) — keeps the wrote-outside-worktree contamination wording.
+      const { committed: committedDrift, dirty: dirtyDrift } = splitDriftByStatus(REPO_ROOT, drifted);
       if (dirtyDrift.length) console.log(`  ⚠ MAIN-TREE CONTAMINATION ${r.id} (KI-L65): item files changed in the MAIN working tree during the run window — an agent likely wrote outside its worktree. Inspect + repair BEFORE applying:\n` + dirtyDrift.map((d) => `      ${d.file} (${d.was} -> ${d.now})`).join('\n'));
-      if (committedDrift.length) console.log(`  ℹ COMMITTED DELIVERY ${r.id} (KI-E35): item files changed in main via HUMAN commits during the run window (clean vs HEAD) — likely the operator committed this item's output; verify intent, no repair needed:\n` + committedDrift.map((d) => `      ${d.file} (${d.was} -> ${d.now})`).join('\n'));
+      if (committedDrift.length) console.log(`  ℹ COMMITTED DELIVERY ${r.id} (KI-E35): item files changed in main via HUMAN commits during the run window (clean per git status) — likely the operator committed this item's output; verify intent, no repair needed:\n` + committedDrift.map((d) => `      ${d.file} (${d.was} -> ${d.now})`).join('\n'));
     } catch { /* detection aid only */ }
   }
   const { applied, rejected, skipped } = foldResults(ledger, arr);
@@ -1530,15 +1531,13 @@ function cmdGc(flags) {
     try { pruneWorktrees(); console.log('gc: pruned dead worktree admin refs (safe)'); } catch { /* ignore */ }
   }
   // KI-E37: agent/verify runs can leave docker-compose projects whose config lives in a (possibly
-  // already-removed) worktree. Sweep them; ONLY projects whose config path sits under the factory's
-  // worktrees root are ever touched — host stacks are structurally out of reach.
+  // already-removed) worktree. Sweep them; ONLY projects whose EVERY config file sits under the
+  // CONFIGURED worktrees root (abs(cfg.paths.worktreesState), separator-anchored — review fix) are
+  // ever touched, so host stacks — including hybrid host+override projects — stay out of reach.
   try {
-    const wtRoot = join(FACTORY_ROOT, 'state', 'worktrees');
-    const raw = execFileSync('docker', ['compose', 'ls', '--all', '--format', 'json'], { encoding: 'utf8' }).trim();
-    let projects = [];
-    if (raw) { try { projects = JSON.parse(raw); } catch { projects = raw.split('\n').filter(Boolean).map((l) => JSON.parse(l)); } }
-    if (!Array.isArray(projects)) projects = [projects];
-    const stray = projects.filter((p) => String(p.ConfigFiles || '').includes(wtRoot));
+    const wtRoot = abs(cfg.paths.worktreesState);
+    const raw = execFileSync('docker', ['compose', 'ls', '--all', '--format', 'json'], { encoding: 'utf8' });
+    const stray = strayComposeProjects(parseComposeLs(raw), wtRoot);
     if (stray.length) {
       console.log(`gc: ${stray.length} worktree-scoped docker-compose project(s)` + (flags.yes ? '' : ' (dry-run — pass --yes to `compose down -v` them)'));
       for (const p of stray) {

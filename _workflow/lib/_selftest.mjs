@@ -698,6 +698,30 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
   ok(dsrc.includes('force-dirty-overlap') && dsrc.includes('dirtyMainPaths(REPO_ROOT)'), 'KI-E14: cmdGroup wires the dirty-overlap guard with a --force-dirty-overlap escape');
 }
 
+// KI-E35 (review fix): splitDriftByStatus — behavioral, throwaway real-git repo: only COMMITTED drift
+// reads as human delivery; an uncommitted edit AND an untracked stray (the live ITEM-H5 shape,
+// invisible to `git diff HEAD`) both stay in the contamination bucket.
+{
+  const { splitDriftByStatus } = await import('./mainguard.mjs');
+  const { mkdtempSync: mk35, writeFileSync: wf35, rmSync: rm35 } = await import('node:fs');
+  const root35 = mk35(join(tmpdir(), 'e35split-'));
+  const g35 = (...a) => execFileSync('git', ['-C', root35, ...a], { encoding: 'utf8' });
+  g35('init', '-q');
+  wf35(join(root35, 'committed.txt'), 'v1');
+  wf35(join(root35, 'modified.txt'), 'v1');
+  g35('add', '.');
+  g35('-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-q', '-m', 'base', '--no-gpg-sign', '--no-verify');
+  wf35(join(root35, 'committed.txt'), 'v2');
+  g35('add', 'committed.txt');
+  g35('-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-q', '-m', 'human delivery', '--no-gpg-sign', '--no-verify');
+  wf35(join(root35, 'modified.txt'), 'v2');
+  wf35(join(root35, 'untracked-new.txt'), 'stray');
+  const s35 = splitDriftByStatus(root35, [{ file: 'committed.txt' }, { file: 'modified.txt' }, { file: 'untracked-new.txt' }]);
+  eq(s35.committed.map((d) => d.file), ['committed.txt'], 'KI-E35: committed drift classifies as human delivery');
+  eq(s35.dirty.map((d) => d.file), ['modified.txt', 'untracked-new.txt'], 'KI-E35: an uncommitted edit AND an untracked stray both classify as contamination (review fix)');
+  rm35(root35, { recursive: true, force: true });
+}
+
 // KI-D12 refinement (2026-07-20): `placeholder`-lexeme hits are pruned from files whose OWN added
 // lines carry the sanctioned secret-template markers (REPLACE_WITH_/CHANGE_ME) — those files
 // implement/test the loud-placeholder convention (the 9/9 ITEM-M2 WARN-noise class). Other
@@ -1173,7 +1197,27 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
   ok(dsrc20.includes("'FAILED', 'ESCALATED', 'BLOCKED'"), 'KI-E34: cmdRecover accepts BLOCKED (owner-ruling recovery)');
   ok(dsrc20.includes('COMMITTED DELIVERY') && dsrc20.includes('MAIN-TREE CONTAMINATION'), 'KI-E35: fold splits human-committed delivery from agent contamination');
   ok(dsrc20.includes('possibly DELIVERED in HEAD (KI-E36)'), 'KI-E36: escalations queue carries the delivered-in-HEAD hint');
-  ok(dsrc20.includes("['compose', '-p', p.Name, 'down', '-v', '--remove-orphans']") && dsrc20.includes("join(FACTORY_ROOT, 'state', 'worktrees')"), 'KI-E37: gc sweeps only worktree-scoped compose projects');
+  ok(dsrc20.includes("['compose', '-p', p.Name, 'down', '-v', '--remove-orphans']") && dsrc20.includes('strayComposeProjects(parseComposeLs(raw), wtRoot)') && dsrc20.includes('abs(cfg.paths.worktreesState)'), 'KI-E37: gc downs only compose projects under the CONFIGURED worktrees root (review fix)');
+}
+
+// KI-E37 (review fix): compose-ls parsing + the stray filter — behavioral (pure, no docker).
+{
+  const { parseComposeLs, strayComposeProjects } = await import('./worktree.mjs');
+  eq(parseComposeLs(''), [], 'KI-E37: blank compose-ls output -> no projects');
+  eq(parseComposeLs('[{"Name":"a","ConfigFiles":"/x/a.yml"}]').length, 1, 'KI-E37: JSON-array shape parses');
+  eq(parseComposeLs('{"Name":"a"}\n{"Name":"b"}').length, 2, 'KI-E37: NDJSON shape parses');
+  eq(parseComposeLs('{"Name":"solo"}').length, 1, 'KI-E37: a lone object is wrapped');
+  const WT37 = '/repo/_f/state/worktrees';
+  const strays37 = strayComposeProjects([
+    { Name: 'wt', ConfigFiles: WT37 + '/ID-1/docker-compose.yml' },
+    { Name: 'sibling', ConfigFiles: WT37 + '-archive/x/docker-compose.yml' },
+    { Name: 'hybrid', ConfigFiles: '/host/docker-compose.yml,' + WT37 + '/ID-2/override.yml' },
+    { Name: 'host', ConfigFiles: '/host/docker-compose.yml' },
+    { Name: 'multiwt', ConfigFiles: WT37 + '/ID-3/a.yml, ' + WT37 + '/ID-3/b.yml' },
+  ], WT37);
+  eq(strays37.map((p) => p.Name), ['wt', 'multiwt'], 'KI-E37: EVERY config must sit under the ANCHORED worktrees root — sibling dirs + hybrid host projects never match (review fix)');
+  eq(strayComposeProjects([{ Name: 'w', ConfigFiles: WT37 + '/ID/x.yml' }], WT37 + '/').length, 1, 'KI-E37: trailing-separator root normalizes');
+  eq(strayComposeProjects(null, WT37).length, 0, 'KI-E37: null projects -> empty');
 }
 
 // KI-E22: acceptance-surface lint (the KI-E16 generalization) — pure heuristic over injected IO.
