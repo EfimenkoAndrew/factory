@@ -59,6 +59,13 @@ reproduce the defect).
   your test reds the suite, it is NOT done — fix it or switch to the direct-unit approach. Set
   `red=true` only when the targeted test genuinely fails on the OLD code AND passes/compiles cleanly
   once the fix lands; a self-broken test is not a red proof.
+- **REAL-SHAPE SEEDING (KI-E38)**: when your test seeds an entity/aggregate the code under test WRITES
+  back — especially a JSON-mapped/owned aggregate — populate EVERY optional collection and nullable
+  member the model declares with at least one realistic value, or state in your `note` why an omission
+  is safe. This rule is UNCONDITIONAL — in-memory and real-infra seeds alike (review fix): a minimal
+  seed can green a write path that throws or corrupts on real rows (live: an owned-JSON collection
+  absent from the seed hid an EF re-parent throw — `__synthesizedOrdinal is part of a key` — that only
+  production-shaped data exposed, after every gate had approved).
 
 ### REAL-INFRA TESTS (when the prompt says REAL-INFRA, or `realInfra=true`)
 - **First, judge the DEFECT SHAPE.** Real infra is required when the bug's correctness depends on real-DB

@@ -44,6 +44,24 @@ export function driftAgainstSnapshot(repoRoot, snap) {
   return drifted
 }
 
+// KI-E35 (review fix) — split drifted files into COMMITTED delivery vs DIRTY/untracked contamination.
+// "Clean" means `git status --porcelain` reports NOTHING for the path — no staged/unstaged edit and
+// not untracked — so the drift can only have arrived via commits (human delivery; the factory never
+// commits). An UNTRACKED file is dirty here: `git diff HEAD` is blind to it (exit 0), which is exactly
+// how an agent-created stray (the live ITEM-H5 shape above) must NOT read as a committed delivery.
+// Any git failure classifies dirty — conservative: the ⚠ direction, same as the pre-split behavior.
+export function splitDriftByStatus(repoRoot, drifted) {
+  const committed = []
+  const dirty = []
+  for (const d of drifted || []) {
+    let clean = false
+    try { clean = execFileSync('git', ['-C', repoRoot, 'status', '--porcelain', '--', d.file], { encoding: 'utf8' }).trim() === '' } catch { /* repo error -> dirty */ }
+    const bucket = clean ? committed : dirty
+    bucket.push(d)
+  }
+  return { committed, dirty }
+}
+
 // KI-E14 (2026-07-20) — pre-claim complement to the KI-L65 post-hoc drift check above.
 //
 // A worktree is created from HEAD, so an item whose files[] intersect UNCOMMITTED main-tree

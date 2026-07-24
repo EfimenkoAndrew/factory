@@ -275,6 +275,7 @@ function compose(role, item, extra) {
     '  - Honour code-style / service-design / dataflow / security / trust-and-monetisation / deploy-verification.',
     '  - The FULL .claude/rules/*.md set is ALREADY in your system context (auto-loaded) — do NOT spend tool calls re-Reading those rule files; cite them from context.',
     '  - product-scope.md red-lines are HARD STOPS: never "fix" by adding a tax/purchase-fee/SAR/gov-report/shipping surface. If the only fix crosses one, STOP and report scope-stop.',
+    '  - `scopeViolation:true` means EXACTLY a product-scope.md red-line was crossed (above) — the one hard-stop. A diff that merely touches a file OUTSIDE the item\'s declared files[] touch-set is NOT a scopeViolation: report it as a normal finding (note whether the extra file is justified) and set the verdict on its merits. Do not conflate "outside the lock-set" with "crossed a product red-line" (KI-E30).',
     '  - A real divergence from a pattern requires a standards-evolution.md ledger entry + call-site tag in the SAME change.',
     '  - No false "production-ready" (execution-policy.md §4): leave no TODO/FIXME/HACK/stub.',
   )
@@ -439,7 +440,10 @@ async function runItem(item) {
   const frameAndBlock = async function (reason) {
     const fr = await call('decision-framer', R.decisionFramer, DECISION_SCHEMA, 'This item is BLOCKED (cannot be auto-resolved without an owner ruling): ' + reason + '. Frame the decision for the human queue: the specific question, 2-4 options each with its consequence, and a recommendation. WRITE state/items/' + id + '/decision.md.', 'Plan')
     res.artifacts.decision = 'state/items/' + id + '/decision.md'
-    return finish('BLOCKED', (fr && fr.headline) ? fr.headline : reason)
+    // KI-E30 follow-up (review fix): the queue note keeps the RAW reason (incl. the flagging gate's
+    // own headline) even when the framer answers — bracketed after the framer's headline, so a
+    // mislabelled block stays self-evident from the queue instead of living only in the framer prompt.
+    return finish('BLOCKED', (fr && fr.headline) ? (String(fr.headline) + ' [' + reason + ']') : reason)
   }
   // Phase-6 re-fix convergence: when re-running a previously-FAILED item, feed the prior gate/review feedback
   // to the test-author + fixer so the re-attempt COMPLETES the fix instead of repeating the same omission
@@ -778,7 +782,7 @@ async function runItem(item) {
     // item into the owner queue on a false premise). The inconsistent flag is preserved on
     // gateDetails for the audit trail instead of blocking.
     if (gr && gr.scopeViolation) {
-      if (gr.verdict !== 'APPROVED') return await frameAndBlock(b.key + ': product-scope violation (hard stop)')
+      if (gr.verdict !== 'APPROVED') return await frameAndBlock(b.key + ': product-scope violation (hard stop)' + (gr.headline ? ' — gate headline: ' + String(gr.headline).slice(0, 200) : ''))
       if (res.gateDetails[b.key]) res.gateDetails[b.key].scopeViolationIgnored = true
     }
   }

@@ -38,6 +38,42 @@ FACTORY_GRAFANA_PORT=3100     # ...and every other port
 
 Defaults reproduce the historical single-host names exactly, so an existing stack is unaffected.
 
+### Alternative: fold the stack into the host repo's compose (KI-E39)
+
+Instead of running this standalone project, the four services can live in the HOST repo's own
+`docker-compose.yaml` under an opt-in `factory` profile — one command brings up dev infra and factory
+telemetry together, and the identity/port collisions KI-E25 exists for disappear (compose project
+scoping replaces `container_name`). The load-bearing details, proven in a live host integration: put
+the services on a DEDICATED network with aliases `exporter` / `otel-collector` / `prometheus` (this
+stack's configs resolve those names and stay byte-for-byte unmodified), drop `container_name`, remap
+only host ports the host stack already owns, and bind-mount configs/data from the mount path.
+`compose-profile.example.yaml` is a copy-paste template. The session env for the cost panels then
+points at the REMAPPED OTLP port (see `claude-code-telemetry.env.example`).
+
+## Claude Code cost telemetry (the two token/cache panels) — KI-E28
+
+The dashboard ships two cost panels — **Claude Code token rate by type** and **Prompt-cache hit
+ratio** — that read `claude_code_token_usage_tokens_total`. That series is emitted by the **Claude
+Code session itself**, not by the factory exporter, so it appears only once you point your session's
+OpenTelemetry at this collector. The collector is already wired to accept it (`otel-collector.yaml`
+routes the OTLP `metrics` pipeline to Prometheus; the OTLP HTTP port is exposed) — the only missing
+piece is the session-side env. Until you set it, those two panels are **empty, not broken**; every
+`factory_*` panel populates without it.
+
+```bash
+# in the shell that launches the factory's Claude Code session:
+set -a; . telemetry/claude-code-telemetry.env; set +a   # from claude-code-telemetry.env.example
+```
+
+Point `OTEL_EXPORTER_OTLP_ENDPOINT` at this host's collector HTTP port — `http://localhost:4318`
+for the default stack, or `http://localhost:<FACTORY_OTLP_HTTP_PORT>` (e.g. `4418`) for a KI-E25
+second stack. See `claude-code-telemetry.env.example` for the full set.
+
+> The **Span-derived stage latency p90** panel is live-only: the exporter pushes spans to the
+> collector only for events that arrive **while it is running** (historical events replay as
+> `factory_*` metrics but are not re-pushed as spans — AD-13). The **Stage duration p95** panel is
+> the duration authority and always populates from the exporter's own histogram, stack-up or not.
+
 ## Permanence
 
 - `prometheus-data` / `grafana-data` are **named volumes** — they survive `docker compose down`

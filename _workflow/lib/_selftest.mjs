@@ -7,7 +7,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   emptyLedger, syncFromGraph, transition, foldResults, canTransition,
-  countByState, writeJsonAtomic, readJson, FORWARD,
+  countByState, writeJsonAtomic, readJson, unwrapResultEnvelope, FORWARD,
 } from './ledger.mjs';
 import { computeReady, waitingOnDeps } from './graph.mjs';
 import { isFactoryWorktreePath } from './worktree.mjs';
@@ -28,6 +28,8 @@ import { classifyLine as loClassify, firstLexeme as loLexeme, findLeftovers } fr
 import { splitAcceptanceClauses } from './acceptance.mjs';
 import { dissentersFrom, roleForGateKey, recoveryTransitions, recoveryFoldSkeleton, priorCycleOf } from './recover.mjs';
 import { extractHeadings, buildDocMap, readRoleBriefs } from './promptpack.mjs';
+import { githubIssueToItem, markdownChecklistToItems, extractSection, severityFromLabels, themeFromLabels, ingestReport } from './ingest.mjs';
+import { costTelemetryReady } from './preflight.mjs';
 import { fileURLToPath } from 'node:url';
 
 let pass = 0, fail = 0;
@@ -600,6 +602,7 @@ try {
   eq(by['SMOKE-SCOPEFLAG'] && by['SMOKE-SCOPEFLAG'].toState, 'CLOSED', 'KI-L57: an APPROVED gate with a stray scopeViolation flag does NOT hard-stop the item');
   ok(by['SMOKE-SCOPEFLAG'] && by['SMOKE-SCOPEFLAG'].gateDetails && by['SMOKE-SCOPEFLAG'].gateDetails['gate:developer'] && by['SMOKE-SCOPEFLAG'].gateDetails['gate:developer'].scopeViolationIgnored === true, 'KI-L57: the inconsistent flag is preserved on gateDetails for the audit trail');
   eq(by['SMOKE-SCOPESTOP'] && by['SMOKE-SCOPESTOP'].toState, 'BLOCKED', 'KI-L57: a CHANGES_REQUIRED gate with scopeViolation still hard-stops (genuine scope-stop path intact)');
+  ok(String((by['SMOKE-SCOPESTOP'] && by['SMOKE-SCOPESTOP'].note) || '').includes('gate headline: stub genuine red-line'), 'KI-E30 (review fix): the flagging gate headline reaches the queue-visible block note');
   eq(calls.filter((c) => c.label.endsWith(':checkpoint')).length, 6, 'exec-smoke: every item result checkpointed via a haiku write agent (KI-L40)');
 }
 
@@ -694,6 +697,45 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
   // driver wiring pin: group carries the guard + the escape flag
   const dsrc = readFileSync(new URL('../driver.mjs', import.meta.url), 'utf8');
   ok(dsrc.includes('force-dirty-overlap') && dsrc.includes('dirtyMainPaths(REPO_ROOT)'), 'KI-E14: cmdGroup wires the dirty-overlap guard with a --force-dirty-overlap escape');
+}
+
+// KI-E35 (review fix): splitDriftByStatus — behavioral, throwaway real-git repo: only COMMITTED drift
+// reads as human delivery; an uncommitted edit AND an untracked stray (the live ITEM-H5 shape,
+// invisible to `git diff HEAD`) both stay in the contamination bucket.
+{
+  const { splitDriftByStatus } = await import('./mainguard.mjs');
+  const { mkdtempSync: mk35, writeFileSync: wf35, rmSync: rm35 } = await import('node:fs');
+  const root35 = mk35(join(tmpdir(), 'e35split-'));
+  const g35 = (...a) => execFileSync('git', ['-C', root35, ...a], { encoding: 'utf8' });
+  g35('init', '-q');
+  wf35(join(root35, 'committed.txt'), 'v1');
+  wf35(join(root35, 'modified.txt'), 'v1');
+  g35('add', '.');
+  g35('-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-q', '-m', 'base', '--no-gpg-sign', '--no-verify');
+  wf35(join(root35, 'committed.txt'), 'v2');
+  g35('add', 'committed.txt');
+  g35('-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-q', '-m', 'human delivery', '--no-gpg-sign', '--no-verify');
+  wf35(join(root35, 'modified.txt'), 'v2');
+  wf35(join(root35, 'untracked-new.txt'), 'stray');
+  const s35 = splitDriftByStatus(root35, [{ file: 'committed.txt' }, { file: 'modified.txt' }, { file: 'untracked-new.txt' }]);
+  eq(s35.committed.map((d) => d.file), ['committed.txt'], 'KI-E35: committed drift classifies as human delivery');
+  eq(s35.dirty.map((d) => d.file), ['modified.txt', 'untracked-new.txt'], 'KI-E35: an uncommitted edit AND an untracked stray both classify as contamination (review fix)');
+  rm35(root35, { recursive: true, force: true });
+}
+
+// KI-E36 (review fix): parkedAtMs + allCommittedAfter — the delivered-in-HEAD date logic, pure.
+{
+  const { parkedAtMs, allCommittedAfter } = await import('./ledger.mjs');
+  const rowP = { state: 'BLOCKED', updatedAt: '2026-07-24T12:00:00Z', history: [{ from: null, to: 'READY', at: '2026-07-01T00:00:00Z' }, { from: 'READY', to: 'BLOCKED', at: '2026-07-10T00:00:00Z' }] };
+  eq(parkedAtMs(rowP), Date.parse('2026-07-10T00:00:00Z'), 'KI-E36: park baseline = the history entry that ENTERED the current state, not updatedAt');
+  eq(parkedAtMs({ state: 'ESCALATED', updatedAt: '2026-07-24T12:00:00Z' }), Date.parse('2026-07-24T12:00:00Z'), 'KI-E36: no matching history -> updatedAt fallback');
+  eq(parkedAtMs({ state: 'BLOCKED' }), null, 'KI-E36: no usable timestamp -> null (hint suppressed)');
+  const iso36 = { 'a.cs': '2026-07-11T00:00:00Z', 'b.cs': '2026-07-12T00:00:00Z', 'never.cs': '' };
+  const lk36 = (f) => iso36[f];
+  ok(allCommittedAfter(['a.cs', 'b.cs'], Date.parse('2026-07-10T00:00:00Z'), lk36) === true, 'KI-E36: every touch-set file newer than the park -> hint fires');
+  ok(allCommittedAfter(['a.cs', 'never.cs'], Date.parse('2026-07-10T00:00:00Z'), lk36) === false, 'KI-E36: a never-committed file suppresses the hint');
+  ok(allCommittedAfter([], Date.parse('2026-07-10T00:00:00Z'), lk36) === false, 'KI-E36: an empty touch-set never hints');
+  ok(allCommittedAfter(['a.cs'], null, lk36) === false, 'KI-E36: an unknown park time never hints');
 }
 
 // KI-D12 refinement (2026-07-20): `placeholder`-lexeme hits are pruned from files whose OWN added
@@ -1020,6 +1062,14 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
   ok(readFileSync(new URL('../../agents/review-edgecase.md', import.meta.url), 'utf8').includes('EARLY POSITION (KI-E12'), 'KI-E12: edge-case brief carries the early-position contract');
   ok(readFileSync(new URL('../../agents/marker-probe.md', import.meta.url), 'utf8').includes('marker-probe (KI-E10)'), 'KI-E10: marker-probe brief exists');
   ok(readFileSync(new URL('../../agents/fixer.md', import.meta.url), 'utf8').includes('DOC-CLAIM SELF-CHECK (KI-E11)'), 'KI-E11: fixer card carries the claims self-check');
+  ok(readFileSync(new URL('../../agents/test-author.md', import.meta.url), 'utf8').includes('REAL-SHAPE SEEDING (KI-E38'), 'KI-E38: test-author brief carries the real-shape seeding rule');
+  ok(readFileSync(new URL('../../agents/review-testreview.md', import.meta.url), 'utf8').includes('Seed-shape completeness (KI-E38'), 'KI-E38: test-review brief carries the seed-shape completeness lens');
+  const ta38 = readFileSync(new URL('../../agents/test-author.md', import.meta.url), 'utf8');
+  ok(ta38.indexOf('REAL-SHAPE SEEDING (KI-E38') < ta38.indexOf('### REAL-INFRA TESTS'), 'KI-E38 (review fix): the seeding rule is UNCONDITIONAL — it lives before/outside the REAL-INFRA-only section');
+  const compose39 = readFileSync(new URL('../../telemetry/compose-profile.example.yaml', import.meta.url), 'utf8');
+  ok(!/^\s*container_name\s*:/m.test(compose39), 'KI-E39: the host-compose profile carries NO container_name key (the KI-E25 collision class stays dead)');
+  ok(compose39.includes('- exporter') && compose39.includes('- otel-collector') && compose39.includes('- prometheus'), 'KI-E39: the three aliases the stock configs resolve are declared');
+  ok((compose39.match(/profiles:/g) || []).length === 4, 'KI-E39: all four services are gated behind the factory profile');
 }
 
 // KI-D12: LeftoverScan — the deterministic detector + the factory-side probe wiring.
@@ -1155,15 +1205,43 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
   eq(roleForGateKey('probe:leftover-scan'), null, 'KI-E20: probe keys have no re-gate role');
   eq(recoveryTransitions('FAILED')[0], 'CLAIMED', 'KI-E20: FAILED recovery walks the full chain from CLAIMED');
   eq(recoveryTransitions('ESCALATED'), ['CLOSED'], 'KI-E20: ESCALATED recovery is the single CLOSED hop (KI-L62)');
+  eq(recoveryTransitions('BLOCKED')[0], 'CLAIMED', 'KI-E34: BLOCKED recovery (post-reset, from READY) walks the full chain from CLAIMED');
+  eq(recoveryTransitions('BLOCKED').length, 10, 'KI-E34: the BLOCKED recovery chain is the full 10-hop re-entry');
   eq(priorCycleOf({ resultId: 'X-1#46' }, 9), 46, 'KI-E20: recovery cycle parsed from the prior checkpoint');
   eq(priorCycleOf(null, 9), 9, 'KI-E20: no checkpoint -> fallback cycle');
   const sk = recoveryFoldSkeleton('X-1', { state: 'FAILED', worktree: 'wt', branch: 'b' }, { codeChange: true, needsRealInfra: false, rootCauseFiles: ['a.cs'], integrateRaw: true, resultId: 'X-1#46' }, 46);
   eq(sk.resultId, 'X-1#46r', 'KI-E20: skeleton resultId is #<cycle>r');
   eq(sk.attemptsDelta, 0, 'KI-E20: a recovery consumes no retry budget');
   ok(sk.codeChange === true && sk.integrateRaw === true && sk.transitions.length === 10, 'KI-E20: machine-evidence flags carry over; the FAILED chain has 10 hops');
+  ok(String(recoveryFoldSkeleton('X-0', { state: 'BLOCKED' }, null, 3).codeChange).startsWith('<FILL'), 'KI-E34 (review fix): a prior-less skeleton FILL-prompts codeChange — never silently the no-evidence doc/config path');
   const dsrc20 = readFileSync(join(import.meta.dirname, '..', 'driver.mjs'), 'utf8');
   ok(dsrc20.includes("case 'recover'") && dsrc20.includes('recovery_prepared') && dsrc20.includes('mutation-proof.txt'), 'KI-E20: driver wires recover + telemetry + the evidence contract');
   ok(dsrc20.includes("case 'decisions-digest'") && dsrc20.includes('Rule-together bundles'), 'KI-E24: driver wires the ranked owner-decision digest');
+  ok(dsrc20.includes("'FAILED', 'ESCALATED', 'BLOCKED'"), 'KI-E34: cmdRecover accepts BLOCKED (owner-ruling recovery)');
+  ok(dsrc20.includes('COMMITTED DELIVERY') && dsrc20.includes('MAIN-TREE CONTAMINATION'), 'KI-E35: fold splits human-committed delivery from agent contamination');
+  ok(dsrc20.includes('possibly DELIVERED in HEAD (KI-E36)'), 'KI-E36: escalations queue carries the delivered-in-HEAD hint');
+  ok((dsrc20.match(/deliveredInHeadHint\(/g) || []).length >= 3, 'KI-E36 (review fix): the delivered-in-HEAD hint renders in BOTH the queue and the decisions-digest');
+  ok(dsrc20.includes("['compose', '-p', p.Name, 'down', '-v', '--remove-orphans']") && dsrc20.includes('strayComposeProjects(parseComposeLs(raw), wtRoot)') && dsrc20.includes('abs(cfg.paths.worktreesState)'), 'KI-E37: gc downs only compose projects under the CONFIGURED worktrees root (review fix)');
+}
+
+// KI-E37 (review fix): compose-ls parsing + the stray filter — behavioral (pure, no docker).
+{
+  const { parseComposeLs, strayComposeProjects } = await import('./worktree.mjs');
+  eq(parseComposeLs(''), [], 'KI-E37: blank compose-ls output -> no projects');
+  eq(parseComposeLs('[{"Name":"a","ConfigFiles":"/x/a.yml"}]').length, 1, 'KI-E37: JSON-array shape parses');
+  eq(parseComposeLs('{"Name":"a"}\n{"Name":"b"}').length, 2, 'KI-E37: NDJSON shape parses');
+  eq(parseComposeLs('{"Name":"solo"}').length, 1, 'KI-E37: a lone object is wrapped');
+  const WT37 = '/repo/_f/state/worktrees';
+  const strays37 = strayComposeProjects([
+    { Name: 'wt', ConfigFiles: WT37 + '/ID-1/docker-compose.yml' },
+    { Name: 'sibling', ConfigFiles: WT37 + '-archive/x/docker-compose.yml' },
+    { Name: 'hybrid', ConfigFiles: '/host/docker-compose.yml,' + WT37 + '/ID-2/override.yml' },
+    { Name: 'host', ConfigFiles: '/host/docker-compose.yml' },
+    { Name: 'multiwt', ConfigFiles: WT37 + '/ID-3/a.yml, ' + WT37 + '/ID-3/b.yml' },
+  ], WT37);
+  eq(strays37.map((p) => p.Name), ['wt', 'multiwt'], 'KI-E37: EVERY config must sit under the ANCHORED worktrees root — sibling dirs + hybrid host projects never match (review fix)');
+  eq(strayComposeProjects([{ Name: 'w', ConfigFiles: WT37 + '/ID/x.yml' }], WT37 + '/').length, 1, 'KI-E37: trailing-separator root normalizes');
+  eq(strayComposeProjects(null, WT37).length, 0, 'KI-E37: null projects -> empty');
 }
 
 // KI-E22: acceptance-surface lint (the KI-E16 generalization) — pure heuristic over injected IO.
@@ -1180,6 +1258,26 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
   ok(dsrc22.includes('ACCEPT-SURFACE') && dsrc22.includes('KI-E22 WARN'), 'KI-E22: graph-audit reports + group-time advisory warn wired');
   ok(dsrc22.includes('ledger-path append(s) (KI-E16)'), 'KI-E16: graph-audit --fix appends the ledger path for shared-file gaps');
   ok(dsrc22.includes('SWEEP CANDIDATE (KI-E21)'), 'KI-E21: suggest recommends the sweep channel for large homogeneous clusters');
+
+  // KI-E32: a token in a reference / citation / exclusion context is NOT flagged as a missing edit target
+  eq(acceptanceSurfaceGaps({ target: 'SvcA', acceptance: 'A new endpoint modeled on the existing ItemsController for parity.', files: [] }, io22).length, 0, 'KI-E32: "modeled on X" is a reference, not a gap');
+  eq(acceptanceSurfaceGaps({ target: 'SvcA', acceptance: 'Uses the same chain OrdersController uses today.', files: [] }, io22).length, 0, 'KI-E32: trailing "X uses" reads as a reference, not a gap');
+  eq(acceptanceSurfaceGaps({ target: 'SvcA', acceptance: 'ResolveThing at doc/data-flows/SvcA.md:42 explains it.', files: ['SvcA/README.md'] }, io22).length, 0, 'KI-E32: a File:line citation is a reference, not a gap');
+  eq(acceptanceSurfaceGaps({ target: 'SvcA', acceptance: 'Do NOT touch OrdersController; leave it alone.', files: [] }, io22).length, 0, 'KI-E32: "do NOT touch X" exclusion is not a gap');
+  // …but an ACTIVELY-named edit target still surfaces (the heuristic stays conservative)
+  eq(acceptanceSurfaceGaps({ target: 'SvcA', acceptance: 'ItemsController clamps page before querying.', files: [] }, io22).map((g) => g.resolved), ['SvcA/src/Api/ItemsController.cs'], 'KI-E32: an actively-named surface is still a gap (no over-suppression)');
+}
+
+// KI-E31: the fold path accepts the Workflow harness envelope directly
+{
+  const payload = { mode: 'run', cycle: 3, results: [{ id: 'WI-A', toState: 'CLOSED' }] };
+  eq(unwrapResultEnvelope({ summary: 's', agentCount: 4, logs: [], result: payload }), payload, 'KI-E31: {…,result:{…}} envelope unwraps to the fold payload');
+  eq(unwrapResultEnvelope(payload), payload, 'KI-E31: a direct results object passes through unchanged');
+  const arr = [{ id: 'WI-A', toState: 'CLOSED' }];
+  eq(unwrapResultEnvelope(arr), arr, 'KI-E31: a bare results array passes through unchanged');
+  // a business object that merely has a `.result` field (not the Workflow envelope) is NOT unwrapped
+  const notEnv = { result: { verdict: 'ok' }, results: [{ id: 'X' }] };
+  eq(unwrapResultEnvelope(notEnv), notEnv, 'KI-E31: an object already carrying .results is not unwrapped (backward-compatible)');
 }
 
 // KI-E18/KI-E23 exec-smoke: the acceptance-scan stage runs pre-band — a gap triggers ONE bounded
@@ -1218,6 +1316,63 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
   eq(d2 && d2.toState, 'FAILED', 'KI-E18 smoke: a persistent gap FAILS pre-band');
   ok(String((d2 && d2.note) || '').startsWith('acceptance-scan (KI-E18)'), 'KI-E18 smoke: the fail note carries the clause-level feedback');
   ok(d2 && d2.gateDetails && d2.gateDetails['probe:acceptance-scan'] && d2.gateDetails['probe:acceptance-scan'].findings.length === 1, 'KI-E18 smoke: gateDetails carry the gap findings for feedback.md');
+}
+
+// ---- KI-E27: multi-source ingestion mappers -------------------------------------------------
+{
+  // severity + theme from labels
+  eq(severityFromLabels([{ name: 'bug' }, { name: 'P1' }]), 'HIGH', 'ingest: P1 label -> HIGH');
+  eq(severityFromLabels(['critical']), 'CRITICAL', 'ingest: critical label -> CRITICAL');
+  eq(severityFromLabels([], 'LOW'), 'LOW', 'ingest: no label -> fallback severity');
+  eq(severityFromLabels([]), 'MEDIUM', 'ingest: no label, no fallback -> MEDIUM');
+  eq(themeFromLabels([{ name: 'security' }]), 'security', 'ingest: security label -> security theme (escalate routing)');
+  eq(themeFromLabels([{ name: 'CRM' }]), 'crm-link-integrity', 'ingest: CRM label -> crm-link-integrity theme');
+  eq(themeFromLabels([]), 'triage', 'ingest: unmatched label -> triage theme');
+
+  // extractSection pulls a markdown section, stops at the next same-or-shallower heading
+  const body = '## Summary\nx\n## Expected behavior\nClicking opens the record.\nSecond line.\n## Impact\ny';
+  eq(extractSection(body, ['expected behaviou?r']), 'Clicking opens the record.\nSecond line.', 'ingest: extractSection lifts the section body and stops at the next heading');
+  eq(extractSection(body, ['nonexistent']), null, 'ingest: extractSection returns null when the heading is absent');
+
+  // an issue WITH an acceptance section -> escalate/non-trivial, files[] empty, source stamped, never auto
+  const withAcc = githubIssueToItem(
+    { number: 1716, title: 'Open in CRM opens the activity', body, labels: [{ name: 'bug' }, { name: 'CRM' }] },
+    { repo: 'jooooel/seqaro', idPrefix: 'GH' });
+  eq(withAcc.id, 'GH-1716', 'ingest: github id is prefix + issue number');
+  eq(withAcc.autonomyTier, 'escalate', 'ingest: acceptance section found -> escalate (human confirms), never auto');
+  eq(withAcc.fixType, 'non-trivial', 'ingest: acceptance section found -> non-trivial');
+  eq(withAcc.theme, 'crm-link-integrity', 'ingest: theme routed from labels');
+  eq(withAcc.source, 'jooooel/seqaro#1716', 'ingest: source stamps repo#number');
+  eq(withAcc.files, [], 'ingest: files[] starts empty — the human authors the lock set');
+  ok(/^[A-Z0-9]+(-[A-Z0-9]+)+$/.test(withAcc.id), 'ingest: generated id is schema-valid');
+
+  // an issue WITHOUT an acceptance section -> blocked triage / owner-decision, with a triage ownerDecision
+  const noAcc = githubIssueToItem({ number: 42, title: 'Vague thing', body: 'no structure here', labels: [] }, { repo: 'o/r' });
+  eq(noAcc.autonomyTier, 'blocked', 'ingest: no acceptance section -> blocked triage (never auto-runs)');
+  eq(noAcc.fixType, 'owner-decision', 'ingest: no acceptance section -> owner-decision');
+  ok(!!noAcc.ownerDecision, 'ingest: triage item carries an ownerDecision prompt');
+  ok(!!noAcc.acceptance && !!noAcc.regressionTest, 'ingest: triage item still fills acceptance/regressionTest so merge-graph validation passes (as triage text)');
+
+  // markdown checklist -> one blocked item per unchecked box
+  const items = markdownChecklistToItems('- [ ] First task\n- [x] done already\nnot a task\n* [ ] Second task', { idPrefix: 'BL' });
+  eq(items.length, 3, 'ingest: markdown picks up every checklist line (checked or not)');
+  eq(items[0].id, 'BL-1', 'ingest: markdown id is prefix + 1-based index');
+  eq(items.every((i) => i.autonomyTier === 'blocked'), true, 'ingest: markdown items are all blocked triage');
+
+  // report split
+  const rep = ingestReport([withAcc, noAcc, ...items]);
+  eq(rep.total, 5, 'ingest: report totals every item');
+  eq(rep.escalate, 1, 'ingest: report counts the one escalate item');
+  eq(rep.blocked, 4, 'ingest: report counts the blocked-triage items');
+}
+
+// KI-E33: cost-telemetry readiness probe (pure over injected env)
+{
+  eq(costTelemetryReady({ CLAUDE_CODE_ENABLE_TELEMETRY: '1', OTEL_EXPORTER_OTLP_ENDPOINT: 'http://localhost:4318' }).ready, true, 'KI-E33: enable=1 + endpoint set -> ready');
+  eq(costTelemetryReady({ OTEL_EXPORTER_OTLP_ENDPOINT: 'http://localhost:4318' }).ready, false, 'KI-E33: no CLAUDE_CODE_ENABLE_TELEMETRY -> not gathered');
+  eq(costTelemetryReady({ CLAUDE_CODE_ENABLE_TELEMETRY: '1' }).ready, false, 'KI-E33: no OTLP endpoint -> not gathered');
+  eq(costTelemetryReady({ FACTORY_TELEMETRY: '0', CLAUDE_CODE_ENABLE_TELEMETRY: '1', OTEL_EXPORTER_OTLP_ENDPOINT: 'x' }).ready, false, 'KI-E33: FACTORY_TELEMETRY=0 disables regardless');
+  ok(/telemetry\/claude-code-telemetry\.env\.example|CLAUDE_CODE_ENABLE_TELEMETRY/.test(readFileSync(join(import.meta.dirname, '..', 'driver.mjs'), 'utf8')), 'KI-E33: driver preflight surfaces the cost-telemetry cue');
 }
 
 console.log(`\nself-test: ${pass} passed, ${fail} failed`);
