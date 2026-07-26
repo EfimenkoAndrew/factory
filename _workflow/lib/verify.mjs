@@ -62,6 +62,21 @@ export function verdictFromParse(p, baselineFailures) {
   return { pass: true, reason: 'machine evidence: build clean, tests green' };
 }
 
+// KI-E43 — integrate/verify baseline parity. `r.baselineFailures` is the RUN-reported environmental
+// baseline (RED-stage capture preferred, verify-stage fallback); `baseline-raw.txt` is the DISK
+// transcript of the pre-fix full-suite run (build-test.sh suite teed at RED time — auditable, and it
+// survives a killed run). The effective baseline is the LARGER of the two counts: a runner that
+// under-reported (the cycle-47 ITEM-H15 false regression — the LIGHT-band verify skips the full
+// suite, so baselineFailures folded empty while integrate's full suite saw 6 pre-existing
+// Docker-unavailable Testcontainers failures) is corrected by its own transcript; a transcript-less
+// run keeps the reported array exactly as before. This is NOT a general weakening of the override:
+// the count still only OFFSETS pre-existing failures — any failure beyond it stays a regression.
+export function effectiveBaseline(baselineArr, baselineParse) {
+  const reported = (Array.isArray(baselineArr) && baselineArr.length) || 0
+  const fromDisk = (baselineParse && baselineParse.suite && typeof baselineParse.suite.failed === 'number' && baselineParse.suite.failed > 0) ? baselineParse.suite.failed : 0
+  return Math.max(reported, fromDisk)
+}
+
 // P1 — the RED proof marker. The test-author tees the PRE-FIX run; `FACTORY::RED::<exit>` with a NON-ZERO
 // exit proves the regression test genuinely fails on old code (non-vacuous). hasData=false => no red
 // transcript at all (the driver FAILs a code item that produced none — a vacuous test is the silent way a

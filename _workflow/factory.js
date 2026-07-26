@@ -63,7 +63,7 @@ const PLAN_SCHEMA = { type: 'object', additionalProperties: false, required: ['r
 // KI-L37: verificationOnly (reFix only) — the test-author attests every prior finding is already
 // addressed in the CURRENT tree (or explicitly out of scope) and no NEW red is possible; the item
 // skips the fixer and proceeds to verify + gates on the standing prior-round red proof.
-const TEST_SCHEMA = { type: 'object', additionalProperties: false, required: ['red', 'note'], properties: { red: { type: 'boolean' }, verificationOnly: { type: 'boolean' }, testFiles: { type: 'array', items: { type: 'string' } }, runCmd: { type: 'string' }, evidence: { type: 'string' }, note: { type: 'string' } } }
+const TEST_SCHEMA = { type: 'object', additionalProperties: false, required: ['red', 'note'], properties: { red: { type: 'boolean' }, verificationOnly: { type: 'boolean' }, testFiles: { type: 'array', items: { type: 'string' } }, runCmd: { type: 'string' }, baselineFailures: { type: 'array', items: { type: 'string' } }, evidence: { type: 'string' }, note: { type: 'string' } } }
 const FIX_SCHEMA = { type: 'object', additionalProperties: false, required: ['applied', 'scopeStop', 'summary'], properties: { applied: { type: 'boolean' }, filesChanged: { type: 'array', items: { type: 'string' } }, summary: { type: 'string' }, scopeStop: { type: 'boolean' }, divergence: { type: ['string', 'null'] }, note: { type: 'string' } } }
 const STRARR = { type: 'array', items: { type: 'string' } }
 // KI-L28: build/targetedTest are VERDICTS — the lifecycle gate tests /^pass/i on the RETURNED field.
@@ -403,6 +403,7 @@ async function runItem(item) {
   const BT = 'bash ' + FDIR + '/verify/build-test.sh'
   const RAW = itemsDir(id) + '/verify-raw.txt'
   const PACKCMD = BT + ' pack ' + wtPath + ' ' + itemsDir(id) + '/review-pack.md'
+  const sln = item.solution || CFG.solution || (item.target + ' solution (e.g. ' + item.target + '/' + item.target + '.sln)') // per-item solution wins (multi-target groups); hoisted from the Verify stage for the KI-E43 RED-stage baseline brief
   // KI-E11 — deterministic phantom-path self-check, moved EARLY (fix/editorial time) from the fold-time
   // F2 WARN (cycle-39 ITEM-HI-11: fabricated `Api/Controllers/Support/` + a phantom consumer claim cost a
   // full FAILED review round). The fixer runs it BEFORE handing off; the fold's F2 WARN stays the backstop.
@@ -466,6 +467,12 @@ async function runItem(item) {
   // the driver re-greps it to prove the test is non-vacuous (genuinely fails on old code). A vacuous test that
   // passes on both old AND new code is the silent way a bad fix sails through — this closes it.
   const redHint = 'RED PROOF (mandatory): after writing the regression test, RUN it against the CURRENT unfixed worktree and TEE the raw output to ' + itemsDir(id) + '/verify-red-raw.txt (ABSOLUTE path — never a relative state/items/...). A .cs test MUST fail now (compile-or-assert red, non-zero exit); a grep/script assertion MUST show the defect present. Emit a marker line `FACTORY::RED::<exitcode>` into that file (non-zero for a .cs test). The driver re-greps it — a self-reported red=true without a failing transcript does NOT advance the item.'
+    // KI-E43 — the environmental full-suite baseline is capturable ONLY while the tree is still unfixed
+    // (post-fix, a fix-broken test would launder into the baseline). On a Docker-less host the integrate
+    // full suite WILL see pre-existing Docker-unavailable Testcontainers failures; with no baseline the
+    // deterministic fold override false-fails the item (cycle 47: ITEM-H15, 6 env failures vs
+    // baseline 0 — a 10/10-APPROVED item FAILED). Docker-present hosts skip the extra suite run (no cost).
+    + ' FULL-SUITE BASELINE (KI-E43): FIRST run `docker info >/dev/null 2>&1; echo exit=$?`. If it FAILS (non-zero — no Docker), the integrate stage\'s full suite will hit pre-existing Docker-unavailable failures that are NOT this fix\'s fault: capture the pre-fix baseline NOW, while the tree is still unfixed — run `' + BT + ' suite ' + sln + ' 2>&1 | tee ' + itemsDir(id) + '/baseline-raw.txt` (ABSOLUTE path) and return baselineFailures = the FAILING test names from that run (exclude your new regression test if it appears). If `docker info` SUCCEEDS, skip the baseline run and omit baselineFailures.'
   // P2: if the defect shape is real-DB-dependent (normalizer flag OR a concurrency/raw-SQL/constraint keyword),
   // the test MUST be Testcontainers-backed (an in-memory green will be REJECTED at fold). If it is a pure
   // query-LOGIC bug, an in-memory test is correct — do NOT force a container where the provider behaves identically.
@@ -509,7 +516,6 @@ async function runItem(item) {
 
   // 4. runner (independent build + green + suite)
   phase('Verify')
-  const sln = item.solution || CFG.solution || (item.target + ' solution (e.g. ' + item.target + '/' + item.target + '.sln)') // per-item solution wins (multi-target groups)
   // P10: codeChange counts the test the test-author ACTUALLY wrote — a doc/config item whose fix shipped a real
   // .cs regression test MUST still build + run it (a doc-skip must never bypass the independent build/green gate).
   const codeChange = filesHaveCs || (test && Array.isArray(test.testFiles) && test.testFiles.some(function (f) { return /\.cs$/.test(f) }))
@@ -544,7 +550,11 @@ async function runItem(item) {
       ? 'LIGHT code item — run EXACTLY these two commands (substitute only the touched test .csproj + the new test\'s filter), nothing hand-rolled: (1) `' + BT + ' build <touched .csproj> 2>&1 | tee -a ' + RAW + '` (2) `' + BT + ' filter <test .csproj> "<TestClassName>" 2>&1 | tee -a ' + RAW + '`. SKIP the full-solution build + full suite for speed. The FACTORY:: markers those commands emit into ' + RAW + ' ARE the machine evidence the fold requires — without them a green fix is overridden to FAILED.'
       : 'FULL code item — run EXACTLY these three commands (substitute only the test .csproj + filter): (1) `' + BT + ' build ' + sln + ' 2>&1 | tee -a ' + RAW + '` (2) `' + BT + ' filter <test .csproj> "<TestClassName>" 2>&1 | tee -a ' + RAW + '` (3) `' + BT + ' suite ' + sln + ' 2>&1 | tee -a ' + RAW + '`. The FACTORY:: markers in ' + RAW + ' ARE the machine evidence the fold requires.')) + claimsVerifyHint + packHint
   const realInfraHint = needsRealInfra ? ' REAL-INFRA MANDATORY (' + item.theme + '/' + item.severity + '): the targeted test MUST run against real Postgres/Redis via Testcontainers, NOT EF in-memory. Emit a machine marker line `FACTORY::REALINFRA::<kind>` (e.g. Testcontainers-Postgres) into verify-raw.txt ONLY when a real container actually started and the test bound to it; if Docker is unavailable set dockerAbsent=true and DO NOT emit the marker. The driver re-greps verify-raw.txt for that marker — a self-reported realInfraExercised without the marker does NOT close the item. GREP-ANCHORED SELF-REPORT (KI-E10): before returning, run `grep -c "FACTORY::REALINFRA::" ' + RAW + '` and set realInfraExercised STRICTLY from that output (>0 -> true, 0 -> false); quote the grep command + its output in evidence — never report the field from memory.' : ''
-  const verify = await call('runner', R.runner, VERIFY_SCHEMA, verifyHint + realInfraHint + (item.reFix ? ' RE-FIX: the PRIOR attempt\'s test file(s) are EXPECTED in this worktree alongside the new one — do NOT report them as debris; only flag genuine scratch/diagnostic/duplicate files.' : ''), 'Verify')
+  // KI-E50 — mid-band main-drift check: fold/resume detection ran HOURS after the write (cycle 48:
+  // 4/6 lanes wrote main mid-band). The runner runs the read-only driver check between verify and
+  // the gate band so drift is visible to the gates + checkpoint the moment it exists. Warn-only.
+  const mainCheckHint = ' MAIN-DRIFT CHECK (KI-E50): run `node ' + FDIR + '/_workflow/driver.mjs main-check ' + id + '` (read-only, never blocks you). If it prints a ⚠ MAIN-DRIFT line, copy that line VERBATIM into your note and do NOT edit/repair the main tree — the worktree stays your only edit surface; repair is operator judgment.'
+  const verify = await call('runner', R.runner, VERIFY_SCHEMA, verifyHint + realInfraHint + mainCheckHint + (item.reFix ? ' RE-FIX: the PRIOR attempt\'s test file(s) are EXPECTED in this worktree alongside the new one — do NOT report them as debris; only flag genuine scratch/diagnostic/duplicate files.' : ''), 'Verify')
   res.artifacts.verify = 'state/items/' + id + '/verify.json'
   if (!verify) { res.infraSuspect = true; return finish('FAILED', 'runner agent UNAVAILABLE (null after retries — possible infra/credit failure, NOT a quality verdict)') } // KI-L53
   if (!/^pass/i.test(String(verify.build))) return finish('FAILED', 'build failed: ' + (verify.evidence || ''))
@@ -598,9 +608,15 @@ async function runItem(item) {
       ? 'realInfra marker probed PRESENT on disk (runner self-report lagged its own artifact — KI-L44 class); fold grep remains the authority'
       : 'realInfra self-report not true — close/fail deferred to the driver fold-time FACTORY::REALINFRA:: marker grep'
   } else if (needsRealInfra) res.note = 'real-infra verified (' + (verify.realInfraKind || 'Testcontainers') + ')'
-  // Propagate the runner's environmental baseline so the driver's DETERMINISTIC fold-time check (KI-D3) does
+  // Propagate the environmental baseline so the driver's DETERMINISTIC fold-time check (KI-D3) does
   // not false-fail a legitimate pass on a deprived runner (build / targeted-test failures stay baseline-independent).
-  res.baselineFailures = Array.isArray(verify.baselineFailures) ? verify.baselineFailures : []
+  // KI-E43: the RED-stage capture (pre-fix full suite, teed to baseline-raw.txt) is the SOUND baseline —
+  // it cannot launder a fix-broken test; the verify-stage runner report stays the fallback (LIGHT-band
+  // verify skips the full suite, which is exactly how cycle 47 folded baselineFailures=[] against an
+  // integrate suite carrying 6 pre-existing Docker-unavailable failures).
+  res.baselineFailures = (test && Array.isArray(test.baselineFailures) && test.baselineFailures.length)
+    ? test.baselineFailures
+    : (Array.isArray(verify.baselineFailures) ? verify.baselineFailures : [])
   res.transitions.push('GREEN', 'BUILT', 'TESTED')
 
   // Editorial (Band C) — advisory, doc items only; applies doc fixes in the worktree, NEVER blocks.
@@ -892,7 +908,7 @@ async function runItem(item) {
   // 9. integrator — global green + hand-off (no mutating git)
   phase('Integrate')
   const integHint = codeChange
-    ? 'Solution: ' + sln + '. Run the GLOBAL regression build + full suite in the worktree — EXACTLY: `bash ' + FDIR + '/verify/build-test.sh build ' + sln + ' 2>&1 | tee -a ' + itemsDir(id) + '/integrate-raw.txt` then `bash ' + FDIR + '/verify/build-test.sh suite ' + sln + ' 2>&1 | tee -a ' + itemsDir(id) + '/integrate-raw.txt` (ABSOLUTE paths; the driver re-greps that file for the FACTORY::BUILD / FACTORY::SUITE markers — a self-reported globalGreen without the transcript does NOT integrate). regressionDelta = new failures beyond the verify-stage baseline. Do NOT stage/commit/merge.'
+    ? 'Solution: ' + sln + '. Run the GLOBAL regression build + full suite in the worktree — EXACTLY: `bash ' + FDIR + '/verify/build-test.sh build ' + sln + ' 2>&1 | tee -a ' + itemsDir(id) + '/integrate-raw.txt` then `bash ' + FDIR + '/verify/build-test.sh suite ' + sln + ' 2>&1 | tee -a ' + itemsDir(id) + '/integrate-raw.txt` (ABSOLUTE paths; the driver re-greps that file for the FACTORY::BUILD / FACTORY::SUITE markers — a self-reported globalGreen without the transcript does NOT integrate). regressionDelta = new failures beyond the recorded baseline (the RED-stage pre-fix full-suite capture in ' + itemsDir(id) + '/baseline-raw.txt when present — KI-E43 — else the verify-stage baseline). Do NOT stage/commit/merge.'
     : 'Solution: ' + sln + '. DOC/CONFIG item — no .cs changed; confirm the doc/config acceptance, report globalGreen=true, regressionDelta=0. Do NOT stage/commit/merge.'
   const integ = await call('integrator', R.integrator, INTEG_SCHEMA, integHint, 'Integrate')
   res.artifacts.integrate = 'state/items/' + id + '/integrate.md'

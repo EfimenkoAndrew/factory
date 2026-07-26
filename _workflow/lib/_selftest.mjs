@@ -14,7 +14,7 @@ import { isFactoryWorktreePath } from './worktree.mjs';
 import { makeLimiter, pool, retry } from './pool.mjs';
 import { loadRouting, resolve } from './router.mjs';
 import { conflictFor, lockedFiles } from './locks.mjs';
-import { parseVerifyRaw, verdictFromParse, debrisFiles, parseRedRaw, hasRealInfraMarker, touchedRootCause } from './verify.mjs';
+import { parseVerifyRaw, verdictFromParse, debrisFiles, parseRedRaw, hasRealInfraMarker, touchedRootCause, effectiveBaseline } from './verify.mjs';
 import { acquireLock, releaseLock } from './lock.mjs';
 import { checkRoutingDrift, buildFactoryRouting } from './routing-drift.mjs';
 import { changedFiles } from './worktree.mjs';
@@ -1072,6 +1072,31 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
   ok((compose39.match(/profiles:/g) || []).length === 4, 'KI-E39: all four services are gated behind the factory profile');
 }
 
+// KI-E40 (2026-07-24): gate-verdict vocabulary classifier + usage rendering. The report counted
+// only the literal APPROVED, so 100%-passing reaudit (code=ok…), adjudicator (UPHELD), regate
+// (CONFIRMED) and direct-recovery (converged-remedy…) rows rendered 0% — a poisoned quality
+// signal; and KI-E23 usage events were collected but never rendered anywhere.
+{
+  const T = await import('./telemetry.mjs');
+  ok(T.verdictOk('APPROVED') && T.verdictOk('UPHELD') && T.verdictOk('CONFIRMED'), 'KI-E40: literal ok verdicts classify ok');
+  ok(T.verdictOk('code=ok') && T.verdictOk('code=ok edge-case=ok security=ok'), 'KI-E40: reaudit key=ok families classify ok');
+  ok(T.verdictOk('converged-remedy (gate:developer + review:adversarial aligned)'), 'KI-E40: direct-recovery converged-remedy prose classifies ok');
+  ok(!T.verdictOk('CHANGES_REQUIRED') && !T.verdictOk('') && !T.verdictOk('code=ok security=fail') && !T.verdictOk('MYSTERY'), 'KI-E40: fail/unknown/mixed-key vocab classifies not-ok');
+  ok(!T.verdictOk('OVERRULED') && T.KNOWN_FAIL_VERDICT.test('OVERRULED'), 'KI-E40: adjudicator OVERRULED is known-fail (Ok-rate reads as dissent-upheld calibration), never unclassified');
+  const agg40 = T.aggregateEvents([
+    { event: 'item_folded', source: 'driver', item: 'A', cycle: 48, attrs: { toState: 'CLOSED', gates: { reaudit: 'code=ok security=ok', adjudicator: 'UPHELD', 'gate:qa': 'CHANGES_REQUIRED', 'gate:x': 'MYSTERY', 'gate:y': 'OVERRULED' } } },
+    { event: 'usage', source: 'driver', cycle: 48, attrs: { outputTokens: 12345, file: 'results-cycle-48.json' } },
+  ]);
+  eq(agg40.usage, [{ cycle: 48, file: 'results-cycle-48.json', outputTokens: 12345 }], 'KI-E40: usage events aggregate');
+  const md40 = T.renderTelemetryReport(agg40, { generatedAt: 'T', file: 'f' });
+  ok(md40.includes('| reaudit | 1 | 1 | 100% |') && md40.includes('| adjudicator | 1 | 1 | 100% |'), 'KI-E40: role ok-vocabularies count as Ok in the gate table');
+  ok(md40.includes('| gate:qa | 1 | 0 | 0% |'), 'KI-E40: CHANGES_REQUIRED still counts not-ok');
+  ok(md40.includes('Unclassified verdict vocabulary') && md40.includes('`MYSTERY`×1'), 'KI-E40: unknown vocabulary self-reports in the footnote');
+  ok(!md40.includes('`CHANGES_REQUIRED`×') && !md40.includes('`OVERRULED`×'), 'KI-E40: known-fail vocabulary is NOT flagged as unclassified');
+  ok(md40.includes('## Fold-time token usage') && md40.includes('12,345'), 'KI-E40: usage section renders token spend');
+  ok(md40.includes('late-failure spend'), 'KI-E40: failure-concentration reading note present');
+}
+
 // KI-D12: LeftoverScan — the deterministic detector + the factory-side probe wiring.
 {
   // detector: genuine deferrals HIT, sanctioned mechanisms + excluded paths + legit code do NOT.
@@ -1427,6 +1452,95 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
   eq(costTelemetryReady({ FACTORY_TELEMETRY: '0', CLAUDE_CODE_ENABLE_TELEMETRY: '1', OTEL_METRICS_EXPORTER: 'otlp', OTEL_EXPORTER_OTLP_ENDPOINT: 'x' }).ready, true, 'KI-E33 (review fix): FACTORY_TELEMETRY mutes only factory events — session cost telemetry is an independent plane');
   ok(/http\/protobuf/.test(costTelemetryReady({ CLAUDE_CODE_ENABLE_TELEMETRY: '1', OTEL_METRICS_EXPORTER: 'otlp', OTEL_EXPORTER_OTLP_ENDPOINT: 'x' }).note || ''), 'KI-E33 (review fix): the protocol-unset caution rides on ready (grpc default vs the :4318 HTTP collector)');
   ok(/telemetry\/claude-code-telemetry\.env\.example|CLAUDE_CODE_ENABLE_TELEMETRY/.test(readFileSync(join(import.meta.dirname, '..', 'driver.mjs'), 'utf8')), 'KI-E33: driver preflight surfaces the cost-telemetry cue');
+}
+
+// KI-E43: integrate/verify baseline parity — the effective baseline is the LARGER of the
+// run-reported array and the RED-time baseline-raw.txt transcript (pure; the cycle-47
+// ITEM-H15 false regression — 6 pre-existing Docker-unavailable failures vs baseline [] —
+// is the motivating case).
+{
+  eq(effectiveBaseline([], null), 0, 'KI-E43: no report + no transcript -> 0 (pre-KI-E43 behavior unchanged)');
+  eq(effectiveBaseline(['A', 'B'], null), 2, 'KI-E43: transcript-less run keeps the reported baseline');
+  eq(effectiveBaseline(undefined, null), 0, 'KI-E43: absent report array -> 0, never NaN');
+  eq(effectiveBaseline([], parseVerifyRaw('FACTORY::SUMMARY::suite exit=1 failed=6 passed=700 skipped=0')), 6, 'KI-E43: empty report + RED-time transcript with 6 env failures -> 6 (the ITEM-H15 cycle-47 shape)');
+  eq(effectiveBaseline(['A'], parseVerifyRaw('FACTORY::SUMMARY::suite exit=1 failed=6 passed=700 skipped=0')), 6, 'KI-E43: the larger of the two counts wins');
+  eq(effectiveBaseline(['A', 'B', 'C'], parseVerifyRaw('FACTORY::SUMMARY::suite exit=1 failed=1 passed=9')), 3, 'KI-E43: a bigger reported array is never shrunk by the transcript');
+  eq(effectiveBaseline([], parseVerifyRaw('no markers here')), 0, 'KI-E43: an unparseable baseline transcript contributes 0');
+  eq(effectiveBaseline([], parseVerifyRaw('FACTORY::SUMMARY::suite exit=0 failed=0 passed=10')), 0, 'KI-E43: a GREEN baseline transcript adds nothing — no free failure allowance');
+  const drvText43 = readFileSync(join(import.meta.dirname, '..', 'driver.mjs'), 'utf8');
+  const facText43 = readFileSync(join(import.meta.dirname, '..', 'factory.js'), 'utf8');
+  ok(/baseline-raw\.txt/.test(drvText43) && /effectiveBaseline\(/.test(drvText43), 'KI-E43: the fold override merges the RED-time baseline transcript');
+  ok(/FULL-SUITE BASELINE \(KI-E43\)/.test(facText43), 'KI-E43: the RED brief instructs the pre-fix baseline capture on Docker-less hosts');
+  ok(/test\.baselineFailures/.test(facText43), 'KI-E43: the checkpoint prefers the RED-stage baseline over the verify-stage report');
+}
+
+// KI-E41/E42/E44: killed-run relaunch hardening — main-guard at resume, artifact quarantine,
+// reconstruct usage passthrough (cycle-47 post-mortem engine fixes).
+{
+  const T42 = await import('./telemetry.mjs');
+  const junk = T42.nonCanonicalArtifacts(['RESULT.md', 'COMPLETION.md', 'notes.txt', 'plan.md', 'gate-developer.md', 'review-adversarial.md', 'feedback.md', 'result.json', 'verify-raw.txt', 'main-snapshot.json', 'baseline-raw.txt', 'review-pack.md', 'last-failure.md']);
+  eq(junk, ['RESULT.md', 'COMPLETION.md', 'notes.txt'], 'KI-E42: exactly the improvised artifacts classify non-canonical (the cycle-47 stray RESULT.md class); stage + control files never do');
+  eq(T42.nonCanonicalArtifacts([]), [], 'KI-E42: empty artifact dir -> nothing to quarantine');
+  const drvText42 = readFileSync(join(import.meta.dirname, '..', 'driver.mjs'), 'utf8');
+  ok(/resume --quarantine/.test(drvText42) && /flags\.quarantine/.test(drvText42), 'KI-E42: resume detects debris always, moves only on --quarantine');
+  ok(/MAIN-GUARD/.test(drvText42) && /KI-E41/.test(drvText42), 'KI-E41: resume diffs main-snapshot.json for relaunch candidates before printing the launch lines');
+  ok(/usage-tokens/.test(drvText42) && /KI-E44/.test(drvText42), 'KI-E44: reconstruct accepts --usage-tokens and stamps payload.usage for the fold emit');
+  ok(/gapsByItem/.test(drvText42) && /KI-E45/.test(drvText42), 'KI-E45: the claim-time main-snapshot unions files[] with the KI-E22 acceptance-resolved paths');
+}
+
+// KI-E46..E51 (2026-07-26): telemetry-driven effectiveness wave — direct-recovery classification
+// (the KPI undercounted the factory's dominant close path: 5 of 9 live recoveries read as plain
+// re-band closes), recovery folds out of the derived duration authority, band-split first-pass
+// KPI, agent event-vocabulary clamp + ts-paired agent durations, the mid-band main-drift check,
+// and the count-claim / test-comment briefs targeting the fix-introduced-defect class.
+{
+  const T = await import('./telemetry.mjs');
+  // KI-E46 — the classifier over every live recovery signature
+  ok(T.isRecoveryResultId('X#47r') && T.isRecoveryResultId('X#27r3'), 'KI-E46: #Nr and #NrK resultIds classify as recovery');
+  ok(!T.isRecoveryResultId('X#47') && !T.isRecoveryResultId('') && !T.isRecoveryResultId(null), 'KI-E46: plain #N / empty / null never classify');
+  ok(T.isDirectRecoveryFold({ gates: { 'direct-recovery': 'converged-remedy (x)' } }), 'KI-E46: legacy gates-map signature classifies');
+  ok(T.isDirectRecoveryFold({ note: 'direct-recovery, 4 delta re-gate rounds to convergence' }), 'KI-E46: scaffolded note prefix classifies (the live cycle-47r/48r shape)');
+  ok(T.isDirectRecoveryFold({ resultId: 'A#48r' }) && T.isDirectRecoveryFold({ direct: true }), 'KI-E46: emit-time resultId/direct stamps classify');
+  ok(!T.isDirectRecoveryFold({ note: 'closed clean; not a direct-recovery' }) && !T.isDirectRecoveryFold({}), 'KI-E46: a mid-note mention or empty attrs never classifies (prefix-anchored)');
+  // KI-E46 + KI-E48 end-to-end: a recovery close counts recovered (never first-pass); bands split
+  const agg46 = T.aggregateEvents([
+    { event: 'item_folded', source: 'driver', item: 'A', cycle: 47, attrs: { toState: 'FAILED', band: 'LIGHT', gates: { 'gate:qa': 'CHANGES_REQUIRED' } } },
+    { event: 'item_folded', source: 'driver', item: 'A', cycle: 47, attrs: { toState: 'CLOSED', band: 'LIGHT', note: 'direct-recovery (3 lenses converged)', gates: {} } },
+    { event: 'item_folded', source: 'driver', item: 'B', cycle: 48, attrs: { toState: 'CLOSED', band: 'LIGHT', gates: { 'gate:qa': 'APPROVED' } } },
+    { event: 'item_folded', source: 'driver', item: 'C', cycle: 49, attrs: { toState: 'CLOSED', band: 'FULL', resultId: 'C#49', gates: { 'gate:qa': 'APPROVED' } } },
+  ]);
+  eq(agg46.itemFolds['A'].map((f) => f.direct), [false, true], 'KI-E46: the scaffolded recovery fold classifies direct in aggregation');
+  const md46 = T.renderTelemetryReport(agg46, { generatedAt: 'T', file: 'f' });
+  ok(md46.includes('First-pass close rate (clean first fold / closed) | 2/3'), 'KI-E46: a recovery close is never first-pass');
+  ok(md46.includes('Direct-recovery rate (recovered closes / closed) | 1/3'), 'KI-E46: the scaffolded recovery close now counts in the KPI');
+  ok(md46.includes('| First-pass — FULL band (KI-E48) | 1/1 closed = 100% (1 folded) |'), 'KI-E48: FULL-band split row renders');
+  ok(md46.includes('| First-pass — LIGHT band (KI-E48) | 1/2 closed = 50% (2 folded) |'), 'KI-E48: LIGHT-band split row renders');
+  const aggLegacy = T.aggregateEvents([{ event: 'item_folded', source: 'driver', item: 'A', attrs: { toState: 'CLOSED', gates: {} } }]);
+  ok(!T.renderTelemetryReport(aggLegacy, { generatedAt: 'T', file: 'f' }).includes('KI-E48'), 'KI-E48: a pure-legacy (unstamped) stream renders no band rows');
+  // KI-E48 — ts-paired agent durations (agents never pass --durMs; the table was permanently empty)
+  const aggTs = T.aggregateEvents([
+    { event: 'stage_start', source: 'agent', item: 'A', role: 'fixer', stage: 'fix', ts: '2026-07-26T10:00:00.000Z' },
+    { event: 'stage_end', source: 'agent', item: 'A', role: 'fixer', stage: 'fix', ts: '2026-07-26T10:05:00.000Z' },
+    { event: 'stage_start', source: 'agent', item: 'B', role: 'runner', ts: '2026-07-26T10:00:00.000Z' },
+    { event: 'stage_end', source: 'agent', item: 'B', role: 'runner', ts: '2026-07-27T10:00:00.000Z' },
+  ]);
+  eq(aggTs.agentStages.fix, [300000], 'KI-E48: paired agent start/end ts derive a best-effort duration');
+  ok(!aggTs.agentStages.verify, 'KI-E48: a pair spanning the gap fence is dropped (dead-attempt start + relaunch end)');
+  // KI-E49 — the agent event-vocabulary clamp
+  eq(T.clampAgentEvent('stage_start'), 'stage_start', 'KI-E49: canonical events pass the clamp');
+  eq(T.clampAgentEvent('dummy_probe'), 'agent_note', 'KI-E49: a free-typed event clamps to agent_note (the live probe/dummy_probe/tool_use class)');
+  eq(T.clampAgentEvent(''), 'agent_note', 'KI-E49: empty clamps too (emit still requires --event upstream)');
+  // source contracts
+  const drv46 = readFileSync(join(import.meta.dirname, '..', 'driver.mjs'), 'utf8');
+  ok(/isRecoveryResultId\(r\.resultId\)/.test(drv46) && /KI-E47/.test(drv46), 'KI-E47: the fold derives no stage timeline for a recovery fold + stamps direct/resultId');
+  ok(/case 'main-check'/.test(drv46) && /KI-E50/.test(drv46), 'KI-E50: driver main-check command exists (read-only, warn-only)');
+  ok(!/MUTATING = new Set\(\[[^\]]*main-check/.test(drv46), 'KI-E50: main-check is NOT in the mutating set (no lock, no lease)');
+  const fac46 = readFileSync(join(import.meta.dirname, '..', 'factory.js'), 'utf8');
+  ok(/MAIN-DRIFT CHECK \(KI-E50\)/.test(fac46) && /main-check ' \+ id/.test(fac46), 'KI-E50: the runner verify hint carries the mid-band main-check command');
+  const emit46 = readFileSync(join(import.meta.dirname, '..', 'telemetry-emit.mjs'), 'utf8');
+  ok(/clampAgentEvent/.test(emit46) && /origEvent/.test(emit46), 'KI-E49: telemetry-emit clamps the vocabulary and preserves the original name');
+  ok(readFileSync(join(import.meta.dirname, '..', '..', 'agents', 'fixer.md'), 'utf8').includes('COUNT-CLAIM SELF-CHECK (KI-E51)'), 'KI-E51: fixer card carries the count-claim self-check');
+  ok(readFileSync(join(import.meta.dirname, '..', '..', 'agents', 'test-author.md'), 'utf8').includes('COMMENT POLICY (KI-E51)'), 'KI-E51: test-author card carries the test-comment policy');
 }
 
 console.log(`\nself-test: ${pass} passed, ${fail} failed`);

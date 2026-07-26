@@ -81,6 +81,18 @@ export function stageForArtifact(name) {
   return null;
 }
 
+// KI-E42 — killed-run artifact quarantine support. The canonical per-item artifact vocabulary is
+// exactly: the STAGE_ARTIFACTS filenames + the gate-*.md / review-*.md patterns (stageForArtifact)
+// + the driver-owned control files below. Anything ELSE left in state/items/<id>/ by a KILLED
+// attempt is agent improvisation and can mislead the relaunch's agents/reporters (cycle 47 live: a
+// stray RESULT.md claiming "false positive — already fixed, no action taken" from dead run #1 was
+// read mid-run #2; two gates burned findings on the debris). Pure classification over FILE names —
+// the driver owns directory filtering and the actual move (`resume --quarantine`).
+export const CONTROL_ARTIFACTS = ['feedback.md', 'last-failure.md', 'main-snapshot.json', 'review-pack.md', 'baseline-raw.txt'];
+export function nonCanonicalArtifacts(names) {
+  return (names || []).filter((n) => !stageForArtifact(n) && !CONTROL_ARTIFACTS.includes(n));
+}
+
 // ---- canonical stage vocabulary (AD-12) -----------------------------------------------------
 // ONE stage enum for every consumer. Agents emit --role (their exact brief name — they know it);
 // stage is DERIVED here, never free-typed by an LLM. normalizeStage() maps every legacy/loose
@@ -162,6 +174,50 @@ export function quantile(nums, q) {
   return s[Math.min(s.length - 1, Math.max(0, Math.ceil(q * s.length) - 1))];
 }
 
+// ---- gate-verdict vocabulary (KI-E40) -------------------------------------------------------
+// The fold's gates map carries role-specific ok-vocabularies: APPROVED (gates / review flows /
+// probes), UPHELD (adjudicator), CONFIRMED (adjudicator-regate), 'code=ok security=ok' key=ok
+// families (reaudit), 'converged-remedy …' prose (direct-recovery). The report previously
+// counted ONLY the literal APPROVED — rendering 100%-passing reaudit/adjudicator/regate/
+// direct-recovery rows as 0% and poisoning the quality signal. verdictOk() classifies; unknown
+// vocabulary counts not-ok AND is surfaced by the report footnote (self-reporting drift instead
+// of a silent miscount).
+export const KNOWN_FAIL_VERDICT = /^(CHANGES[_-]REQUIRED|REJECTED|REFUTED|OVERTURNED|OVERRULED|FAILED|BLOCKED)$/i;
+export function verdictOk(v) {
+  const s = String(v == null ? '' : v).trim();
+  if (!s) return false;
+  if (/^(APPROVED|UPHELD|CONFIRMED)$/i.test(s)) return true;
+  if (/^converged-remedy\b/i.test(s)) return true;
+  return /^[\w.-]+=ok(\s+[\w.-]+=ok)*$/i.test(s); // reaudit families — EVERY token must be key=ok
+}
+
+// ---- direct-recovery classification (KI-E46) ------------------------------------------------
+// The KI-E20 `recover` scaffold folds with resultId "<id>#<cycle>r" (also #Nr2, #Nr3 …) and a
+// note that STARTS with "direct-recovery"; older hand-rolled recovery folds carried a literal
+// 'direct-recovery' key in the gates map instead. The KPI previously recognized ONLY the
+// gates-map signature, so every scaffolded recovery close (5 of the 9 live recoveries) read as a
+// plain re-band close — under-counting the factory's DOMINANT close path (direct-recovery rate
+// rendered 14% vs 31% real). All live signatures classify now; the fold ALSO stamps attrs.direct
+// + attrs.resultId at emit time so future streams never need prose sniffing.
+export function isRecoveryResultId(rid) { return /#\d+r\d*$/i.test(String(rid || '')); }
+export function isDirectRecoveryFold(attrs) {
+  const a = attrs || {};
+  if (a.direct === true) return true;
+  if (a.gates && a.gates['direct-recovery'] !== undefined) return true;
+  if (isRecoveryResultId(a.resultId)) return true;
+  return /^direct-recovery\b/i.test(String(a.note || '').trim()); // prefix-anchored: a mid-note mention never classifies
+}
+
+// KI-E49 — agent event-vocabulary clamp. Agents free-typed --event names into the stream
+// (live: probe / dummy_probe / tool_use); the AD-10 agent seam emits exactly two canonical
+// events. Anything else becomes 'agent_note' (the original name is preserved by the caller in
+// attrs.origEvent) so the stream vocabulary stays bounded without losing the breadcrumb.
+export const AGENT_EVENTS = ['stage_start', 'stage_end'];
+export function clampAgentEvent(name) {
+  const n = String(name || '').trim();
+  return AGENT_EVENTS.includes(n) ? n : 'agent_note';
+}
+
 // KI-E13 gap-fence: a derived stage duration above this spans a dead gap between runs (cross-session
 // relaunch, overnight idle — the KI-E9 16.5h `plan` row), not real stage work. The fold stamps
 // attrs.gapSuspect at emit time; aggregation ALSO applies the threshold defensively so pre-fix
@@ -169,7 +225,7 @@ export function quantile(nums, q) {
 export const GAP_FENCE_MS = 4 * 3600 * 1000;
 
 export function aggregateEvents(events) {
-  const agg = { total: 0, byEvent: {}, bySource: {}, outcomes: {}, cycles: {}, gates: {}, stages: {}, agentStages: {}, models: {}, infraSuspect: 0, items: {}, itemFolds: {}, failedAt: {}, gapOutliers: [], agentPairs: {} };
+  const agg = { total: 0, byEvent: {}, bySource: {}, outcomes: {}, cycles: {}, gates: {}, stages: {}, agentStages: {}, models: {}, infraSuspect: 0, items: {}, itemFolds: {}, failedAt: {}, gapOutliers: [], agentPairs: {}, usage: [] };
   for (const e of events || []) {
     if (!e || typeof e !== 'object' || !e.event) continue;
     agg.total++;
@@ -185,8 +241,9 @@ export function aggregateEvents(events) {
       if (e.item) {
         agg.items[e.item] = st;
         // KI-E13 KPIs: the per-item fold sequence (stream order = chronological) with the
-        // direct-recovery signature (a 'direct-recovery' key in the fold's gates map).
-        (agg.itemFolds[e.item] = agg.itemFolds[e.item] || []).push({ st, direct: !!(e.attrs && e.attrs.gates && e.attrs.gates['direct-recovery']) });
+        // direct-recovery signature (KI-E46: emit stamp / gates key / #Nr resultId / note prefix)
+        // and the KI-E23b band stamp (KI-E48 band-split KPI).
+        (agg.itemFolds[e.item] = agg.itemFolds[e.item] || []).push({ st, direct: isDirectRecoveryFold(e.attrs), band: (e.attrs && e.attrs.band) || null });
       }
     }
     if (e.event === 'stage_end' && typeof e.durMs === 'number' && e.stage) {
@@ -199,12 +256,30 @@ export function aggregateEvents(events) {
         if (e.attrs && e.attrs.final === 'FAILED') agg.failedAt[e.stage] = (agg.failedAt[e.stage] || 0) + 1;
       } else (agg.agentStages[e.stage] = agg.agentStages[e.stage] || []).push(e.durMs);
     }
+    // KI-E40: fold-time usage events (KI-E23 emits one per folded results file) — collected so
+    // the report renders token spend instead of leaving it invisible in the raw stream.
+    if (e.event === 'usage' && e.attrs && typeof e.attrs.outputTokens === 'number') {
+      agg.usage.push({ cycle: e.cycle != null ? e.cycle : '?', file: e.attrs.file || '?', outputTokens: e.attrs.outputTokens });
+    }
     // KI-E13 liveness: pair agent stage_start/stage_end per item+role — an unmatched start is an
     // agent that died mid-stage (classifier-blocked / killed; the KI-D8 class), invisible before.
+    // KI-E48: the same pairing derives a best-effort agent-reported DURATION from the two ts
+    // stamps (agents never pass --durMs — they cannot know their own wall-clock), so the
+    // "agent-reported" table stops rendering permanently empty. Latest-start-wins (a retried
+    // stage measures the final attempt); gap-fenced; never evidentiary (AD-12 unchanged).
     if (e.source === 'agent' && (e.event === 'stage_start' || e.event === 'stage_end')) {
       const k = (e.item || '?') + ' :: ' + (e.role || e.stage || '?');
       const p = agg.agentPairs[k] = agg.agentPairs[k] || { starts: 0, ends: 0 };
-      if (e.event === 'stage_start') p.starts++; else p.ends++;
+      if (e.event === 'stage_start') { p.starts++; p.lastStartMs = Date.parse(e.ts) || undefined; }
+      else {
+        p.ends++;
+        if (typeof e.durMs !== 'number' && p.lastStartMs) {
+          const d = (Date.parse(e.ts) || 0) - p.lastStartMs;
+          const stage = normalizeStage(e.stage) || roleToStage(e.role);
+          if (stage && d > 0 && d <= GAP_FENCE_MS) (agg.agentStages[stage] = agg.agentStages[stage] || []).push(d);
+          p.lastStartMs = undefined;
+        }
+      }
     }
   }
   return agg;
@@ -220,11 +295,18 @@ export function renderTelemetryReport(agg, meta = {}) {
     const rows = Object.entries(obj).sort((a, b) => b[1] - a[1]).map(([k, v]) => `| ${k} | ${v} |`);
     return rows.length ? [`| ${ha} | ${hb} |`, '|---|---|', ...rows].join('\n') : '_none_';
   };
+  // KI-E40: classify per-role ok-vocabularies (APPROVED/UPHELD/CONFIRMED/key=ok/converged-remedy)
+  // instead of counting only the literal APPROVED; surface any vocabulary the classifier does not
+  // recognize so drift self-reports instead of silently reading as 0%.
   const gateRows = Object.entries(agg.gates).map(([g, vs]) => {
     const total = Object.values(vs).reduce((a, b) => a + b, 0);
-    const approved = vs.APPROVED || 0;
-    return `| ${g} | ${total} | ${approved} | ${total ? Math.round((approved / total) * 100) : 0}% |`;
+    const okN = Object.entries(vs).reduce((a, [k, n]) => a + (verdictOk(k) ? n : 0), 0);
+    return `| ${g} | ${total} | ${okN} | ${total ? Math.round((okN / total) * 100) : 0}% |`;
   });
+  const unclassified = [];
+  for (const [g, vs] of Object.entries(agg.gates)) {
+    for (const [k, n] of Object.entries(vs)) if (!verdictOk(k) && !KNOWN_FAIL_VERDICT.test(String(k).trim())) unclassified.push(`${g} → \`${k}\`×${n}`);
+  }
   const cycleRows = Object.entries(agg.cycles).sort((a, b) => Number(a[0]) - Number(b[0]))
     .map(([c, v]) => `| ${c} | ${v.folded} | ${v.closed} |`);
   // KI-E13 KPIs — the two factory-quality headline numbers, from the per-item fold sequences:
@@ -235,12 +317,26 @@ export function renderTelemetryReport(agg, meta = {}) {
   const firstPass = closedItems.filter((fs) => fs[0].st === 'CLOSED' && !fs[0].direct);
   const recovered = closedItems.filter((fs) => fs.some((f) => f.st === 'CLOSED' && f.direct));
   const pct = (a, b) => b ? Math.round((a / b) * 100) + '%' : 'n/a';
+  // KI-E48 — band-split first-pass (the §A.34 watch-list measurement): an item is keyed by the
+  // band of its FIRST fold (the run whose outcome defines first-pass). Rows render only once
+  // band stamps exist in the stream (KI-E23b, cycle 47+); a pure-legacy stream stays unchanged.
+  const bandOf = (fs) => (fs[0] && fs[0].band) || '(unstamped)';
+  const bandRows = [];
+  const bandNames = [...new Set(perItem.map(bandOf))];
+  if (bandNames.some((b) => b !== '(unstamped)')) {
+    for (const b of bandNames.sort()) {
+      const closedB = closedItems.filter((fs) => bandOf(fs) === b);
+      const fpB = closedB.filter((fs) => fs[0].st === 'CLOSED' && !fs[0].direct);
+      bandRows.push(`| First-pass — ${b} band (KI-E48) | ${fpB.length}/${closedB.length} closed = ${pct(fpB.length, closedB.length)} (${perItem.filter((fs) => bandOf(fs) === b).length} folded) |`);
+    }
+  }
   const kpi = [
     '| KPI | Value |', '|---|---|',
     `| Items folded (unique) | ${perItem.length} |`,
     `| Items closed | ${closedItems.length} |`,
     `| First-pass close rate (clean first fold / closed) | ${firstPass.length}/${closedItems.length} = ${pct(firstPass.length, closedItems.length)} |`,
     `| Direct-recovery rate (recovered closes / closed) | ${recovered.length}/${closedItems.length} = ${pct(recovered.length, closedItems.length)} |`,
+    ...bandRows,
   ].join('\n');
   const failedRows = Object.entries(agg.failedAt || {}).sort((a, b) => b[1] - a[1]).map(([s, n]) => `| ${s} | ${n} |`);
   const gapRows = (agg.gapOutliers || []).map((g) => `| ${g.item} | ${g.stage} | ${(g.durMs / 3600000).toFixed(1)}h |`);
@@ -261,11 +357,19 @@ export function renderTelemetryReport(agg, meta = {}) {
     '## Gap-fenced duration outliers (excluded from percentiles — dead time between runs, KI-E13)', '',
     gapRows.length ? ['| Item | Stage | Wall |', '|---|---|---|', ...gapRows].join('\n') : '_none_', '',
     '## Failure concentration (final stage before a FAILED fold)', '',
+    '_Reading (KI-E40): `checkpoint` here means the item ran the FULL band and wrote its checkpoint before the FAILED verdict — late-failure spend, not a checkpoint crash. An agent that DIED mid-checkpoint shows under Unmatched agent stage_starts (KI-D8) instead._', '',
     failedRows.length ? ['| Stage | FAILED folds ending here |', '|---|---|', ...failedRows].join('\n') : '_none_', '',
     '## Stage durations — agent-reported (best-effort, non-evidentiary)', '', stageTable(agg.agentStages), '',
     '## Unmatched agent stage_starts (agent died mid-stage — blocked/killed, KI-D8 class)', '',
     unmatched.length ? ['| Item :: role | starts | ends |', '|---|---|---|', ...unmatched].join('\n') : '_none_', '',
-    '## Gate verdicts', '', gateRows.length ? ['| Gate | Runs | Approved | Rate |', '|---|---|---|---|', ...gateRows].join('\n') : '_none_', '',
+    '## Gate verdicts', '', gateRows.length ? ['| Gate | Runs | Ok | Rate |', '|---|---|---|---|', ...gateRows].join('\n') : '_none_', '',
+    unclassified.length ? `_Unclassified verdict vocabulary (counted not-ok — extend verdictOk() if these are passes, KI-E40): ${unclassified.join(', ')}_\n` : '',
+    '## Fold-time token usage (KI-E23 usage events)', '',
+    (agg.usage || []).length
+      ? ['| Cycle | Results file | Output tokens |', '|---|---|---|',
+        ...agg.usage.map((u) => `| ${u.cycle} | ${u.file} | ${u.outputTokens.toLocaleString('en-US')} |`),
+        `| **total** | | **${agg.usage.reduce((a, u) => a + u.outputTokens, 0).toLocaleString('en-US')}** |`].join('\n')
+      : '_none — usage events land on folds from KI-E23 onward_', '',
     '## Agent-call volume by model (from fold cost)', '', kv(agg.models, 'Model', 'Calls'), '',
   ].join('\n');
 }

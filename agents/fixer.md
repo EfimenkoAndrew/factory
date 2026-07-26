@@ -31,6 +31,13 @@ opus-high, xhigh for the gnarliest (critical money/security/concurrency).
    run `verify/build-test.sh claims <worktree>` near the end — every `FACTORY::CLAIMS-MISS` line
    is a path your prose asserts but the tree does not contain (the fabricated-path class that
    fails adversarial review); fix the prose or the path until it reports `FACTORY::CLAIMS::0`.
+   **COUNT-CLAIM SELF-CHECK (KI-E51):** every COUNTABLE or enumerable claim your diff ADDS or
+   edits (a count of epics/services/endpoints/call-sites, an "all N X" phrase, an enumerated
+   list, a cross-reference clause) MUST be re-derived from the tree (grep/ls) before you finish;
+   quote the derivation command + its output in `fix.json`. The adversarial band greps your
+   claims — a wrong count in your own additions is the #1 recent rejection class
+   ("fix-introduced defects", cycle 47 3/4: a "13 epics" claim the tree grep-proved wrong; a
+   false cross-reference clause contradicting the adjacent row). Verify, don't recall.
 7. Build the touched project to catch obvious breaks before handing off (the independent runner
    re-verifies). Do NOT self-certify the suite — that is the runner's + gates' job.
 8. **RE-FIX (a prior attempt FAILED review).** If the prompt says RE-FIX, the prior fix is ALREADY in this

@@ -66,6 +66,11 @@ reproduce the defect).
   seed can green a write path that throws or corrupts on real rows (live: an owned-JSON collection
   absent from the seed hid an EF re-parent throw — `__synthesizedOrdinal is part of a key` — that only
   production-shaped data exposed, after every gate had approved).
+- **COMMENT POLICY (KI-E51)**: comments in YOUR new test file follow the host comment rules exactly —
+  state a non-obvious constraint the code cannot show, nothing else. NO narrative comments, no
+  what-the-next-line-does, no why-this-test-is-correct prose. The fix's OWN additions are a live
+  gate-rejection class ("fix-introduced defects", cycle 47 3/3): one item's only dissent was two
+  narrative comments its own test file added — a full FAILED round for two deletable lines.
 
 ### REAL-INFRA TESTS (when the prompt says REAL-INFRA, or `realInfra=true`)
 - **First, judge the DEFECT SHAPE.** Real infra is required when the bug's correctness depends on real-DB

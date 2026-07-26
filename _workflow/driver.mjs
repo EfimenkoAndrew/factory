@@ -16,7 +16,7 @@
 //   graph tooling, the controller lease, and worktree management). The dispatch table in
 //   main() at the bottom of this file is the source of truth.
 
-import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync, statSync } from 'node:fs';
+import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync, statSync, renameSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { dirname, join, basename, relative, resolve as presolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -30,7 +30,7 @@ import { loadGraph, computeReady, waitingOnDeps, byId } from './lib/graph.mjs';
 import { loadRouting, resolve as routeResolve, concurrencyFor } from './lib/router.mjs';
 import { addWorktree, removeWorktree, listWorktrees, changedFiles, pruneWorktrees, isFactoryWorktreePath, parseComposeLs, strayComposeProjects } from './lib/worktree.mjs';
 import { acquireLock, releaseLock } from './lib/lock.mjs';
-import { parseVerifyRaw, verdictFromParse, debrisFiles, parseRedRaw, hasRealInfraMarker, touchedRootCause } from './lib/verify.mjs';
+import { parseVerifyRaw, verdictFromParse, debrisFiles, parseRedRaw, hasRealInfraMarker, touchedRootCause, effectiveBaseline } from './lib/verify.mjs';
 import { preflight, dockerAvailable } from './lib/preflight.mjs';
 import { classifyFilesEntry, buildBasenameIndex, acceptanceSurfaceGaps } from './lib/graphaudit.mjs';
 import { renderFeedback } from './lib/feedback.mjs';
@@ -44,7 +44,7 @@ import { snapshotMainFiles, driftAgainstSnapshot, dirtyMainPaths, filesOverlapDi
 import { buildDocMap, readRoleBriefs } from './lib/promptpack.mjs';
 // KI-E7 — telemetry is OBSERVATIONAL ONLY (ai-factory-observability spine AD-1..3/AD-11): emit()
 // never throws, never blocks a command, and never feeds a fold verdict. FACTORY_TELEMETRY=0 disables.
-import { emit as temit, deriveStageTimeline, readEvents, aggregateEvents, renderTelemetryReport, telemetryFile, GAP_FENCE_MS } from './lib/telemetry.mjs';
+import { emit as temit, deriveStageTimeline, readEvents, aggregateEvents, renderTelemetryReport, telemetryFile, GAP_FENCE_MS, nonCanonicalArtifacts, isRecoveryResultId } from './lib/telemetry.mjs';
 import { lintWorktreeDocClaims } from './lib/doclint.mjs'; // F2 — phantom doc-path detection aid at fold (WARN-only)
 import { findLeftovers } from './lib/leftover-scan.mjs'; // KI-D12 — deferral/tech-debt lexicon detection aid at fold (WARN-only)
 
@@ -430,7 +430,13 @@ function deterministicVerifyOverride(cfg, ledger, wi, r) {
   const id = r.id;
   const readIf = (f) => { const p = abs(join(cfg.paths.items, id, f)); return existsSync(p) ? readFileSync(p, 'utf8') : null; };
   const codeChange = !!r.codeChange;
-  const baseline = (Array.isArray(r.baselineFailures) && r.baselineFailures.length) || 0;
+  // KI-E43 — effective baseline: the run-reported array OR the RED-time pre-fix full-suite transcript
+  // (baseline-raw.txt), whichever counts MORE pre-existing failures. Cycle 47 (ITEM-H15): the
+  // LIGHT-band verify skips the full suite, so baselineFailures folded [] while integrate's full suite
+  // carried 6 pre-existing Docker-unavailable Testcontainers failures — a 10/10-APPROVED item
+  // false-FAILED on exactly this comparison. The transcript is teed at RED time (tree still unfixed),
+  // so it can never launder a fix-broken test into the baseline; failures beyond it stay regressions.
+  const baseline = effectiveBaseline(r.baselineFailures, (() => { const t = readIf('baseline-raw.txt'); return t ? parseVerifyRaw(t) : null; })());
   const fail = (reason) => {
     r.transitions = ['FAILED']; r.toState = 'FAILED';
     r.note = 'deterministic fold-time override: ' + reason + (r.note ? ' [agent claimed: ' + r.note + ']' : '');
@@ -743,27 +749,35 @@ function cmdFold(file, flags) {
     for (const r of arr) {
       if (skippedIds.has(r.id) || !appliedIds.has(r.id)) continue;
       const row = ledger.items[r.id] || {};
-      const claimHist = (row.history || []).filter((h) => h.to === 'CLAIMED');
-      const claimMs = claimHist.length ? Date.parse(claimHist[claimHist.length - 1].at) : 0;
-      const tl = deriveStageTimeline(abs(join(cfg.paths.items, r.id)), { sinceMs: claimMs || undefined });
-      let prevMs = claimMs || (tl.length ? tl[0].firstMs : 0);
-      for (let si = 0; si < tl.length; si++) {
-        const s = tl[si];
-        // F3: one event per STAGE (same-stage artifacts collapsed); durMs = wall from the previous
-        // stage's end; bandSpanMs = first..last artifact inside a parallel band (0 for single-file).
-        const durMs = Math.max(0, Math.round(s.mtimeMs - prevMs));
-        const at = { files: s.files.length, bandSpanMs: s.bandSpanMs };
-        // KI-E13 gap-fence: a duration over GAP_FENCE_MS spans a dead gap between runs (cross-session
-        // relaunch, overnight idle — the KI-E9 16.5h `plan` row), not real stage work. Stamp it so the
-        // report excludes it from percentiles; the event itself stays (honest wall-clock).
-        if (durMs > GAP_FENCE_MS) at.gapSuspect = true;
-        // KI-E13: stamp the item's fold outcome on the LAST stage so per-stage failure concentration
-        // is derivable from the stream (which stage the item died in).
-        if (si === tl.length - 1) at.final = r.toState;
-        temit({ source: 'derived', event: 'stage_end', item: r.id, cycle: cyc, lane: row.runLabel || undefined, stage: s.stage, ts: s.ts, durMs, attrs: at });
-        prevMs = s.mtimeMs;
+      // KI-E47 — a recovery fold (#Nr resultId) emits NO derived stage timeline: the band's
+      // timeline was emitted at the ORIGINAL fold, and the recovery's artifact mtimes measure the
+      // operator-paced remedy/re-gate window (live: 4 re-gate rounds over hours folded as a fake
+      // 1.8h "gates" duration that polluted the p95 duration authority). The item_folded record
+      // (with the KI-E46 direct stamp) is the recovery's telemetry.
+      const isRec = isRecoveryResultId(r.resultId);
+      if (!isRec) {
+        const claimHist = (row.history || []).filter((h) => h.to === 'CLAIMED');
+        const claimMs = claimHist.length ? Date.parse(claimHist[claimHist.length - 1].at) : 0;
+        const tl = deriveStageTimeline(abs(join(cfg.paths.items, r.id)), { sinceMs: claimMs || undefined });
+        let prevMs = claimMs || (tl.length ? tl[0].firstMs : 0);
+        for (let si = 0; si < tl.length; si++) {
+          const s = tl[si];
+          // F3: one event per STAGE (same-stage artifacts collapsed); durMs = wall from the previous
+          // stage's end; bandSpanMs = first..last artifact inside a parallel band (0 for single-file).
+          const durMs = Math.max(0, Math.round(s.mtimeMs - prevMs));
+          const at = { files: s.files.length, bandSpanMs: s.bandSpanMs };
+          // KI-E13 gap-fence: a duration over GAP_FENCE_MS spans a dead gap between runs (cross-session
+          // relaunch, overnight idle — the KI-E9 16.5h `plan` row), not real stage work. Stamp it so the
+          // report excludes it from percentiles; the event itself stays (honest wall-clock).
+          if (durMs > GAP_FENCE_MS) at.gapSuspect = true;
+          // KI-E13: stamp the item's fold outcome on the LAST stage so per-stage failure concentration
+          // is derivable from the stream (which stage the item died in).
+          if (si === tl.length - 1) at.final = r.toState;
+          temit({ source: 'derived', event: 'stage_end', item: r.id, cycle: cyc, lane: row.runLabel || undefined, stage: s.stage, ts: s.ts, durMs, attrs: at });
+          prevMs = s.mtimeMs;
+        }
       }
-      temit({ source: 'driver', event: 'item_folded', item: r.id, cycle: cyc, lane: row.runLabel || undefined, outcome: row.state || r.toState, attempts: row.attempts, attrs: { toState: r.toState, band: r.band || undefined, transitions: (r.transitions || []).slice(0, 12), gates: r.gates || {}, cost: r.cost || {}, infraSuspect: !!r.infraSuspect, verificationOnly: !!r.verificationOnly, note: String(r.note || '').slice(0, 240) } }); // KI-E23: band stamped so gate-value/cost split LIGHT vs FULL
+      temit({ source: 'driver', event: 'item_folded', item: r.id, cycle: cyc, lane: row.runLabel || undefined, outcome: row.state || r.toState, attempts: row.attempts, attrs: { toState: r.toState, band: r.band || undefined, resultId: r.resultId || undefined, direct: isRec || undefined, transitions: (r.transitions || []).slice(0, 12), gates: r.gates || {}, cost: r.cost || {}, infraSuspect: !!r.infraSuspect, verificationOnly: !!r.verificationOnly, note: String(r.note || '').slice(0, 240) } }); // KI-E23: band stamped so gate-value/cost split LIGHT vs FULL; KI-E46: direct/resultId stamped so recovery closes classify without prose sniffing
     }
     temit({ source: 'driver', event: 'fold_summary', cycle: cyc, attrs: { file: basename(foldPath), applied: applied.length, rejected: rejected.length, skipped: skipped.length, overrides: overrides.length, infraRetries: infraApplied.length, escalated: escalated.length } });
     // KI-E23 (P6c): the run's token usage, returned by factory.js from the runtime budget counter —
@@ -827,6 +841,50 @@ function cmdResume(flags) {
   // rebuild worktrees/claims it already has — and, pre-KI-L51, lost reFix stamps). Print the exact lines.
   if (!flags['reset-stale'] && relaunch.size) {
     console.log('  relaunch candidates (CLAIMED, no cycle-' + cyc + ' checkpoint, launcher still on disk):');
+    const relaunchIds = [...relaunch.values()].flat();
+    // KI-E41 — relaunch pre-flight MAIN-GUARD. The KI-L65 contamination diff used to run only at FOLD;
+    // a relaunch after a killed run therefore re-ran the whole band against a possibly-poisoned
+    // "read-only reference" main (cycle 47 live: run #1's fixers leaked fix variants — one factually
+    // wrong — into the MAIN tree; the sanctioned verbatim relaunch burned 2h+ before the fold detector
+    // fired). Diff the claim-time snapshot NOW, before the operator copies the relaunch line. Same
+    // posture as the fold check: warn loudly, never block — repairing main is operator judgment.
+    for (const id of relaunchIds) {
+      try {
+        const snapPath = abs(join(cfg.paths.items, id, 'main-snapshot.json'));
+        if (!existsSync(snapPath)) continue;
+        const { committed, dirty } = splitDriftByStatus(REPO_ROOT, driftAgainstSnapshot(REPO_ROOT, (readJson(snapPath) || {}).files || {}));
+        if (dirty.length) console.log(`    ⚠ MAIN-GUARD ${id} (KI-E41): item files DRIFTED in the MAIN tree since claim — an agent of the dead run likely wrote outside its worktree. REPAIR MAIN FIRST (restore to HEAD or apply the gated worktree copy), THEN relaunch — the band reads main as its read-only reference:\n` + dirty.map((d) => `        ${d.file} (${d.was} -> ${d.now})`).join('\n'));
+        if (committed.length) console.log(`    ℹ MAIN-GUARD ${id} (KI-E41/KI-E35): item files changed in main via HUMAN commits since claim (clean per git status) — verify the relaunch is still meaningful against the new main:\n` + committed.map((d) => `        ${d.file}`).join('\n'));
+      } catch { /* detection aid only — never blocks the relaunch listing */ }
+    }
+    // KI-E42 — killed-run artifact quarantine. A dead attempt's improvised artifacts (cycle 47: a stray
+    // RESULT.md claiming "false positive — already fixed, no action taken") survive into the relaunch's
+    // artifact dir and mislead its agents/reporters. Detect always; MOVE only on --quarantine (a plain
+    // `resume` stays read-only). Canonical vocabulary = STAGE_ARTIFACTS + gate/review patterns + the
+    // driver control files (lib/telemetry.mjs nonCanonicalArtifacts); directories are never touched.
+    const debrisByItem = [];
+    for (const id of relaunchIds) {
+      try {
+        const dir = abs(join(cfg.paths.items, id));
+        if (!existsSync(dir)) continue;
+        const names = readdirSync(dir).filter((n) => { try { return statSync(join(dir, n)).isFile(); } catch { return false; } });
+        const junk = nonCanonicalArtifacts(names);
+        if (junk.length) debrisByItem.push({ id, dir, junk });
+      } catch { /* detection aid only */ }
+    }
+    if (debrisByItem.length && flags.quarantine) {
+      for (const d of debrisByItem) {
+        const qdir = join(d.dir, 'quarantine-' + new Date().toISOString().replace(/[:.]/g, '-'));
+        try {
+          mkdirSync(qdir, { recursive: true });
+          for (const n of d.junk) { try { renameSync(join(d.dir, n), join(qdir, n)); } catch (e) { console.log(`    ! quarantine failed for ${d.id}/${n}: ${e && e.message}`); } }
+          console.log(`    quarantined ${d.id}: ${d.junk.join(', ')} -> ${qdir}`);
+        } catch (e) { console.log(`    ! quarantine dir failed for ${d.id}: ${e && e.message}`); }
+      }
+    } else if (debrisByItem.length) {
+      console.log('    ⚠ NON-CANONICAL artifacts from the dead attempt (KI-E42) — they can mislead the relaunch\'s agents/reporters. Run `resume --quarantine` to move them aside BEFORE relaunching:');
+      for (const d of debrisByItem) console.log(`        ${d.id}: ${d.junk.join(', ')}`);
+    }
     for (const [script, ids] of relaunch) console.log(`    Workflow({ scriptPath: "${abs(script)}" })   # ${ids.join(', ')}`);
     console.log('    (relaunch preserves claims/worktrees/reFix stamps; use --reset-stale ONLY when abandoning these runs instead.)');
   }
@@ -886,7 +944,17 @@ function cmdReconstruct(flags) {
     if (missing.length) console.log(`  in-flight with no checkpoint (must re-run): ${missing.join(', ')}`);
     return;
   }
-  writeJsonAtomic(out, { mode: 'reconstructed', cycle: cyc, results });
+  // KI-E44 — usage passthrough: checkpoints carry NO usage (factory.js reports the run total only at
+  // RETURN time, which a killed run never reaches), so a reconstructed fold emitted no KI-E23 usage
+  // event (cycle 47 live: 1,752,299 output tokens visible only in the harness task output, invisible
+  // to cost telemetry). `--usage-tokens <N>` lets the controller pass the harness-reported total
+  // through; the fold's existing usage emit then fires exactly as on the live path. Observational
+  // only — it never affects any verdict.
+  const payload = { mode: 'reconstructed', cycle: cyc, results };
+  const ut = flags['usage-tokens'] ? parseInt(flags['usage-tokens'], 10) : NaN;
+  if (Number.isFinite(ut) && ut > 0) { payload.usage = { outputTokens: ut }; console.log(`  usage passthrough (KI-E44): outputTokens=${ut} will emit at fold`); }
+  else console.log('  (no --usage-tokens <N> passed — checkpoints carry no usage, so this fold will emit NO usage event; pass the harness-reported output-token total to keep cost telemetry complete — KI-E44)');
+  writeJsonAtomic(out, payload);
   console.log(`reconstruct: ${results.length} checkpointed result(s) for cycle ${cyc} -> ${out}`);
   for (const r of results) console.log(`  ${r.id}: ${r.toState} — ${String(r.note || '').slice(0, 110)}`);
   if (already.length) console.log(`  already folded (skipped): ${already.join(', ')}`);
@@ -1260,13 +1328,17 @@ function cmdGroup(flags) {
   // when an item's acceptance names a real repo file its files[] (the lock set) does not carry —
   // the fixer would be lock-forbidden from meeting acceptance (the ITEM-M7 controller-clause
   // class, cycle 46). Advisory only; costs one git ls-files per group.
+  const gapsByItem = new Map(); // KI-E45 — acceptance-resolved paths feed the claim-time main-snapshot below
   try {
     const tracked22 = execFileSync('git', ['-C', REPO_ROOT, 'ls-files'], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 }).trimEnd().split('\n');
     const byBase22 = buildBasenameIndex(tracked22);
     const exists22 = (p) => existsSync(presolve(REPO_ROOT, p));
     for (const wi of picked) {
       const gaps22 = acceptanceSurfaceGaps(wi, { existsOnDisk: exists22, byBasename: byBase22, targetDir: wi.target && exists22(wi.target) ? wi.target : null });
-      if (gaps22.length) console.log('  KI-E22 WARN ' + wi.id + ': acceptance names repo file(s) absent from files[] (the lock set) — ' + gaps22.map((g) => g.token + ' -> ' + g.resolved).join(', ') + '. Hand-append to files[] before grouping if the fix must touch them.');
+      if (gaps22.length) {
+        gapsByItem.set(wi.id, gaps22.map((g) => g.resolved).filter(Boolean));
+        console.log('  KI-E22 WARN ' + wi.id + ': acceptance names repo file(s) absent from files[] (the lock set) — ' + gaps22.map((g) => g.token + ' -> ' + g.resolved).join(', ') + '. Hand-append to files[] before grouping if the fix must touch them.');
+      }
     }
   } catch { /* advisory only */ }
   // Similarity-batch stamp (owner directive 2026-07-04): when the whole batch is ONE similarity
@@ -1335,10 +1407,14 @@ function cmdGroup(flags) {
       if (row) { row.worktree = it.worktree.path; row.branch = it.worktree.branch; row.prevState = prev; row.runLabel = labelSlug; row.runScript = runScriptRel; }
       // KI-L65 — snapshot the item's files[] as they exist in the MAIN tree at claim time; the fold
       // re-hashes and warns on drift (an agent writing outside its worktree — witnessed twice, cycle 35).
+      // KI-E45 — the snapshot is the UNION of files[] and the KI-E22 acceptance-resolved paths: a fixer
+      // chasing an acceptance clause writes exactly those files, and a files[]-only snapshot is blind to
+      // them (witnessed cycle 48: ITEM-H16's lane wrote an acceptance-named CONTEXT.md
+      // in MAIN — every fold-time drift check missed it; only a manual broad sweep caught it).
       try {
         const snapDir = abs(join(cfg.paths.items, it.id));
         if (!existsSync(snapDir)) mkdirSync(snapDir, { recursive: true });
-        writeJsonAtomic(join(snapDir, 'main-snapshot.json'), { at: new Date().toISOString(), files: snapshotMainFiles(REPO_ROOT, it.files) });
+        writeJsonAtomic(join(snapDir, 'main-snapshot.json'), { at: new Date().toISOString(), files: snapshotMainFiles(REPO_ROOT, [...new Set([...(it.files || []), ...(gapsByItem.get(it.id) || [])])]) });
       } catch { /* best-effort — detection aid, never blocks a claim */ }
     }
     if (claimFailed.length) console.log('  WARN: group-claim REFUSED for (unexpected — not in a claimable state):', claimFailed.join(', '));
@@ -1419,7 +1495,7 @@ function cmdPreflight() {
   // panels feed off the SESSION's OTLP telemetry, not the factory's events.jsonl).
   const ct = env.costTelemetry || { ready: false, reason: 'unknown' };
   console.log(`  cost telemetry: ${ct.ready ? 'ready → ' + ct.endpoint + (ct.note ? ' (' + ct.note + ')' : '') : 'NOT gathered — ' + ct.reason}`);
-  if (!ct.ready) console.log('  -> source telemetry/claude-code-telemetry.env.example (ALL of CLAUDE_CODE_ENABLE_TELEMETRY=1, OTEL_METRICS_EXPORTER=otlp, OTEL_EXPORTER_OTLP_PROTOCOL, OTEL_EXPORTER_OTLP_ENDPOINT) before launching the session (KI-E28/KI-E33). factory_* metrics still land; only the token/cache panels are affected.');
+  if (!ct.ready) console.log('  -> source telemetry/claude-code-telemetry.env.example (ALL of CLAUDE_CODE_ENABLE_TELEMETRY=1, OTEL_METRICS_EXPORTER=otlp, OTEL_EXPORTER_OTLP_PROTOCOL, OTEL_EXPORTER_OTLP_ENDPOINT) before launching the session (KI-E28/KI-E33). Export them in the SHELL that launches the session (`set -a; source telemetry/claude-code-telemetry.env; set +a; claude`) — settings.json `env` is NOT reliably forwarded for OTEL_* on every runtime (observed 2026-07-26: settings carried all 5 vars, the session received only CLAUDE_CODE_ENABLE_TELEMETRY). factory_* metrics still land; only the token/cache panels are affected.');
   if (!env.docker) console.log('  -> run realInfra items only on a Docker-capable host (CI); a non-realInfra cycle is fine here.');
 }
 
@@ -2118,6 +2194,31 @@ function cmdController(flags, rest) {
   console.log('controller subcommands: status (default) | claim [--label X] [--force] | release --controller <token> | heartbeat --controller <token>');
 }
 
+// KI-E50 — MID-BAND main-drift check (read-only; no lock, no lease). The KI-L65/KI-E41 detectors
+// run at FOLD and RESUME; contamination that happens DURING a band stayed invisible for hours
+// (cycle 48: 4/6 lanes wrote main; the fold flagged it long after sibling agents had read the
+// poisoned tree). The runner calls this between verify and the gate band (factory.js verifyHint)
+// and pastes any ⚠ line into its note, so the gates and the checkpoint see the drift the moment
+// it exists. WARN-ONLY, same posture as the fold/resume checks: the verdict concerns the
+// WORKTREE, repairing main is operator judgment, and the parked KI-L65 prevention ruling
+// (sandbox / fail-fast / accept) is deliberately untouched. Always exits 0.
+function cmdMainCheck(rest) {
+  const cfg = loadConfig();
+  const ids = (rest || []).filter(Boolean);
+  if (!ids.length) { console.log('usage: driver main-check <itemId> [...] — re-hash each item\'s claim-time main-snapshot against the MAIN tree (read-only, warn-only)'); return; }
+  for (const id of ids) {
+    const snapPath = abs(join(cfg.paths.items, id, 'main-snapshot.json'));
+    if (!existsSync(snapPath)) { console.log(`MAIN-CHECK ${id}: no main-snapshot.json (unclaimed or pre-KI-L65 claim) — nothing to compare`); continue; }
+    try {
+      const drifted = driftAgainstSnapshot(REPO_ROOT, (readJson(snapPath) || {}).files || {});
+      if (!drifted.length) { console.log(`MAIN-CHECK ${id}: clean — no main-tree drift on the snapshot set`); continue; }
+      const { committed, dirty } = splitDriftByStatus(REPO_ROOT, drifted);
+      if (dirty.length) console.log(`⚠ MAIN-DRIFT ${id} (KI-E50/KI-L65): main-tree file(s) changed mid-run — an agent likely wrote outside its worktree. Do NOT edit or repair main yourself; report this line verbatim:\n` + dirty.map((d) => `    ${d.file} (${d.was} -> ${d.now})`).join('\n'));
+      if (committed.length) console.log(`ℹ MAIN-CHECK ${id}: committed drift (human delivery, KI-E35) — verify intent, no repair needed:\n` + committed.map((d) => `    ${d.file}`).join('\n'));
+    } catch (e) { console.log(`MAIN-CHECK ${id}: check failed (${e && e.message}) — treat as unknown, not clean`); }
+  }
+}
+
 // KI-E7 / spine AD-9: the evaluation path reads events.jsonl directly (full fidelity — never
 // Prometheus aggregates) and renders reports/telemetry-latest.md. Read-only; no lock needed.
 function cmdTelemetryReport(flags) {
@@ -2166,8 +2267,9 @@ function dispatch(cmd, flags, rest) {
     case 'worktree-add': case 'worktree-remove': case 'worktree-list': return cmdWorktree(cmd, rest);
     case 'controller': return cmdController(flags, rest); // KI-C11 — lease management: status | claim | release | heartbeat
     case 'telemetry-report': return cmdTelemetryReport(flags); // KI-E7 / spine AD-9 — evaluation report from events.jsonl
+    case 'main-check': return cmdMainCheck(rest); // KI-E50 — mid-band main-drift check (read-only, warn-only)
     default:
-      console.log('commands: init | status | select | claim | reset | fold | reconstruct | recover | resume | progress | burndown | cost | escalations | decisions-digest | group | suggest | cycle | sweep | sweep-fold | gc | preflight | graph-audit | realinfra-lint | report-cycle | ingest | merge-graph | controller | telemetry-report | worktree-add|remove|list');
+      console.log('commands: init | status | select | claim | reset | fold | reconstruct | recover | resume | progress | burndown | cost | escalations | decisions-digest | group | suggest | cycle | sweep | sweep-fold | gc | preflight | graph-audit | realinfra-lint | report-cycle | ingest | merge-graph | controller | telemetry-report | main-check | worktree-add|remove|list');
   }
 }
 
