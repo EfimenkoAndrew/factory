@@ -86,19 +86,33 @@ host_root() {
 }
 mount_path() {
   # An EXPLICIT --host always wins (self-location must never redirect a targeted command at
-  # the copy of the factory this script happens to live in — E2E-caught).
-  if [ -n "$HOST" ]; then printf '%s/%s' "$(host_root)" "$DIR"; return; fi
+  # the copy of the factory this script happens to live in — E2E-caught). host_root failures
+  # return 1 so the caller dies ONCE with host_root's message, not with a bogus half-empty path.
+  local r
+  if [ -n "$HOST" ]; then r="$(host_root)" || return 1; printf '%s/%s' "$r" "$DIR"; return; fi
   local m; m="$(self_mount)" && { printf '%s' "$m"; return; }
-  printf '%s/%s' "$(host_root)" "$DIR"
+  r="$(host_root)" || return 1
+  printf '%s/%s' "$r" "$DIR"
 }
-host_of_mount() { # the HOST repo root enclosing a mount (mount/.. sits inside the host repo)
-  git -C "$1/.." rev-parse --show-toplevel 2>/dev/null || (cd "$1/../.." && pwd)
+host_of_mount() { # the HOST repo root enclosing a mount
+  git -C "$1/.." rev-parse --show-toplevel 2>/dev/null && return
+  # git-less fallback: the host root sits depth(DIR) levels above the mount — walk, don't hardcode
+  local up="$1" seg="$DIR"
+  while [ "$seg" != "${seg%/*}" ]; do up="$up/.."; seg="${seg%/*}"; done
+  (cd "$up/.." && pwd)
 }
 
 # Latest published release: highest vX.Y.Z tag on the remote; empty → main (no releases yet).
+# An UNREACHABLE remote dies loudly here — before this guard, a network/DNS failure surfaced as
+# a silent exit-1 (stderr was discarded and set -e killed the command substitution wordlessly).
 resolve_latest() {
-  git ls-remote --tags --refs "$REPO" 'refs/tags/v[0-9]*' 2>/dev/null \
-    | sed 's|.*refs/tags/||' | sort -V | tail -1
+  local out
+  out="$(git ls-remote --tags --refs "$REPO" 'refs/tags/v[0-9]*' 2>&1)" \
+    || die "cannot reach $REPO (git ls-remote failed: $(printf '%s' "$out" | tail -1))"
+  # Strict vX.Y.Z only (review fix): sort -V ranks v1.0.0-rc1 ABOVE v1.0.0 and a date-like
+  # v20250101 above every real release — one hand-pushed experimental tag must not redirect
+  # every install and cron upgrade. `|| true`: zero strict tags is the legitimate empty case.
+  printf '%s' "$out" | sed -n 's|.*refs/tags/||p' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1 || true
 }
 resolve_target() {
   if [ -n "$WANT_VERSION" ]; then printf '%s' "$WANT_VERSION"; return; fi
@@ -121,6 +135,23 @@ run_selftest() { # $1 = mount
 }
 
 # ---- install --------------------------------------------------------------------------
+# Transactional cleanup (review fix): a mid-install failure (bad --version tag, red selftest,
+# init crash) must not strand a half-mount that blocks the corrective re-run at the "already
+# installed" check with init never having run. Clone mode removes the mount THIS RUN created;
+# submodule mode prints the exact undo. Disarmed the moment the engine install is complete —
+# the (optional) telemetry bootstrap after that point is non-fatal by design.
+INSTALL_CREATED=""; INSTALL_ROOT=""; INSTALL_UNDO_SUBMODULE=0
+install_cleanup() {
+  local rc="$1"; trap - EXIT
+  [ "$rc" = 0 ] && return 0
+  if [ -n "$INSTALL_CREATED" ] && [ -d "$INSTALL_CREATED" ]; then
+    warn "install FAILED (exit $rc) — removing the partial mount $INSTALL_CREATED so a corrective re-run starts clean"
+    rm -rf "$INSTALL_CREATED"
+  elif [ "$INSTALL_UNDO_SUBMODULE" = 1 ]; then
+    warn "install FAILED (exit $rc) mid-submodule — undo with: git -C '$INSTALL_ROOT' submodule deinit -f '$DIR'; git -C '$INSTALL_ROOT' rm -f '$DIR'; rm -rf '$INSTALL_ROOT/.git/modules/$DIR'"
+  fi
+  exit "$rc"
+}
 cmd_install() {
   command -v git >/dev/null || die "git is required"
   command -v node >/dev/null || die "node >= 20.11 is required"
@@ -128,15 +159,19 @@ cmd_install() {
   root="$(host_root)"; target="$(resolve_target)"; mount="$root/$DIR"
   [ -e "$mount/_workflow/driver.mjs" ] && die "already installed at $mount — use: setup/install.sh upgrade"
   log "installing factory $target -> $mount (host: $root, mode: $([ $SUBMODULE = 1 ] && echo submodule || echo clone))"
+  INSTALL_ROOT="$root"; trap 'install_cleanup $?' EXIT
   if [ $SUBMODULE = 1 ]; then
-    git -C "$root" submodule add "$REPO" "$DIR"
+    git -C "$root" submodule add "$REPO" "$DIR"; INSTALL_UNDO_SUBMODULE=1
     [ "$target" != "main" ] && git -C "$mount" checkout --quiet "$target"
     log "submodule added — remember to COMMIT .gitmodules + the gitlink in the host repo"
   else
-    git clone --quiet "$REPO" "$mount"
+    git clone --quiet "$REPO" "$mount"; INSTALL_CREATED="$mount"
     [ "$target" != "main" ] && git -C "$mount" checkout --quiet "$target"
     if [ $NO_GITIGNORE = 0 ]; then
       if ! grep -qxF "$DIR/" "$root/.gitignore" 2>/dev/null; then
+        # pad a newline first — appending to a no-trailing-newline .gitignore would glue the
+        # comment onto its last entry (review fix)
+        if [ -f "$root/.gitignore" ] && [ -n "$(tail -c1 "$root/.gitignore")" ]; then echo >> "$root/.gitignore"; fi
         { echo "# AI Implementation Factory mount (own git checkout; upgraded via setup/install.sh)"; echo "$DIR/"; } >> "$root/.gitignore"
         log "added '$DIR/' to host .gitignore (disable with --no-gitignore)"
       fi
@@ -146,7 +181,12 @@ cmd_install() {
   log "running setup/init.mjs ${initflags[*]}"
   node "$mount/setup/init.mjs" "${initflags[@]}"
   run_selftest "$mount" || die "selftest FAILED on a fresh install of $target — refusing to finish; report this version"
-  if [ $NO_TELEMETRY = 0 ]; then cmd_telemetry_up "$mount" "$root"; else warn "telemetry bootstrap skipped (--no-telemetry) — run: setup/install.sh telemetry-up"; fi
+  trap - EXIT
+  if [ $NO_TELEMETRY = 0 ]; then
+    # non-fatal (review fix): a port collision / compose hiccup must not fail — or roll back —
+    # a fully good engine install; the stack is re-runnable any time.
+    cmd_telemetry_up "$mount" "$root" || warn "telemetry bootstrap FAILED — the engine itself installed fine; re-run later: setup/install.sh telemetry-up"
+  else warn "telemetry bootstrap skipped (--no-telemetry) — run: setup/install.sh telemetry-up"; fi
   log "installed $(cat "$mount/VERSION" 2>/dev/null || echo "$target") at $mount — see SETUP.md § Feed it work"
 }
 
@@ -162,16 +202,33 @@ cmd_upgrade() {
   fi
   target="$(resolve_target)"; prev="$(git -C "$mount" rev-parse HEAD)"
   cur="$(git -C "$mount" describe --tags --always 2>/dev/null || echo "$prev")"
-  log "upgrade: $cur -> $target (state/, reports/, queue/, telemetry data + .env are untouched by design)"
   git -C "$mount" fetch --quiet --tags origin
+  # up-to-date short-circuit + downgrade guard (review fix): cron `upgrade --yes` must not
+  # re-churn an already-current mount, and a regressed "latest" (newest tag deleted upstream)
+  # must announce itself before silently downgrading every host.
+  local want=""
+  if [ "$target" = "main" ]; then want="$(git -C "$mount" rev-parse origin/main 2>/dev/null || true)"
+  else want="$(git -C "$mount" rev-parse "refs/tags/$target^{commit}" 2>/dev/null || true)"; fi
+  if [ -n "$want" ] && [ "$want" = "$prev" ]; then log "already on $target — up to date (nothing fetched-out-of-date; selftest-verified install untouched)"; return 0; fi
+  case "$cur:$target" in v[0-9]*:v[0-9]*)
+    if [ "$cur" != "$target" ] && [ "$(printf '%s\n%s\n' "$cur" "$target" | sort -V | tail -1)" = "$cur" ]; then
+      warn "target $target is OLDER than installed $cur — proceeding, but a downgrade is only right when deliberate (pin with --version to silence)"
+    fi;;
+  esac
+  log "upgrade: $cur -> $target (state/, reports/, queue/, telemetry data + .env are untouched by design)"
   if [ "$target" = "main" ]; then git -C "$mount" checkout --quiet origin/main
   else git -C "$mount" checkout --quiet "$target" || die "version '$target' not found on the remote"; fi
   if run_selftest "$mount"; then
+    # refresh host-side scaffolding (review fix): the /ai-factory controller skill + runtime
+    # scaffolding are installed by init.mjs — an upgrade that skips it leaves every host running
+    # the new engine with the old skill. init.mjs is idempotent and never overwrites locally
+    # edited files (.factory-new siblings).
+    node "$mount/setup/init.mjs" --repo-root "$(host_of_mount "$mount")" || warn "init refresh FAILED — the engine upgrade itself is green; run by hand: node $mount/setup/init.mjs --repo-root <host-root>"
     log "upgraded to $target. changes:"
     git -C "$mount" log --oneline "$prev..HEAD" | head -20 || true
   else
     warn "selftest FAILED on $target — ROLLING BACK to $cur"
-    git -C "$mount" checkout --quiet "$prev"
+    git -C "$mount" checkout --quiet "$prev" || die "ROLLBACK FAILED — the mount is LEFT ON $target; repair by hand: git -C $mount checkout $prev"
     die "rolled back to $cur; $target is not safe on this host (report it)"
   fi
 }
@@ -194,10 +251,16 @@ ensure_env_files() { # $1 = mount
     cp "$tdir/.env.example" "$tdir/.env"
     log "wrote telemetry/.env (stock ports + stack identity; per-host, gitignored — KI-E25: second host repo on one machine changes FACTORY_COMPOSE_PROJECT/FACTORY_CONTAINER_PREFIX + ports)"
   fi
-  local port; port="$(grep -E '^FACTORY_OTLP_HTTP_PORT=' "$tdir/.env" | tail -1 | cut -d= -f2)"; port="${port:-4318}"
+  # `|| true`: a hand-trimmed .env may drop a key — grep's no-match exit must not kill the
+  # script under `set -euo pipefail` (the ${var:-default} fallbacks below are the intended path).
+  local port; port="$(grep -E '^FACTORY_OTLP_HTTP_PORT=' "$tdir/.env" | tail -1 | cut -d= -f2 || true)"; port="${port:-4318}"
   if [ ! -f "$tdir/claude-code-telemetry.env" ]; then
     sed "s|http://localhost:4318|http://localhost:$port|" "$tdir/claude-code-telemetry.env.example" > "$tdir/claude-code-telemetry.env"
     log "wrote telemetry/claude-code-telemetry.env (OTLP endpoint http://localhost:$port; per-host, gitignored)"
+  elif ! grep -q "localhost:$port" "$tdir/claude-code-telemetry.env"; then
+    # reconcile check (review fix): the file is create-once (user edits are never overwritten),
+    # so a later port change in telemetry/.env silently strands sessions on a dead endpoint.
+    warn "telemetry/claude-code-telemetry.env does not point at the current OTLP port ($port per telemetry/.env) — sessions may export to a dead endpoint; delete the file and re-run telemetry-up to regenerate"
   fi
 }
 merge_settings_env() { # $1 = mount, $2 = host root — .claude/settings.local.json env block
@@ -208,7 +271,17 @@ merge_settings_env() { # $1 = mount, $2 = host root — .claude/settings.local.j
     for (const l of fs.readFileSync(envFile, "utf8").split("\n")) {
       const m = l.match(/^([A-Z0-9_]+)=(.*)$/); if (m) kv[m[1]] = m[2];
     }
-    let s = {}; try { s = JSON.parse(fs.readFileSync(settingsPath, "utf8")); } catch {}
+    let s = {};
+    if (fs.existsSync(settingsPath)) {
+      // An EXISTING but unparseable settings file is never clobbered — a blind rewrite here
+      // would silently destroy any existing permissions/hooks blocks. Warn + skip; the
+      // shell-profile block (the KI-E33-reliable path) still carries the session env.
+      try { s = JSON.parse(fs.readFileSync(settingsPath, "utf8")); }
+      catch (e) {
+        console.error("[factory] REFUSING to touch " + settingsPath + " — existing file is not valid JSON (" + e.message + "); fix it or merge the env block from " + envFile + " by hand");
+        process.exit(0);
+      }
+    }
     s.env = { ...(s.env || {}), ...kv };
     fs.mkdirSync(path.dirname(settingsPath), { recursive: true });
     fs.writeFileSync(settingsPath, JSON.stringify(s, null, 2) + "\n");
@@ -216,7 +289,10 @@ merge_settings_env() { # $1 = mount, $2 = host root — .claude/settings.local.j
   ' "$2/.claude/settings.local.json" "$1/telemetry/claude-code-telemetry.env"
 }
 shell_env_install() { # $1 = mount — the RELIABLE session-env path (KI-E33: some runtimes do not forward OTEL_* from settings env)
-  local marker="# >>> ai-factory cost telemetry >>>" endmark="# <<< ai-factory cost telemetry <<<" f
+  # marker is MOUNT-SCOPED (review fix): on a KI-E25 machine (second host repo, second stack,
+  # remapped ports) an unscoped marker would make host B skip its block and keep exporting
+  # host A's endpoint.
+  local marker="# >>> ai-factory cost telemetry ($1) >>>" endmark="# <<< ai-factory cost telemetry ($1) <<<" f
   for f in "$HOME/.bashrc" "$HOME/.zshrc"; do
     [ "$f" = "$HOME/.zshrc" ] && [ ! -f "$f" ] && continue
     grep -qF "$marker" "$f" 2>/dev/null && { log "shell env already installed in $f"; continue; }
@@ -242,8 +318,8 @@ cmd_telemetry_up() { # [$1 = mount, $2 = host root] — also callable directly
   command -v docker >/dev/null || { warn "docker not found — telemetry stack NOT started (env files are ready; run telemetry-up after installing docker)"; return 0; }
   log "starting telemetry stack (docker compose up -d)"
   docker compose --project-directory "$mount/telemetry" up -d
-  local prom; prom="$(grep -E '^FACTORY_PROM_PORT=' "$mount/telemetry/.env" | tail -1 | cut -d= -f2)"; prom="${prom:-9090}"
-  local graf; graf="$(grep -E '^FACTORY_GRAFANA_PORT=' "$mount/telemetry/.env" | tail -1 | cut -d= -f2)"; graf="${graf:-3000}"
+  local prom; prom="$(grep -E '^FACTORY_PROM_PORT=' "$mount/telemetry/.env" | tail -1 | cut -d= -f2 || true)"; prom="${prom:-9090}"
+  local graf; graf="$(grep -E '^FACTORY_GRAFANA_PORT=' "$mount/telemetry/.env" | tail -1 | cut -d= -f2 || true)"; graf="${graf:-3000}"
   local i=0; until curl -fsS -m 2 "http://localhost:$prom/-/ready" >/dev/null 2>&1; do
     i=$((i+1)); [ $i -ge 15 ] && { warn "prometheus not ready after 30s — check: docker compose --project-directory $mount/telemetry ps"; return 0; }
     sleep 2
@@ -253,6 +329,7 @@ cmd_telemetry_up() { # [$1 = mount, $2 = host root] — also callable directly
 }
 cmd_telemetry_down() {
   local mount; mount="$(mount_path)"
+  command -v docker >/dev/null || die "docker not found — nothing to stop"
   local flags=(); [ $PURGE = 1 ] && flags+=(-v)
   docker compose --project-directory "$mount/telemetry" down "${flags[@]+"${flags[@]}"}"
   log "telemetry stack stopped$([ $PURGE = 1 ] && echo ' (volumes purged)')"
@@ -264,6 +341,7 @@ case "$CMD" in
   status)         cmd_status;;
   telemetry-up)   cmd_telemetry_up;;
   telemetry-down) cmd_telemetry_down;;
-  help|"")        sed -n '2,44p' "${BASH_SOURCE[0]:-$0}" 2>/dev/null | sed 's/^# \{0,1\}//'; exit 0;;
+  help|"")        if [ -f "${BASH_SOURCE[0]:-}" ]; then sed -n '2,41p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+                  else echo "ai-factory installer — commands: install | upgrade | status | telemetry-up | telemetry-down (full header help needs a saved copy; see SETUP.md §0)"; fi; exit 0;;
   *) die "unknown command: $CMD (install | upgrade | status | telemetry-up | telemetry-down)";;
 esac
