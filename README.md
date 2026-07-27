@@ -21,8 +21,15 @@ control plane is zero-dependency Node (>= 20.11). Nothing to `npm install`.
 ## Use it in YOUR repo (clone & set up)
 
 The factory is repo-agnostic and ships as its own repository —
-<https://github.com/EfimenkoAndrew/factory>. Mount it in any host repo (submodule
-recommended, any path), initialize, feed it a findings-graph:
+<https://github.com/EfimenkoAndrew/factory>. **Versioned one-liner (KI-E52)** — installs the
+latest release, selftest-gated, and bootstraps the per-developer telemetry stack:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/EfimenkoAndrew/factory/main/setup/install.sh | bash -s -- install
+# later: <mount>/setup/install.sh upgrade --yes   (selftest-gated; auto-rollback on red)
+```
+
+Manual mount (the same thing, by hand):
 
 ```bash
 git submodule add https://github.com/EfimenkoAndrew/factory.git _bmad-output/ai-factory
