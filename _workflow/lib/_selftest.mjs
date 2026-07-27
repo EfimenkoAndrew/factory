@@ -895,7 +895,7 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
   eq(D.extractPathClaims('Three controllers under `Api/Controllers/Support/`: see https://x.y/a/b and v1.2.3'), ['Api/Controllers/Support/'], 'doclint: extracts path claims, skips URLs + versions');
   eq(D.extractPathClaims('run scripts/services.json and {placeholder}/x plus k8s/base/*.yaml'), ['scripts/services.json'], 'doclint: skips placeholders + globs');
   eq(D.extractPathClaims('mute/unmute analytics/CRM Conversations/Messages/Notifications drill-down/requeue/soft-drop ../Rel/Path'), [], 'doclint: prose slash-alternations + relative parents are NOT path claims (live-tuned precision)');
-  eq(D.extractPathClaims('see doc/runbooks/marketplace-admin.md and Controllers/Admin/AdminController.cs'), ['doc/runbooks/marketplace-admin.md', 'Controllers/Admin/AdminController.cs'], 'doclint: extension-bearing file claims are kept');
+  eq(D.extractPathClaims('see doc/runbooks/admin-portal.md and Controllers/Admin/AdminController.cs'), ['doc/runbooks/admin-portal.md', 'Controllers/Admin/AdminController.cs'], 'doclint: extension-bearing file claims are kept');
   eq(D.extractPathClaims('backoff 500ms/1s/1.5s and 2s/4s/8s windows'), [], 'doclint: all-numeric timing lists are not path claims (cycle-40 live false positive)');
   eq(D.extractPathClaims('pull hub.docker.com/v2/repositories/prom/tags/v1.2.3 or raw.githubusercontent.com/nodejs/Release/main/schedule.json'), [], 'doclint: scheme-less URLs (bare hostname first segment) are web claims, not tree paths (KI-E11 live false positive)');
   eq(D.extractPathClaims('see Svc.Api/Controllers/Admin/AdminController.cs'), ['Svc.Api/Controllers/Admin/AdminController.cs'], 'doclint: .NET Dotted.Names first segments survive the hostname skip');
@@ -1084,7 +1084,7 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
   ok(!T.verdictOk('CHANGES_REQUIRED') && !T.verdictOk('') && !T.verdictOk('code=ok security=fail') && !T.verdictOk('MYSTERY'), 'KI-E40: fail/unknown/mixed-key vocab classifies not-ok');
   ok(!T.verdictOk('OVERRULED') && T.KNOWN_FAIL_VERDICT.test('OVERRULED'), 'KI-E40: adjudicator OVERRULED is known-fail (Ok-rate reads as dissent-upheld calibration), never unclassified');
   const agg40 = T.aggregateEvents([
-    { event: 'item_folded', source: 'driver', item: 'A', cycle: 48, attrs: { toState: 'CLOSED', gates: { reaudit: 'code=ok security=ok', adjudicator: 'UPHELD', 'gate:qa': 'CHANGES_REQUIRED', 'gate:x': 'MYSTERY', 'gate:y': 'OVERRULED' } } },
+    { event: 'item_folded', source: 'driver', item: 'A', cycle: 48, attrs: { toState: 'CLOSED', gates: { reaudit: 'code=ok security=ok', adjudicator: 'UPHELD', 'gate:qa': 'CHANGES_REQUIRED', 'gate:x': 'MYSTERY', 'gate:y': 'OVERRULED', 'gate:z': 'code=ok security=no', 'gate:w': 'code=NULL' } } },
     { event: 'usage', source: 'driver', cycle: 48, attrs: { outputTokens: 12345, file: 'results-cycle-48.json' } },
   ]);
   eq(agg40.usage, [{ cycle: 48, file: 'results-cycle-48.json', outputTokens: 12345 }], 'KI-E40: usage events aggregate');
@@ -1093,6 +1093,8 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
   ok(md40.includes('| gate:qa | 1 | 0 | 0% |'), 'KI-E40: CHANGES_REQUIRED still counts not-ok');
   ok(md40.includes('Unclassified verdict vocabulary') && md40.includes('`MYSTERY`×1'), 'KI-E40: unknown vocabulary self-reports in the footnote');
   ok(!md40.includes('`CHANGES_REQUIRED`×') && !md40.includes('`OVERRULED`×'), 'KI-E40: known-fail vocabulary is NOT flagged as unclassified');
+  ok(md40.includes('| gate:z | 1 | 0 | 0% |') && md40.includes('| gate:w | 1 | 0 | 0% |'), 'KI-E40: mixed/NULL reaudit families count not-ok in the gate table');
+  ok(!md40.includes('`code=ok security=no`×') && !md40.includes('`code=NULL`×'), 'KI-E40: known-fail reaudit FAMILIES never pollute the drift footnote (review find)');
   ok(md40.includes('## Fold-time token usage') && md40.includes('12,345'), 'KI-E40: usage section renders token spend');
   ok(md40.includes('late-failure spend'), 'KI-E40: failure-concentration reading note present');
 }
@@ -1470,6 +1472,7 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
   const drvText43 = readFileSync(join(import.meta.dirname, '..', 'driver.mjs'), 'utf8');
   const facText43 = readFileSync(join(import.meta.dirname, '..', 'factory.js'), 'utf8');
   ok(/baseline-raw\.txt/.test(drvText43) && /effectiveBaseline\(/.test(drvText43), 'KI-E43: the fold override merges the RED-time baseline transcript');
+  ok(/KI-E43 reFix fence/.test(drvText43) && /prevState === 'FAILED'/.test(drvText43), 'KI-E43: a reFix round distrusts a transcript (re)captured after claim — the prior fix cannot launder its own breakage into the baseline (review find)');
   ok(/FULL-SUITE BASELINE \(KI-E43\)/.test(facText43), 'KI-E43: the RED brief instructs the pre-fix baseline capture on Docker-less hosts');
   ok(/test\.baselineFailures/.test(facText43), 'KI-E43: the checkpoint prefers the RED-stage baseline over the verify-stage report');
 }
@@ -1484,12 +1487,13 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
   const drvText42 = readFileSync(join(import.meta.dirname, '..', 'driver.mjs'), 'utf8');
   ok(/resume --quarantine/.test(drvText42) && /flags\.quarantine/.test(drvText42), 'KI-E42: resume detects debris always, moves only on --quarantine');
   ok(/MAIN-GUARD/.test(drvText42) && /KI-E41/.test(drvText42), 'KI-E41: resume diffs main-snapshot.json for relaunch candidates before printing the launch lines');
+  ok(/MAIN-GUARD \$\{id\} SKIPPED/.test(drvText42) && /DEBRIS-CHECK \$\{id\} SKIPPED/.test(drvText42), 'KI-E41/E42: a failed relaunch check ANNOUNCES itself — silence never reads as clean (review find)');
   ok(/usage-tokens/.test(drvText42) && /KI-E44/.test(drvText42), 'KI-E44: reconstruct accepts --usage-tokens and stamps payload.usage for the fold emit');
   ok(/gapsByItem/.test(drvText42) && /KI-E45/.test(drvText42), 'KI-E45: the claim-time main-snapshot unions files[] with the KI-E22 acceptance-resolved paths');
 }
 
 // KI-E46..E51 (2026-07-26): telemetry-driven effectiveness wave — direct-recovery classification
-// (the KPI undercounted the factory's dominant close path: 5 of 9 live recoveries read as plain
+// (the KPI undercounted the factory's dominant close path: 9 of 13 live recoveries read as plain
 // re-band closes), recovery folds out of the derived duration authority, band-split first-pass
 // KPI, agent event-vocabulary clamp + ts-paired agent durations, the mid-band main-drift check,
 // and the count-claim / test-comment briefs targeting the fix-introduced-defect class.
@@ -1532,7 +1536,7 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
   eq(T.clampAgentEvent(''), 'agent_note', 'KI-E49: empty clamps too (emit still requires --event upstream)');
   // source contracts
   const drv46 = readFileSync(join(import.meta.dirname, '..', 'driver.mjs'), 'utf8');
-  ok(/isRecoveryResultId\(r\.resultId\)/.test(drv46) && /KI-E47/.test(drv46), 'KI-E47: the fold derives no stage timeline for a recovery fold + stamps direct/resultId');
+  ok(/isRecoveryResultId\(r\.resultId\) \|\| isDirectRecoveryFold\(/.test(drv46) && /KI-E47/.test(drv46), 'KI-E47: the fold derives no stage timeline for ANY recovery-signature fold (full KI-E46 set) + stamps direct/resultId');
   ok(/case 'main-check'/.test(drv46) && /KI-E50/.test(drv46), 'KI-E50: driver main-check command exists (read-only, warn-only)');
   ok(!/MUTATING = new Set\(\[[^\]]*main-check/.test(drv46), 'KI-E50: main-check is NOT in the mutating set (no lock, no lease)');
   const fac46 = readFileSync(join(import.meta.dirname, '..', 'factory.js'), 'utf8');

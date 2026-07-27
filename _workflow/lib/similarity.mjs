@@ -14,8 +14,8 @@ export const STOP = new Set(('the a an of for or and to in on is are no not miss
 // service / infra tokens that are target-specific noise, not the systemic pattern
 export const NOISE = new Set(('search redis postgres rabbitmq minio scylladb seaweedfs admin identity users payments '
   + 'orders products media messaging notification analytics compliance casefiles config finance risk audit '
-  + 'marketplace shop portal erika crypto auth iam shopadmin webportal adminportal service svc '
-  + 'i2p i2pd mailservice').split(/\s+/));
+  + 'marketplace shop portal billing crypto auth iam shopadmin webportal adminportal service svc '
+  + 'kafka mongo email mail').split(/\s+/));
 
 export function sig(item) {
   const words = String(item.title || '').toLowerCase().replace(/[^a-z0-9 -]/g, ' ').split(/\s+/);

@@ -36,7 +36,7 @@ opus-high, xhigh for the gnarliest (critical money/security/concurrency).
    list, a cross-reference clause) MUST be re-derived from the tree (grep/ls) before you finish;
    quote the derivation command + its output in `fix.json`. The adversarial band greps your
    claims — a wrong count in your own additions is the #1 recent rejection class
-   ("fix-introduced defects", cycle 47 3/4: a "13 epics" claim the tree grep-proved wrong; a
+   ("fix-introduced defects", cycle 47 3/4: an epic-count claim the tree grep-disproved; a
    false cross-reference clause contradicting the adjacent row). Verify, don't recall.
 7. Build the touched project to catch obvious breaks before handing off (the independent runner
    re-verifies). Do NOT self-certify the suite — that is the runner's + gates' job.

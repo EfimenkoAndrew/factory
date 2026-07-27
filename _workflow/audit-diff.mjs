@@ -65,7 +65,7 @@ const RULES = [
   { id: 'NS-BLOCK', sev: 'LOW', when: isCs, test: (l) => /^namespace\s+[\w.]+\s*$/.test(l.trimEnd()) === false && /^namespace\s+[\w.]+\s*\{/.test(l),
     msg: 'block-scoped namespace — use a file-scoped namespace (code-style.md)' },
   { id: 'SCOPE-TAX', sev: 'HIGH', when: isCs, test: (l) => /\b(TaxRate|TaxAmount|TaxJurisdiction|TaxableAmount|IsTaxOfficer)\b/.test(l),
-    msg: 'tax surface — the marketplace has NO tax responsibility (product-scope.md §2). HARD STOP.' },
+    msg: 'tax surface — this host has NO tax responsibility (product-scope.md §2). HARD STOP.' },
   { id: 'SCOPE-FEE', sev: 'HIGH', when: isCs, test: (l) => /FeeType\.ServiceFee\b/.test(l),
     msg: 'FeeType.ServiceFee / purchase fee — forbidden (product-scope.md §3/§5). HARD STOP.' },
   { id: 'SCOPE-SAR', sev: 'HIGH', when: isCs, test: (l) => /\b(SuspiciousActivityReport|ReferToAuthorities|TaxReportGenerator)\b/.test(l),

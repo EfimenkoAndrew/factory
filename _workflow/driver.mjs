@@ -44,7 +44,7 @@ import { snapshotMainFiles, driftAgainstSnapshot, dirtyMainPaths, filesOverlapDi
 import { buildDocMap, readRoleBriefs } from './lib/promptpack.mjs';
 // KI-E7 — telemetry is OBSERVATIONAL ONLY (ai-factory-observability spine AD-1..3/AD-11): emit()
 // never throws, never blocks a command, and never feeds a fold verdict. FACTORY_TELEMETRY=0 disables.
-import { emit as temit, deriveStageTimeline, readEvents, aggregateEvents, renderTelemetryReport, telemetryFile, GAP_FENCE_MS, nonCanonicalArtifacts, isRecoveryResultId } from './lib/telemetry.mjs';
+import { emit as temit, deriveStageTimeline, readEvents, aggregateEvents, renderTelemetryReport, telemetryFile, GAP_FENCE_MS, nonCanonicalArtifacts, isRecoveryResultId, isDirectRecoveryFold } from './lib/telemetry.mjs';
 import { lintWorktreeDocClaims } from './lib/doclint.mjs'; // F2 — phantom doc-path detection aid at fold (WARN-only)
 import { findLeftovers } from './lib/leftover-scan.mjs'; // KI-D12 — deferral/tech-debt lexicon detection aid at fold (WARN-only)
 
@@ -436,7 +436,28 @@ function deterministicVerifyOverride(cfg, ledger, wi, r) {
   // carried 6 pre-existing Docker-unavailable Testcontainers failures — a 10/10-APPROVED item
   // false-FAILED on exactly this comparison. The transcript is teed at RED time (tree still unfixed),
   // so it can never launder a fix-broken test into the baseline; failures beyond it stay regressions.
-  const baseline = effectiveBaseline(r.baselineFailures, (() => { const t = readIf('baseline-raw.txt'); return t ? parseVerifyRaw(t) : null; })());
+  // KI-E43 reFix fence (review find): "the tree is still unfixed at RED time" holds ONLY on a first
+  // attempt — a reFix worktree already carries the prior FAILED fix, so a baseline RE-captured during
+  // the reFix round would launder that fix's own breakage into the allowance. The transcript is
+  // trusted on a reFix (prevState FAILED/ESCALATED) only when its mtime PREDATES this attempt's
+  // claim (i.e. it is the FIRST round's capture); a re-capture is ignored loudly. The brief also
+  // tells the test-author not to re-capture — this fence is the deterministic backstop.
+  const baselineParse = (() => {
+    const p = abs(join(cfg.paths.items, id, 'baseline-raw.txt'));
+    if (!existsSync(p)) return null;
+    const row43 = (ledger.items || {})[id] || {};
+    if (row43.prevState === 'FAILED' || row43.prevState === 'ESCALATED') {
+      const ch = (row43.history || []).filter((h) => h.to === 'CLAIMED');
+      const claimMs43 = ch.length ? Date.parse(ch[ch.length - 1].at) : 0;
+      let mtime43 = Infinity; try { mtime43 = statSync(p).mtimeMs; } catch { /* unreadable -> distrust */ }
+      if (claimMs43 && mtime43 >= claimMs43) {
+        console.log(`  KI-E43 reFix fence ${id}: baseline-raw.txt was (re)captured DURING this reFix attempt — the tree already carries the prior fix, so the transcript is IGNORED (the run-reported baseline stands)`);
+        return null;
+      }
+    }
+    return parseVerifyRaw(readFileSync(p, 'utf8'));
+  })();
+  const baseline = effectiveBaseline(r.baselineFailures, baselineParse);
   const fail = (reason) => {
     r.transitions = ['FAILED']; r.toState = 'FAILED';
     r.note = 'deterministic fold-time override: ' + reason + (r.note ? ' [agent claimed: ' + r.note + ']' : '');
@@ -753,8 +774,10 @@ function cmdFold(file, flags) {
       // timeline was emitted at the ORIGINAL fold, and the recovery's artifact mtimes measure the
       // operator-paced remedy/re-gate window (live: 4 re-gate rounds over hours folded as a fake
       // 1.8h "gates" duration that polluted the p95 duration authority). The item_folded record
-      // (with the KI-E46 direct stamp) is the recovery's telemetry.
-      const isRec = isRecoveryResultId(r.resultId);
+      // (with the KI-E46 direct stamp) is the recovery's telemetry. The FULL KI-E46 signature set
+      // decides (review find): a hand-rolled recovery fold may omit the #Nr resultId and carry
+      // only the legacy gates key / note prefix — those must not pollute the authority either.
+      const isRec = isRecoveryResultId(r.resultId) || isDirectRecoveryFold({ resultId: r.resultId, gates: r.gates, note: r.note });
       if (!isRec) {
         const claimHist = (row.history || []).filter((h) => h.to === 'CLAIMED');
         const claimMs = claimHist.length ? Date.parse(claimHist[claimHist.length - 1].at) : 0;
@@ -855,7 +878,7 @@ function cmdResume(flags) {
         const { committed, dirty } = splitDriftByStatus(REPO_ROOT, driftAgainstSnapshot(REPO_ROOT, (readJson(snapPath) || {}).files || {}));
         if (dirty.length) console.log(`    ⚠ MAIN-GUARD ${id} (KI-E41): item files DRIFTED in the MAIN tree since claim — an agent of the dead run likely wrote outside its worktree. REPAIR MAIN FIRST (restore to HEAD or apply the gated worktree copy), THEN relaunch — the band reads main as its read-only reference:\n` + dirty.map((d) => `        ${d.file} (${d.was} -> ${d.now})`).join('\n'));
         if (committed.length) console.log(`    ℹ MAIN-GUARD ${id} (KI-E41/KI-E35): item files changed in main via HUMAN commits since claim (clean per git status) — verify the relaunch is still meaningful against the new main:\n` + committed.map((d) => `        ${d.file}`).join('\n'));
-      } catch { /* detection aid only — never blocks the relaunch listing */ }
+      } catch (e) { console.log(`    MAIN-GUARD ${id} SKIPPED (${e && e.message}) — treat as UNCHECKED, not clean (KI-E41; never blocks the relaunch listing)`); }
     }
     // KI-E42 — killed-run artifact quarantine. A dead attempt's improvised artifacts (cycle 47: a stray
     // RESULT.md claiming "false positive — already fixed, no action taken") survive into the relaunch's
@@ -870,7 +893,7 @@ function cmdResume(flags) {
         const names = readdirSync(dir).filter((n) => { try { return statSync(join(dir, n)).isFile(); } catch { return false; } });
         const junk = nonCanonicalArtifacts(names);
         if (junk.length) debrisByItem.push({ id, dir, junk });
-      } catch { /* detection aid only */ }
+      } catch (e) { console.log(`    DEBRIS-CHECK ${id} SKIPPED (${e && e.message}) — treat as UNCHECKED, not clean (KI-E42)`); }
     }
     if (debrisByItem.length && flags.quarantine) {
       for (const d of debrisByItem) {
@@ -951,8 +974,10 @@ function cmdReconstruct(flags) {
   // through; the fold's existing usage emit then fires exactly as on the live path. Observational
   // only — it never affects any verdict.
   const payload = { mode: 'reconstructed', cycle: cyc, results };
-  const ut = flags['usage-tokens'] ? parseInt(flags['usage-tokens'], 10) : NaN;
+  const rawUt = flags['usage-tokens'];
+  const ut = rawUt ? parseInt(rawUt, 10) : NaN;
   if (Number.isFinite(ut) && ut > 0) { payload.usage = { outputTokens: ut }; console.log(`  usage passthrough (KI-E44): outputTokens=${ut} will emit at fold`); }
+  else if (rawUt !== undefined) console.log(`  --usage-tokens '${rawUt}' is not a positive integer — usage NOT stamped; re-run with the harness-reported output-token total (KI-E44)`);
   else console.log('  (no --usage-tokens <N> passed — checkpoints carry no usage, so this fold will emit NO usage event; pass the harness-reported output-token total to keep cost telemetry complete — KI-E44)');
   writeJsonAtomic(out, payload);
   console.log(`reconstruct: ${results.length} checkpointed result(s) for cycle ${cyc} -> ${out}`);

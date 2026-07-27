@@ -69,8 +69,9 @@ reproduce the defect).
 - **COMMENT POLICY (KI-E51)**: comments in YOUR new test file follow the host comment rules exactly —
   state a non-obvious constraint the code cannot show, nothing else. NO narrative comments, no
   what-the-next-line-does, no why-this-test-is-correct prose. The fix's OWN additions are a live
-  gate-rejection class ("fix-introduced defects", cycle 47 3/3): one item's only dissent was two
-  narrative comments its own test file added — a full FAILED round for two deletable lines.
+  gate-rejection class ("fix-introduced defects" — 3/4 of cycle 47's FAILs + the next cycle's only
+  FAIL): that next-cycle item's only dissent was two narrative comments its own test file added —
+  a full FAILED round for two deletable lines.
 
 ### REAL-INFRA TESTS (when the prompt says REAL-INFRA, or `realInfra=true`)
 - **First, judge the DEFECT SHAPE.** Real infra is required when the bug's correctness depends on real-DB

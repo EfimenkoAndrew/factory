@@ -473,6 +473,7 @@ async function runItem(item) {
     // deterministic fold override false-fails the item (cycle 47: ITEM-H15, 6 env failures vs
     // baseline 0 — a 10/10-APPROVED item FAILED). Docker-present hosts skip the extra suite run (no cost).
     + ' FULL-SUITE BASELINE (KI-E43): FIRST run `docker info >/dev/null 2>&1; echo exit=$?`. If it FAILS (non-zero — no Docker), the integrate stage\'s full suite will hit pre-existing Docker-unavailable failures that are NOT this fix\'s fault: capture the pre-fix baseline NOW, while the tree is still unfixed — run `' + BT + ' suite ' + sln + ' 2>&1 | tee ' + itemsDir(id) + '/baseline-raw.txt` (ABSOLUTE path) and return baselineFailures = the FAILING test names from that run (exclude your new regression test if it appears). If `docker info` SUCCEEDS, skip the baseline run and omit baselineFailures.'
+    + (item.reFix ? ' RE-FIX EXCEPTION (KI-E43): do NOT re-capture the baseline — this worktree already carries the prior attempt\'s fix, so a capture NOW would launder that fix\'s own breakage into the allowance. The FIRST round\'s baseline-raw.txt (already on disk) stands; the driver ignores a re-captured one.' : '')
   // P2: if the defect shape is real-DB-dependent (normalizer flag OR a concurrency/raw-SQL/constraint keyword),
   // the test MUST be Testcontainers-backed (an in-memory green will be REJECTED at fold). If it is a pure
   // query-LOGIC bug, an in-memory test is correct — do NOT force a container where the provider behaves identically.

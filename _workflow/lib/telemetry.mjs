@@ -183,6 +183,10 @@ export function quantile(nums, q) {
 // vocabulary counts not-ok AND is surfaced by the report footnote (self-reporting drift instead
 // of a silent miscount).
 export const KNOWN_FAIL_VERDICT = /^(CHANGES[_-]REQUIRED|REJECTED|REFUTED|OVERTURNED|OVERRULED|FAILED|BLOCKED)$/i;
+// Known-fail reaudit FAMILIES (review find): 'code=ok security=no' / 'code=NULL' are the reaudit's
+// real failure vocabulary — they count not-ok (verdictOk is strict all-ok), and they must not
+// pollute the unclassified-drift footnote as if they were unrecognized passes.
+export const KNOWN_FAIL_FAMILY = /^[\w.-]+=(ok|no|null|fail)(\s+[\w.-]+=(ok|no|null|fail))*$/i;
 export function verdictOk(v) {
   const s = String(v == null ? '' : v).trim();
   if (!s) return false;
@@ -195,10 +199,11 @@ export function verdictOk(v) {
 // The KI-E20 `recover` scaffold folds with resultId "<id>#<cycle>r" (also #Nr2, #Nr3 …) and a
 // note that STARTS with "direct-recovery"; older hand-rolled recovery folds carried a literal
 // 'direct-recovery' key in the gates map instead. The KPI previously recognized ONLY the
-// gates-map signature, so every scaffolded recovery close (5 of the 9 live recoveries) read as a
+// gates-map signature, so every scaffolded recovery close (9 of the 13 live recoveries) read as a
 // plain re-band close — under-counting the factory's DOMINANT close path (direct-recovery rate
-// rendered 14% vs 31% real). All live signatures classify now; the fold ALSO stamps attrs.direct
-// + attrs.resultId at emit time so future streams never need prose sniffing.
+// rendered 4/29 = 14% vs 13/29 = 45% real, per the KI-E46 registry row). All live signatures
+// classify now; the fold ALSO stamps attrs.direct + attrs.resultId at emit time so future
+// streams never need prose sniffing.
 export function isRecoveryResultId(rid) { return /#\d+r\d*$/i.test(String(rid || '')); }
 export function isDirectRecoveryFold(attrs) {
   const a = attrs || {};
@@ -305,7 +310,10 @@ export function renderTelemetryReport(agg, meta = {}) {
   });
   const unclassified = [];
   for (const [g, vs] of Object.entries(agg.gates)) {
-    for (const [k, n] of Object.entries(vs)) if (!verdictOk(k) && !KNOWN_FAIL_VERDICT.test(String(k).trim())) unclassified.push(`${g} → \`${k}\`×${n}`);
+    for (const [k, n] of Object.entries(vs)) {
+      const kt = String(k).trim();
+      if (!verdictOk(k) && !KNOWN_FAIL_VERDICT.test(kt) && !KNOWN_FAIL_FAMILY.test(kt)) unclassified.push(`${g} → \`${k}\`×${n}`);
+    }
   }
   const cycleRows = Object.entries(agg.cycles).sort((a, b) => Number(a[0]) - Number(b[0]))
     .map(([c, v]) => `| ${c} | ${v.folded} | ${v.closed} |`);

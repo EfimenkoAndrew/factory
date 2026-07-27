@@ -12,7 +12,7 @@ import { execFileSync } from 'node:child_process';
 // slash-joined word alternations ("mute/unmute", "analytics/CRM", "A/B/C feature lists") — a
 // claim is kept ONLY when it is unambiguously path-shaped: it ends with '/' (explicit directory
 // claim, the witness shape) OR its last segment carries a file extension (services.json,
-// marketplace-admin.md, AdminController.cs).
+// admin-portal.md, AdminController.cs).
 const CLAIM_RE = /(?:^|[\s`"'(\[])((?:[A-Za-z0-9_.-]+\/)+[A-Za-z0-9_.-]+\/?)(?=$|[\s`"')\],;:])/g;
 const SKIP_RE = /https?:|[*{}<>$]|\.\.\.|^\d+(\.\d+)*\/?$|(^|\/)\.\.(\/|$)/;
 
