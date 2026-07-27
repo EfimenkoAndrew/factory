@@ -8,7 +8,7 @@
 //   node <factory>/_workflow/telemetry-emit.mjs --event stage_start --item ITEM-H13 --role fixer
 //   node <factory>/_workflow/telemetry-emit.mjs --event stage_end --item ITEM-H13 --role fixer --outcome ok --durMs 84210
 try {
-  const { emit, roleToStage, normalizeStage } = await import('./lib/telemetry.mjs');
+  const { emit, roleToStage, normalizeStage, clampAgentEvent } = await import('./lib/telemetry.mjs');
   const argv = process.argv.slice(2);
   // 'source' is deliberately NOT accepted from argv (review finding #2): this CLI is the AGENT
   // seam, and AD-2's authority ranking collapses if an agent can stamp source:derived/driver.
@@ -29,6 +29,10 @@ try {
   // absent --stage derives from --role. Unmappable values are dropped (role remains on the event).
   const stage = e.stage ? normalizeStage(e.stage) : roleToStage(e.role);
   if (stage) e.stage = stage; else delete e.stage;
+  // KI-E49 — the agent seam emits exactly the two canonical stage events; a free-typed --event
+  // (live in the stream: probe / dummy_probe / tool_use) is clamped to 'agent_note' with the
+  // original name preserved in attrs, so the stream vocabulary stays bounded.
+  if (e.event) { const clamped = clampAgentEvent(e.event); if (clamped !== e.event) { e.attrs.origEvent = String(e.event).slice(0, 100); e.event = clamped; } }
   if (!Object.keys(e.attrs).length) delete e.attrs;
   if (!e.event) process.stderr.write('[telemetry-emit] --event required; skipped\n');
   else emit(e);
