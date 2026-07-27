@@ -10,6 +10,51 @@ This repo ships **engine-only** — no findings, ledger, or run history. You sup
 items (a `findings-graph.json`); everything under `state/`, `reports/`, and `queue/` is
 generated per host at runtime and is gitignored, so no project data ever enters this repo.
 
+## 0. TL;DR — versioned team install (KI-E52)
+
+One line, run from anywhere inside your host repo:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/EfimenkoAndrew/factory/main/setup/install.sh | bash -s -- install
+```
+
+That installs the **latest release** (a `vX.Y.Z` tag; falls back to `main` with a notice
+until the first release is cut) into `_bmad-output/ai-factory`, runs `setup/init.mjs`
+(scaffolding + the `/ai-factory` controller skill), **gates on the full selftest suite**
+(the current assert count lives in `CLAUDE.md`), and
+bootstraps YOUR telemetry infra: the Grafana/Prometheus/OTel compose stack (`docker compose
+up -d`, per-host `telemetry/.env`) plus the session **cost-telemetry env** installed three
+ways — per-host env file, host `.claude/settings.local.json` `env` block, and (recommended —
+some runtimes do not forward `OTEL_*` from settings env, KI-E33) a sourced block in your
+shell profile. Useful variants:
+
+```bash
+… | bash -s -- install --submodule --hooks     # submodule mount + the pre-push audit gate
+… | bash -s -- install --version v1.2.0        # pin a version
+… | bash -s -- install --no-telemetry          # skip the observability bootstrap
+```
+
+Day-2, from the installed mount:
+
+```bash
+_bmad-output/ai-factory/setup/install.sh status          # installed vs latest release
+_bmad-output/ai-factory/setup/install.sh upgrade --yes   # fetch latest, SELFTEST-GATED —
+                                                         # a red selftest auto-ROLLS-BACK;
+                                                         # state/ reports/ queue/ telemetry
+                                                         # data + .env are never touched
+_bmad-output/ai-factory/setup/install.sh telemetry-up    # (re)start the per-dev stack
+```
+
+`upgrade --yes` is unattended-safe (cron it if you want auto-upgrades). Maintainers cut
+releases with `setup/release.sh <patch|minor|major|X.Y.Z>` (the explicit `X.Y.Z` form is how
+the FIRST release matching the seeded `VERSION` is cut) — it verifies local main is exactly
+`origin/main`, enforces the SAME selftest gate, bumps `VERSION`, prepends `CHANGELOG.md`,
+tags `vX.Y.Z`, pushes atomically, and publishes the GitHub Release the installers resolve.
+On a PR-only main (direct pushes blocked by a ruleset) it automatically publishes via the
+tag + a `release/vX.Y.Z` branch + a PR instead. `setup/_e2e.sh` is the hermetic end-to-end
+harness for all of this (local fixture remote, no network) — run it before cutting.
+The sections below are the manual path and the details.
+
 ## 1. Prerequisites
 
 | Requirement | Why | Hard? |

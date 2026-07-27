@@ -1547,5 +1547,39 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
   ok(readFileSync(join(import.meta.dirname, '..', '..', 'agents', 'test-author.md'), 'utf8').includes('COMMENT POLICY (KI-E51)'), 'KI-E51: test-author card carries the test-comment policy');
 }
 
+// KI-E52 (2026-07-26): versioned releases + team install/upgrade + per-developer telemetry
+// bootstrap (setup/install.sh, setup/release.sh, VERSION, CHANGELOG.md). Source-contract pins —
+// the behaviours are E2E-tested by the installer's own fixture flow (install → rollback-on-red →
+// pinned upgrade → telemetry env → vendored refusal).
+{
+  const ROOT = join(import.meta.dirname, '..', '..');
+  const ver = readFileSync(join(ROOT, 'VERSION'), 'utf8').trim();
+  ok(/^\d+\.\d+\.\d+$/.test(ver), 'KI-E52: VERSION is semver X.Y.Z');
+  const inst = readFileSync(join(ROOT, 'setup', 'install.sh'), 'utf8');
+  ok(/ls-remote --tags --refs/.test(inst) && /sort -V/.test(inst), 'KI-E52: latest release resolves from remote vX.Y.Z tags (no gh dependency for installs)');
+  ok(/run_selftest/.test(inst) && /_selftest\.mjs/.test(inst), 'KI-E52: install AND upgrade are selftest-gated');
+  ok(/ROLLING BACK/.test(inst) && inst.includes('git -C "$mount" checkout --quiet "$prev"'), 'KI-E52: a red selftest on upgrade ROLLS BACK to the previous ref');
+  ok(/VENDORED/.test(inst), 'KI-E52: a vendored (.git-less) mount is refused, never half-upgraded');
+  ok(inst.includes('claude-code-telemetry.env') && inst.includes('settings.local.json'), 'KI-E52: telemetry bootstrap writes the per-host env file AND merges the host settings env block');
+  ok(/ai-factory cost telemetry/.test(inst) && /\.bashrc/.test(inst), 'KI-E52: optional shell-profile env block (the KI-E33-reliable session path) is marker-guarded');
+  ok(inst.includes('docker compose --project-directory'), 'KI-E52: the compose stack starts against the mount telemetry dir (per-host .env respected, KI-E25)');
+  ok(inst.includes('if [ -n "$HOST" ]'), 'KI-E52: an explicit --host beats script self-location (E2E-caught redirect bug)');
+  const rel = readFileSync(join(ROOT, 'setup', 'release.sh'), 'utf8');
+  ok(/_selftest\.mjs/.test(rel) && /git tag -a/.test(rel) && rel.includes('> VERSION'), 'KI-E52: release cut is selftest-gated, bumps VERSION, tags vX.Y.Z');
+  const gi = readFileSync(join(ROOT, '.gitignore'), 'utf8');
+  ok(/^telemetry\/\.env$/m.test(gi), 'KI-E52: per-host telemetry/.env is gitignored (E2E-caught — upgrades must see a clean tree)');
+  // Deep-review hardening pins (2026-07-27) — behaviors are exercised end to end by setup/_e2e.sh.
+  const { execFileSync: exf52 } = await import('node:child_process');
+  let parse52 = true;
+  try { for (const s of ['install.sh', 'release.sh', '_e2e.sh']) exf52('bash', ['-n', join(ROOT, 'setup', s)]); } catch { parse52 = false; }
+  ok(parse52, 'KI-E52: install.sh / release.sh / _e2e.sh all parse (bash -n)');
+  ok(existsSync(join(ROOT, 'setup', '_e2e.sh')), 'KI-E52: the hermetic E2E harness ships in-tree — the "E2E-tested" claim is re-runnable');
+  ok(/REFUSING to touch/.test(inst), 'KI-E52: an existing-but-unparseable settings.local.json is refused, never clobbered (review fix)');
+  ok(inst.includes('cannot reach $REPO') && inst.includes("grep -E '^v[0-9]+\\.[0-9]+\\.[0-9]+$'"), 'KI-E52: latest-release resolve dies loudly on an unreachable remote and only strict vX.Y.Z tags win (review fix)');
+  ok(inst.includes('install_cleanup') && inst.includes('rm -rf "$INSTALL_CREATED"'), 'KI-E52: a failed install removes the mount it created — no half-install blocks the corrective re-run (review fix)');
+  ok(inst.includes('|| warn "telemetry bootstrap FAILED') && inst.includes('setup/init.mjs" --repo-root "$(host_of_mount'), 'KI-E52: telemetry failure never fails a good engine install; upgrade refreshes host scaffolding via init.mjs (review fix)');
+  ok(rel.includes('git push --atomic origin main "refs/tags/$TAG"') && rel.includes('rev-parse origin/main') && rel.includes('HEAD:refs/heads/release/$TAG'), 'KI-E52: release cut is origin-synced + atomic, and a PR-only main falls back to tag + release-branch + PR (review find: a rejected --follow-tags push still published the tag)');
+}
+
 console.log(`\nself-test: ${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);
