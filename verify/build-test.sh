@@ -9,17 +9,38 @@
 #   build-test.sh filter  <test.csproj-or-sln> "<FullyQualified~or~Name>"   # POST-FIX: proves the test is GREEN
 #   build-test.sh suite   <test.csproj-or-sln>
 #   build-test.sh claims    <worktree-path>       # KI-E11: phantom doc-path lint (FACTORY::CLAIMS::<n>)
-#   build-test.sh leftovers <worktree-path>       # KI-D12: deferral/tech-debt lexicon lint (FACTORY::LEFTOVER::<n>)
+#   build-test.sh leftovers <worktree-path>       # KI-D12: deferral/tech-debt lexicon lint (FACTORY::LEFTOVER::<n>) — engine-owned, runs BEFORE the local-override seam
+#   build-test.sh comments  <worktree-path>       # KI-E59: no-new-comments lint (FACTORY::COMMENT::<n>) — engine-owned, runs BEFORE the local-override seam
 #   build-test.sh pack      <worktree-path> <out> # review pack snapshot for the gate band
 #
 # NEVER runs git. Read-only against the repo except for build artifacts in the worktree.
 set -uo pipefail
 
+# Engine-owned diff lints run BEFORE the host-override seam below: leftovers/comments are
+# stack-agnostic (pure git-diff + node — no dotnet), so a host's build-test.local.sh never needs to
+# implement them, and a pre-existing override that predates a lint subcommand must not swallow it
+# (PR#9 review: an old override's unknown-subcommand usage error carried no FACTORY::COMMENT marker,
+# which parsed downstream as count=0 — the whole gate silently vanished on every override host and
+# even recorded a false APPROVED).
+#   leftovers — KI-D12 deferral-lexicon candidate detector (haiku probe classifies punt-vs-legit).
+#   comments  — KI-E59 no-new-comments detector (host-policy `noNewComments` gates the callers; NO
+#               classifier stage — when the policy is on, every hit is a hard violation).
+case "${1:-}" in
+  leftovers|comments)
+    _wt="${2:-}"
+    if [ -z "$_wt" ]; then echo "usage: build-test.sh ${1} <worktree>" >&2; exit 64; fi
+    _SD=$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)
+    if [ "$1" = "leftovers" ]; then exec node "$_SD/../_workflow/leftover-lint.mjs" "$_wt"; fi
+    exec node "$_SD/../_workflow/comment-lint.mjs" "$_wt"
+    ;;
+esac
+
 # Host-stack override seam (KI-E17, SETUP.md § 6): the default runner below is .NET (dotnet
 # build/test emitting the FACTORY:: markers). A non-.NET host drops an EXECUTABLE
 # verify/build-test.local.sh next to this file implementing the SAME subcommand + marker
-# contract; it takes over everything. A local script that wants to delegate back to this
-# default must set FACTORY_BT_NO_LOCAL=1 to avoid recursion. (Gitignored — never committed.)
+# contract; it takes over everything EXCEPT the engine-owned diff lints dispatched above. A local
+# script that wants to delegate back to this default must set FACTORY_BT_NO_LOCAL=1 to avoid
+# recursion. (Gitignored — never committed.)
 _LOCAL="$(dirname "${BASH_SOURCE[0]:-$0}")/build-test.local.sh"
 if [ -x "$_LOCAL" ] && [ -z "${FACTORY_BT_NO_LOCAL:-}" ]; then exec "$_LOCAL" "$@"; fi
 
@@ -105,21 +126,6 @@ case "$cmd" in
     node "$SCRIPT_DIR/../_workflow/claims-lint.mjs" "$wt"
     exit $?
     ;;
-  leftovers)
-    # KI-D12 (2026-07-19): deterministic LeftoverScan — greps the worktree diff's ADDED lines for the
-    # intentionally-created-tech-debt lexicon (TODO/FIXME/HACK/XXX, NotImplementedException, "for now",
-    # "deferred", "temporary workaround", "follow-up", …), excluding the sanctioned mechanisms
-    # (standards-evolution: tags, .claude/rules + _bmad-output docs, REPLACE_WITH_/CHANGE_ME secret
-    # templates). Emits FACTORY::LEFTOVER-HIT::<file>::<lexeme>::<line> + FACTORY::LEFTOVER::<count>;
-    # exit 1 when count>0. Candidate detector only — a haiku probe classifies punt-vs-legit, the fold
-    # re-greps as the backstop. Same lib the factory's probe + fold read (single source of truth).
-    #   usage: build-test.sh leftovers <worktree-path>
-    wt="$target"
-    if [ -z "$wt" ]; then echo "usage: build-test.sh leftovers <worktree>" >&2; exit 64; fi
-    SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
-    node "$SCRIPT_DIR/../_workflow/leftover-lint.mjs" "$wt"
-    exit $?
-    ;;
   pack)
     # REVIEW PACK (cache-strategic reviewer input, 2026-07-18): ONE machine-generated snapshot of the
     # worktree change (git status + full diff vs HEAD + untracked-file contents) that every
@@ -154,7 +160,7 @@ case "$cmd" in
     exit 0
     ;;
   *)
-    echo "usage: build-test.sh build|red|filter|suite|claims|pack <target> [filter|outfile]" >&2
+    echo "usage: build-test.sh build|red|filter|suite|claims|leftovers|comments|pack <target> [filter|outfile]" >&2
     exit 64
     ;;
 esac

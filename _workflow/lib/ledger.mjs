@@ -163,6 +163,14 @@ export function transition(ledger, id, to, note) {
   return true;
 }
 
+// KI-E53 (PR#9 review — extracted from cmdEscalationsSync for a behavioral pin): the last real
+// reason on a ledger row. `row.note` is a dead field nothing assigns — only per-transition
+// history[].note entries carry reasons, so the human decision queue walks history from the tail.
+export function lastHistoryNote(r) {
+  const h = ((r && r.history) || []).filter((x) => x.note);
+  return h.length ? h[h.length - 1].note : '(no note)';
+}
+
 // Fold a batch of per-item Workflow results into the ledger atomically (single writer).
 // Each result: { id, toState, artifacts?, gates?, cost?, worktree?, branch?, note?, attemptsDelta? }.
 // Unknown ids and disallowed transitions are collected into `rejected` (never silently lost).

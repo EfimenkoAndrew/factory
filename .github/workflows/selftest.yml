@@ -1,0 +1,20 @@
+# PR#9 review — CI selftest gate. Before this, no CI ran any selftest (only the branch-name
+# check): a PR that broke the engine merged green unless someone ran the suite by hand. The main
+# suite spawns the opencode suite too, so one command gates both runtimes. Node + git + bash only —
+# no dotnet/docker required (the suite is hermetic: git fixtures in tmpdirs, in-process exec-smoke).
+name: selftest
+on:
+  push:
+    branches: [main]
+  pull_request:
+jobs:
+  selftest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Engine selftest (includes the opencode suite)
+        run: node _workflow/lib/_selftest.mjs

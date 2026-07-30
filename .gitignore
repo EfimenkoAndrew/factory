@@ -14,6 +14,11 @@ state/*.pre-fresh-*
 # Host-local overrides (KI-E17 / SETUP.md § 6) — per-host, never committed
 config/factory.config.local.json
 verify/build-test.local.sh
+# Repo style profiles (KI-E60) are HOST data — derived from each host's own private repos' PRs, the
+# exact class KI-E26 keeps out of this engine repo. Only the README + the fictional example ship.
+agents/repo-profiles/*
+!agents/repo-profiles/README.md
+!agents/repo-profiles/_example.Contoso.Widgets.md
 telemetry/.env
 telemetry/claude-code-telemetry.env
 # Telemetry stream (KI-E7 / spine AD-8) — generated event data, never committed
