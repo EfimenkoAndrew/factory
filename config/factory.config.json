@@ -15,6 +15,11 @@
     "ttlMinutes": 240,
     "note": "Session-controller lease: every mutating driver command requires state/controller.json's token (--controller / FACTORY_CONTROLLER); free or TTL-stale lease auto-claims, FRESH foreign lease refuses. TTL must outlast the longest group->fold gap (a full Workflow band). Advisory anti-footgun, not a security boundary."
   },
+  "policies": {
+    "noNewComments": false,
+    "noSchemaChanges": false,
+    "note": "HOST-OWNER directives, OFF in the shipped engine (PR#9 review — one host's house rules must not be universal). noNewComments: the KI-E57/KI-E59 zero-new-comments rule + its 3-layer mechanical gate. noSchemaChanges: the KI-E58 no-migrations/no-schema-change hard stop for planner/fixer. Enable per host in config/factory.config.local.json (gitignored, KI-E17 seam): { \"policies\": { \"noNewComments\": true, \"noSchemaChanges\": true } }. The driver prints the effective state at every group/sweep."
+  },
   "maxItemRetries": 2,
   "retryBonusOnConvergence": true,
   "maxBonusRounds": 1,

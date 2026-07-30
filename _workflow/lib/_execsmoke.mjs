@@ -23,6 +23,7 @@ export function defaultAgentStub(opts, blockedGate) {
   const label = (opts && opts.label) || '';
   if (p.written) return { written: true };
   if (p.covered !== undefined) return { covered: true, gaps: [] }; // KI-E18 AcceptanceScan probe (happy path)
+  if (p.count !== undefined) return { count: 0, hits: [] }; // KI-E59 CommentScan probe (happy path — zero new comments)
   if (p.red) return { red: true, testFiles: ['X/src/X.Tests/SomeTests.cs'], runCmd: 'stub', evidence: 'stub', note: 'stub' };
   if (p.applied) return { applied: true, filesChanged: ['X/src/Some.cs'], summary: 'stub', scopeStop: false, divergence: null, note: 'stub' };
   if (p.build) return { build: 'pass', targetedTest: 'pass', suite: { passed: 2, failed: 0, skipped: 0 }, realInfraExercised: false, debris: [], evidence: 'FACTORY::BUILD::RESULT exit=0 (stub)', note: 'stub' };
@@ -86,6 +87,10 @@ export function smokeBatch() {
   const base = { target: 'X', layer: 'service', dependsOn: [], gateSet: [], autonomyTier: 'auto', source: 'smoke', solution: 'X/X.sln', peers: [] };
   return {
     cycle: 0, concurrency: 2, attempts: 1, repoRoot: '.', templatesDir: '_bmad-output/ai-factory/agents', config: {}, dryRun: false,
+    // PR#9 review — the smoke exercises the policy-ON lanes (comment probe + HOST POLICY prompt
+    // blocks); a policy-OFF lane in the selftest passes a batch without this key and asserts the
+    // probe is skipped (the shipped-engine default).
+    policies: { noNewComments: true, noSchemaChanges: true },
     items: [
       { ...base, id: 'SMOKE-DOC', title: 'doc drift', severity: 'HIGH', theme: 'doc-drift', fixType: 'doc-drift', files: ['doc/data-flows/X.md'], acceptance: 'doc fixed', regressionTest: 'grep', realInfra: false, worktree: wt('SMOKE-DOC') },
       { ...base, id: 'SMOKE-CODE', title: 'authz hole', severity: 'CRITICAL', theme: 'security-multitenancy', fixType: 'non-trivial', files: ['X/src/Some.cs'], acceptance: 'policy enforced', regressionTest: 'test', realInfra: false, worktree: wt('SMOKE-CODE') },

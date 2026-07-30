@@ -1,10 +1,10 @@
 // Self-test for the factory lib (run: node _bmad-output/ai-factory/_workflow/lib/_selftest.mjs).
 // Exercises the state machine, deps/locks READY computation, fold, and atomic I/O —
 // the Phase-0 acceptance surface that does not need the Workflow runtime.
-import { mkdtempSync, writeFileSync as fsWrite, readFileSync, existsSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync as fsWrite, readFileSync, existsSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, dirname, basename, resolve as resolvePath, sep } from 'node:path';
 import {
   emptyLedger, syncFromGraph, transition, foldResults, canTransition,
   countByState, writeJsonAtomic, readJson, unwrapResultEnvelope, FORWARD,
@@ -14,7 +14,7 @@ import { isFactoryWorktreePath } from './worktree.mjs';
 import { makeLimiter, pool, retry } from './pool.mjs';
 import { loadRouting, resolve } from './router.mjs';
 import { conflictFor, lockedFiles } from './locks.mjs';
-import { parseVerifyRaw, verdictFromParse, debrisFiles, parseRedRaw, hasRealInfraMarker, touchedRootCause, effectiveBaseline } from './verify.mjs';
+import { parseVerifyRaw, verdictFromParse, debrisFiles, parseRedRaw, hasRealInfraMarker, touchedRootCause, effectiveBaseline, decodeTranscript } from './verify.mjs';
 import { acquireLock, releaseLock } from './lock.mjs';
 import { checkRoutingDrift, buildFactoryRouting } from './routing-drift.mjs';
 import { changedFiles } from './worktree.mjs';
@@ -25,9 +25,11 @@ import { sig, jaccard, similarSigs, clusterBySimilarity, batchPatternFor } from 
 import { loadController, isStale as controllerStale, claimController, verifyController, releaseController } from './controller.mjs';
 import { execSmoke, smokeBatch } from './_execsmoke.mjs';
 import { classifyLine as loClassify, firstLexeme as loLexeme, findLeftovers } from './leftover-scan.mjs';
+import { classifyCommentLine as csClassify, findComments } from './comment-scan.mjs';
 import { splitAcceptanceClauses } from './acceptance.mjs';
 import { dissentersFrom, roleForGateKey, recoveryTransitions, recoveryFoldSkeleton, priorCycleOf } from './recover.mjs';
-import { extractHeadings, buildDocMap, readRoleBriefs } from './promptpack.mjs';
+import { extractHeadings, buildDocMap, readRoleBriefs, readRepoProfiles, PROFILE_CAP } from './promptpack.mjs';
+import { loadPolicies, renderPolicies, POLICY_TEXT } from './policy.mjs'; // PR#9 review — host-policy seam
 import { githubIssueToItem, markdownChecklistToItems, extractSection, severityFromLabels, themeFromLabels, ingestReport, enforceIngestTier, countCheckedBoxes } from './ingest.mjs';
 import { costTelemetryReady } from './preflight.mjs';
 import { fileURLToPath } from 'node:url';
@@ -220,6 +222,26 @@ eq(debrisFiles(['verify.json', 'verify-raw.txt', 'Svc/src/Foo.cs'], ['Svc/src/Fo
   ok(touchedRootCause(['k8s/base/services/marketing-service.yaml', 'ServiceE/src/ServiceE.Tests/Infrastructure/DeploymentSecretCompletenessTests.cs'],
     ['ServiceE/src/ServiceE.Infrastructure/Promo/PromoCodeHasher.cs']),
     'touchedRootCause: config fix (.yaml changed) + only a .cs test -> ok (not test-only) [KI-L24]');
+}
+
+// KI-E54 — decodeTranscript: BOM-aware decode so a UTF-16-emitting producer (e.g. a subagent's `tee`
+// crossing into a PowerShell-hosted shell, where `tee`/Out-File/`>` default to UTF-16LE) never silently
+// mis-decodes a fold-time transcript read into unparseable mojibake.
+{
+  const plain = 'FACTORY::RED::START foo\nFACTORY::RED::1\n';
+  eq(decodeTranscript(Buffer.from(plain, 'utf8')), plain, 'decodeTranscript: plain UTF-8/ASCII (no BOM) decodes byte-identically to the old hardcoded utf8 read');
+  const utf16le = Buffer.concat([Buffer.from([0xFF, 0xFE]), Buffer.from(plain, 'utf16le')]);
+  eq(decodeTranscript(utf16le), plain, 'decodeTranscript: UTF-16LE BOM (PowerShell tee/Out-File/> default) decodes back to the original ASCII text');
+  ok(parseRedRaw(decodeTranscript(utf16le)).hasData && parseRedRaw(decodeTranscript(utf16le)).exit === 1, 'decodeTranscript: a UTF-16LE-mangled verify-red-raw.txt now round-trips through parseRedRaw correctly (the live KI-E54 failure mode)');
+  const beBytes = Buffer.from(plain, 'utf16le');
+  for (let i = 0; i + 1 < beBytes.length; i += 2) { const t = beBytes[i]; beBytes[i] = beBytes[i + 1]; beBytes[i + 1] = t; }
+  const utf16be = Buffer.concat([Buffer.from([0xFE, 0xFF]), beBytes]);
+  eq(decodeTranscript(utf16be), plain, 'decodeTranscript: UTF-16BE BOM also decodes back to the original ASCII text');
+  const utf8bom = Buffer.concat([Buffer.from([0xEF, 0xBB, 0xBF]), Buffer.from(plain, 'utf8')]);
+  eq(decodeTranscript(utf8bom), plain, 'decodeTranscript: UTF-8 BOM is stripped');
+  eq(decodeTranscript(Buffer.alloc(0)), '', 'decodeTranscript: empty buffer -> empty string, never throws');
+  const dsrc54 = readFileSync(join(import.meta.dirname, '..', 'driver.mjs'), 'utf8');
+  ok(dsrc54.includes("decodeTranscript(readFileSync(p)) : null") && dsrc54.includes('parseVerifyRaw(decodeTranscript(readFileSync(p)))'), 'KI-E54: driver wires decodeTranscript at BOTH fold-time transcript read sites (readIf + the inline baseline-raw.txt read)');
 }
 
 // KI-C6: FAILED -> ESCALATED legal (retry-bound exhausted surfaces to the human queue).
@@ -821,7 +843,7 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
   let evs = T.readEvents(T.telemetryFile());
   ok(evs.length === 1 && evs[0].event === 'unit_test' && evs[0].v === 1, 'telemetry: JSONL round-trip reads back exactly the enabled event');
   // agent CLI: always exit 0; role->stage derivation; free-typed --stage normalized (AD-12)
-  const cli = new URL('../telemetry-emit.mjs', import.meta.url).pathname;
+  const cli = fileURLToPath(new URL('../telemetry-emit.mjs', import.meta.url));
   execFileSync('node', [cli], { env: { ...process.env } }); // no --event: still exit 0 (never blocks an agent)
   execFileSync('node', [cli, '--event', 'stage_start', '--item', 'T-2', '--role', 'fixer'], { env: { ...process.env } });
   execFileSync('node', [cli, '--event', 'stage_end', '--item', 'T-2', '--stage', 'RED', '--durMs', '42'], { env: { ...process.env } });
@@ -958,9 +980,10 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
   eq(extractHeadings(doc), ['§ Alpha @L3', '§ Beta sub @L5', '§ Gamma @L7'], 'promptpack: extractHeadings levels + line numbers');
   eq(extractHeadings(doc, 2).length, 2, 'promptpack: extractHeadings cap');
   // buildDocMap: injected io — existing docs map to heading lines; missing docs skipped; no target -> [].
+  const posixOf = (p) => String(p).split(sep).join('/');
   const fakeFs = {
-    existsSync: (p) => p.endsWith('doc/data-flows/Svc.md') || p.endsWith('Svc/CONTEXT.md'),
-    readFileSync: (p) => p.endsWith('CONTEXT.md') ? '## Deps\n' : '## API\nx\n## Events\n',
+    existsSync: (p) => posixOf(p).endsWith('doc/data-flows/Svc.md') || posixOf(p).endsWith('Svc/CONTEXT.md'),
+    readFileSync: (p) => posixOf(p).endsWith('CONTEXT.md') ? '## Deps\n' : '## API\nx\n## Events\n',
   };
   const dm = buildDocMap('/repo', 'Svc', fakeFs);
   eq(dm.length, 2, 'promptpack: buildDocMap maps only existing docs');
@@ -969,8 +992,7 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
   eq(buildDocMap('/repo', '', fakeFs), [], 'promptpack: buildDocMap empty target -> []');
   eq(buildDocMap('/repo', 'Svc', { existsSync: () => { throw new Error('io'); }, readFileSync: () => '' }), [], 'promptpack: buildDocMap io failure is best-effort []');
   // readRoleBriefs: injected io — .md only, role keyed, capped; dir failure -> {}.
-  const fakeDir = { readdirSync: () => ['fixer.md', 'notes.txt', 'gate-qa.md'], readFileSync: (p) => 'BRIEF:' + basenameOf(p) };
-  function basenameOf(p) { return String(p).split('/').pop(); }
+  const fakeDir = { readdirSync: () => ['fixer.md', 'notes.txt', 'gate-qa.md'], readFileSync: (p) => 'BRIEF:' + basename(p) };
   const briefs = readRoleBriefs('/agents', fakeDir);
   eq(Object.keys(briefs).sort(), ['fixer', 'gate-qa'], 'promptpack: readRoleBriefs .md-only role keys');
   ok(briefs.fixer === 'BRIEF:fixer.md', 'promptpack: readRoleBriefs content');
@@ -978,9 +1000,8 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
 
   // factory.js invariants: shared prefix order (GUARDRAILS before every role-conditional block),
   // pack seams, inline-brief branch, docMap block, telemetry verdict split.
-  const LIBDIR = dirname2(fileURLToPath(import.meta.url));
+  const LIBDIR = dirname(fileURLToPath(import.meta.url));
   const fsrc = readFileSync(join(LIBDIR, '..', 'factory.js'), 'utf8');
-  function dirname2(p) { return p.replace(/\/[^/]+$/, ''); }
   const iGuard = fsrc.indexOf("'GUARDRAILS (.claude/rules");
   const iPack = fsrc.indexOf("'REVIEW PACK: Read '");
   const iD7 = fsrc.indexOf('PARALLEL REVIEW STAGE — LIVE-PROBE');
@@ -1005,6 +1026,57 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
   eq(headless, 6, 'briefs: all 6 method cards carry the HEADLESS METHOD CARD contract');
   eq(invokes, 0, 'briefs: no method card still instructs invoking the interactive bmad skill');
   ok(readFileSync(join(AG, 'review-adversarial.md'), 'utf8').includes('NO quota'), 'briefs: adversarial card replaces the ten-findings quota with gate calibration');
+}
+
+// KI-E60: readRepoProfiles — a purely-ADDITIVE per-repo style overlay (agents/repo-profiles/<target>.md)
+// layered on top of (never instead of) the universal agents/*.md briefs every target already gets
+// (KI-E56: a universal brief cannot correctly describe every real repo's own conventions, e.g.
+// NUnit vs xUnit+FluentAssertions). Same read-only-best-effort shape as readRoleBriefs: injected
+// io — .md only, target keyed, capped; dir failure (the common "no profile yet" case) -> {}, never
+// a throw — a target with no profile file behaves EXACTLY as it did before this mechanism existed.
+{
+  const fakeProfileDir = { readdirSync: () => ['Contoso.Web.md', 'notes.txt', 'Fabrikam.Api.md', 'README.md', '_example.Contoso.Widgets.md'], readFileSync: (p) => 'PROFILE:' + basename(p) };
+  const profiles = readRepoProfiles('/agents/repo-profiles', fakeProfileDir);
+  eq(Object.keys(profiles).sort(), ['Contoso.Web', 'Fabrikam.Api'], 'promptpack: readRepoProfiles .md-only target keys (README + _example.* excluded — docs/template, never real target keys)');
+  ok(profiles['Contoso.Web'] === 'PROFILE:Contoso.Web.md', 'promptpack: readRepoProfiles content');
+  eq(readRepoProfiles('/agents/repo-profiles', { readdirSync: () => { throw new Error('io'); } }), {}, 'promptpack: readRepoProfiles missing-dir/io-failure -> {} (compose omits the overlay; the universal brief alone stays authoritative)');
+  // PR#9 review — profiles cap at PROFILE_CAP (30k), NOT the 12k BRIEF_CAP: real profiles run
+  // 8-26KB and the BRIEF_CAP slice silently dropped 30-53% of 3 of the first 4 live profiles.
+  ok(PROFILE_CAP > 12000, 'PR#9: PROFILE_CAP exceeds BRIEF_CAP (profiles are bigger than role briefs)');
+  const big = { readdirSync: () => ['Big.md'], readFileSync: () => 'y'.repeat(PROFILE_CAP + 5000) };
+  eq(readRepoProfiles('/p', big)['Big.md'.replace(/\.md$/, '')].length, PROFILE_CAP, 'PR#9: an oversize profile truncates at PROFILE_CAP (both runtimes share this bound)');
+  const mid = { readdirSync: () => ['Mid.md'], readFileSync: () => 'y'.repeat(20000) };
+  eq(readRepoProfiles('/p', mid)['Mid'].length, 20000, 'PR#9: a 20k profile (over the old 12k BRIEF_CAP) now survives whole');
+
+  // static grep-based wiring checks (mirroring the fsrc.includes(...) pattern used above/elsewhere in
+  // this file for other mechanisms): both runtimes actually read + inject the overlay, and driver.mjs
+  // actually feeds it into the batch (KI-E2 split — the Workflow runtime has no fs of its own).
+  const fsrc60 = readFileSync(join(import.meta.dirname, '..', 'factory.js'), 'utf8');
+  ok(fsrc60.includes('A.repoProfiles'), 'KI-E60: factory.js reads A.repoProfiles (the driver-inlined per-target overlay)');
+  ok(fsrc60.includes('REPO-SPECIFIC STYLE PROFILE'), 'KI-E60: factory.js injects the REPO-SPECIFIC STYLE PROFILE label into the prompt');
+  const csrc60 = readFileSync(join(import.meta.dirname, '..', 'opencode', 'compose.mjs'), 'utf8');
+  ok(csrc60.includes("'repo-profiles'"), 'KI-E60: opencode/compose.mjs resolves the agents/repo-profiles/<target>.md path');
+  ok(csrc60.includes('REPO-SPECIFIC STYLE PROFILE'), 'KI-E60: opencode/compose.mjs injects the SAME REPO-SPECIFIC STYLE PROFILE label');
+  const dsrc60 = readFileSync(join(import.meta.dirname, '..', 'driver.mjs'), 'utf8');
+  ok(dsrc60.includes('readRepoProfiles') && dsrc60.includes("'repo-profiles'"), 'KI-E60: driver.mjs imports + calls readRepoProfiles against the repo-profiles subdir');
+}
+
+// KI-E60: exec-smoke — a populated A.repoProfiles for the smoke batch's own target ("X") must not
+// disturb any existing lane's behaviour. execSmoke's stub harness only records {label, model} per
+// call, never the prompt string, so this cannot assert the injected TEXT itself (the static grep
+// checks above already cover that); it proves presence is a harmless no-op to the surrounding
+// orchestration — no agentOverride/blockedGate needed, so every lane must still complete exactly as
+// the unmodified KI-L43 baseline block above does (regression-safety: that baseline block is
+// untouched by this change and must still pass on its own).
+{
+  const src = readFileSync(join(import.meta.dirname, '..', 'factory.js'), 'utf8');
+  const batchWithProfile = { ...smokeBatch(), repoProfiles: { X: 'REPO-PROFILE (smoke): NUnit, Assert.That, no comments.' } };
+  const { result, calls } = await execSmoke(src, batchWithProfile);
+  ok(!(result.results || []).some((r) => String(r.note || '').startsWith('runItem threw')), 'KI-E60: NO runItem crash with A.repoProfiles populated (KI-L36-class regression check)');
+  const by60 = Object.fromEntries((result.results || []).map((r) => [r.id, r]));
+  eq(by60['SMOKE-DOC'] && by60['SMOKE-DOC'].toState, 'CLOSED', 'KI-E60: doc/editorial lane still completes with a populated A.repoProfiles for its own target');
+  eq(by60['SMOKE-CODE'] && by60['SMOKE-CODE'].toState, 'CLOSED', 'KI-E60: FULL code lane still completes to CLOSED with a populated A.repoProfiles for its own target');
+  eq(calls.filter((c) => c.label.endsWith(':checkpoint')).length, 6, 'KI-E60: every item result still checkpointed (six items, same as the unmodified KI-L43 baseline)');
 }
 
 // KI-E10/E11/E12/E13 + KI-D8 4th mitigation (2026-07-19, session 20 — telemetry-driven quality wave):
@@ -1121,7 +1193,8 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
 // KI-D12: build-test.sh leftovers subcommand -> CLI; CLI emits the marker from the SAME lib the probe reads.
 {
   const bts = readFileSync(new URL('../../verify/build-test.sh', import.meta.url), 'utf8');
-  ok(bts.includes('leftovers)') && bts.includes('leftover-lint.mjs'), 'KI-D12: build-test.sh leftovers subcommand wired to the CLI');
+  ok(bts.includes('leftovers|comments)') && bts.includes('leftover-lint.mjs'), 'KI-D12: build-test.sh leftovers subcommand wired to the CLI (engine-owned dispatch BEFORE the local-override seam — PR#9)');
+  ok(bts.indexOf('leftovers|comments)') < bts.indexOf('build-test.local.sh"') , 'PR#9: the diff-lint dispatch precedes the build-test.local.sh override exec (a stale host override can never swallow the lints)');
   const lcli = readFileSync(new URL('../leftover-lint.mjs', import.meta.url), 'utf8');
   ok(lcli.includes('FACTORY::LEFTOVER::') && lcli.includes('findLeftovers'), 'KI-D12: leftover CLI emits the machine marker from the SAME leftover-scan lib the probe + fold read');
 }
@@ -1146,18 +1219,216 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
   eq(cleanBy['SMOKE-CODE'] && cleanBy['SMOKE-CODE'].gates && cleanBy['SMOKE-CODE'].gates['probe:leftover-scan'], 'APPROVED', 'KI-D12: a clean verdict records probe:leftover-scan APPROVED in the gates map');
 }
 
+// KI-E59: CommentScan — the deterministic detector + the factory-side probe wiring. Runs BEFORE
+// leftover-scan; unlike leftover-scan there is NO classify step — every hit is a hard violation
+// (owner directive 2026-07-30: no comment may ever be added or reworded, zero exceptions).
+{
+  // detector: any new comment syntax HITS; a bare URL (no real comment marker) does NOT.
+  ok(csClassify('X/src/Foo.cs', '  var x = 1; // trailing comment'), 'KI-E59: a trailing // comment is a hit');
+  ok(csClassify('X/src/Foo.cs', '  // standalone comment'), 'KI-E59: a standalone // comment is a hit');
+  ok(csClassify('X/src/Foo.cs', '  /* block comment */'), 'KI-E59: a /* */ block comment is a hit');
+  ok(csClassify('X/src/Foo.html', '  <!-- html comment -->'), 'KI-E59: an <!-- --> HTML comment is a hit');
+  ok(!csClassify('X/src/Foo.cs', '  var url = "https://example.com";'), 'KI-E59: a bare URL with no comment marker is NOT a hit');
+  ok(!csClassify('X/src/Foo.cs', '  var a = "https://x.com"; var b = "https://y.com";'), 'KI-E59: multiple URLs with no real comment marker is NOT a hit');
+  ok(csClassify('X/src/Foo.cs', '  var url = "https://example.com"; // real comment'), 'KI-E59: a URL EARLIER in the line does not mask a REAL comment LATER on the same line');
+  ok(!csClassify('X/src/Foo.cs', '  '), 'KI-E59: a blank line is not a hit');
+  // PR#9 review — measured false-positive classes killed by string-stripping + extension awareness:
+  ok(!csClassify('X/src/Foo.cs', '  var sep = "//";'), 'PR#9: a "//" string literal is NOT a hit');
+  ok(!csClassify('X/src/Foo.cs', '  var url = "//cdn.example.com/lib.js";'), 'PR#9: a protocol-relative URL in a string is NOT a hit');
+  ok(!csClassify('X/src/Foo.cs', '  var b64 = "qL7//9k=";'), 'PR#9: base64 in a string is NOT a hit');
+  ok(!csClassify('X/proj.csproj', '  <Compile Include="**/*.cs" />'), 'PR#9: a csproj glob Include is NOT a hit (quoted attribute value stripped)');
+  ok(!csClassify('X/app.js', 'while (x --> 0) n++;'), 'PR#9: the --> idiom in a non-markup file is NOT a hit');
+  ok(!csClassify('X/app.js', 'const re = /\\/\\//;'), 'PR#9: a JS regex literal containing // is NOT a hit');
+  ok(!csClassify('docs/note.md', '<!-- toc -->'), 'PR#9: .md files are never scanned (KI-E58 sends residual-gap notes to docs)');
+  ok(!csClassify('data.json', '"path": "a//b",'), 'PR#9: .json files are never scanned (JSON has no comments)');
+  ok(csClassify('X/q.sql', '-- add index on users').kind === 'dash', 'PR#9: a SQL -- comment IS a hit');
+  ok(csClassify('X/deploy.yml', 'port: 8080 # inline comment').kind === 'hash', 'PR#9: a YAML # comment IS a hit');
+  ok(!csClassify('X/cfg.yml', 'other: p#ss'), 'PR#9: a # with no preceding whitespace in YAML is NOT a comment');
+  ok(csClassify('X/Page.razor', '@* razor comment *@').kind === 'razor', 'PR#9: a Razor @* *@ comment IS a hit');
+  ok(csClassify('X/run.ps1', '<# block #>').kind === 'block', 'PR#9: a PowerShell <# #> block comment IS a hit');
+  ok(!csClassify('X/run.sh', '#!/usr/bin/env bash'), 'PR#9: a shebang is NOT a hit');
+  // Move-suppression + Windows-safe untracked reads (findComments level) — real git fixture:
+  {
+    const mvd = mkdtempSync(join(tmpdir(), 'csmove-'));
+    const g = (...a) => execFileSync('git', ['-C', mvd, ...a], { encoding: 'utf8' });
+    g('init', '-q', '.'); g('config', 'user.email', 't@t'); g('config', 'user.name', 't');
+    fsWrite(join(mvd, 'Move.cs'), 'namespace Old.Ns\n{\n    // pre-existing invariant comment\n    class A { }\n}\n');
+    g('add', '-A'); g('commit', '-qm', 'base');
+    fsWrite(join(mvd, 'Move.cs'), 'namespace New.Ns;\n\n// pre-existing invariant comment\nclass A { }\n// BRAND NEW comment\n');
+    fsWrite(join(mvd, 'NewTests.cs'), 'public class T {\n    // untracked comment in new test file\n}\n');
+    const mhits = findComments(mvd, 50);
+    eq(mhits.map((h) => h.line).sort(), ['// BRAND NEW comment', '// untracked comment in new test file'],
+      'PR#9: a byte-identical MOVED/re-indented comment is suppressed (file-scoped-ns conversion no longer hard-fails); genuinely new + untracked-file comments still hit');
+    eq(mhits.skipped, 0, 'PR#9: untracked files read via readFileSync (no cat dependency), zero skipped');
+  }
+  // factory wiring contract (grep-visible; exec-smoke below RUNS the FAIL path)
+  const fsrc = readFileSync(join(import.meta.dirname, '..', 'factory.js'), 'utf8');
+  ok(fsrc.includes('const COMMENT_SCHEMA') && fsrc.includes("call('comment-probe'"), 'KI-E59: factory declares COMMENT_SCHEMA + runs the haiku comment-probe');
+  ok(fsrc.includes("' comments ' + wtPath"), 'KI-E59: the probe invokes build-test.sh comments on the worktree');
+  ok(fsrc.includes('typeof cs.count'), 'KI-E59: only an EXPLICIT numeric count acts (a malformed/unavailable probe never sinks an item)');
+  ok(fsrc.includes('cs.count >= 0'), 'PR#9: the count:-1 scan-unavailable report records NO gate verdict (fold backstop covers)');
+  ok(fsrc.includes('A.policies.noNewComments'), 'PR#9: the comment probe runs ONLY when the host enables policies.noNewComments');
+  ok(fsrc.indexOf("call('comment-probe'") < fsrc.indexOf("call('leftover-probe'"), 'KI-E59: the comment-probe call runs BEFORE the leftover-probe call');
+}
+
+// KI-E59: build-test.sh comments subcommand -> CLI; CLI emits the marker from the SAME lib the probe reads.
+{
+  const bts = readFileSync(new URL('../../verify/build-test.sh', import.meta.url), 'utf8');
+  ok(bts.includes('comments)') && bts.includes('comment-lint.mjs'), 'KI-E59: build-test.sh comments subcommand wired to the CLI');
+  const ccli = readFileSync(new URL('../comment-lint.mjs', import.meta.url), 'utf8');
+  ok(ccli.includes('FACTORY::COMMENT::') && ccli.includes('findComments'), 'KI-E59: comment CLI emits the machine marker from the SAME comment-scan lib the probe + fold read');
+}
+
+// KI-E59: exec-smoke — a comment-probe hit FAILS the code lane PRE-BAND (before leftover-scan even
+// runs), and a clean verdict (count=0) lets it proceed to CLOSED with the gate recorded.
+{
+  const src = readFileSync(join(import.meta.dirname, '..', 'factory.js'), 'utf8');
+  const hit = await execSmoke(src, smokeBatch(), {
+    agentOverride: (prompt, opts) => ((opts && opts.label) === 'SMOKE-CODE:comment-probe')
+      ? { count: 1, hits: ['X/src/Some.cs [line]: // new comment'] } : undefined,
+  });
+  const hitBy = Object.fromEntries((hit.result.results || []).map((r) => [r.id, r]));
+  eq(hitBy['SMOKE-CODE'] && hitBy['SMOKE-CODE'].toState, 'FAILED', 'KI-E59: a non-zero comment-scan count FAILS the code lane');
+  ok(String(hitBy['SMOKE-CODE'] && hitBy['SMOKE-CODE'].note || '').includes('comment-scan'), 'KI-E59: the FAIL note cites comment-scan');
+  ok(!hit.calls.some((c) => c.label === 'SMOKE-CODE:leftover-probe'), 'KI-E59: a comment-scan FAIL short-circuits BEFORE the leftover-probe call ever runs');
+  ok(!hit.calls.some((c) => c.label === 'SMOKE-CODE:gate-architect'), 'KI-E59: the comment-scan FAIL is PRE-BAND (no opus gate spent)');
+  const cleanRun = await execSmoke(src, smokeBatch(), {
+    agentOverride: (prompt, opts) => ((opts && opts.label) === 'SMOKE-CODE:comment-probe') ? { count: 0, hits: [] } : undefined,
+  });
+  const cleanBy = Object.fromEntries((cleanRun.result.results || []).map((r) => [r.id, r]));
+  eq(cleanBy['SMOKE-CODE'] && cleanBy['SMOKE-CODE'].toState, 'CLOSED', 'KI-E59: a clean comment-scan verdict lets the code lane proceed to CLOSED');
+  eq(cleanBy['SMOKE-CODE'] && cleanBy['SMOKE-CODE'].gates && cleanBy['SMOKE-CODE'].gates['probe:comment-scan'], 'APPROVED', 'KI-E59: a clean verdict records probe:comment-scan APPROVED in the gates map');
+  // PR#9 review — the gate is HOST-POLICY-GATED: with policies absent (the shipped-engine default)
+  // the probe never runs at all, even when it WOULD have reported a hit.
+  const offBatch = { ...smokeBatch() };
+  delete offBatch.policies;
+  const offRun = await execSmoke(src, offBatch, {
+    agentOverride: (prompt, opts) => (String((opts && opts.label) || '').endsWith(':comment-probe'))
+      ? { count: 9, hits: ['would-have-failed'] } : undefined,
+  });
+  ok(!offRun.calls.some((c) => c.label.endsWith(':comment-probe')), 'PR#9: with policies.noNewComments OFF (default) the comment probe is never called');
+  const offBy = Object.fromEntries((offRun.result.results || []).map((r) => [r.id, r]));
+  eq(offBy['SMOKE-CODE'] && offBy['SMOKE-CODE'].toState, 'CLOSED', 'PR#9: policy-OFF code lane closes with no comment gate involved');
+  // PR#9 review — count:-1 (scan unavailable) is fail-open: no gate recorded, item proceeds.
+  const unavailRun = await execSmoke(src, smokeBatch(), {
+    agentOverride: (prompt, opts) => ((opts && opts.label) === 'SMOKE-CODE:comment-probe') ? { count: -1, hits: [] } : undefined,
+  });
+  const unavailBy = Object.fromEntries((unavailRun.result.results || []).map((r) => [r.id, r]));
+  eq(unavailBy['SMOKE-CODE'] && unavailBy['SMOKE-CODE'].toState, 'CLOSED', 'PR#9: a count:-1 scan-unavailable probe never sinks the item');
+  ok(!(unavailBy['SMOKE-CODE'].gates || {})['probe:comment-scan'], 'PR#9: scan-unavailable records NO probe:comment-scan gate (an APPROVED requires a real count 0)');
+}
+
+// KI-E59: the opencode port (runtime.mjs) mirrors the SAME gate fully deterministically (no LLM at
+// all — a DIRECT findComments import since the PR#9 review: no bash dependency, Windows-safe, and
+// immune to the build-test.local.sh override seam), policy-gated, checked first in the mech
+// 'leftover' step, FAILing immediately on any hit before the leftover scan runs. A throwing scan
+// records NO gate key (never a false APPROVED — AP#19); its behavioral pins live in the opencode
+// suite (spawned green below).
+{
+  const rsrc = readFileSync(join(import.meta.dirname, '..', 'opencode', 'runtime.mjs'), 'utf8');
+  ok(rsrc.includes("from '../lib/comment-scan.mjs'") && rsrc.includes('runCommentGate('), 'KI-E59: runtime.mjs imports findComments directly (no bash seam) via runCommentGate');
+  ok(rsrc.includes('loadPolicies(FACTORY_ROOT)'), 'PR#9: runtime.mjs gates the comment check on the host policy (same loader as the driver)');
+  ok(rsrc.includes('FACTORY::COMMENT::') && rsrc.includes('FACTORY::COMMENT-HIT::'), 'KI-E59: runtime.mjs writes the comment-scan markers (comment-raw.txt in the CLI format)');
+  ok(rsrc.includes('comment-scan (KI-E59)'), 'KI-E59: runtime.mjs FAILs with a comment-scan-cited note');
+  ok(rsrc.indexOf('runCommentGate(') < rsrc.indexOf("runBuildTest(progress.ctx.factoryRoot, 'leftovers'"), 'KI-E59: runtime.mjs checks comments BEFORE leftovers in the mech step');
+}
+
+// KI-E59: driver.mjs fold-time WARN-only backstop (mirrors the KI-D12/F2 posture — a detection aid,
+// never a fold-blocker) re-greps each folding result's worktree independent of any LLM verdict.
+{
+  const dsrc = readFileSync(join(import.meta.dirname, '..', 'driver.mjs'), 'utf8');
+  ok(dsrc.includes("import { findComments } from './lib/comment-scan.mjs'"), 'KI-E59: driver.mjs imports findComments for the fold backstop');
+  ok(dsrc.includes('COMMENT') && dsrc.includes('findComments(r.worktree'), 'KI-E59: driver.mjs fold re-greps each folding result worktree for comments');
+  ok(dsrc.includes('.noNewComments) for (const r of arr)'), 'PR#9: the fold COMMENT backstop is host-policy-gated (never warns on hosts where comments are allowed)');
+}
+
+// KI-E53 (PR#9 review) — the escalations note walk, behaviorally: r.note is a dead field nothing
+// assigns; only per-transition history[].note entries carry the real reason. Previously pinned by
+// a source-regex only — a defect inside the walk itself would have passed.
+{
+  const L = await import('./ledger.mjs');
+  eq(L.lastHistoryNote({ history: [{ from: 'GATED', to: 'ESCALATED', note: 'auto-drafted; awaiting sign-off' }, { from: 'X', to: 'Y', note: null }] }),
+    'auto-drafted; awaiting sign-off', 'KI-E53: lastHistoryNote returns the LAST note-bearing history entry, skipping note-less hops');
+  eq(L.lastHistoryNote({ note: 'dead static field', history: [] }), '(no note)', 'KI-E53: the dead row.note field is never consulted');
+  eq(L.lastHistoryNote({}), '(no note)', 'KI-E53: a history-less row renders (no note), never throws');
+  const dsrcE53 = readFileSync(join(import.meta.dirname, '..', 'driver.mjs'), 'utf8');
+  ok(dsrcE53.includes('const lastNote = lastHistoryNote'), 'KI-E53: cmdEscalationsSync routes through the lib helper (both the per-item line and the retry-exhausted section)');
+  const escBody = dsrcE53.slice(dsrcE53.indexOf('function cmdEscalationsSync'), dsrcE53.indexOf('\nfunction ', dsrcE53.indexOf('function cmdEscalationsSync') + 1));
+  ok(escBody.length > 100 && !/\br\.note \|\|/.test(escBody), 'KI-E53: the escalations renderer never falls back to the dead ledger-row r.note field (fold RESULT objects elsewhere legitimately carry .note)');
+}
+
+// PR#9 review (LOW) — opencode resolveTarget: UNC paths are absolute (never joined onto the
+// worktree) and the outside-worktree compare case-folds ONLY on win32.
+{
+  const rsrcRT = readFileSync(join(import.meta.dirname, '..', 'opencode', 'runtime.mjs'), 'utf8');
+  ok(rsrcRT.includes("t.startsWith('\\\\\\\\')"), 'PR#9: resolveTarget treats UNC \\\\server\\share targets as absolute');
+  ok(rsrcRT.includes("process.platform === 'win32' ? s.toLowerCase() : s"), 'PR#9: resolveTarget case-folds the worktree-prefix compare only on win32');
+}
+
+// PR#9 review — the host-policy seam itself: lib/policy.mjs loader + the driver/factory wiring.
+{
+  const pd = mkdtempSync(join(tmpdir(), 'pol-'));
+  eq(loadPolicies(pd), { noNewComments: false, noSchemaChanges: false }, 'policy: no config at all -> both OFF (shipped-engine default)');
+  mkdirSync(join(pd, 'config'), { recursive: true });
+  fsWrite(join(pd, 'config', 'factory.config.json'), JSON.stringify({ policies: { noNewComments: false, noSchemaChanges: false } }));
+  fsWrite(join(pd, 'config', 'factory.config.local.json'), JSON.stringify({ policies: { noNewComments: true } }));
+  eq(loadPolicies(pd), { noNewComments: true, noSchemaChanges: false }, 'policy: gitignored local overlay flips a policy per host (KI-E17 seam)');
+  fsWrite(join(pd, 'config', 'factory.config.local.json'), '{ broken json');
+  eq(loadPolicies(pd), { noNewComments: false, noSchemaChanges: false }, 'policy: an unreadable overlay never throws — falls back to the committed config');
+  eq(renderPolicies({ noNewComments: true }), 'noNewComments=on noSchemaChanges=off', 'policy: renderPolicies one-liner for the driver status prints');
+  // Committed config ships BOTH policies OFF — a public engine must not default to one owner's rules.
+  const shipped = JSON.parse(readFileSync(join(import.meta.dirname, '..', '..', 'config', 'factory.config.json'), 'utf8'));
+  eq(!!(shipped.policies && shipped.policies.noNewComments), false, 'policy: shipped config has noNewComments OFF');
+  eq(!!(shipped.policies && shipped.policies.noSchemaChanges), false, 'policy: shipped config has noSchemaChanges OFF');
+  // factory.js cannot import policy.mjs (sandboxed) — its inlined HOST POLICY strings must stay
+  // byte-identical to POLICY_TEXT, in BOTH compose() and sweepCompose() (2 sites each).
+  const fsrcP = readFileSync(join(import.meta.dirname, '..', 'factory.js'), 'utf8');
+  eq((fsrcP.split(POLICY_TEXT.noNewComments).length - 1), 2, 'policy: factory.js inlines POLICY_TEXT.noNewComments byte-identically in compose + sweepCompose');
+  eq((fsrcP.split(POLICY_TEXT.noSchemaChanges).length - 1), 2, 'policy: factory.js inlines POLICY_TEXT.noSchemaChanges byte-identically in compose + sweepCompose');
+  ok(fsrcP.includes('A.policies && A.policies.noSchemaChanges'), 'policy: factory.js injects the schema-change block only when the host enabled it');
+  // Driver: every runArgs-emitting lane (select, group, sweep) carries policies + profiles/briefs.
+  const dsrcP = readFileSync(join(import.meta.dirname, '..', 'driver.mjs'), 'utf8');
+  ok((dsrcP.match(/policies: loadPolicies\(FACTORY_ROOT\)/g) || []).length >= 3, 'policy: select + group + sweep runArgs all carry policies');
+  ok((dsrcP.match(/repoProfiles: readRepoProfiles\(/g) || []).length >= 3, 'PR#9: select + group + sweep runArgs all carry repoProfiles (the sweep/select KI-E60 gap)');
+  ok((dsrcP.match(/briefs: readRoleBriefs\(/g) || []).length >= 3, 'PR#9: select + group + sweep runArgs all carry inlined briefs');
+  ok(dsrcP.includes('renderPolicies(runArgs.policies)'), 'policy: the driver prints the effective policy state at launch (an unset overlay is visible, never silent)');
+  ok(dsrcP.includes('POLICY_TEXT.noNewComments') && dsrcP.includes('POLICY_TEXT.noSchemaChanges'), 'policy: recover prompts inject the canonical POLICY_TEXT blocks');
+  // sweepCompose parity: brief inlining + profile overlay now reach sweep agents too.
+  ok(fsrcP.includes('swBrief') && fsrcP.includes('swProfile'), 'PR#9: sweepCompose inlines the role brief + injects the repo profile (sweep prompt parity)');
+  // KI-O2 stays pinned: FIX_SCHEMA accepts the object divergence shape the fixer brief asks for.
+  ok(fsrcP.includes("divergence: { type: ['string', 'null', 'object'] }"), 'KI-O2: FIX_SCHEMA divergence accepts string|null|object');
+}
+
+// PR#9 review — the opencode suite is now gated by THIS selftest (previously it was invoked by
+// nothing automated: no CI selftest, and setup/release.sh + install.sh gate only on this file, so
+// wiring it here makes every release/install/upgrade gate cover the port too).
+{
+  let oout = '';
+  try {
+    oout = execFileSync(process.execPath, [join(import.meta.dirname, '..', 'opencode', '_selftest.mjs')],
+      { encoding: 'utf8', cwd: join(import.meta.dirname, '..', '..'), maxBuffer: 16 * 1024 * 1024 });
+  } catch (e) {
+    oout = String((e && e.stdout) || '') + '\nSPAWN-FAILED: ' + String((e && e.message) || e);
+  }
+  ok(/TOTAL: \d+ passed, 0 failed/.test(oout), 'PR#9: the opencode suite runs green under the main selftest (' + ((/TOTAL: [^\n]+/.exec(oout) || ['no TOTAL line'])[0]) + ')');
+}
+
 // KI-E17: portable mounts — host-repo-root walk-up + stock-prefix config rewrite.
 {
   const { findRepoRoot, resolveRepoRoot, swapMountPrefix, STOCK_MOUNT } = await import('./rootfind.mjs');
   // walk-up starts at the mount's PARENT: the factory's own .git (submodule gitfile at the
   // mount root) must never win; the first ancestor holding .git does.
+  // findRepoRoot/resolveRepoRoot normalize every path through node:path's resolve() internally,
+  // which prepends the current drive on win32 (`/host` -> `C:\host`) — mirror that here so the
+  // fake fs keys and expected roots match on every platform (KI-E17 is pure path math, no real fs).
+  const R = (p) => resolvePath(p);
   const fakeFs = (present) => ({ existsSync: (p) => present.includes(p) });
-  eq(findRepoRoot('/host/_bmad-output/ai-factory', fakeFs(['/host/.git', '/host/_bmad-output/ai-factory/.git'])), '/host',
+  eq(findRepoRoot('/host/_bmad-output/ai-factory', fakeFs([R('/host/.git'), R('/host/_bmad-output/ai-factory/.git')])), R('/host'),
     'KI-E17: walk-up finds the HOST .git, never the factory submodule gitfile');
-  eq(findRepoRoot('/host/tools/factory', fakeFs(['/host/.git'])), '/host', 'KI-E17: any mount depth resolves to the enclosing repo');
+  eq(findRepoRoot('/host/tools/factory', fakeFs([R('/host/.git')])), R('/host'), 'KI-E17: any mount depth resolves to the enclosing repo');
   eq(findRepoRoot('/nowhere/factory', fakeFs([])), null, 'KI-E17: no enclosing repo -> null (standalone checkout)');
-  eq(resolveRepoRoot('/x/factory', { FACTORY_REPO_ROOT: '/override' }, fakeFs([])), '/override', 'KI-E17: FACTORY_REPO_ROOT env wins');
-  eq(resolveRepoRoot('/a/b/factory', {}, fakeFs([])), '/a', 'KI-E17: git-less fallback stays the legacy ../..');
+  eq(resolveRepoRoot('/x/factory', { FACTORY_REPO_ROOT: '/override' }, fakeFs([])), R('/override'), 'KI-E17: FACTORY_REPO_ROOT env wins');
+  eq(resolveRepoRoot('/a/b/factory', {}, fakeFs([])), R('/a'), 'KI-E17: git-less fallback stays the legacy ../..');
   // config rewrite: identity at the stock mount; prefix-swap (root + every paths entry) elsewhere.
   const mk = () => ({ root: STOCK_MOUNT, auditRoot: '_bmad-output/YOUR-AUDIT', paths: { ledger: STOCK_MOUNT + '/state/ledger.json', agents: STOCK_MOUNT + '/agents' } });
   eq(swapMountPrefix(mk(), STOCK_MOUNT, STOCK_MOUNT).paths.ledger, STOCK_MOUNT + '/state/ledger.json', 'KI-E17: stock mount is untouched (the host project layout identical)');
@@ -1258,6 +1529,7 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
   ok(dsrc20.includes('closedDepsWithLiveWorktree(picked, ledger.items'), 'KI-E29 (review fix): cmdGroup wires the pure warn core');
   ok(dsrc20.includes('unwrapResultEnvelope(readJson(foldPath)') && dsrc20.includes('payload carried ZERO results'), 'KI-E31 (review fix): cmdFold wires the unwrap AND stops loudly on a zero-result payload (no success affect)');
   ok(readFileSync(join(import.meta.dirname, '..', 'factory.js'), 'utf8').includes('means EXACTLY a product-scope.md red-line'), 'KI-E30: the shared gate prompt carries the scopeViolation clarification');
+  ok(/return `## \$\{id\} — \$\{r\.state\}\\n\\n- \$\{lastNote\(r\)\}/.test(dsrc20), 'KI-E53: escalations per-item line renders lastNote(r) (the real last-transition reason) — not the never-populated static r.note field');
 }
 
 // KI-E37 (review fix): compose-ls parsing + the stray filter — behavioral (pure, no docker).
@@ -1544,7 +1816,23 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
   const emit46 = readFileSync(join(import.meta.dirname, '..', 'telemetry-emit.mjs'), 'utf8');
   ok(/clampAgentEvent/.test(emit46) && /origEvent/.test(emit46), 'KI-E49: telemetry-emit clamps the vocabulary and preserves the original name');
   ok(readFileSync(join(import.meta.dirname, '..', '..', 'agents', 'fixer.md'), 'utf8').includes('COUNT-CLAIM SELF-CHECK (KI-E51)'), 'KI-E51: fixer card carries the count-claim self-check');
-  ok(readFileSync(join(import.meta.dirname, '..', '..', 'agents', 'test-author.md'), 'utf8').includes('COMMENT POLICY (KI-E51)'), 'KI-E51: test-author card carries the test-comment policy');
+  ok(readFileSync(join(import.meta.dirname, '..', '..', 'agents', 'test-author.md'), 'utf8').includes('NO-COMMENTS POLICY (KI-E51/KI-E57'), 'KI-E51: test-author card carries the absolute no-comments policy');
+  ok(readFileSync(join(import.meta.dirname, '..', '..', 'agents', 'fixer.md'), 'utf8').includes('NO-COMMENTS POLICY (KI-E55/KI-E57'), 'KI-E55: fixer card carries the absolute no-comments policy (KI-E51 extended from test files to every file the fixer touches)');
+  ok(readFileSync(join(import.meta.dirname, '..', '..', 'agents', 'gate-developer.md'), 'utf8').includes('Hunt and FAIL on (KI-E55/KI-E57'), 'KI-E55: gate-developer card carries the absolute no-comments backstop check');
+  ok(readFileSync(join(import.meta.dirname, '..', '..', 'agents', 'review-code.md'), 'utf8').includes('KI-E51/KI-E55/KI-E57'), 'KI-E55: review-code card excludes ALL new comments from its style-nits carve-out, not just narrative ones');
+  ok(readFileSync(join(import.meta.dirname, '..', '..', 'agents', 'test-author.md'), 'utf8').includes('KI-E56'), 'KI-E56: test-author card no longer hardcodes a single test framework assumption');
+  ok(readFileSync(join(import.meta.dirname, '..', '..', 'agents', 'fixer.md'), 'utf8').includes('DB/schema changes (KI-E58, HOST-POLICY-GATED)'), 'KI-E58: fixer card carries the host-policy-gated no-schema-changes hard stop');
+  ok(readFileSync(join(import.meta.dirname, '..', '..', 'agents', 'planner.md'), 'utf8').includes('DB/schema changes (KI-E58, HOST-POLICY-GATED)'), 'KI-E58: planner card carries the host-policy-gated no-schema-changes hard stop');
+  // PR#9 review — the policy sections are CONDITIONAL on the injected HOST POLICY blocks, with an
+  // explicit policy-OFF branch, and fixer Do-6's divergence call-site tag is waived under the
+  // no-comments policy (previously Do-6 mandated a comment Do-7 forbade — a self-contradiction).
+  for (const b of ['fixer', 'test-author', 'gate-developer', 'review-code', 'planner']) {
+    const bt = readFileSync(join(import.meta.dirname, '..', '..', 'agents', b + '.md'), 'utf8');
+    ok(bt.includes('HOST POLICY —'), 'PR#9: ' + b + ' card conditions its policy section on the HOST POLICY prompt block');
+    ok(/When NO such block is present/i.test(bt), 'PR#9: ' + b + ' card states the policy-OFF behaviour explicitly');
+  }
+  ok(readFileSync(join(import.meta.dirname, '..', '..', 'agents', 'fixer.md'), 'utf8').includes('the ledger entry alone'), 'PR#9: fixer Do-6 waives the call-site tag comment under the no-comments policy (Do-6/Do-7 contradiction resolved)');
+  ok(readFileSync(join(import.meta.dirname, '..', '..', 'agents', 'gate-architect.md'), 'utf8').includes('HOST POLICY — NO DB/SCHEMA CHANGES'), 'PR#9: gate-architect reconciles the CLI-migrations norm with the no-schema-changes policy');
 }
 
 // KI-E52 (2026-07-26): versioned releases + team install/upgrade + per-developer telemetry

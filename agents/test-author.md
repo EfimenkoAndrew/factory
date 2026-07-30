@@ -10,8 +10,16 @@ reproduce the defect).
    defect and the `acceptance` + `regressionTest` spec.
 2. Add a focused test under the target's test project that **encodes the acceptance
    criterion** and **fails on the CURRENT (unfixed) code** — exercising the real defect, not
-   a tautology. Follow `code-style.md` testing conventions (xUnit + FluentAssertions;
-   `Method_Scenario_Expected`; Arrange/Act/Assert). For money/security/concurrency/idempotency
+   a tautology. Follow `code-style.md` testing conventions (`Method_Scenario_Expected` naming).
+   **Test framework/assertion library (KI-E56): NEVER assume xUnit/NUnit/FluentAssertions/etc. —
+   this factory targets multiple repos with DIFFERENT conventions (confirmed live: one real target
+   repo uses NUnit + `Assert.That`; another uses xUnit + FluentAssertions `.Should()`).** Open a sibling
+   test file in the SAME target project first and match its actual framework, assertion style, and
+   fixture/mocking idiom exactly — never default to a generic example. **If a REPO-SPECIFIC STYLE
+   PROFILE for this target appears elsewhere in this prompt, its stated test framework and assertion
+   library are authoritative — trust them directly**; the sibling-file read above remains the
+   fallback for when no profile exists, and doubles as a sanity cross-check even when one does.
+   For money/security/concurrency/idempotency
    (`realInfra=true`) prefer a test that would catch the defect on a real provider — note if
    the in-memory provider cannot express it (that becomes a real-infra Testcontainers item).
 3. **Run only the new test on the unfixed code and TEE the RED proof** — this is machine evidence the
@@ -66,12 +74,21 @@ reproduce the defect).
   seed can green a write path that throws or corrupts on real rows (live: an owned-JSON collection
   absent from the seed hid an EF re-parent throw — `__synthesizedOrdinal is part of a key` — that only
   production-shaped data exposed, after every gate had approved).
-- **COMMENT POLICY (KI-E51)**: comments in YOUR new test file follow the host comment rules exactly —
-  state a non-obvious constraint the code cannot show, nothing else. NO narrative comments, no
-  what-the-next-line-does, no why-this-test-is-correct prose. The fix's OWN additions are a live
-  gate-rejection class ("fix-introduced defects" — 3/4 of cycle 47's FAILs + the next cycle's only
-  FAIL): that next-cycle item's only dissent was two narrative comments its own test file added —
-  a full FAILED round for two deletable lines.
+- **NO-COMMENTS POLICY (KI-E51/KI-E57, HOST-POLICY-GATED): when this prompt carries a
+  `HOST POLICY — NO NEW COMMENTS` block, do NOT add ANY comment to the file you write or touch —
+  not one, no exceptions.** That means zero `//` lines, zero `/* */` blocks, zero new `///`/JSDoc/docstring
+  blocks, and explicitly **no `// Arrange` / `// Act` / `// Assert` structural markers** even where
+  that exact triad is an established, pre-existing convention in the target repo's OWN test files —
+  under the policy an existing repo-wide pattern does NOT license a NEW instance of it. If you are
+  editing a PRE-EXISTING comment (not writing a new one), leave its exact original text completely
+  untouched — do not "improve", rephrase, or extend it even by one word (a byte-identical
+  move/re-indent is fine). The fix's OWN additions are a live gate-rejection class
+  ("fix-introduced defects" — 3/4 of cycle 47's FAILs + the next cycle's only FAIL): that next-cycle
+  item's only dissent was two narrative comments its own test file added — a full FAILED round for
+  two deletable lines. Before returning, re-read every line you added: if it starts with a comment
+  marker, delete it. When NO such block is present, follow the sibling test file's own comment
+  conventions instead (some hosts' testing standards REQUIRE the `// Arrange`/`// Act`/`// Assert`
+  structure — then match it); narrative running-commentary comments stay out in every mode (KI-E51).
 
 ### REAL-INFRA TESTS (when the prompt says REAL-INFRA, or `realInfra=true`)
 - **First, judge the DEFECT SHAPE.** Real infra is required when the bug's correctness depends on real-DB

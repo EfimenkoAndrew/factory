@@ -96,6 +96,31 @@ export function hasRealInfraMarker(text) {
   return typeof text === 'string' && /FACTORY::REALINFRA::\S+/.test(text);
 }
 
+// KI-E54 — every fold-time transcript read (verify/integrate/verify-red/baseline -raw.txt) hardcoded
+// readFileSync(p,'utf8') with ZERO defense: a producer that emits UTF-16 instead of UTF-8/ASCII (e.g. a
+// dispatched subagent's `| tee <file>` command crossing into a PowerShell-hosted shell, where PowerShell's
+// `tee`/`Tee-Object` alias and `>`/Out-File all default to UTF-16LE) silently mis-decodes under a plain
+// 'utf8' read — every FACTORY:: marker regex in this file then finds nothing in the mojibake, degrading to
+// hasData:false / "no-machine-evidence" with NO error or warning anywhere in the fold path (live-caught
+// 2026-07-28 on a real production item: a genuine FACTORY::RED::1 proof existed in the subagent's own
+// transcript, but the teed verify-red-raw.txt landed as UTF-16LE bytes and read back unparseable,
+// triggering a false deterministic-override FAILED on real, correctly-produced evidence). Pure
+// BOM-sniffing decode: the driver
+// calls this on the raw Buffer instead of assuming 'utf8'. A plain UTF-8/ASCII file with no BOM (the common
+// case, unchanged) decodes byte-identically to the old `readFileSync(p,'utf8')` — additive only, never a
+// behaviour change on the path that already worked.
+export function decodeTranscript(buf) {
+  if (!buf || !buf.length) return '';
+  if (buf.length >= 2 && buf[0] === 0xFF && buf[1] === 0xFE) return buf.slice(2).toString('utf16le'); // UTF-16LE BOM
+  if (buf.length >= 2 && buf[0] === 0xFE && buf[1] === 0xFF) { // UTF-16BE BOM — byte-swap, then decode as LE
+    const swapped = Buffer.from(buf.slice(2));
+    for (let i = 0; i + 1 < swapped.length; i += 2) { const t = swapped[i]; swapped[i] = swapped[i + 1]; swapped[i + 1] = t; }
+    return swapped.toString('utf16le');
+  }
+  if (buf.length >= 3 && buf[0] === 0xEF && buf[1] === 0xBB && buf[2] === 0xBF) return buf.slice(3).toString('utf8'); // UTF-8 BOM
+  return buf.toString('utf8');
+}
+
 // P9 — did the fix touch a real (non-test) file? A fixer that greens only the test never closes the bug.
 // The failure mode we deterministically catch is EXACTLY "the diff changed ONLY tests" (the line of intent):
 // so the fix must change at least one NON-TEST file — of ANY kind, source (.cs) OR config. A `.yaml` / `.sh`

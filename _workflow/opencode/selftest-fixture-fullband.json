@@ -1,0 +1,23 @@
+{
+  "item": {
+    "id": "SELFTEST-ITEM-FULLBAND",
+    "target": "SelfTest",
+    "layer": "service",
+    "title": "Self-test FULL-band fixture for the OpenCode adapter",
+    "severity": "CRITICAL",
+    "theme": "idempotency-dataflow",
+    "fixType": "non-trivial",
+    "files": ["src/Foo.cs", "src/Tests/FooTests.cs"],
+    "acceptance": "Given X, the system does Y. When Z happens, it never does W.",
+    "regressionTest": "A unit test that fails on old code and passes on new code.",
+    "realInfra": false,
+    "autonomyTier": "auto",
+    "fixHint": "(none — synthetic fixture item, not a real product defect)",
+    "source": "opencode-adapter self-test (FULL band)"
+  },
+  "worktreePath": "C:/fake/host/worktree",
+  "branch": "n/a (fixture — no real worktree)",
+  "cycle": 1,
+  "state": "READY",
+  "prevState": null
+}

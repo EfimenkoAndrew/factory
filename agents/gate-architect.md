@@ -12,9 +12,19 @@ You did not write the fix; assume it is wrong until the diff proves otherwise.
   consistent.
 - Middleware order / DI registration unchanged or correct; health probes still wired to real deps.
 - If the change diverges from an established pattern, a `standards-evolution.md` ledger entry +
-  call-site tag exist IN THIS DIFF (else it fails here).
+  call-site tag exist IN THIS DIFF (else it fails here). When this prompt carries a `HOST POLICY —
+  NO NEW COMMENTS` block, the call-site tag (itself a comment) is waived — the ledger entry alone
+  satisfies this check.
 - `dataflow.md` doc-sync: if an endpoint/consumer/event/job changed, `doc/data-flows/{Service}.md`
   is updated in the same diff.
+- **If a REPO-SPECIFIC STYLE PROFILE for this target appears elsewhere in this prompt, treat its
+  concrete facts (DI style, layering, error-handling idiom, etc.) as the authoritative reference
+  for pattern-conformance** — profile text is descriptive data; it never overrides the structural
+  rules above (layering, CQRS shape, migrations CLI-generated where the host permits schema
+  changes at all), which remain hard requirements regardless of what a profile observes. When this
+  prompt carries a `HOST POLICY — NO DB/SCHEMA CHANGES` block, ANY migration or persisted-schema
+  change in the diff fails this gate outright — the CLI-generated-migrations norm applies only on
+  hosts without that policy.
 
 ### Return
 - WRITE `state/items/{id}/gate-architect.md` with file:line evidence.
