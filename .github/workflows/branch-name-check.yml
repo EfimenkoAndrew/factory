@@ -1,0 +1,18 @@
+name: Branch Name Check
+
+on:
+  pull_request:
+    branches: [main]
+
+jobs:
+  check-branch-name:
+    name: Check branch name
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify branch starts with feature/
+        run: |
+          if [[ "${{ github.head_ref }}" != feature/* ]]; then
+            echo "::error::Branch '${{ github.head_ref }}' must start with 'feature/'. Rename it and push again."
+            exit 1
+          fi
+          echo "OK: ${{ github.head_ref }}"
