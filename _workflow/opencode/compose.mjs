@@ -54,12 +54,35 @@ export function compose(role, item, extra, ctx) {
     '  source: ' + item.source,
   ];
   if (Array.isArray(item.docMap) && item.docMap.length) {
-    lines.push('', 'DOC MAP (section index of this target\'s reference docs — Read targeted sections via offset/limit at the @L line numbers; do NOT read these docs whole):');
-    for (const d of item.docMap) lines.push('  ' + d);
+    // KI-E61 (2026-08-02) — verbatim port of factory.js's fix. See factory.js compose() for the
+    // full root-cause writeup: bare-relative doc-map paths let an agent's Edit call silently reuse
+    // the REPO-ROOT path it Read from, contaminating main when that same relative path is also in
+    // the item's files[] touch-set.
+    lines.push('', 'DOC MAP (section index of this target\'s reference docs, READ-ONLY — Read targeted sections via offset/limit at the @L line numbers; do NOT read these docs whole):');
+    for (const d of item.docMap) {
+      const rel = String(d).split(' :: ')[0];
+      lines.push('  ' + ctx.repoRoot + '/' + d);
+      if ((item.files || []).includes(rel)) {
+        lines.push('    ^ THIS path is ALSO in your files[] touch-set above. The line just shown is the REPO-ROOT read-only copy — do NOT Edit it. Your edit target for ' + rel + ' is: ' + wtPath + '/' + rel);
+      }
+    }
   }
   if (item.batchPattern) {
     lines.push('', 'BATCH PATTERN — SIMILARITY BATCH: ' + item.batchPattern,
       '  Every sibling item in this batch applies the SAME class of change to its own target. Make YOUR change structurally IDENTICAL in shape to that shared pattern — same approach, same naming, same comment style, same test structure — minimally adapted to this target. Do NOT invent a novel approach where the shared pattern fits. If THIS target genuinely requires deviating from the pattern, deviate correctly and state exactly why in your result note.');
+  }
+  if (item.precedent) {
+    // KI-E63 — verbatim port of factory.js's fix. A gate-APPROVED, already-CLOSED sibling of the
+    // same change-shape, stamped only when its evidence still exists on disk (driver.mjs
+    // cmdGroup). REPO-ROOT-qualified, same ambiguity lesson as the DOC MAP block above (KI-E61) —
+    // this lives in a DIFFERENT item's directory; read it, never edit it.
+    const p = item.precedent;
+    let pLines = 'PRECEDENT — a gate-APPROVED instance of this exact change-shape already CLOSED: ' + p.id + ' (' + (p.target || '?') + ') — "' + (p.title || '') + '"\n'
+      + '  READ-ONLY reference material in a DIFFERENT item\'s directory — never Edit it, never touch its files.';
+    if (p.fixJson) pLines += '\n  ' + ctx.repoRoot + '/' + p.fixJson + ' — the fixer\'s own record of what changed and why (filesChanged[].rationale).';
+    if (p.worktree) pLines += '\n  ' + ctx.repoRoot + '/' + p.worktree + '/ — the full worktree, if you want the actual diff (git status/diff inside it).';
+    pLines += '\n  Read it first. Make YOUR change structurally consistent with it — same approach, same shape — minimally adapted to this target. If this target genuinely requires deviating, deviate correctly and state exactly why in your result note.';
+    lines.push('', pLines);
   }
   if (Array.isArray(item.peers) && item.peers.length) {
     lines.push('', 'PEER-OWNED SURFACES (sibling items in THIS batch own these files — do NOT modify them; if your fix genuinely requires one, STOP for that file and say so in your result note instead):');
