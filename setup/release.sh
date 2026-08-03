@@ -75,18 +75,21 @@ if [ $PUSH = 1 ]; then
     # branch rules do not govern refs/tags/*, and the push carries the release commit's objects),
     # push the bump commit as a release branch, and open the PR that lands VERSION/CHANGELOG on
     # main. Installers resolve the tag either way — the release is live the moment the tag lands.
+    # Branch is feature/release-$TAG, not release/$TAG — live-caught cutting v1.1.0: a separate
+    # "Check branch name" required status check (added after this script) rejects anything not
+    # prefixed feature/, so the bookkeeping PR itself failed CI until this was renamed.
     warn "direct push to main REJECTED (PR-only ruleset?) — publishing via tag + release branch instead"
-    git push origin "refs/tags/$TAG" || die "tag push failed — the release commit+tag exist LOCALLY; retry by hand: git push origin $TAG && git push origin HEAD:refs/heads/release/$TAG"
-    git push origin "HEAD:refs/heads/release/$TAG" || die "release-branch push failed — tag $TAG IS already published; push the branch by hand: git push origin HEAD:refs/heads/release/$TAG"
+    git push origin "refs/tags/$TAG" || die "tag push failed — the release commit+tag exist LOCALLY; retry by hand: git push origin $TAG && git push origin HEAD:refs/heads/feature/release-$TAG"
+    git push origin "HEAD:refs/heads/feature/release-$TAG" || die "release-branch push failed — tag $TAG IS already published; push the branch by hand: git push origin HEAD:refs/heads/feature/release-$TAG"
     if command -v gh >/dev/null; then
-      gh pr create --base main --head "release/$TAG" --title "release: $TAG" \
+      gh pr create --base main --head "feature/release-$TAG" --title "release: $TAG" \
         --body "VERSION + CHANGELOG bump for $TAG, cut by setup/release.sh. The annotated tag \`$TAG\` already points at this commit, so installers resolve it now; merging lands the bump on main." || true
     fi
-    log "tag $TAG is published — merge the release/$TAG PR to land VERSION/CHANGELOG on main (local main is ahead until then)"
+    log "tag $TAG is published — merge the feature/release-$TAG PR to land VERSION/CHANGELOG on main (local main is ahead until then)"
   fi
   if command -v gh >/dev/null; then gh release create "$TAG" --title "factory $TAG" --generate-notes || true
   else log "gh CLI not found — tag pushed; create the GitHub Release by hand if wanted (installers resolve tags either way)"; fi
 else
-  log "--no-push: commit + tag are local; push with: git push origin main --follow-tags (on a PR-only main: git push origin $TAG && git push origin HEAD:refs/heads/release/$TAG, then PR the branch)"
+  log "--no-push: commit + tag are local; push with: git push origin main --follow-tags (on a PR-only main: git push origin $TAG && git push origin HEAD:refs/heads/feature/release-$TAG, then PR the branch)"
 fi
 log "released $TAG — team upgrades via: <mount>/setup/install.sh upgrade"

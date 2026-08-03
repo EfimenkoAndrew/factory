@@ -2007,7 +2007,7 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
   ok(inst.includes('cannot reach $REPO') && inst.includes("grep -E '^v[0-9]+\\.[0-9]+\\.[0-9]+$'"), 'KI-E52: latest-release resolve dies loudly on an unreachable remote and only strict vX.Y.Z tags win (review fix)');
   ok(inst.includes('install_cleanup') && inst.includes('rm -rf "$INSTALL_CREATED"'), 'KI-E52: a failed install removes the mount it created — no half-install blocks the corrective re-run (review fix)');
   ok(inst.includes('|| warn "telemetry bootstrap FAILED') && inst.includes('setup/init.mjs" --repo-root "$(host_of_mount'), 'KI-E52: telemetry failure never fails a good engine install; upgrade refreshes host scaffolding via init.mjs (review fix)');
-  ok(rel.includes('git push --atomic origin main "refs/tags/$TAG"') && rel.includes('rev-parse origin/main') && rel.includes('HEAD:refs/heads/release/$TAG'), 'KI-E52: release cut is origin-synced + atomic, and a PR-only main falls back to tag + release-branch + PR (review find: a rejected --follow-tags push still published the tag)');
+  ok(rel.includes('git push --atomic origin main "refs/tags/$TAG"') && rel.includes('rev-parse origin/main') && rel.includes('HEAD:refs/heads/feature/release-$TAG'), 'KI-E52: release cut is origin-synced + atomic, and a PR-only main falls back to tag + release-branch + PR (review find: a rejected --follow-tags push still published the tag); the fallback branch is feature/-prefixed to satisfy this repo\'s branch-name CI check (live-caught cutting v1.1.0)');
 }
 
 // KI-E66 (2026-08-03): cache-hit-rate + token-type breakdown did not exist ANYWHERE in the
