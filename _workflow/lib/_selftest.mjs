@@ -8,6 +8,7 @@ import { join, dirname, basename, resolve as resolvePath, sep } from 'node:path'
 import {
   emptyLedger, syncFromGraph, transition, foldResults, canTransition,
   countByState, writeJsonAtomic, readJson, unwrapResultEnvelope, FORWARD,
+  reconcileToStateAndTransitions,
 } from './ledger.mjs';
 import { computeReady, waitingOnDeps } from './graph.mjs';
 import { isFactoryWorktreePath } from './worktree.mjs';
@@ -21,7 +22,7 @@ import { changedFiles } from './worktree.mjs';
 import { classifyFilesEntry, buildBasenameIndex, acceptanceSurfaceGaps } from './graphaudit.mjs';
 import { renderFeedback } from './feedback.mjs';
 import { gateFindingsSummary, isStrictlyNarrower, applyConvergenceBonus, effectiveRetryBound } from './convergence.mjs';
-import { sig, jaccard, similarSigs, clusterBySimilarity, batchPatternFor } from './similarity.mjs';
+import { sig, jaccard, similarSigs, clusterBySimilarity, batchPatternFor, perCliqueBatchPatterns, bestClosedPrecedent } from './similarity.mjs';
 import { loadController, isStale as controllerStale, claimController, verifyController, releaseController } from './controller.mjs';
 import { execSmoke, smokeBatch } from './_execsmoke.mjs';
 import { classifyLine as loClassify, firstLexeme as loLexeme, findLeftovers } from './leftover-scan.mjs';
@@ -493,15 +494,72 @@ try {
   eq(batchPatternFor([A, C]), null, 'similarity: mixed-shape batch -> NO pattern stamp (strict all-pairs rule)');
   eq(batchPatternFor([A, B, D]), null, 'similarity: cross-theme batch -> NO pattern stamp');
   eq(batchPatternFor([A]), null, 'similarity: singleton -> NO pattern stamp');
-  // wiring pins: driver stamps + forwards, factory briefs, cluster.mjs consumes the shared rule
+  // KI-E62 (P1) — perCliqueBatchPatterns: a MIXED batch stamps each qualifying sub-clique
+  // independently instead of stripping the stamp from EVERY item the moment the whole batch
+  // isn't one clique.
+  const perClique = perCliqueBatchPatterns([A, B, C, D]);
+  eq(perClique.get('S-A'), pat, 'similarity: perCliqueBatchPatterns stamps a clique member with the SAME text batchPatternFor(clique) produces');
+  eq(perClique.get('S-B'), pat, 'similarity: perCliqueBatchPatterns stamps BOTH clique members with the identical pattern string');
+  ok(!perClique.has('S-C'), 'similarity: perCliqueBatchPatterns leaves a dissimilar singleton unstamped');
+  ok(!perClique.has('S-D'), 'similarity: perCliqueBatchPatterns leaves a different-theme singleton unstamped');
+  eq(perClique.size, 2, 'similarity: perCliqueBatchPatterns stamps exactly the clique members, nothing else, from a 4-item mixed batch');
+  // Strictly-additive parity: when the WHOLE batch IS one clique, perCliqueBatchPatterns must
+  // produce the IDENTICAL stamp batchPatternFor(items) already did — P1 must never regress the
+  // pre-existing whole-batch-is-one-clique case.
+  const wholeBatchClique = perCliqueBatchPatterns([A, B]);
+  eq(wholeBatchClique.get('S-A'), batchPatternFor([A, B]), 'similarity: perCliqueBatchPatterns([A,B]) matches batchPatternFor([A,B]) exactly when the whole batch is one clique');
+  eq(wholeBatchClique.get('S-B'), batchPatternFor([A, B]), 'similarity: perCliqueBatchPatterns whole-batch-clique parity holds for every member, not just the first');
+  eq(perCliqueBatchPatterns([A]).size, 0, 'similarity: perCliqueBatchPatterns([singleton]) stamps nothing');
+  eq(perCliqueBatchPatterns([A, C]).size, 0, 'similarity: perCliqueBatchPatterns([mixed-shape pair]) stamps nothing (both singletons in the cluster sense)');
+  // wiring pins: driver stamps (per-clique) + forwards per-item, factory briefs, cluster.mjs consumes the shared rule
   const drv = readFileSync(join(import.meta.dirname, '..', 'driver.mjs'), 'utf8');
-  ok(drv.includes('batchPatternFor(picked)'), 'similarity: group auto-stamps the pattern from the picked batch');
-  ok(drv.includes('batchPattern: batchPattern || undefined'), 'similarity: group forwards batchPattern on every item entry');
+  ok(drv.includes('perCliqueBatchPatterns(picked)'), 'similarity: group auto-stamps PER-CLIQUE patterns from the picked batch (KI-E62)');
+  ok(drv.includes('batchPatternById.get(wi.id) || undefined'), 'similarity: group forwards the per-item stamp lookup on every item entry (KI-E62)');
+  // KI-E62 follow-on: suggest's own batch-pattern preview must reflect the SAME per-clique rule
+  // group actually applies, not the retired whole-batch-only check — otherwise a pick(false)
+  // fallback batch (file-disjoint, not all-pairs similar) previews "none" for a batch group WOULD
+  // actually stamp a qualifying sub-clique within.
+  ok(!drv.includes("const pattern = batchPatternFor(batch);"), 'similarity: suggest preview no longer uses the retired whole-batch-only batchPatternFor(batch) check (KI-E62)');
+  ok(drv.includes('const perClique = perCliqueBatchPatterns(batch);'), 'similarity: suggest preview uses perCliqueBatchPatterns(batch) to match group\'s real per-clique stamping (KI-E62)');
+  ok(drv.includes('AUTO, per-clique (KI-E62): '), 'similarity: suggest preview reports a partial per-clique stamp distinctly from a whole-batch stamp');
+  // KI-E62 live-caught regression (2026-08-02): the batchPattern -> batchPatternById rename left a
+  // BARE `batchPattern` reference in the run_prepared telemetry emit, far below the rename site —
+  // a ReferenceError that crashed EVERY real (non-dry-run-only-in-imagination) `group` invocation.
+  // Source-text pins on the rename sites alone did not catch this (they never execute cmdGroup);
+  // caught only by an actual `driver.mjs group --dry` smoke run. Pinned here so this exact class
+  // (a rename that misses a distant usage site) cannot silently regress again.
+  ok(drv.includes('batchPattern: batchPatternById.size > 0'), 'similarity: run_prepared telemetry uses the renamed batchPatternById, not a bare (ReferenceError-crashing) batchPattern (KI-E62)');
   ok(drv.includes("case 'suggest': return cmdSuggest(flags);"), 'similarity: suggest command is dispatched');
   const fsrc = readFileSync(join(import.meta.dirname, '..', 'factory.js'), 'utf8');
   ok(fsrc.includes('BATCH PATTERN — SIMILARITY BATCH: ') && fsrc.includes('structurally IDENTICAL'), 'similarity: factory briefs agents to keep sibling changes structurally identical');
   const csrc = readFileSync(join(import.meta.dirname, '..', 'cluster.mjs'), 'utf8');
   ok(csrc.includes("from './lib/similarity.mjs'"), 'similarity: cluster.mjs imports the shared rule (single source of truth)');
+
+  // KI-E63 (R2) — bestClosedPrecedent: the single, MOST-RECENTLY-closed matching sibling from a
+  // pool of already-CLOSED items, scoped the same way batch-pattern matching is (same theme +
+  // similarSigs), but one-item-vs-pool rather than N-items-vs-each-other (no clustering needed).
+  const closedPool = [
+    { id: 'OLD-1', target: 'SvcX', theme: 'deploy', title: B.title, closedAt: '2026-07-01T00:00:00Z' },
+    { id: 'OLD-2', target: 'SvcY', theme: 'deploy', title: B.title, closedAt: '2026-07-15T00:00:00Z' },
+    { id: 'OLD-3', target: 'SvcZ', theme: 'crypto', title: B.title, closedAt: '2026-07-20T00:00:00Z' },
+    { id: 'OLD-4', target: 'SvcW', theme: 'deploy', title: 'logging format change for structured output', closedAt: '2026-07-25T00:00:00Z' },
+  ];
+  const prec = bestClosedPrecedent(A, closedPool);
+  ok(!!prec, 'similarity: bestClosedPrecedent finds a matching already-closed sibling for a same-shape item');
+  eq(prec && prec.id, 'OLD-2', 'similarity: bestClosedPrecedent picks the MOST RECENT qualifying match (OLD-2), not the first (OLD-1) or a cross-theme/dissimilar one (OLD-3/OLD-4)');
+  eq(bestClosedPrecedent(C, closedPool), null, 'similarity: bestClosedPrecedent returns null when no closed candidate matches the item\'s shape (same-theme OLD-4 is unrelated prose, not a shape match)');
+  eq(bestClosedPrecedent(A, [{ id: 'S-A', target: 'SvcA', theme: 'deploy', title: B.title, closedAt: '2099-01-01' }]), null, 'similarity: bestClosedPrecedent excludes a candidate sharing the item\'s OWN id');
+  eq(bestClosedPrecedent(A, []), null, 'similarity: bestClosedPrecedent([], ) returns null on an empty pool');
+  eq(bestClosedPrecedent(A, null), null, 'similarity: bestClosedPrecedent tolerates a null pool (defensive)');
+  // wiring pins: driver builds the closed-candidate pool + existence-checks before stamping, forwards per-item
+  ok(drv.includes('bestClosedPrecedent(wi, closedCandidates)'), 'similarity: group looks up a precedent for each picked item (KI-E63)');
+  ok(drv.includes('if (!hasFix && !hasWt) continue;'), 'similarity: group NEVER stamps a precedent whose evidence is not actually present on disk (KI-E63)');
+  ok(drv.includes('precedent: precedentByItem.get(wi.id) || undefined'), 'similarity: group forwards the per-item precedent stamp on every item entry (KI-E63)');
+  ok(fsrc.includes('PRECEDENT — a gate-APPROVED instance of this exact change-shape already CLOSED: '), 'factory: precedent block present in shared prefix (KI-E63)');
+  ok(fsrc.includes('never Edit it, never touch its files'), 'factory: precedent is explicitly framed as read-only, foreign-item reference material (KI-E63)');
+  const opsrc63 = readFileSync(join(import.meta.dirname, '..', 'opencode', 'compose.mjs'), 'utf8');
+  ok(opsrc63.includes('PRECEDENT — a gate-APPROVED instance of this exact change-shape already CLOSED: '), 'opencode compose: KI-E63 precedent block ported (runtime parity)');
+  ok(opsrc63.includes('never Edit it, never touch its files'), 'opencode compose: KI-E63 read-only framing ported (runtime parity)');
 }
 
 // KI-C11: session-controller lease — the campaign-level single-owner guard. Two control-plane
@@ -656,6 +714,40 @@ try {
   ok(fr62.applied.some((a) => a.to === 'CLAIMED') && fr62.rejected.length === 0, 'KI-L62: CLAIMED auto-inserted from FAILED; nothing rejected');
 }
 
+// KI-E65: toState/transitions reconciliation — live bug (ITEM-30, cycle 57r): a recovery-fold.json
+// set toState:'FAILED' (a CHANGES_REQUIRED gate) but left transitions ending in the skeleton's
+// default success path ('...,CLOSED'); foldResults walked transitions and silently CLOSED a
+// still-broken item. reconcileToStateAndTransitions must catch and correct this BEFORE fold.
+{
+  eq(reconcileToStateAndTransitions(null), null, 'KI-E65: null result is a no-op');
+  eq(reconcileToStateAndTransitions({ id: 'X', toState: 'FAILED' }), null, 'KI-E65: no transitions array is a no-op (nothing to reconcile against)');
+  eq(reconcileToStateAndTransitions({ id: 'X', transitions: ['RED', 'GREEN'] }), null, 'KI-E65: no toState is a no-op');
+  eq(reconcileToStateAndTransitions({ id: 'X', toState: 'CLOSED', transitions: ['RED', 'GREEN', 'BUILT', 'CLOSED'] }), null, 'KI-E65: already-consistent (last element === toState) is a no-op, unmutated');
+
+  // toState appears mid-array (over-ran its own stated ending) — truncate there.
+  const rMid = { id: 'X', toState: 'FAILED', transitions: ['CLAIMED', 'RED', 'FAILED', 'GREEN', 'BUILT'] };
+  const recMid = reconcileToStateAndTransitions(rMid);
+  ok(!!recMid, 'KI-E65: mid-array toState mismatch is detected and reconciled');
+  eq(rMid.transitions, ['CLAIMED', 'RED', 'FAILED'], 'KI-E65: mid-array case truncates AT the first occurrence of toState, dropping everything after');
+
+  // toState absent from the array entirely (the live ITEM-30 shape) — walk backwards to the last
+  // state canTransition allows to reach toState directly, then append it.
+  const rLive = { id: 'ITEM-30', toState: 'FAILED', transitions: ['CLAIMED', 'RED', 'GREEN', 'BUILT', 'TESTED', 'GATED', 'REFUTE_OK', 'REAUDITED', 'INTEGRATED', 'CLOSED'] };
+  const recLive = reconcileToStateAndTransitions(rLive);
+  ok(!!recLive, 'KI-E65: toState absent from transitions (the live ITEM-30 shape) is detected');
+  eq(rLive.transitions, ['CLAIMED', 'RED', 'GREEN', 'BUILT', 'TESTED', 'GATED', 'REFUTE_OK', 'REAUDITED', 'FAILED'], 'KI-E65: walks back to REAUDITED (the last ACTIVE state, a legal FAILED off-ramp) and appends toState — CLOSED/INTEGRATED are correctly skipped as illegal jump-off points');
+  eq(recLive.before.join(','), 'CLAIMED,RED,GREEN,BUILT,TESTED,GATED,REFUTE_OK,REAUDITED,INTEGRATED,CLOSED', 'KI-E65: correction record preserves the original (pre-mutation) array for logging');
+
+  // End-to-end regression pin: the exact live bug, run through the REAL fold path.
+  const g65 = { items: [{ id: 'WI-65', target: 'X', severity: 'HIGH', fixType: 'non-trivial', files: ['a.cs'], dependsOn: [], autonomyTier: 'auto', layer: 'service', acceptance: '', regressionTest: '', gateSet: [], theme: 't', source: 's' }] };
+  const l65 = emptyLedger('syn65'); syncFromGraph(l65, g65);
+  transition(l65, 'WI-65', 'CLAIMED', 't'); transition(l65, 'WI-65', 'RED', 't'); transition(l65, 'WI-65', 'FAILED', 't');
+  const liveShaped = { id: 'WI-65', resultId: 'WI-65#1r', toState: 'FAILED', gates: { 'gate:developer': 'CHANGES_REQUIRED' }, transitions: ['RED', 'GREEN', 'BUILT', 'TESTED', 'GATED', 'REFUTE_OK', 'REAUDITED', 'INTEGRATED', 'CLOSED'], attemptsDelta: 0 };
+  reconcileToStateAndTransitions(liveShaped);
+  foldResults(l65, [liveShaped]);
+  eq(l65.items['WI-65'].state, 'FAILED', 'KI-E65 regression pin: a recovery-fold with toState=FAILED but transitions ending in CLOSED lands the row on FAILED end-to-end, not CLOSED (the exact live ITEM-30 bug)');
+}
+
 // KI-L60: shadow-driver detection — a factory ITEM WORKTREE path is flagged; the primary checkout
 // (and unrelated paths that merely mention worktrees) are not.
 ok(isFactoryWorktreePath('/repo/_bmad-output/ai-factory/state/worktrees/ITEM-CR-5/_bmad-output/ai-factory/_workflow'), 'KI-L60: worktree shadow driver path detected');
@@ -745,6 +837,41 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
   rm35(root35, { recursive: true, force: true });
 }
 
+// KI-E61 (2026-08-02): repairDirtyDrift — auto-repair for exactly the dirty bucket splitDriftByStatus
+// proves is agent contamination (never human delivery). A present->changed file restores from HEAD;
+// an absent->present file (a stray the worktree agent created) is removed; a repair failure on one
+// path is recorded on that entry and never thrown (a partial repair must not crash the fold).
+{
+  const { splitDriftByStatus: sds66, repairDirtyDrift } = await import('./mainguard.mjs');
+  const { mkdtempSync: mk66, writeFileSync: wf66, readFileSync: rf66, existsSync: ex66, rmSync: rm66 } = await import('node:fs');
+  const root66 = mk66(join(tmpdir(), 'l66repair-'));
+  const g66 = (...a) => execFileSync('git', ['-C', root66, ...a], { encoding: 'utf8' });
+  g66('init', '-q');
+  wf66(join(root66, 'existing.cs'), 'ORIGINAL');
+  g66('add', '.');
+  g66('-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-q', '-m', 'base', '--no-gpg-sign', '--no-verify');
+  wf66(join(root66, 'existing.cs'), 'CONTAMINATED BY A ROGUE AGENT');
+  wf66(join(root66, 'stray.md'), 'a file HEAD never had');
+  const { dirty: dirty66 } = sds66(root66, [{ file: 'existing.cs', was: 'present' }, { file: 'stray.md', was: 'absent' }]);
+  eq(dirty66.length, 2, 'KI-E61: both the mutated tracked file and the new stray classify as dirty');
+  const repaired66 = repairDirtyDrift(root66, dirty66);
+  eq(repaired66.length, 2, 'KI-E61: both dirty entries report as repaired');
+  eq(rf66(join(root66, 'existing.cs'), 'utf8'), 'ORIGINAL', 'KI-E61: present->changed file restored to its HEAD content');
+  ok(!ex66(join(root66, 'stray.md')), 'KI-E61: absent->present stray file removed (checkout cannot restore what HEAD never had)');
+  // a git failure (invalid repo path) must fail closed per-entry, not throw the whole fold
+  const badRepair = repairDirtyDrift(join(root66, 'not-a-repo'), [{ file: 'x.cs', was: 'present' }]);
+  eq(badRepair.length, 0, 'KI-E61: a git failure repairs nothing (excluded from the repaired list)');
+  rm66(root66, { recursive: true, force: true });
+  // driver wiring pin: both the fold-time (KI-L65) and relaunch pre-flight (KI-E41) dirty-drift
+  // checks call the auto-repair, not just report it — a fix that only touches mainguard.mjs and
+  // never gets called would leave the bug live.
+  const dsrc66 = readFileSync(new URL('../driver.mjs', import.meta.url), 'utf8');
+  const foldSite = dsrc66.indexOf('MAIN-TREE CONTAMINATION');
+  const resumeSite = dsrc66.indexOf('MAIN-GUARD ${id} (KI-E41)');
+  ok(foldSite > 0 && dsrc66.slice(Math.max(0, foldSite - 400), foldSite).includes('repairDirtyDrift('), 'driver: KI-E61 fold-time contamination check calls repairDirtyDrift before reporting');
+  ok(resumeSite > 0 && dsrc66.slice(Math.max(0, resumeSite - 400), resumeSite).includes('repairDirtyDrift('), 'driver: KI-E61 resume pre-flight main-guard calls repairDirtyDrift before reporting');
+}
+
 // KI-E36 (review fix): parkedAtMs + allCommittedAfter — the delivered-in-HEAD date logic, pure.
 {
   const { parkedAtMs, allCommittedAfter } = await import('./ledger.mjs');
@@ -814,6 +941,12 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
   const dsrc16 = readFileSync(new URL('../driver.mjs', import.meta.url), 'utf8');
   ok(dsrc16.includes('sharedFileGap') && dsrc16.includes('SHARED-FILE-GAP'), 'KI-E16: graph-audit carries the shared-file gap lint + loud console line');
   ok(/ledger entr\(\?\:y\|ies\)|ledger anchor/.test(dsrc16), 'KI-E16: the lint matches acceptance prose naming a ledger entry/anchor');
+  // KI-E64 (2026-08-02): LEDGER_PATH was '_bmad-output/tech-debt/STANDARDS-LEDGER.md' (missing
+  // "DIVERGENCE") since KI-E16's introduction — a filename that has NEVER existed on disk, so the
+  // gap check could never be satisfied even when files[] correctly carried the real path, and
+  // `graph-audit --fix` would have appended a nonexistent path instead of the real ledger. Pin the
+  // correct constant so this exact typo-regression cannot silently return.
+  ok(dsrc16.includes("const LEDGER_PATH = '_bmad-output/tech-debt/STANDARDS-DIVERGENCE-LEDGER.md';"), 'KI-E64: graph-audit LEDGER_PATH points at the real ledger filename (with DIVERGENCE), not the historical typo');
 }
 
 // KI-E7 / ai-factory-observability spine AD-1..3, AD-11, AD-12: telemetry is a single append-only
@@ -1008,6 +1141,14 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
   ok(iGuard > 0 && iPack > iGuard && iD7 > iPack, 'factory: cache-strategic order — GUARDRAILS < REVIEW PACK < KI-D7 (role tail after shared prefix)');
   ok(fsrc.includes('A.briefs && A.briefs[role]'), 'factory: inline-brief branch present (batch briefs win, pointer fallback)');
   ok(fsrc.includes('DOC MAP (section index'), 'factory: docMap block present in shared prefix');
+  // KI-E61 (2026-08-02): every docMap path must be REPO-anchored at the point of use, and any path
+  // that is ALSO in the item's files[] touch-set must carry an explicit worktree-edit-target line —
+  // this is the actual fix for the main-tree-contamination class (cycle 35/48/56 all hit a doc/
+  // data-flows, CONTEXT.md, or AGENTS.md file, exactly what buildDocMap indexes).
+  ok(fsrc.includes("lines.push('  ' + REPO + '/' + d)"), 'factory: KI-E61 docMap entries are REPO-anchored, not bare-relative');
+  ok(fsrc.includes('THIS path is ALSO in your files[] touch-set') && fsrc.includes("Your edit target for"), 'factory: KI-E61 docMap warns when a reference doc is also an edit target, naming the worktree path');
+  const opsrc66 = readFileSync(join(LIBDIR, '..', 'opencode', 'compose.mjs'), 'utf8');
+  ok(opsrc66.includes('THIS path is ALSO in your files[] touch-set'), 'opencode compose: KI-E61 docMap edit-anchor warning ported (runtime parity)');
   ok(fsrc.includes("--verdict <APPROVED|CHANGES_REQUIRED>"), 'factory: telemetry verdict split for review roles');
   ok(fsrc.includes("' pack ' + wtPath"), 'factory: runner PACKCMD seam present');
   ok(fsrc.includes('REGENERATE the review pack'), 'factory: editorial pass regenerates the pack (KI-L34 final-diff invariant)');
@@ -1867,6 +2008,103 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
   ok(inst.includes('install_cleanup') && inst.includes('rm -rf "$INSTALL_CREATED"'), 'KI-E52: a failed install removes the mount it created — no half-install blocks the corrective re-run (review fix)');
   ok(inst.includes('|| warn "telemetry bootstrap FAILED') && inst.includes('setup/init.mjs" --repo-root "$(host_of_mount'), 'KI-E52: telemetry failure never fails a good engine install; upgrade refreshes host scaffolding via init.mjs (review fix)');
   ok(rel.includes('git push --atomic origin main "refs/tags/$TAG"') && rel.includes('rev-parse origin/main') && rel.includes('HEAD:refs/heads/release/$TAG'), 'KI-E52: release cut is origin-synced + atomic, and a PR-only main falls back to tag + release-branch + PR (review find: a rejected --follow-tags push still published the tag)');
+}
+
+// KI-E66 (2026-08-03): cache-hit-rate + token-type breakdown did not exist ANYWHERE in the
+// factory's own event stream (only in two permanently-empty Grafana panels, KI-E28/KI-E33 — this
+// host's own OTEL exporter env was never actually configured, confirmed live: zero claude_code_*
+// metric names in Prometheus despite the compose stack running). Cycle-scoped bridge from
+// Prometheus into events.jsonl (lib/token-usage.mjs) + a disclosed per-item apportionment of the
+// real KI-E23 output-token total by real per-item call-count share (true per-item measurement is
+// not available from inside factory.js's sandboxed Workflow runtime — budget.spent() is a
+// whole-turn/whole-workflow aggregate only, per platform docs, and this factory's own multi-month
+// history never achieved better despite KI-E23 wanting per-item granularity).
+{
+  const U = await import('./token-usage.mjs');
+  // parseTokenUsageVector — the exact label shape from the already-authored dashboard panels
+  // (telemetry/grafana/dashboards/ai-factory.json), an unknown type ignored, an empty result is
+  // all-zero (never an error).
+  const vec = U.parseTokenUsageVector({ status: 'success', data: { resultType: 'vector', result: [
+    { metric: { type: 'input' }, value: [1700000000, '1000'] },
+    { metric: { type: 'output' }, value: [1700000000, '200'] },
+    { metric: { type: 'cacheRead' }, value: [1700000000, '5000'] },
+    { metric: { type: 'cacheCreation' }, value: [1700000000, '300'] },
+    { metric: { type: 'somethingUnknown' }, value: [1700000000, '99999'] },
+  ] } });
+  eq(vec, { inputTokens: 1000, outputTokens: 200, cacheReadTokens: 5000, cacheCreationTokens: 300 }, 'KI-E66: parseTokenUsageVector sums by the exact dashboard type labels, ignoring an unrecognized type');
+  eq(U.parseTokenUsageVector({ status: 'success', data: { result: [] } }), { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0 }, 'KI-E66: empty Prometheus result -> all-zero, never a throw');
+  eq(U.parseTokenUsageVector(null), { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0 }, 'KI-E66: null/malformed input -> all-zero, never a throw');
+  ok(U.parseTokenUsageVector({ data: { result: [{ metric: { type: 'input' }, values: [[1, '1'], [2, '7']] }] } }).inputTokens === 7, 'KI-E66: a range-vector series (values[]) reads the LATEST sample, not the first');
+
+  // cacheHitRate — the SAME formula already authored in the "Prompt-cache hit ratio" Grafana panel
+  // (cacheRead / (cacheRead + cacheCreation + input)); null (never 0/NaN) with no signal.
+  ok(Math.abs(U.cacheHitRate({ cacheReadTokens: 5000, cacheCreationTokens: 300, inputTokens: 1000 }) - (5000 / 6300)) < 1e-9, 'KI-E66: cacheHitRate matches the dashboard formula exactly');
+  eq(U.cacheHitRate({ cacheReadTokens: 0, cacheCreationTokens: 0, inputTokens: 0 }), null, 'KI-E66: zero denominator -> null, never 0% or NaN (a bare 0 would silently read as measured zero hits, the KI-E40 lesson)');
+  eq(U.cacheHitRate(null), null, 'KI-E66: null usage -> null');
+  eq(U.cacheHitRate({ cacheReadTokens: 100, cacheCreationTokens: 0, inputTokens: 0 }), 1, 'KI-E66: all-cache-read (no fresh input at all) -> 100% hit rate');
+
+  // tokenUsageSummary — bundles totals + hit rate together
+  const summary = U.tokenUsageSummary({ inputTokens: 1000, outputTokens: 200, cacheReadTokens: 5000, cacheCreationTokens: 300 });
+  eq(summary.totalTokens, 6500, 'KI-E66: tokenUsageSummary sums all four buckets');
+  ok(Math.abs(summary.cacheHitRate - (5000 / 6300)) < 1e-9, 'KI-E66: tokenUsageSummary carries the same cacheHitRate formula');
+
+  // buildTokenUsageQuery — the increase() PromQL + the window's END as the query time
+  const q = U.buildTokenUsageQuery(1700000000000, 1700003600000); // exactly 1h window
+  eq(q, { query: 'sum by (type) (increase(claude_code_token_usage_tokens_total[3600s]))', time: 1700003600 }, 'KI-E66: buildTokenUsageQuery windows in seconds and evaluates at the window END');
+
+  // apportionTokensByCallShare — a disclosed apportionment of a REAL total, never a fabricated one
+  eq(U.apportionTokensByCallShare(1000, { A: 3, B: 1 }), { A: 750, B: 250 }, 'KI-E66: apportions the real total proportional to real call-count share');
+  eq(U.apportionTokensByCallShare(1000, {}), {}, 'KI-E66: no call counts -> nothing to apportion against (empty, never a guess)');
+  eq(U.apportionTokensByCallShare(0, { A: 3 }), {}, 'KI-E66: zero real total -> empty (never fabricates a nonzero figure)');
+  eq(U.apportionTokensByCallShare(1000, { A: 0, B: 0 }), {}, 'KI-E66: all-zero call counts -> empty, no divide-by-zero');
+
+  // Integration: aggregateEvents + renderTelemetryReport render both new sections, and the
+  // itemCallCounts aggregation is keyed by cycle so a retried item's later-cycle calls never
+  // dilute an earlier cycle's apportionment.
+  const T = await import('./telemetry.mjs');
+  const agg66 = T.aggregateEvents([
+    { event: 'usage', source: 'driver', cycle: 57, attrs: { outputTokens: 1000, file: 'r57.json' } },
+    { event: 'item_folded', source: 'driver', item: 'X', cycle: 57, attrs: { toState: 'CLOSED', gates: {}, cost: { 'claude-sonnet-5': 3 } } },
+    { event: 'item_folded', source: 'driver', item: 'Y', cycle: 57, attrs: { toState: 'FAILED', gates: {}, cost: { 'claude-opus-4-8': 1 } } },
+    { event: 'token_usage_snapshot', source: 'driver', cycle: 57, ts: '2026-08-03T12:00:00.000Z', attrs: { inputTokens: 1000, outputTokens: 200, cacheReadTokens: 5000, cacheCreationTokens: 300, totalTokens: 6500, cacheHitRate: 5000 / 6300 } },
+  ]);
+  eq(agg66.itemCallCounts[57], { X: 3, Y: 1 }, 'KI-E66: per-item call counts aggregate keyed by cycle');
+  eq(agg66.tokenUsageSnapshots.length, 1, 'KI-E66: token_usage_snapshot events collect into tokenUsageSnapshots');
+  const md66 = T.renderTelemetryReport(agg66, { generatedAt: 'T', file: 'f' });
+  ok(md66.includes('## Session token usage & cache hit rate (KI-E66, cycle-scoped, Prometheus-derived)'), 'KI-E66: the cache-hit-rate section header renders');
+  ok(md66.includes('| 57 | 1,000 | 200 | 5,000 | 300 | 6,500 | 79% |'), 'KI-E66: the cycle-level token/cache-hit-rate row renders with the correct rounded percentage');
+  ok(md66.includes('## Per-item apportioned tokens (estimate — NOT a measurement, KI-E66)'), 'KI-E66: the per-item apportionment section header renders, explicitly labeled as an estimate');
+  ok(md66.includes('| 57 | X | 750 |') && md66.includes('| 57 | Y | 250 |'), 'KI-E66: per-item apportioned tokens render proportional to real call-count share (X:3 calls=750, Y:1 call=250, of the real 1000-token cycle total)');
+  // No snapshot gathered (the common case on a host whose OTEL exporter env is unconfigured, or
+  // Prometheus unreachable/empty) -> an honest NOT-gathered message, never a silent 0/blank table.
+  const aggNone66 = T.aggregateEvents([{ event: 'usage', source: 'driver', cycle: 1, attrs: { outputTokens: 100, file: 'r1.json' } }]);
+  const mdNone66 = T.renderTelemetryReport(aggNone66, { generatedAt: 'T', file: 'f' });
+  ok(mdNone66.includes('_NOT gathered'), 'KI-E66: with no token_usage_snapshot events, the report says NOT gathered rather than rendering an empty/misleading table');
+}
+
+// KI-E67 (2026-08-03): narrative/verdict contradiction detector — found live while auditing
+// ITEM-22, whose non-canonical VERIFICATION-REPORT.md read as confidently "✅ COMPLETE... Ready
+// for merge" while the deterministic fold verdict was FAILED (406 new suite failures).
+{
+  const N = await import('./narrative-check.mjs');
+  const doneText = '# X Verification Report\n\n**Status**: ✅ COMPLETE — All acceptance criteria met.\n\n**Conclusion**\n\nReady for merge. No additional changes required.\n';
+  eq(N.detectNarrativeVerdictContradiction('CLOSED', { 'VERIFICATION-REPORT.md': doneText }), [], 'KI-E67: a CLOSED item with upbeat prose is NOT a contradiction — it is an accurate description, never flagged');
+  eq(N.detectNarrativeVerdictContradiction('FAILED', {}), [], 'KI-E67: no artifact text at all -> no hit');
+  eq(N.detectNarrativeVerdictContradiction('FAILED', { 'plan.md': 'Approach: read the ledger entry and add the tag.' }), [], 'KI-E67: ordinary neutral prose on a FAILED item -> no false positive');
+  const failHits = N.detectNarrativeVerdictContradiction('FAILED', { 'VERIFICATION-REPORT.md': doneText, 'plan.md': 'no marker text here' });
+  eq(failHits.map((h) => h.file), ['VERIFICATION-REPORT.md'], 'KI-E67: the live ITEM-22 shape (FAILED + a confidently-done non-canonical file) is detected, and only the offending file is named');
+  ok(failHits[0].marker.length > 0, 'KI-E67: the hit carries the actual matched phrase, not just a boolean');
+  ok(N.detectNarrativeVerdictContradiction('ESCALATED', { 'x.md': 'Status: fully complete' }).length === 1, 'KI-E67: ESCALATED is treated the same as FAILED (both are "not actually done")');
+  // Every individual strong marker phrase is independently covered, so the marker list can't
+  // silently regress to only matching the ONE phrase used in the composite doneText fixture above.
+  for (const phrase of ['✅ complete', 'all acceptance criteria met', 'ready for merge', 'no additional changes required', 'zero leftovers', 'Status: fully complete']) {
+    ok(N.detectNarrativeVerdictContradiction('FAILED', { 'f.md': phrase }).length === 1, `KI-E67: marker phrase "${phrase}" is independently detected`);
+  }
+  // Fold wiring: the driver actually calls the detector inside cmdFold, scanning every .md in the
+  // item's directory (not just the canonical artifact list) for a FAILED/ESCALATED result.
+  const drvText67 = readFileSync(join(import.meta.dirname, '..', 'driver.mjs'), 'utf8');
+  ok(drvText67.includes('detectNarrativeVerdictContradiction') && drvText67.includes('NARRATIVE-VERDICT-MISMATCH'), 'KI-E67: cmdFold wires the detector and prints the WARN with the KI tag');
+  ok(/toState !== 'FAILED' && r\.toState !== 'ESCALATED'\) continue/.test(drvText67), 'KI-E67: the fold wiring is gated to FAILED/ESCALATED results only, matching the pure function\'s own contract');
 }
 
 console.log(`\nself-test: ${pass} passed, ${fail} failed`);

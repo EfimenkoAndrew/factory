@@ -25,6 +25,7 @@ import {
   emptyLedger, loadLedger, syncFromGraph, transition, foldResults,
   countByState, writeJsonAtomic, readJson, unwrapResultEnvelope, ACTIVE, OFFRAMPS, FORWARD,
   parkedAtMs, allCommittedAfter, closedDepsWithLiveWorktree, lastHistoryNote,
+  reconcileToStateAndTransitions,
 } from './lib/ledger.mjs';
 import { loadGraph, computeReady, waitingOnDeps, byId } from './lib/graph.mjs';
 import { loadRouting, resolve as routeResolve, concurrencyFor } from './lib/router.mjs';
@@ -36,19 +37,21 @@ import { classifyFilesEntry, buildBasenameIndex, acceptanceSurfaceGaps } from '.
 import { renderFeedback } from './lib/feedback.mjs';
 import { dissentersFrom, roleForGateKey, recoveryFoldSkeleton, priorCycleOf } from './lib/recover.mjs'; // KI-E20 — the direct-recovery scaffold
 import { applyConvergenceBonus, effectiveRetryBound } from './lib/convergence.mjs';
-import { clusterBySimilarity, sharedLabel, batchPatternFor, sig as simSig, similarSigs } from './lib/similarity.mjs';
+import { clusterBySimilarity, sharedLabel, perCliqueBatchPatterns, bestClosedPrecedent, sig as simSig, similarSigs } from './lib/similarity.mjs';
 import { loadController, isStale as controllerStale, claimController, verifyController, releaseController, DEFAULT_TTL_MINUTES } from './lib/controller.mjs';
 import { buildFactoryRouting } from './lib/routing-drift.mjs';
 import { githubIssueToItem, markdownChecklistToItems, ingestReport, enforceIngestTier, countCheckedBoxes } from './lib/ingest.mjs'; // KI-E27 — multi-source issue ingestion
-import { snapshotMainFiles, driftAgainstSnapshot, dirtyMainPaths, filesOverlapDirty, splitDriftByStatus } from './lib/mainguard.mjs';
+import { snapshotMainFiles, driftAgainstSnapshot, dirtyMainPaths, filesOverlapDirty, splitDriftByStatus, repairDirtyDrift } from './lib/mainguard.mjs';
 import { buildDocMap, readRoleBriefs, readRepoProfiles } from './lib/promptpack.mjs';
 import { loadPolicies, renderPolicies, POLICY_TEXT } from './lib/policy.mjs'; // PR#9 review — host-policy gating (no-comments / no-schema-changes are per-host, never universal)
 // KI-E7 — telemetry is OBSERVATIONAL ONLY (ai-factory-observability spine AD-1..3/AD-11): emit()
 // never throws, never blocks a command, and never feeds a fold verdict. FACTORY_TELEMETRY=0 disables.
 import { emit as temit, deriveStageTimeline, readEvents, aggregateEvents, renderTelemetryReport, telemetryFile, GAP_FENCE_MS, nonCanonicalArtifacts, isRecoveryResultId, isDirectRecoveryFold } from './lib/telemetry.mjs';
+import { parseTokenUsageVector, buildTokenUsageQuery, tokenUsageSummary } from './lib/token-usage.mjs'; // KI-E66 — cache-hit-rate bridge
 import { lintWorktreeDocClaims } from './lib/doclint.mjs'; // F2 — phantom doc-path detection aid at fold (WARN-only)
 import { findLeftovers } from './lib/leftover-scan.mjs'; // KI-D12 — deferral/tech-debt lexicon detection aid at fold (WARN-only)
 import { findComments } from './lib/comment-scan.mjs'; // KI-E59 — no-new-comments detection aid at fold (WARN-only)
+import { detectNarrativeVerdictContradiction } from './lib/narrative-check.mjs'; // KI-E67 — narrative-vs-verdict contradiction detection aid at fold (WARN-only)
 
 // KI-B1 (closed 2026-07-12): config-authoritative routing for every emitted batch — built from
 // config/model-routing.json via the SAME mapping the drift guard checks, injected into runArgs as
@@ -518,14 +521,14 @@ function deterministicVerifyOverride(cfg, ledger, wi, r) {
     if (r.verificationOnly === true) {
       if (!red.hasData) return fail('verificationOnly item has no verify-red-raw.txt transcript (FACTORY::RED:: marker) — cannot machine-prove the acceptance already holds on the current tree');
       if (red.red) {
-        // KI-L66 — the flag was an in-run MISCLASSIFICATION, but the transcript satisfies the
+        // KI-E61 — the flag was an in-run MISCLASSIFICATION, but the transcript satisfies the
         // STRONGER normal red-green contract: a GENUINE discriminating red (exit!=0) plus the
         // machine green already required above. Auto-correct instead of failing — the evidence
         // outranks the classification in BOTH directions (cycle 35: ITEM-TD-13 lacked the
         // flag its evidence needed; cycle 36: ITEM-H5 carried the flag its evidence didn't —
         // the KI-L37 reFix heuristic stamps verificationOnly even when the test-author went on
         // to produce a real red). Clearing the flag also re-arms the P9 root-cause check below.
-        console.log(`  KI-L66 ${r.id}: verificationOnly flag contradicted by a GENUINE red (exit=${red.exit}) + machine green — auto-corrected to the normal red-green contract (result closes on the STRONGER evidence)`);
+        console.log(`  KI-E61 ${r.id}: verificationOnly flag contradicted by a GENUINE red (exit=${red.exit}) + machine green — auto-corrected to the normal red-green contract (result closes on the STRONGER evidence)`);
         r.verificationOnly = false;
       }
     } else {
@@ -651,6 +654,16 @@ function cmdFold(file, flags) {
   // would double-count cost AND attemptsDelta. Warn loudly instead of silently accepting. (A
   // budget-stopped no-op result is exempt — it is intentionally id-less so `reconstruct` ignores it.)
   for (const r of arr) if (!r.resultId && !r.budgetStopped) console.log(`  WARN: result ${r.id} has NO resultId — no fold-idempotency; a re-fold of this file WILL double-count (give it "<id>#<cycle>[-suffix]")`);
+  // KI-E65 — reconcile toState vs. the transitions array's terminal state BEFORE anything else
+  // reads either field (including the deterministic-verify pass below, which also inspects both).
+  // A hand-authored or agent-authored fold result (recovery-fold.json in particular) can set
+  // toState:'FAILED' while leaving transitions ending in the skeleton's default success path —
+  // foldResults() below walks transitions as primary source of truth, so an unreconciled mismatch
+  // silently CLOSES an item its own toState/gates say FAILED. Always reported when it fires.
+  for (const r of arr) {
+    const rec = reconcileToStateAndTransitions(r);
+    if (rec) console.log(`  ⚠ TOSTATE/TRANSITIONS MISMATCH ${r.id} (KI-E65) — AUTO-CORRECTED: declared toState="${r.toState}" disagreed with the transitions array's terminal state; [${rec.before.join(' -> ')}] -> [${rec.after.join(' -> ')}]`);
+  }
   // Deterministic verify BEFORE the fold so a false-pass is rewritten to FAILED before it is recorded.
   const overrides = [];
   for (const r of arr) { const ov = deterministicVerifyOverride(cfg, ledger, items[r.id], r); if (ov) overrides.push(ov); }
@@ -747,6 +760,26 @@ function cmdFold(file, flags) {
       if (hits.length) console.log(`  ⚠ COMMENT ${r.id} (KI-E59): ${hits.length} new/reworded comment line(s) in the diff on a PASSING item — this host's policy is ZERO new comments; this should never fire (pre-band gate + review band both check it) — investigate immediately:\n` + hits.map((h) => `      ${h.file} :: ${h.kind} :: ${h.line}`).join('\n'));
     } catch { /* detection aid only */ }
   }
+  // KI-E67 — narrative/verdict contradiction check: on a FAILED/ESCALATED result, scan every
+  // markdown file already sitting in state/items/<id>/ (canonical AND non-canonical alike — the
+  // live case was a non-canonical VERIFICATION-REPORT.md) for strong "done/complete/ready for
+  // merge" language that contradicts the deterministic verdict. Same WARN-only posture as F2/
+  // KI-D12/KI-E59: a detection aid surfacing the factory's single largest recurring rejection
+  // driver (agent self-report vs machine-verifiable evidence), never a fold-blocker.
+  for (const r of arr) {
+    try {
+      if (r.toState !== 'FAILED' && r.toState !== 'ESCALATED') continue;
+      const dir = abs(join(cfg.paths.items, r.id));
+      if (!existsSync(dir)) continue;
+      const textsByFile = {};
+      for (const f of readdirSync(dir)) {
+        if (!f.endsWith('.md')) continue;
+        try { textsByFile[f] = readFileSync(join(dir, f), 'utf8'); } catch { /* per-file best-effort */ }
+      }
+      const hits = detectNarrativeVerdictContradiction(r.toState, textsByFile);
+      if (hits.length) console.log(`  ⚠ NARRATIVE-VERDICT-MISMATCH ${r.id} (KI-E67): the item's own artifact prose reads as confidently DONE while the deterministic verdict is ${r.toState} — read the contradiction before trusting either side:\n` + hits.map((h) => `      ${h.file} :: "${h.marker}"`).join('\n'));
+    } catch { /* detection aid only */ }
+  }
   // KI-L65 — MAIN-TREE contamination check: re-hash each not-yet-folded result's files[] in the MAIN
   // tree against the group-time snapshot. Drift before the item's first fold = an agent wrote outside
   // its worktree (witnessed twice in cycle 35: the ITEM-H12 fixer and the ITEM-H5 fixer, both via
@@ -764,7 +797,16 @@ function cmdFold(file, flags) {
       // Anything still dirty — including an UNTRACKED new file, which `git diff HEAD` cannot see (the
       // live ITEM-H5 stray shape; review fix) — keeps the wrote-outside-worktree contamination wording.
       const { committed: committedDrift, dirty: dirtyDrift } = splitDriftByStatus(REPO_ROOT, drifted);
-      if (dirtyDrift.length) console.log(`  ⚠ MAIN-TREE CONTAMINATION ${r.id} (KI-L65): item files changed in the MAIN working tree during the run window — an agent likely wrote outside its worktree. Inspect + repair BEFORE applying:\n` + dirtyDrift.map((d) => `      ${d.file} (${d.was} -> ${d.now})`).join('\n'));
+      if (dirtyDrift.length) {
+        // KI-E61 (2026-08-02): dirty drift has exactly one possible cause (splitDriftByStatus's own
+        // KI-E35 reasoning — the factory never commits), so auto-repair it instead of leaving a WARN
+        // for a human to notice hours later. Still loudly reported either way — repair success is
+        // NOT silent.
+        const repaired = repairDirtyDrift(REPO_ROOT, dirtyDrift);
+        const failed = dirtyDrift.filter((d) => d.repairError);
+        console.log(`  ⚠ MAIN-TREE CONTAMINATION ${r.id} (KI-L65) — AUTO-REPAIRED (KI-E61): item files had changed in the MAIN working tree during the run window (an agent wrote outside its worktree); restored to HEAD:\n` + repaired.map((d) => `      ${d.file} (${d.was} -> ${d.now}) -> restored`).join('\n'));
+        if (failed.length) console.log(`    ⚠ REPAIR FAILED for ${failed.length} file(s) — fix by hand:\n` + failed.map((d) => `      ${d.file}: ${d.repairError}`).join('\n'));
+      }
       if (committedDrift.length) console.log(`  ℹ COMMITTED DELIVERY ${r.id} (KI-E35): item files changed in main via HUMAN commits during the run window (clean per git status) — likely the operator committed this item's output; verify intent, no repair needed:\n` + committedDrift.map((d) => `      ${d.file} (${d.was} -> ${d.now})`).join('\n'));
     } catch { /* detection aid only */ }
   }
@@ -899,7 +941,15 @@ function cmdResume(flags) {
         const snapPath = abs(join(cfg.paths.items, id, 'main-snapshot.json'));
         if (!existsSync(snapPath)) continue;
         const { committed, dirty } = splitDriftByStatus(REPO_ROOT, driftAgainstSnapshot(REPO_ROOT, (readJson(snapPath) || {}).files || {}));
-        if (dirty.length) console.log(`    ⚠ MAIN-GUARD ${id} (KI-E41): item files DRIFTED in the MAIN tree since claim — an agent of the dead run likely wrote outside its worktree. REPAIR MAIN FIRST (restore to HEAD or apply the gated worktree copy), THEN relaunch — the band reads main as its read-only reference:\n` + dirty.map((d) => `        ${d.file} (${d.was} -> ${d.now})`).join('\n'));
+        if (dirty.length) {
+          // KI-E61 (2026-08-02): same auto-repair as the fold check — dirty drift before a relaunch
+          // can only be contamination from the dead run (KI-E35), so fix it now rather than warn and
+          // let the relaunch read a poisoned main as its reference.
+          const repaired = repairDirtyDrift(REPO_ROOT, dirty);
+          const failed = dirty.filter((d) => d.repairError);
+          console.log(`    ⚠ MAIN-GUARD ${id} (KI-E41) — AUTO-REPAIRED (KI-E61): item files had DRIFTED in the MAIN tree since claim (an agent of the dead run wrote outside its worktree); restored to HEAD before relaunch:\n` + repaired.map((d) => `        ${d.file} (${d.was} -> ${d.now}) -> restored`).join('\n'));
+          if (failed.length) console.log(`      ⚠ REPAIR FAILED for ${failed.length} file(s) — fix by hand before relaunching:\n` + failed.map((d) => `        ${d.file}: ${d.repairError}`).join('\n'));
+        }
         if (committed.length) console.log(`    ℹ MAIN-GUARD ${id} (KI-E41/KI-E35): item files changed in main via HUMAN commits since claim (clean per git status) — verify the relaunch is still meaningful against the new main:\n` + committed.map((d) => `        ${d.file}`).join('\n'));
       } catch (e) { console.log(`    MAIN-GUARD ${id} SKIPPED (${e && e.message}) — treat as UNCHECKED, not clean (KI-E41; never blocks the relaunch listing)`); }
     }
@@ -1249,8 +1299,15 @@ function cmdSuggest(flags) {
       say(`  -> node ${MOUNT_REL}/_workflow/cluster.mjs --emit-pattern "${sweepKw}" --slug ${slug}`);
       say(`  -> node ${MOUNT_REL}/_workflow/driver.mjs sweep ${slug} --max-sites 10   (then Workflow the emitted launcher; then: driver sweep-fold <results.json>)`);
     } else {
-      const pattern = batchPatternFor(batch);
-      say(`  batch-pattern: ${pattern ? 'AUTO (stamped by group)' : 'none (mixed shapes — group will not stamp)'}`);
+      // KI-E62 follow-on: `group` now stamps PER-CLIQUE (perCliqueBatchPatterns), not just
+      // whole-batch (batchPatternFor) — this preview must match, or a `pick(false)` fallback
+      // batch (file-disjoint, not all-pairs similar) would wrongly preview "none" for a batch
+      // where group WOULD actually stamp a qualifying sub-clique within it.
+      const perClique = perCliqueBatchPatterns(batch);
+      const preview = perClique.size === 0
+        ? 'none (no qualifying sub-clique — group will not stamp)'
+        : (perClique.size === batch.length ? 'AUTO, whole batch (stamped by group)' : `AUTO, per-clique (KI-E62): ${perClique.size}/${batch.length} member(s) would be stamped`);
+      say(`  batch-pattern: ${preview}`);
       say(`  -> node ${MOUNT_REL}/_workflow/driver.mjs group --ids ${batch.map((w) => w.id).join(',')} --conc 3`);
     }
   }
@@ -1393,12 +1450,64 @@ function cmdGroup(flags) {
       }
     }
   } catch { /* advisory only */ }
+  // KI-E63 (R2, parallelism-and-reuse-analysis-2026-07-26) — precedent stamp: when a picked item's
+  // change-shape matches an ALREADY-CLOSED sibling elsewhere in the ledger (not just this batch),
+  // point the fixer at that gate-APPROVED precedent instead of re-deriving the approach from
+  // scratch. Best-effort and existence-checked: `state/items/<id>/` and the worktree are NOT
+  // guaranteed to survive (worktree gc is explicit-opt-in; this mount's own history shows most
+  // historical `state/items/` dirs already gone by the time a later session runs) — a precedent
+  // is stamped ONLY when at least one of {fix.json, the worktree} is ACTUALLY present on disk
+  // right now, same silent-no-op-when-absent posture buildDocMap/solutionFor already use (KI-E60).
+  // Never a hard requirement, never an error when nothing qualifies.
+  const precedentByItem = new Map();
+  try {
+    const graphById = byId(graph);
+    const closedCandidates = [];
+    for (const [cid, row] of Object.entries(ledger.items)) {
+      if (row.state !== 'CLOSED') continue;
+      const gi = graphById[cid];
+      if (!gi) continue; // a closed row whose graph entry was since removed — nothing to match against
+      const closedAt = (row.history || []).filter((h) => h.to === 'CLOSED').slice(-1)[0]?.at || row.updatedAt || '';
+      closedCandidates.push({ id: cid, target: gi.target, theme: gi.theme, title: gi.title, closedAt });
+    }
+    for (const wi of picked) {
+      const prec = bestClosedPrecedent(wi, closedCandidates);
+      if (!prec) continue;
+      const fixJsonRel = join('state', 'items', prec.id, 'fix.json');
+      const fixJsonAbs = abs(fixJsonRel);
+      const wtRel = join('state', 'worktrees', prec.id);
+      const wtAbs = abs(wtRel);
+      const hasFix = existsSync(fixJsonAbs);
+      const hasWt = existsSync(wtAbs);
+      if (!hasFix && !hasWt) continue; // nothing readable survives — skip, do not stamp a dead pointer
+      precedentByItem.set(wi.id, {
+        id: prec.id, target: prec.target, title: prec.title,
+        fixJson: hasFix ? fixJsonRel : undefined,
+        worktree: hasWt ? wtRel : undefined,
+      });
+      console.log(`  KI-E63 precedent ${wi.id} -> ${prec.id} (${[hasFix && 'fix.json', hasWt && 'worktree'].filter(Boolean).join('+')} readable)`);
+    }
+  } catch (e) { console.log('  KI-E63 precedent lookup SKIPPED (advisory only): ' + (e && e.message)); }
   // Similarity-batch stamp (owner directive 2026-07-04): when the whole batch is ONE similarity
   // cluster (strict all-pairs, same rule as cluster.mjs/suggest), stamp the shared pattern into every
   // item — factory.js briefs each agent to keep its change structurally IDENTICAL to its siblings'.
   // `--pattern "<text>"` forces a hand-written stamp (e.g. a curated sweep); `--no-pattern` suppresses.
-  const batchPattern = flags['no-pattern'] ? null : (flags.pattern ? String(flags.pattern) : batchPatternFor(picked));
-  if (batchPattern) console.log('group: batch-pattern stamped -> ' + batchPattern);
+  // KI-E62 (parallelism-and-reuse-analysis-2026-07-26 candidate P1) — a MIXED batch (two or more
+  // disjoint similarity cliques, e.g. a doc-drift item grouped alongside two pagination-clamp
+  // items) previously got NO stamp for ANY item, even though each clique alone would pass the
+  // strict all-pairs test — silently stripping the convergence benefit from every sibling pair
+  // whenever the operator batched more than one clique into a single Workflow. Cluster first,
+  // then stamp each qualifying sub-clique independently; a whole-batch-is-one-clique batch still
+  // yields the identical single stamp as before (clusterBySimilarity collapses to one cluster
+  // whenever every pair is mutually similar) — strictly additive, never a regression.
+  const batchPatternById = flags['no-pattern'] ? new Map()
+    : (flags.pattern ? new Map(picked.map((wi) => [wi.id, String(flags.pattern)])) : perCliqueBatchPatterns(picked));
+  { // one log line per UNIQUE pattern: a whole-batch clique -> 1 line (unchanged); a mixed batch
+    // with N qualifying sub-cliques -> N lines, one per clique.
+    const idsByPattern = new Map();
+    for (const [id, pattern] of batchPatternById) { if (!idsByPattern.has(pattern)) idsByPattern.set(pattern, []); idsByPattern.get(pattern).push(id); }
+    for (const [pattern, ids] of idsByPattern) console.log('group: batch-pattern stamped for [' + ids.join(', ') + '] -> ' + pattern);
+  }
   // trim + ASCII-sanitize (a few normalizer strings carry → / em-dashes; keep args lean + plain)
   const trim = (s, n) => { s = (s || '').replace(/[‘’]/g, "'").replace(/[“”]/g, '"').replace(/[–—→]/g, '-').replace(/[…]/g, '...'); return s.length > n ? s.slice(0, n - 1) + '...' : s; };
   const items = picked.map((wi) => {
@@ -1422,7 +1531,8 @@ function cmdGroup(flags) {
       fixType: wi.fixType, files: wi.files, dependsOn: wi.dependsOn || [], acceptance: trim(wi.acceptance, 2000),
       regressionTest: trim(wi.regressionTest, 1200), fixHint: trim(wi.fixHint, 1500), realInfra: !!wi.realInfra, gateSet: wi.gateSet, autonomyTier: wi.autonomyTier,
       reFix: ['FAILED', 'CONFLICT'].includes(ledger.items[wi.id].state), // Phase-6: re-run feeds prior gate feedback to test-author+fixer
-      batchPattern: batchPattern || undefined, // similarity batch: factory.js briefs agents to keep sibling changes structurally identical
+      batchPattern: batchPatternById.get(wi.id) || undefined, // similarity batch (per-clique, KI-E62): factory.js briefs agents to keep sibling changes structurally identical
+      precedent: precedentByItem.get(wi.id) || undefined, // KI-E63: a gate-APPROVED, already-CLOSED sibling of the same change-shape, when one still has readable evidence on disk
       // KI-L32 — peer surface ownership: each item's brief names the files its batch siblings own,
       // so a fixer following gate findings cannot silently redo a sibling's work in its own worktree.
       peers: picked.filter((o) => o.id !== wi.id).map((o) => ({ id: o.id, files: (o.files || []).slice(0, 12) })),
@@ -1502,7 +1612,7 @@ function cmdGroup(flags) {
   writeReports(cfg, ledger, graph);
   // KI-E7 telemetry: the lane + per-item claims (spine AD-2 source:driver). A --dry group is a
   // plan-only smoke test — run_prepared records it (attrs.dry) but nothing was claimed.
-  temit({ source: 'driver', event: 'run_prepared', cycle: runArgs.cycle, lane: labelSlug || undefined, attrs: { items: items.map((i) => i.id), concurrency: runArgs.concurrency, dry: !!flags.dry, batchPattern: !!batchPattern, runScript: runScriptPath || runScriptRel } });
+  temit({ source: 'driver', event: 'run_prepared', cycle: runArgs.cycle, lane: labelSlug || undefined, attrs: { items: items.map((i) => i.id), concurrency: runArgs.concurrency, dry: !!flags.dry, batchPattern: batchPatternById.size > 0, runScript: runScriptPath || runScriptRel } });
   if (!flags.dry) for (const it of items) temit({ source: 'driver', event: 'item_claimed', item: it.id, cycle: runArgs.cycle, lane: labelSlug || undefined, attrs: { severity: it.severity, fixType: it.fixType, theme: it.theme, autonomyTier: it.autonomyTier, reFix: !!it.reFix, realInfra: !!it.realInfra, worktree: it.worktree.path } });
   const bytes = JSON.stringify(runArgs).length;
   console.log(`group${flags.dry ? ' (DRY — nothing claimed, no worktrees)' : ''}${labelSlug ? ' [label=' + labelSlug + ']' : ''}: ${items.length} item(s) ${flags.dry ? 'planned' : 'claimed + per-item worktrees'} -> ${runArgsRel} (${bytes} bytes)`);
@@ -1587,7 +1697,11 @@ function cmdGraphAudit(flags) {
   const byBasename = buildBasenameIndex(tracked);
   const existsOnDisk = (p) => existsSync(presolve(REPO_ROOT, p));
   const report = { ok: 0, creation: [], stale: [], ambiguous: [], sharedFileGap: [], surfaceGap: [] };
-  const LEDGER_PATH = '_bmad-output/tech-debt/STANDARDS-LEDGER.md';
+  // KI-E64: was '_bmad-output/tech-debt/STANDARDS-LEDGER.md' (missing "DIVERGENCE") since this
+  // check's introduction (2026-07-20) — a filename that has NEVER existed, so the gap check
+  // below could never be satisfied even when files[] correctly carried the REAL path, and --fix
+  // would have appended a nonexistent path into files[] instead of the real ledger.
+  const LEDGER_PATH = '_bmad-output/tech-debt/STANDARDS-DIVERGENCE-LEDGER.md';
   for (const wi of graph.items) {
     const st = ledger && ledger.items[wi.id] ? ledger.items[wi.id].state : 'READY';
     if (st === 'CLOSED') continue; // history — its files[] served their purpose
@@ -1599,7 +1713,7 @@ function cmdGraphAudit(flags) {
     // structurally unmeetable in-band (cycle 46). Flag every open item whose acceptance names the
     // ledger but whose files[] lacks it, so the operator hand-appends the path BEFORE grouping
     // (KI-L54: the graph is hand-editable) and the file-lock can do its job.
-    if (/STANDARDS-LEDGER|ledger entr(?:y|ies)|ledger anchor/i.test(wi.acceptance || '') && !(wi.files || []).includes(LEDGER_PATH)) {
+    if (/STANDARDS-(?:DIVERGENCE-)?LEDGER|ledger entr(?:y|ies)|ledger anchor/i.test(wi.acceptance || '') && !(wi.files || []).includes(LEDGER_PATH)) {
       report.sharedFileGap.push({ id: wi.id, state: st });
     }
     const targetDir = wi.target && existsOnDisk(wi.target) ? wi.target : null;
@@ -2295,12 +2409,65 @@ function cmdMainCheck(rest) {
   }
 }
 
+// KI-E66 — best-effort bridge from Prometheus's claude_code_token_usage_tokens_total (session-side
+// OTLP, fed only when costTelemetryReady() — KI-E33) into the durable events.jsonl stream.
+// CYCLE-scoped, not per-item: see lib/token-usage.mjs's header for why per-item attribution is not
+// safely available (the factory runs 2-3 items concurrently per SKILL.md; a window-based per-item
+// query would double-count overlapping siblings, and the Workflow runtime's own budget global
+// exposes only a whole-turn aggregate — no finer split exists to read even from inside factory.js).
+// Never blocks, never throws: unreachable Prometheus / no data for the window / any parse error all
+// resolve to null — the KI-E33 "NOT gathered" posture. A bare 0%/0-token result would silently read
+// as real data, which is worse than admitting nothing was gathered (KI-E40's lesson, applied here
+// before it has the chance to repeat).
+async function queryPrometheusTokenUsage(cfg, sinceMs, untilMs) {
+  const base = (cfg && cfg.telemetry && cfg.telemetry.prometheusUrl) || process.env.FACTORY_PROM_URL || 'http://localhost:9090';
+  try {
+    const { query, time } = buildTokenUsageQuery(sinceMs, untilMs);
+    const url = `${String(base).replace(/\/$/, '')}/api/v1/query?query=${encodeURIComponent(query)}&time=${time}`;
+    const res = await fetch(url, { signal: AbortSignal.timeout(5000) });
+    if (!res.ok) return null;
+    const json = await res.json();
+    if (!json || json.status !== 'success') return null;
+    const vec = parseTokenUsageVector(json);
+    if (!vec.inputTokens && !vec.outputTokens && !vec.cacheReadTokens && !vec.cacheCreationTokens) return null; // empty result — nothing gathered for this window, never fabricate a zero
+    return tokenUsageSummary(vec);
+  } catch {
+    return null; // unreachable / timed out / malformed — observational only, never blocks (AD-3)
+  }
+}
+
 // KI-E7 / spine AD-9: the evaluation path reads events.jsonl directly (full fidelity — never
 // Prometheus aggregates) and renders reports/telemetry-latest.md. Read-only; no lock needed.
-function cmdTelemetryReport(flags) {
+//
+// KI-E66 addendum: BEFORE rendering, best-effort-refreshes the current cycle's cache-hit-rate +
+// full token-type breakdown from Prometheus (if reachable and populated) and, on success, emits a
+// `token_usage_snapshot` event so the durable stream (not just a live Grafana view) carries it —
+// AD-9's "evaluation reads the event log" promise, extended to this signal. This is the one place
+// in the driver that awaits async work inside the otherwise-synchronous dispatch()/main() pair
+// (deliberately NOT threaded through as a wider async refactor — out of scope for this addition);
+// the one disclosed side effect is that this command's own `driver_cmd` telemetry event (emitted
+// by main()'s synchronous `finally`, which does not await dispatch()'s returned promise) under-
+// reports durMs by the Prometheus round-trip — cosmetic only, the process itself still blocks
+// until the async work and the report write both complete (Node keeps the event loop alive for the
+// pending fetch), so no data is lost or dropped, only that one timing figure undercounts.
+async function cmdTelemetryReport(flags) {
   const cfg = loadConfig();
   const file = telemetryFile();
+  const ledger = loadLedger(abs(cfg.paths.ledger)) || { cycle: 0 };
   const events = readEvents(file, { limit: flags.limit ? parseInt(flags.limit, 10) : 0 });
+  // Window = the current cycle's OWN observed event span (no top-level "cycle start" field exists
+  // on the ledger) — the same evidence-over-assumption posture as AD-11's mtime backfill. The
+  // upper bound is the cycle's OWN latest observed event, NOT Date.now() — live-caught while
+  // building this: re-running telemetry-report well after a cycle finished, with `now()` as the
+  // upper bound, swept in every unrelated session's token usage between the cycle ending and the
+  // report running, producing a real-looking but contaminated number. Falls back to a 24h lookback
+  // from now only when the current cycle has no events at all yet (e.g. right after `cycle`/
+  // `group`, before anything has landed — an actually-open cycle correctly wants "up to now").
+  const cycleTimes = events.filter((e) => e.cycle === ledger.cycle && e.ts).map((e) => Date.parse(e.ts)).filter(Number.isFinite);
+  const untilMs = cycleTimes.length ? Math.max(...cycleTimes) : Date.now();
+  const sinceMs = cycleTimes.length ? Math.min(...cycleTimes) : untilMs - 24 * 3600 * 1000;
+  const usage = await queryPrometheusTokenUsage(cfg, sinceMs, untilMs);
+  if (usage) temit({ source: 'driver', event: 'token_usage_snapshot', cycle: ledger.cycle, attrs: { windowStartMs: sinceMs, windowEndMs: untilMs, ...usage } });
   const agg = aggregateEvents(events);
   const md = renderTelemetryReport(agg, { file, generatedAt: now() });
   const out = abs(join(cfg.paths.reports, 'telemetry-latest.md'));
@@ -2309,6 +2476,7 @@ function cmdTelemetryReport(flags) {
   console.log(`telemetry-report: ${events.length} event(s) from ${file}`);
   console.log(`  by source: ${JSON.stringify(agg.bySource)}`);
   console.log(`  outcomes:  ${JSON.stringify(agg.outcomes)}`);
+  console.log(usage ? `  session token usage: gathered (cache hit rate ${usage.cacheHitRate == null ? 'n/a' : Math.round(usage.cacheHitRate * 100) + '%'})` : '  session token usage: NOT gathered (see driver.mjs preflight — KI-E33/KI-E66)');
   console.log(`  -> ${out}`);
 }
 

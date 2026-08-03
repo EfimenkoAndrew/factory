@@ -11,6 +11,7 @@
 import { appendFileSync, mkdirSync, existsSync, readFileSync, statSync, readdirSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { apportionTokensByCallShare } from './token-usage.mjs'; // KI-E66 — cache-hit-rate + per-item apportioned tokens
 
 const HERE = dirname(fileURLToPath(import.meta.url)); // _bmad-output/ai-factory/_workflow/lib
 export const FACTORY_ROOT = resolve(HERE, '..', '..');
@@ -230,7 +231,7 @@ export function clampAgentEvent(name) {
 export const GAP_FENCE_MS = 4 * 3600 * 1000;
 
 export function aggregateEvents(events) {
-  const agg = { total: 0, byEvent: {}, bySource: {}, outcomes: {}, cycles: {}, gates: {}, stages: {}, agentStages: {}, models: {}, infraSuspect: 0, items: {}, itemFolds: {}, failedAt: {}, gapOutliers: [], agentPairs: {}, usage: [] };
+  const agg = { total: 0, byEvent: {}, bySource: {}, outcomes: {}, cycles: {}, gates: {}, stages: {}, agentStages: {}, models: {}, infraSuspect: 0, items: {}, itemFolds: {}, failedAt: {}, gapOutliers: [], agentPairs: {}, usage: [], itemCallCounts: {}, tokenUsageSnapshots: [] };
   for (const e of events || []) {
     if (!e || typeof e !== 'object' || !e.event) continue;
     agg.total++;
@@ -242,7 +243,19 @@ export function aggregateEvents(events) {
       if (e.cycle != null) { const c = agg.cycles[e.cycle] = agg.cycles[e.cycle] || { folded: 0, closed: 0 }; c.folded++; if (st === 'CLOSED') c.closed++; }
       if (e.attrs && e.attrs.infraSuspect) agg.infraSuspect++;
       if (e.attrs && e.attrs.gates) for (const [g, v] of Object.entries(e.attrs.gates)) { const gg = agg.gates[g] = agg.gates[g] || {}; gg[String(v)] = (gg[String(v)] || 0) + 1; }
-      if (e.attrs && e.attrs.cost) for (const [m, n] of Object.entries(e.attrs.cost)) agg.models[m] = (agg.models[m] || 0) + (Number(n) || 0);
+      if (e.attrs && e.attrs.cost) {
+        for (const [m, n] of Object.entries(e.attrs.cost)) agg.models[m] = (agg.models[m] || 0) + (Number(n) || 0);
+        // KI-E66: per-item call-count total (across all models), KEYED BY CYCLE — the real/accurate
+        // share weight apportionTokensByCallShare() divides that SAME cycle's real measured token
+        // total across. Never a token count itself, just the existing per-item cost map's own call
+        // tally; cycle-keyed so a retried item's later-cycle calls don't dilute an earlier cycle's
+        // apportionment (or vice versa).
+        if (e.item && e.cycle != null) {
+          const itemCalls = Object.values(e.attrs.cost).reduce((a, n) => a + (Number(n) || 0), 0);
+          const byItem = agg.itemCallCounts[e.cycle] = agg.itemCallCounts[e.cycle] || {};
+          byItem[e.item] = (byItem[e.item] || 0) + itemCalls;
+        }
+      }
       if (e.item) {
         agg.items[e.item] = st;
         // KI-E13 KPIs: the per-item fold sequence (stream order = chronological) with the
@@ -265,6 +278,17 @@ export function aggregateEvents(events) {
     // the report renders token spend instead of leaving it invisible in the raw stream.
     if (e.event === 'usage' && e.attrs && typeof e.attrs.outputTokens === 'number') {
       agg.usage.push({ cycle: e.cycle != null ? e.cycle : '?', file: e.attrs.file || '?', outputTokens: e.attrs.outputTokens });
+    }
+    // KI-E66: cycle-scoped session token usage + cache hit rate, best-effort-bridged from
+    // Prometheus at telemetry-report time (driver.mjs queryPrometheusTokenUsage). Never per-item —
+    // see lib/token-usage.mjs's header for why.
+    if (e.event === 'token_usage_snapshot' && e.attrs) {
+      agg.tokenUsageSnapshots.push({
+        cycle: e.cycle != null ? e.cycle : '?', ts: e.ts,
+        inputTokens: e.attrs.inputTokens || 0, outputTokens: e.attrs.outputTokens || 0,
+        cacheReadTokens: e.attrs.cacheReadTokens || 0, cacheCreationTokens: e.attrs.cacheCreationTokens || 0,
+        totalTokens: e.attrs.totalTokens || 0, cacheHitRate: typeof e.attrs.cacheHitRate === 'number' ? e.attrs.cacheHitRate : null,
+      });
     }
     // KI-E13 liveness: pair agent stage_start/stage_end per item+role — an unmatched start is an
     // agent that died mid-stage (classifier-blocked / killed; the KI-D8 class), invisible before.
@@ -378,6 +402,24 @@ export function renderTelemetryReport(agg, meta = {}) {
         ...agg.usage.map((u) => `| ${u.cycle} | ${u.file} | ${u.outputTokens.toLocaleString('en-US')} |`),
         `| **total** | | **${agg.usage.reduce((a, u) => a + u.outputTokens, 0).toLocaleString('en-US')}** |`].join('\n')
       : '_none — usage events land on folds from KI-E23 onward_', '',
+    '## Session token usage & cache hit rate (KI-E66, cycle-scoped, Prometheus-derived)', '',
+    '_Requires `driver.mjs preflight` to report `cost telemetry: ready` for the session that ran the cycle (KI-E33) AND a reachable Prometheus with the claude_code_token_usage_tokens_total metric. NOT per-item — Claude Code has no concept of a factory work item, and the factory runs 2-3 items concurrently (SKILL.md), so a per-item window query would double-count overlapping siblings. See "Per-item apportioned tokens" below for the best available item-level view._', '',
+    (agg.tokenUsageSnapshots || []).length
+      ? ['| Cycle | Input | Output | Cache read | Cache creation | Total | Cache hit rate |', '|---|---|---|---|---|---|---|',
+        ...agg.tokenUsageSnapshots.map((u) => `| ${u.cycle} | ${u.inputTokens.toLocaleString('en-US')} | ${u.outputTokens.toLocaleString('en-US')} | ${u.cacheReadTokens.toLocaleString('en-US')} | ${u.cacheCreationTokens.toLocaleString('en-US')} | ${u.totalTokens.toLocaleString('en-US')} | ${u.cacheHitRate == null ? 'n/a' : Math.round(u.cacheHitRate * 100) + '%'} |`)].join('\n')
+      : '_NOT gathered — either the session lacked the OTLP metrics-exporter env (`driver.mjs preflight`) or Prometheus was unreachable when this report ran (`driver.mjs telemetry-report` re-attempts the query every time; re-run after fixing either)_', '',
+    '## Per-item apportioned tokens (estimate — NOT a measurement, KI-E66)', '',
+    '_Real per-item token measurement is not available: the Workflow runtime exposes only a whole-run output-token counter (no per-item split), confirmed by this factory'
+      + "'s own multi-month history never achieving better despite KI-E23 wanting per-item granularity. This table divides each cycle's REAL, measured output-token total (the Fold-time token usage section above) across that cycle's items by their REAL, measured call-count share (ledger cost map) — a disclosed apportionment of a real number, never a fabricated one. Treat as directional, not exact._",
+    '',
+    (() => {
+      const rows = [];
+      for (const u of agg.usage || []) {
+        const shares = apportionTokensByCallShare(u.outputTokens, (agg.itemCallCounts || {})[u.cycle] || {});
+        for (const [item, tok] of Object.entries(shares).sort((a, b) => b[1] - a[1])) rows.push(`| ${u.cycle} | ${item} | ${tok.toLocaleString('en-US')} |`);
+      }
+      return rows.length ? ['| Cycle | Item | Apportioned output tokens (est.) |', '|---|---|---|', ...rows].join('\n') : '_none — needs both a fold-time usage event and item_folded cost data for the same cycle_';
+    })(), '',
     '## Agent-call volume by model (from fold cost)', '', kv(agg.models, 'Model', 'Calls'), '',
   ].join('\n');
 }

@@ -171,6 +171,37 @@ export function lastHistoryNote(r) {
   return h.length ? h[h.length - 1].note : '(no note)';
 }
 
+// KI-E65 — a fold result's `toState` and the LAST element of its `transitions` array are two
+// independent fields with no structural link at the schema level. `foldResults` below walks
+// `transitions` as the primary source of truth and only falls back to `[toState]` when
+// `transitions` is empty/absent — so a result that sets toState:'FAILED' while leaving
+// transitions ending in the skeleton's default success path ('...,CLOSED') silently CLOSES the
+// item instead of failing it. Live-caught 2026-08-03: a recovery-fold.json's fold-prep step
+// correctly wrote toState:'FAILED' (and a gates map with a CHANGES_REQUIRED entry) but left the
+// inherited transitions array ending in CLOSED; folding it landed the row on CLOSED with a
+// still-broken item (ITEM-30, cycle 57r) silently marked done. Reconcile the two fields BEFORE
+// anything else reads them: if they already agree, no-op. If they disagree and `toState`
+// appears earlier in `transitions`, truncate there (the array over-ran its own stated ending).
+// If `toState` does not appear in `transitions` at all (the live case above), walk backwards
+// from the end of `transitions` for the last state that is a legal jumping-off point for
+// `toState` per `canTransition`, truncate there, and append `toState`. Never silently keeps a
+// transitions array that disagrees with an explicit toState — always returns a correction
+// record when it changes anything, so the caller can report it loudly (never a silent fix-up).
+export function reconcileToStateAndTransitions(r) {
+  if (!r || !r.toState || !Array.isArray(r.transitions) || !r.transitions.length) return null;
+  const before = r.transitions.slice();
+  if (before[before.length - 1] === r.toState) return null; // already consistent
+  const idx = before.indexOf(r.toState);
+  if (idx !== -1) {
+    r.transitions = before.slice(0, idx + 1);
+  } else {
+    let cut = before.length;
+    while (cut > 0 && !canTransition(before[cut - 1], r.toState)) cut--;
+    r.transitions = [...before.slice(0, cut), r.toState];
+  }
+  return { id: r.id, before, after: r.transitions.slice() };
+}
+
 // Fold a batch of per-item Workflow results into the ledger atomically (single writer).
 // Each result: { id, toState, artifacts?, gates?, cost?, worktree?, branch?, note?, attemptsDelta? }.
 // Unknown ids and disallowed transitions are collected into `rejected` (never silently lost).

@@ -254,15 +254,51 @@ function compose(role, item, extra) {
   // whole 500-1000-line docs (repeated whole-doc reads across ~15 band agents were a top
   // token sink in the cycle-39/40 telemetry).
   if (Array.isArray(item.docMap) && item.docMap.length) {
-    lines.push('', 'DOC MAP (section index of this target\'s reference docs — Read targeted sections via offset/limit at the @L line numbers; do NOT read these docs whole):')
-    for (const d of item.docMap) lines.push('  ' + d)
+    // KI-E61 (2026-08-02): every prior main-tree-contamination incident this factory has caught
+    // (cycle 35 ITEM-H12/ITEM-H5, cycle 48 ITEM-H16, cycle 56 ITEM-H18) hit a doc/data-flows,
+    // CONTEXT.md, or AGENTS.md file — exactly the three file types this DOC MAP indexes. Root
+    // cause: the paths below are bare-relative (e.g. "doc/data-flows/IdentityPortal.md") with no
+    // anchor stated AT THE POINT OF USE. An agent correctly Reads them against REPO ROOT (per the
+    // "read audit docs from the REPO ROOT" line elsewhere in this prompt) — then, when the SAME
+    // work item's acceptance criteria requires EDITING that identical relative path (the
+    // dataflow.md doc-sync rule fires on most code-touching items), Edit naturally reuses the
+    // exact path string already in hand from the Read, which resolves to REPO ROOT — a silent
+    // slide from "read-only reference" to "edited the main tree" with no rule ever knowingly
+    // broken. Prior incidents were treated as agent non-compliance and answered with detection
+    // only (mainguard.mjs); this is the first fix at the actual ambiguity. Every path below is now
+    // fully qualified, and any of them that also appears in this item's files[] touch-set gets an
+    // unmissable second line naming the worktree path to edit instead.
+    lines.push('', 'DOC MAP (section index of this target\'s reference docs, READ-ONLY — Read targeted sections via offset/limit at the @L line numbers; do NOT read these docs whole):')
+    for (const d of item.docMap) {
+      const rel = String(d).split(' :: ')[0]
+      lines.push('  ' + REPO + '/' + d)
+      if ((item.files || []).includes(rel)) {
+        lines.push('    ^ THIS path is ALSO in your files[] touch-set above. The line just shown is the REPO-ROOT read-only copy — do NOT Edit it. Your edit target for ' + rel + ' is: ' + wtPath + '/' + rel)
+      }
+    }
   }
-  // Similarity batch (owner directive 2026-07-04): the driver stamps batchPattern when the whole
-  // batch is ONE similarity cluster — siblings apply the SAME class of change to their own targets.
-  // Uniform diffs converge gates faster and give the user one review shape instead of N novel ones.
+  // Similarity batch (owner directive 2026-07-04): the driver stamps batchPattern per qualifying
+  // similarity clique (KI-E62) — either the whole batch is one cluster, or, in a mixed batch, each
+  // sub-clique of >=2 mutually-similar siblings gets its own stamp. Siblings under the SAME stamp
+  // apply the SAME class of change to their own targets. Uniform diffs converge gates faster and
+  // give the user one review shape instead of N novel ones.
   if (item.batchPattern) {
     lines.push('', 'BATCH PATTERN — SIMILARITY BATCH: ' + item.batchPattern,
       '  Every sibling item in this batch applies the SAME class of change to its own target. Make YOUR change structurally IDENTICAL in shape to that shared pattern — same approach, same naming, same comment style, same test structure — minimally adapted to this target. Do NOT invent a novel approach where the shared pattern fits. If THIS target genuinely requires deviating from the pattern, deviate correctly and state exactly why in your result note.')
+  }
+  // Precedent stamp (KI-E63, R2): a gate-APPROVED, already-CLOSED sibling of the same
+  // change-shape, stamped only when its evidence still exists on disk (driver.mjs cmdGroup —
+  // worktrees/state-items are not guaranteed to survive). REPO-ROOT-qualified paths, same
+  // ambiguity lesson as the DOC MAP block above (KI-E61) — this lives in a DIFFERENT item's
+  // directory; read it, never edit it.
+  if (item.precedent) {
+    const p = item.precedent
+    let pLines = 'PRECEDENT — a gate-APPROVED instance of this exact change-shape already CLOSED: ' + p.id + ' (' + (p.target || '?') + ') — "' + (p.title || '') + '"\n'
+      + '  READ-ONLY reference material in a DIFFERENT item\'s directory — never Edit it, never touch its files.'
+    if (p.fixJson) pLines += '\n  ' + REPO + '/' + p.fixJson + ' — the fixer\'s own record of what changed and why (filesChanged[].rationale).'
+    if (p.worktree) pLines += '\n  ' + REPO + '/' + p.worktree + '/ — the full worktree, if you want the actual diff (git status/diff inside it).'
+    pLines += '\n  Read it first. Make YOUR change structurally consistent with it — same approach, same shape — minimally adapted to this target. If this target genuinely requires deviating, deviate correctly and state exactly why in your result note.'
+    lines.push('', pLines)
   }
   // KI-L32 — peer surface ownership: a fixer following gate findings must not silently redo a batch
   // sibling's work in ITS worktree (cycle-20: the ITEM-C-DEPLOY fixer re-delivered the split-out

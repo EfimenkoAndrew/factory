@@ -62,6 +62,34 @@ export function splitDriftByStatus(repoRoot, drifted) {
   return { committed, dirty }
 }
 
+// KI-E61 (2026-08-02) — auto-repair for the DIRTY-drift case. splitDriftByStatus's own reasoning
+// already proves this is safe: the factory never commits (§ hard rule, PLAN.md/CLAUDE.md), so
+// dirty/untracked drift on a snapshotted path can ONLY have arrived via an agent writing outside
+// its worktree — there is no legitimate-human-action interpretation for it (that's the COMMITTED
+// bucket, left untouched, still operator judgment per KI-E35). Every prior fold treated dirty
+// drift as WARN-only ("repairing main is operator judgment") and left it for a human to notice —
+// this run's ITEM-H18 contamination sat in the tree until manually caught. Repair each dirty
+// entry to its pre-drift state: `was: 'present'` restores from HEAD (the file existed and was
+// overwritten); `was: 'absent'` removes it (a stray new file HEAD never had — checkout can't
+// restore what was never committed). Returns the entries it actually repaired; a repair failure
+// on one file is reported, never thrown — a partial repair must not crash the fold.
+export function repairDirtyDrift(repoRoot, dirty) {
+  const repaired = []
+  for (const d of dirty || []) {
+    try {
+      if (d.was === 'absent') {
+        execFileSync('git', ['-C', repoRoot, 'clean', '-f', '--', d.file], { encoding: 'utf8' })
+      } else {
+        execFileSync('git', ['-C', repoRoot, 'checkout', '--quiet', 'HEAD', '--', d.file], { encoding: 'utf8' })
+      }
+      repaired.push(d)
+    } catch (e) {
+      d.repairError = String((e && e.message) || e)
+    }
+  }
+  return repaired
+}
+
 // KI-E14 (2026-07-20) — pre-claim complement to the KI-L65 post-hoc drift check above.
 //
 // A worktree is created from HEAD, so an item whose files[] intersect UNCOMMITTED main-tree

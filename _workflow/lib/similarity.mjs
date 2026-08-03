@@ -95,3 +95,41 @@ export function batchPatternFor(items) {
   return 'same change-shape across ' + arr.length + ' sibling item(s) / ' + targets.length + ' target(s) ['
     + targets.join(', ') + ']; theme=' + (arr[0].theme || '?') + '; shared signature: ' + top.join(' ');
 }
+
+// Per-clique batch-pattern stamps (parallelism-and-reuse-analysis-2026-07-26 candidate P1).
+// batchPatternFor() is all-or-nothing: a heterogeneous batch (two or more disjoint similarity
+// cliques, e.g. a doc-drift item + two pagination-clamp items grouped into one Workflow) gets
+// NO stamp for ANY item, even though each clique on its own would pass the strict all-pairs
+// test. Cluster first, then stamp each qualifying cluster independently. A batch that IS one
+// single clique yields the IDENTICAL stamp batchPatternFor(items) already produced —
+// clusterBySimilarity collapses to exactly one cluster whenever every pair is mutually
+// similar, so this is strictly additive over the whole-batch-only behavior.
+export function perCliqueBatchPatterns(items) {
+  const byId = new Map();
+  for (const cluster of clusterBySimilarity(items || [])) {
+    if (cluster.length < 2) continue;
+    const pattern = batchPatternFor(cluster);
+    if (!pattern) continue;
+    for (const it of cluster) byId.set(it.id, pattern);
+  }
+  return byId;
+}
+
+// Precedent stamp (parallelism-and-reuse-analysis-2026-07-26 candidate R2). Given a NEW item and a
+// pool of CANDIDATE already-CLOSED siblings (each { id, target, theme, title, closedAt }, pulled
+// from the WHOLE ledger/graph history — not just the current batch), return the single
+// best-matching precedent: same theme + similarSigs, preferring the MOST RECENTLY closed match
+// (it reflects whatever convention has since been established/refined) — or null when none
+// qualifies. Pure and cheap (linear scan, no clustering/union-find needed: this is one-item-vs-pool,
+// not N-items-vs-each-other).
+export function bestClosedPrecedent(item, closedCandidates) {
+  const s = sig(item);
+  let best = null;
+  for (const c of (closedCandidates || [])) {
+    if (!c || c.id === item.id) continue;
+    if ((c.theme || '?') !== (item.theme || '?')) continue;
+    if (!similarSigs(sig(c), s)) continue;
+    if (!best || String(c.closedAt || '') > String(best.closedAt || '')) best = c;
+  }
+  return best;
+}

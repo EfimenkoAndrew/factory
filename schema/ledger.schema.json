@@ -1,6 +1,6 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
-  "$id": "impl-factory/ledger",
+  "$id": "azathoth-factory/ledger",
   "title": "Ledger",
   "description": "Authoritative, resumable state of every work item. The filesystem checkpoint. Single writer (driver.mjs) folds per-item Workflow results in atomically; agents never write this file directly (they write state/items/<id>/<stage>.json).",
   "type": "object",
