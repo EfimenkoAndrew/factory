@@ -72,6 +72,10 @@ export function emitMany(events) { let n = 0; for (const e of events || []) if (
 export const STAGE_ARTIFACTS = [
   ['plan.md', 'plan'], ['test.json', 'test'], ['verify-red-raw.txt', 'test'],
   ['fix.json', 'fix'], ['verify.json', 'verify'], ['verify-raw.txt', 'verify'],
+  // KI-E71: leftover-raw.txt is the KI-D12 leftover-scan probe's OWN canonical artifact
+  // (factory.js: `res.artifacts['probe:leftover-scan'] = 'state/items/' + id + '/leftover-raw.txt'`)
+  // — every item that reaches that pre-band stage produces it, dead run or not.
+  ['leftover-raw.txt', 'probe:leftover-scan'],
   ['adjudication.md', 'gates'], ['decision.md', 'gates'], ['refute.md', 'refute'],
   ['reaudit.md', 'reaudit'], ['integrate.md', 'integrate'], ['integrate-raw.txt', 'integrate'],
   ['mutation-proof.txt', 'integrate'], ['result.json', 'checkpoint'],

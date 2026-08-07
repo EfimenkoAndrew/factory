@@ -40,3 +40,41 @@ export function detectNarrativeVerdictContradiction(toState, textsByFile) {
   }
   return hits;
 }
+
+// KI-E74C — the MIRROR case. detectNarrativeVerdictContradiction above catches a FAILED/ESCALATED
+// verdict contradicted by confident-DONE prose; this catches the opposite direction, a CLOSED
+// verdict contradicted by an artifact that ITSELF admits something is NOT actually resolved.
+//
+// Found live 2026-08-07 on ITEM-H1: the runner's OWN verify.json wrote, verbatim, "Build+targeted-
+// test green here does NOT mean round 2's findings are resolved — they are not, and are unaddressed
+// in this worktree as of this pass" — naming 5 specific unaddressed findings from an earlier review
+// round. All 8 gates/reviews subsequently APPROVED anyway (the note had no channel to reach them —
+// see KI-E74B, the separate PREVENTIVE fix that now surfaces it in every review-role prompt). This
+// is the DETECTIVE backstop for when the preventive fix isn't enough — an agent still misses the
+// surfaced note, or a similar admission lands in some OTHER artifact.
+//
+// Deliberately conservative, mirroring the ORIGINAL's discipline: fires ONLY on toState CLOSED (an
+// item that ends FAILED/BLOCKED/ESCALATED with cautionary language is not a contradiction — it is
+// an accurate description), and only on STRONG, unambiguous non-resolution admissions modeled
+// directly on the ITEM-H1 phrasing — never a bare appearance of "unresolved" (a LOW finding
+// correctly deferred as non-blocking commonly and legitimately uses that word).
+const NON_RESOLUTION_MARKERS = [
+  /does not mean[^.\n]{0,60}(?:resolved|addressed)/i,
+  /\b(?:findings?|issues?)[^.\n]{0,40}(?:are|remain|stay) (?:not resolved|unresolved|unaddressed)/i,
+  /unaddressed in (?:this|the) worktree/i,
+  /resolved[,.]?\s*(?:—|-)\s*they are not\b/i,
+];
+// Pure core (selftest-covered): given the fold toState and a map of {filename: text}, return the
+// files whose text contains a strong non-resolution admission, when toState signals success.
+export function detectUnresolvedCaveatOnClose(toState, textsByFile) {
+  if (toState !== 'CLOSED') return [];
+  const hits = [];
+  for (const [file, text] of Object.entries(textsByFile || {})) {
+    const t = String(text || '');
+    for (const re of NON_RESOLUTION_MARKERS) {
+      const m = t.match(re);
+      if (m) { hits.push({ file, marker: m[0] }); break; } // one hit per file is enough to flag it
+    }
+  }
+  return hits;
+}

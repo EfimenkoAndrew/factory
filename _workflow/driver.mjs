@@ -25,7 +25,7 @@ import {
   emptyLedger, loadLedger, syncFromGraph, transition, foldResults,
   countByState, writeJsonAtomic, readJson, unwrapResultEnvelope, ACTIVE, OFFRAMPS, FORWARD,
   parkedAtMs, allCommittedAfter, closedDepsWithLiveWorktree, lastHistoryNote,
-  reconcileToStateAndTransitions,
+  reconcileToStateAndTransitions, deriveUnfoldedCycle,
 } from './lib/ledger.mjs';
 import { loadGraph, computeReady, waitingOnDeps, byId } from './lib/graph.mjs';
 import { loadRouting, resolve as routeResolve, concurrencyFor } from './lib/router.mjs';
@@ -48,10 +48,11 @@ import { loadPolicies, renderPolicies, POLICY_TEXT } from './lib/policy.mjs'; //
 // never throws, never blocks a command, and never feeds a fold verdict. FACTORY_TELEMETRY=0 disables.
 import { emit as temit, deriveStageTimeline, readEvents, aggregateEvents, renderTelemetryReport, telemetryFile, GAP_FENCE_MS, nonCanonicalArtifacts, isRecoveryResultId, isDirectRecoveryFold } from './lib/telemetry.mjs';
 import { parseTokenUsageVector, buildTokenUsageQuery, tokenUsageSummary } from './lib/token-usage.mjs'; // KI-E66 — cache-hit-rate bridge
+import { loadPriorAttempt, priorAttemptStages } from './lib/prior-attempt.mjs'; // KI-E69 — cross-session plan/test/fix reuse on relaunch
 import { lintWorktreeDocClaims } from './lib/doclint.mjs'; // F2 — phantom doc-path detection aid at fold (WARN-only)
 import { findLeftovers } from './lib/leftover-scan.mjs'; // KI-D12 — deferral/tech-debt lexicon detection aid at fold (WARN-only)
 import { findComments } from './lib/comment-scan.mjs'; // KI-E59 — no-new-comments detection aid at fold (WARN-only)
-import { detectNarrativeVerdictContradiction } from './lib/narrative-check.mjs'; // KI-E67 — narrative-vs-verdict contradiction detection aid at fold (WARN-only)
+import { detectNarrativeVerdictContradiction, detectUnresolvedCaveatOnClose } from './lib/narrative-check.mjs'; // KI-E67 — narrative-vs-verdict contradiction detection aid at fold (WARN-only); KI-E74C — the mirror direction
 
 // KI-B1 (closed 2026-07-12): config-authoritative routing for every emitted batch — built from
 // config/model-routing.json via the SAME mapping the drift guard checks, injected into runArgs as
@@ -780,6 +781,26 @@ function cmdFold(file, flags) {
       if (hits.length) console.log(`  ⚠ NARRATIVE-VERDICT-MISMATCH ${r.id} (KI-E67): the item's own artifact prose reads as confidently DONE while the deterministic verdict is ${r.toState} — read the contradiction before trusting either side:\n` + hits.map((h) => `      ${h.file} :: "${h.marker}"`).join('\n'));
     } catch { /* detection aid only */ }
   }
+  // KI-E74C — the MIRROR of KI-E67: on a CLOSED result, scan every markdown file PLUS verify.json
+  // (the proven real-world source — ITEM-H1 live, 2026-08-07 — of exactly this admission; verify.json
+  // is deliberately included here even though the KI-E67 loop above stays .md-only, since broadening
+  // an ALREADY-shipped, working check risks it, while this new check has no existing behavior to
+  // protect) for a strong admission that something is NOT actually resolved despite the item closing.
+  // Same WARN-only posture — a detection aid, never a fold-blocker; gates/PO judge the substance.
+  for (const r of arr) {
+    try {
+      if (r.toState !== 'CLOSED') continue;
+      const dir = abs(join(cfg.paths.items, r.id));
+      if (!existsSync(dir)) continue;
+      const textsByFile = {};
+      for (const f of readdirSync(dir)) {
+        if (!f.endsWith('.md') && f !== 'verify.json') continue;
+        try { textsByFile[f] = readFileSync(join(dir, f), 'utf8'); } catch { /* per-file best-effort */ }
+      }
+      const hits = detectUnresolvedCaveatOnClose(r.toState, textsByFile);
+      if (hits.length) console.log(`  ⚠ UNRESOLVED-CAVEAT-ON-CLOSE ${r.id} (KI-E74C): the item's own artifact admits something is NOT actually resolved despite closing — read the contradiction before trusting the CLOSED verdict:\n` + hits.map((h) => `      ${h.file} :: "${h.marker}"`).join('\n'));
+    } catch { /* detection aid only */ }
+  }
   // KI-L65 — MAIN-TREE contamination check: re-hash each not-yet-folded result's files[] in the MAIN
   // tree against the group-time snapshot. Drift before the item's first fold = an agent wrote outside
   // its worktree (witnessed twice in cycle 35: the ITEM-H12 fixer and the ITEM-H5 fixer, both via
@@ -865,7 +886,7 @@ function cmdFold(file, flags) {
           prevMs = s.mtimeMs;
         }
       }
-      temit({ source: 'driver', event: 'item_folded', item: r.id, cycle: cyc, lane: row.runLabel || undefined, outcome: row.state || r.toState, attempts: row.attempts, attrs: { toState: r.toState, band: r.band || undefined, resultId: r.resultId || undefined, direct: isRec || undefined, transitions: (r.transitions || []).slice(0, 12), gates: r.gates || {}, cost: r.cost || {}, infraSuspect: !!r.infraSuspect, verificationOnly: !!r.verificationOnly, note: String(r.note || '').slice(0, 240) } }); // KI-E23: band stamped so gate-value/cost split LIGHT vs FULL; KI-E46: direct/resultId stamped so recovery closes classify without prose sniffing
+      temit({ source: 'driver', event: 'item_folded', item: r.id, cycle: cyc, lane: row.runLabel || undefined, outcome: row.state || r.toState, attempts: row.attempts, attrs: { toState: r.toState, band: r.band || undefined, resultId: r.resultId || undefined, direct: isRec || undefined, transitions: (r.transitions || []).slice(0, 12), gates: r.gates || {}, cost: r.cost || {}, infraSuspect: !!r.infraSuspect, verificationOnly: !!r.verificationOnly, priorAttemptReuse: (r.priorAttemptReuse && r.priorAttemptReuse.length) ? r.priorAttemptReuse : undefined, note: String(r.note || '').slice(0, 240) } }); // KI-E23: band stamped so gate-value/cost split LIGHT vs FULL; KI-E46: direct/resultId stamped so recovery closes classify without prose sniffing; KI-E69: priorAttemptReuse visible whenever a relaunch reused a killed run's artifacts
     }
     temit({ source: 'driver', event: 'fold_summary', cycle: cyc, attrs: { file: basename(foldPath), applied: applied.length, rejected: rejected.length, skipped: skipped.length, overrides: overrides.length, infraRetries: infraApplied.length, escalated: escalated.length } });
     // KI-E23 (P6c): the run's token usage, returned by factory.js from the runtime budget counter —
@@ -892,9 +913,10 @@ function cmdResume(flags) {
   if (!ledger) { console.log('no ledger — nothing to resume'); return; }
   const inflight = Object.values(ledger.items).filter((r) => ACTIVE.includes(r.state));
   console.log(`resume: cycle ${ledger.cycle}, ${inflight.length} in-flight item(s)`);
-  // Current-cycle checkpoint check (same rule as reconstruct): a CLAIMED item whose run died BEFORE
-  // checkpointing has no state/items/<id>/result.json with resultId "<id>#<cycle+1>".
-  const cyc = ledger.cycle + 1;
+  // KI-E73: checkpoint detection now derives the relevant cycle from on-disk evidence (same rule as
+  // reconstruct, ACTUALLY shared this time) instead of blindly assuming ledger.cycle + 1 — a
+  // same-cycle checkpoint (the normal KI-E69 --reuse relaunch shape) is no longer invisible here.
+  const cyc = deriveUnfoldedCycle(abs(cfg.paths.items), ledger);
   const hasCheckpoint = (id) => {
     const p = abs(join(cfg.paths.items, id, 'result.json'));
     if (!existsSync(p)) return false;
@@ -981,8 +1003,50 @@ function cmdResume(flags) {
       console.log('    ⚠ NON-CANONICAL artifacts from the dead attempt (KI-E42) — they can mislead the relaunch\'s agents/reporters. Run `resume --quarantine` to move them aside BEFORE relaunching:');
       for (const d of debrisByItem) console.log(`        ${d.id}: ${d.junk.join(', ')}`);
     }
+    // KI-E69 — cross-session prior-attempt reuse: on --reuse, regenerate each relaunch candidate's
+    // run-args/run-script with plan/test/fix reused from whatever is ALREADY on disk from THIS SAME
+    // claim (freshness gated per item's own claim timestamp) — everything from verify onward always
+    // runs fresh regardless (unchanged design: gates re-adjudicate the worktree on every relaunch,
+    // SKILL.md § Recovery; verify.json's on-disk shape was found to NOT reliably match the plain
+    // pass/fail strings runItem() reads, so it is deliberately never reused — see lib/prior-attempt.mjs).
+    // Best-effort: a failure to read/regenerate one script never blocks the relaunch line for the rest.
+    if (flags.reuse) {
+      for (const [script, ids] of relaunch) {
+        try {
+          const runArgsPath = abs(script).replace(/run-script/, 'run-args').replace(/\.js$/, '.json');
+          if (!existsSync(runArgsPath)) { console.log(`    KI-E69: no matching run-args at ${runArgsPath} — reuse SKIPPED for ${ids.join(', ')}, relaunching cold`); continue; }
+          const runArgs = readJson(runArgsPath);
+          // KI-E69 review fix: run-args.json is a group-time SNAPSHOT — it does not see a later
+          // hand-edit to the emitted run-script (exactly what KI-E68 did: concurrency 2 -> 6 directly
+          // in state/run-script.js) or a config fix landed after the original group. Regenerating
+          // FROM the stale snapshot would silently UNDO such a fix. Refresh concurrency from the
+          // CURRENT config the same way cmdGroup itself resolves it, unless --conc explicitly overrides.
+          const freshConc = flags.conc ? parseInt(flags.conc, 10) : ((cfg.concurrency && cfg.concurrency.default) || 6);
+          if (freshConc !== runArgs.concurrency) { console.log(`    KI-E69: concurrency refreshed ${runArgs.concurrency} -> ${freshConc} (current config default; --conc to override)`); runArgs.concurrency = freshConc; }
+          let reusedAny = false;
+          for (const id of ids) {
+            const it = (runArgs.items || []).find((x) => x.id === id);
+            if (!it) continue;
+            const row = ledger.items[id];
+            const claimHist = ((row && row.history) || []).filter((h) => h.to === 'CLAIMED');
+            const claimMs = claimHist.length ? Date.parse(claimHist[claimHist.length - 1].at) : 0;
+            const itemDir = abs(join(cfg.paths.items, id));
+            const pa = loadPriorAttempt(itemDir, claimMs || undefined);
+            const stages = priorAttemptStages(pa);
+            if (stages.length) { it.priorAttempt = pa; reusedAny = true; console.log(`    KI-E69: ${id} will REUSE {${stages.join(', ')}} from its already-on-disk attempt — verify onward still runs fresh`); }
+          }
+          if (reusedAny) {
+            const labelSlug = ((ledger.items[ids[0]] || {}).runLabel) || null;
+            const regenPath = emitLauncherScript(cfg, runArgs, labelSlug);
+            if (regenPath) console.log(`    KI-E69: regenerated ${regenPath} with the reuse above`);
+            else console.log('    KI-E69: WARN — regeneration failed; the relaunch line below still points at the UNMODIFIED script (full re-run)');
+          }
+        } catch (e) { console.log(`    KI-E69: reuse SKIPPED for script ${script} (${e && e.message}) — relaunching cold`); }
+      }
+    }
     for (const [script, ids] of relaunch) console.log(`    Workflow({ scriptPath: "${abs(script)}" })   # ${ids.join(', ')}`);
     console.log('    (relaunch preserves claims/worktrees/reFix stamps; use --reset-stale ONLY when abandoning these runs instead.)');
+    if (!flags.reuse) console.log('    (pass --reuse to skip regenerating plan/test/fix for items whose artifacts already exist from THIS claim, KI-E69 — verify onward always re-runs fresh regardless.)');
   }
   if (flags['reset-stale']) { writeJsonAtomic(abs(cfg.paths.ledger), ledger); writeReports(cfg, ledger, graph); console.log(`  -> reset ${resetN}/${inflight.length} stale in-flight (FAILED-provenance rows back to FAILED, rest to READY)`); }
   console.log('counts:', JSON.stringify(countByState(ledger)));
@@ -1001,27 +1065,9 @@ function cmdReconstruct(flags) {
   if (!ledger) { console.log('no ledger'); return; }
   // group emits the in-flight batch with cycle = ledger.cycle + 1; fold bumps ledger.cycle — so the
   // killed (unfolded) cycle is +1 by default. --cycle N overrides for unusual recoveries.
-  // KI-L63: with PARALLEL LANES, the first sibling fold bumps ledger.cycle to the lanes' shared
-  // cycle N — the blind +1 then guesses N+1 and misses every remaining lane's checkpoints. Derive
-  // the default from the checkpoints themselves: the highest cycle among UNFOLDED result.json files;
-  // fall back to ledger.cycle + 1 only when none exist. --cycle still overrides everything.
+  // KI-L63 / KI-E73: derivation shared with cmdResume's checkpoint detection — see deriveUnfoldedCycle.
   const itemsRoot = abs(cfg.paths.items);
-  let cyc;
-  if (flags.cycle) {
-    cyc = parseInt(flags.cycle, 10);
-  } else {
-    let best = 0;
-    for (const id of (existsSync(itemsRoot) ? readdirSync(itemsRoot) : [])) {
-      const p0 = join(itemsRoot, id, 'result.json');
-      if (!existsSync(p0)) continue;
-      let r0; try { r0 = readJson(p0); } catch { continue; }
-      const m = r0 && typeof r0.resultId === 'string' ? r0.resultId.match(/#(\d+)(?:r\d*)?$/) : null;
-      if (!m) continue;
-      if (ledger.folded && ledger.folded[r0.resultId]) continue; // already folded — inert
-      best = Math.max(best, parseInt(m[1], 10));
-    }
-    cyc = best || ledger.cycle + 1;
-  }
+  const cyc = flags.cycle ? parseInt(flags.cycle, 10) : deriveUnfoldedCycle(itemsRoot, ledger);
   const results = [], stale = [], already = [];
   for (const id of (existsSync(itemsRoot) ? readdirSync(itemsRoot) : [])) {
     const p = join(itemsRoot, id, 'result.json');
@@ -1583,7 +1629,10 @@ function cmdGroup(flags) {
     writeJsonAtomic(abs(cfg.paths.ledger), ledger);
   }
   const runArgs = {
-    cycle: ledger.cycle + 1, concurrency: flags.conc ? parseInt(flags.conc, 10) : 2, attempts: cfg.attempts, repoRoot: REPO_ROOT,
+    // KI-E68: default was a bare hardcoded 2, disconnected from config.concurrency's documented
+    // tiers (nothing ever read them). Now sources cfg.concurrency.default (operator-tunable in ONE
+    // place); --conc still overrides per-invocation for an active-throttle/quiet judgment call.
+    cycle: ledger.cycle + 1, concurrency: flags.conc ? parseInt(flags.conc, 10) : ((cfg.concurrency && cfg.concurrency.default) || 6), attempts: cfg.attempts, repoRoot: REPO_ROOT,
     templatesDir: cfg.paths.agents,
     config: { solution: flags.solution || null },
     routing: injectedRouting(cfg), // KI-B1: config/model-routing.json is authoritative at launch
@@ -1661,7 +1710,10 @@ function cmdPreflight() {
   const env = preflight();
   console.log('preflight (environment readiness):');
   console.log(`  docker: ${env.docker ? 'available' : 'ABSENT'}` + (env.docker ? '' : ' — realInfra items (money/security/concurrency) cannot close; they park BLOCKED:needs-docker'));
-  console.log(`  dotnet: ${env.dotnet ? 'available' : 'ABSENT'}` + (env.dotnet ? '' : ' — build/test verify cannot run on this host'));
+  // KI-E72: dotnetAvailable() now also credits the verify/build-test.local.sh host shim (KI-E17) that
+  // the REAL verify path already uses — surface which trust boundary applied so "available (via shim)"
+  // is never confused with "on this controller session's own raw PATH".
+  console.log(`  dotnet: ${env.dotnet ? 'available' + (env.dotnetViaShim ? ' (via verify/build-test.local.sh host shim — not on this session\'s own PATH, but every real verify call resolves it)' : ' (on PATH)') : 'ABSENT'}` + (env.dotnet ? '' : ' — build/test verify cannot run on this host'));
   // KI-E33: warn up front when a run's token/cost telemetry will NOT be gathered (the dashboard cost
   // panels feed off the SESSION's OTLP telemetry, not the factory's events.jsonl).
   const ct = env.costTelemetry || { ready: false, reason: 'unknown' };
@@ -2074,6 +2126,20 @@ function cmdDecisionsDigest() {
   const byTarget = {};
   for (const r of rows) (byTarget[r.target] ||= []).push(r.id);
   const bundles = Object.entries(byTarget).filter(([, ids]) => ids.length >= 2).sort((a, b) => b[1].length - a[1].length);
+  // KI-E74 — cross-service question bundling. byTarget above only catches the SAME service asking
+  // twice; the SAME underlying owner question recurring across DIFFERENT services (verified live
+  // 2026-08-07: 7 parked items across 6 different host services were all the identical "build a
+  // shared pure-type assembly, or ratify permanent per-service duplication?" question, invisible to
+  // byTarget because none of them shared a target with another) is invisible to it. cluster.mjs's
+  // OWN clusterBySimilarity (theme + title-keyword overlap) already detects exactly this pattern for
+  // the SWEEP report — reuse it here instead of maintaining a second, weaker classifier that only
+  // ever sees identical targets.
+  const clusterInput = rows.map((r) => ({ id: r.id, title: (items[r.id] || {}).title || '', theme: (items[r.id] || {}).theme || '?' }));
+  const crossServiceBundles = clusterBySimilarity(clusterInput)
+    .filter((c) => c.length >= 2)
+    .map((c) => ({ items: c, ids: c.map((x) => x.id), targets: [...new Set(c.map((x) => (items[x.id] || {}).target || '?'))] }))
+    .filter((b) => b.targets.length >= 2) // the byTarget bundle above already owns the same-target case
+    .sort((a, b) => b.ids.length - a.ids.length);
   const md = [
     '# Owner-decision digest — ranked (severity x age)',
     '',
@@ -2093,6 +2159,14 @@ function cmdDecisionsDigest() {
       ...rows.filter((row) => row.delivered).map((row) => `- \`${row.id}\` — every touch-set file has a commit newer than the park`),
       '',
     ] : []),
+    '## Candidate cross-service question bundles (KI-E74) — VERIFY before ruling, do not assume',
+    '',
+    'Clustered by title-keyword overlap (same as the cluster.mjs SWEEP report), chain-transitive — a large cluster CAN loop in a tangentially-related outlier that only shares a generic boilerplate phrase ("owner ruling", "permanently unavailable") with ONE other member, not real subject-matter overlap with the group. Read each id\'s actual title before assuming one ruling resolves all of them; a partial ruling (some ids, not all) is a normal and expected outcome here.',
+    '',
+    crossServiceBundles.length
+      ? crossServiceBundles.map((b) => `- **${sharedLabel(b.items, 5)}** (${b.ids.length} items / ${b.targets.length} services: ${b.targets.join(', ')}): ${b.ids.map((i) => '`' + i + '`').join(', ')}`).join('\n')
+      : '_none_',
+    '',
     '## Rule-together bundles (same target — one sitting)',
     '',
     bundles.length ? bundles.map(([t, ids]) => `- **${t}** (${ids.length}): ${ids.map((i) => '`' + i + '`').join(', ')}`).join('\n') : '_none_',

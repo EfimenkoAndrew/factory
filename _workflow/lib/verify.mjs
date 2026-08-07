@@ -19,12 +19,24 @@ function lastMatch(text, source) {
 // Parse the FACTORY::...::RESULT markers + the dotnet "Passed!/Failed!" summary from a captured
 // build-test.sh transcript. hasData=false => nothing parseable (caller trusts the agent verdict).
 export function parseVerifyRaw(text) {
-  const out = { hasData: false, build: null, suite: null, targetedFail: false, suiteExit: null };
+  const out = { hasData: false, build: null, suite: null, targetedFail: false, targetedFailClass: null, suiteExit: null };
   if (!text || typeof text !== 'string') return out;
   const bm = lastMatch(text, 'FACTORY::BUILD::RESULT\\s+exit=(-?\\d+)\\s+errors=(\\d+)');
   if (bm) { out.hasData = true; out.build = { exit: parseInt(bm[1], 10), errors: parseInt(bm[2], 10) }; }
+  // KI-E70 — FILTER::START names the test CLASS this invocation targets (build-test.sh:
+  // `FACTORY::TEST::FILTER::START $target :: $filter`). A runner legitimately running SEVERAL
+  // different classes in one verify pass (not always a same-class retry — ITEM-H1 live, 2026-08-07:
+  // 5 distinct classes filtered in sequence, the last one failing on an unrelated Testcontainers
+  // connection error) emits one START+RESULT pair per class, strictly in order. Pairing the LAST
+  // RESULT with the LAST START (by count, not by trusting a single "the" targeted test) lets the
+  // override name the SPECIFIC class that failed instead of a misleading singular "the targeted
+  // regression test".
+  const classNames = [...text.matchAll(/FACTORY::TEST::FILTER::START\s+\S+\s*::\s*([^\r\n]+)/g)].map((m) => m[1].trim());
   const fm = lastMatch(text, 'FACTORY::TEST::FILTER::RESULT\\s+exit=(-?\\d+)');
-  if (fm) { out.hasData = true; out.targetedFail = parseInt(fm[1], 10) !== 0; }
+  if (fm) {
+    out.hasData = true; out.targetedFail = parseInt(fm[1], 10) !== 0;
+    if (out.targetedFail && classNames.length) out.targetedFailClass = classNames[classNames.length - 1];
+  }
   // dotnet: "Failed!  - Failed: 2, Passed: 10, Skipped: 1, Total: 13" / "Passed!  - Failed: 0, Passed: 13, ..."
   const sm = lastMatch(text, '(?:Passed!|Failed!)[^\\n]*?Failed:\\s*(\\d+),\\s*Passed:\\s*(\\d+)(?:,\\s*Skipped:\\s*(\\d+))?');
   if (sm) { out.hasData = true; out.suite = { failed: +sm[1], passed: +sm[2], skipped: sm[3] ? +sm[3] : 0 }; }
@@ -55,7 +67,7 @@ export function parseVerifyRaw(text) {
 export function verdictFromParse(p, baselineFailures) {
   if (!p || !p.hasData) return { pass: true, reason: 'no-machine-evidence' };
   if (p.build && (p.build.exit !== 0 || p.build.errors > 0)) return { pass: false, reason: 'build failed (exit=' + p.build.exit + ', errors=' + p.build.errors + ')' };
-  if (p.targetedFail) return { pass: false, reason: 'targeted regression test did not pass' };
+  if (p.targetedFail) return { pass: false, reason: p.targetedFailClass ? ('targeted regression test did not pass (' + p.targetedFailClass + ')') : 'targeted regression test did not pass' };
   const base = baselineFailures || 0;
   if (p.suite && p.suite.failed - base > 0) return { pass: false, reason: (p.suite.failed - base) + ' new suite failure(s) beyond baseline ' + base };
   if (typeof p.suiteExit === 'number' && p.suiteExit !== 0 && !p.suite) return { pass: false, reason: 'suite exited non-zero (exit=' + p.suiteExit + ')' };

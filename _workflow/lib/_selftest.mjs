@@ -8,7 +8,7 @@ import { join, dirname, basename, resolve as resolvePath, sep } from 'node:path'
 import {
   emptyLedger, syncFromGraph, transition, foldResults, canTransition,
   countByState, writeJsonAtomic, readJson, unwrapResultEnvelope, FORWARD,
-  reconcileToStateAndTransitions,
+  reconcileToStateAndTransitions, deriveUnfoldedCycle,
 } from './ledger.mjs';
 import { computeReady, waitingOnDeps } from './graph.mjs';
 import { isFactoryWorktreePath } from './worktree.mjs';
@@ -32,7 +32,8 @@ import { dissentersFrom, roleForGateKey, recoveryTransitions, recoveryFoldSkelet
 import { extractHeadings, buildDocMap, readRoleBriefs, readRepoProfiles, PROFILE_CAP } from './promptpack.mjs';
 import { loadPolicies, renderPolicies, POLICY_TEXT } from './policy.mjs'; // PR#9 review — host-policy seam
 import { githubIssueToItem, markdownChecklistToItems, extractSection, severityFromLabels, themeFromLabels, ingestReport, enforceIngestTier, countCheckedBoxes } from './ingest.mjs';
-import { costTelemetryReady } from './preflight.mjs';
+import { costTelemetryReady, shimAvailable, dotnetAvailable } from './preflight.mjs';
+import { chmodSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
 let pass = 0, fail = 0;
@@ -186,6 +187,24 @@ ok(canTransition('CLAIMED', 'READY'), 'CLAIMED->READY (un-claim) still legal');
   const retry = 'FACTORY::BUILD::RESULT exit=0 errors=0\nFACTORY::TEST::FILTER::RESULT exit=1\nFACTORY::TEST::FILTER::RESULT exit=0\nFACTORY::TEST::SUITE::RESULT exit=0';
   eq(parseVerifyRaw(retry).targetedFail, false, 'parseVerifyRaw uses the LAST filter marker (retry fail-then-pass -> not failed)');
   eq(verdictFromParse(parseVerifyRaw(retry), 0).pass, true, 'verdict: filter retry that ends green -> PASS (no false fail)');
+
+  // KI-E70 — ITEM-H1 live shape (2026-08-07): a runner filters SEVERAL DISTINCT test classes in one
+  // verify pass (not a same-class retry); the LAST class's failure must be attributed BY NAME, not
+  // reported as a vague singular "the targeted regression test".
+  const multiClass = 'FACTORY::BUILD::RESULT exit=0 errors=0\n'
+    + 'FACTORY::TEST::FILTER::START /p/A.csproj :: ClassATests\n     Passed: 3\nFACTORY::TEST::FILTER::RESULT exit=0\nFACTORY::SUMMARY::filter exit=0\n'
+    + 'FACTORY::TEST::FILTER::START /p/A.csproj :: ClassBTests\n     Passed: 6\nFACTORY::TEST::FILTER::RESULT exit=0\nFACTORY::SUMMARY::filter exit=0\n'
+    + 'FACTORY::TEST::FILTER::START /p/A.csproj :: ClassETests\n     Failed: 1\nFACTORY::TEST::FILTER::RESULT exit=1\nFACTORY::SUMMARY::filter exit=1\n';
+  const pmc = parseVerifyRaw(multiClass);
+  eq(pmc.targetedFail, true, 'parseVerifyRaw: multi-class transcript, last class failing -> targetedFail true');
+  eq(pmc.targetedFailClass, 'ClassETests', 'KI-E70: targetedFailClass names the LAST class, not the first-run one');
+  eq(verdictFromParse(pmc, 0).reason, 'targeted regression test did not pass (ClassETests)', 'KI-E70: verdict reason names the specific failing class');
+  // Same-class retry still attributes correctly (no regression from the class-pairing addition).
+  const retrySameClass = 'FACTORY::TEST::FILTER::START /p/A.csproj :: FooTests\nFACTORY::TEST::FILTER::RESULT exit=1\nFACTORY::TEST::FILTER::START /p/A.csproj :: FooTests\nFACTORY::TEST::FILTER::RESULT exit=0\n';
+  eq(parseVerifyRaw(retrySameClass).targetedFailClass, null, 'KI-E70: a retry that ends green carries no targetedFailClass (targetedFail is false)');
+  // A transcript with no FILTER::START at all (e.g. a bare/legacy marker) degrades to no class name,
+  // never a crash or a fabricated attribution.
+  eq(parseVerifyRaw('FACTORY::TEST::FILTER::RESULT exit=1').targetedFailClass, null, 'KI-E70: no START marker present -> targetedFailClass stays null, not fabricated');
 }
 
 // KI-D1: debris = OBVIOUS factory-artifact / scratch files only (conservative — gates review real edits).
@@ -1202,6 +1221,27 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
   ok(dsrc60.includes('readRepoProfiles') && dsrc60.includes("'repo-profiles'"), 'KI-E60: driver.mjs imports + calls readRepoProfiles against the repo-profiles subdir');
 }
 
+// KI-E74B — the runner's VERIFY_SCHEMA `note` field (an honest caveat, e.g. "green here does NOT
+// mean a prior review round's findings are resolved") was captured into a local `verify` variable
+// and then never read again by any later stage — silently dropped, with no channel reaching the
+// gate/review band, which only ever saw review-pack.md (a pure git-diff snapshot, zero narrative).
+// ITEM-H1 live, 2026-08-07: 8 gates approved a worktree the runner's own verify.json ALREADY said
+// did not address known issues; only an unrelated deterministic transcript check (KI-E70) happened
+// to catch it. Fixed by threading verify.note onto item.verifyNote (survives into every later
+// review-role compose() call for the item) and rendering it prominently when present.
+{
+  const fsrc74 = readFileSync(join(import.meta.dirname, '..', 'factory.js'), 'utf8');
+  ok(/if \(verify\.note && String\(verify\.note\)\.trim\(\)\) item\.verifyNote = String\(verify\.note\)\.trim\(\)/.test(fsrc74), 'KI-E74B: factory.js threads the runner\'s verify.note onto item.verifyNote right after the runner call, before any early FAILED return');
+  ok(/if \(item\.verifyNote\) lines\.push\('', 'VERIFY-STAGE NOTE/.test(fsrc74), 'KI-E74B: factory.js renders item.verifyNote prominently in the review-role prompt tail');
+  // The render call site must be INSIDE the isReviewRole branch (only gates/reviews see it, not the
+  // fixer/planner/runner itself) — assert it sits after the isReviewRole guard opens.
+  const reviewBranchIdx = fsrc74.indexOf('const isReviewRole = ');
+  const verifyNoteRenderIdx = fsrc74.indexOf('VERIFY-STAGE NOTE (from the runner');
+  ok(reviewBranchIdx >= 0 && verifyNoteRenderIdx > reviewBranchIdx, 'KI-E74B: the verifyNote render lives inside the review-role branch, not the shared prefix every role sees');
+  const csrc74 = readFileSync(join(import.meta.dirname, '..', 'opencode', 'compose.mjs'), 'utf8');
+  ok(/if \(item\.verifyNote\) lines\.push\('', 'VERIFY-STAGE NOTE/.test(csrc74), 'KI-E74B: opencode/compose.mjs mirrors the SAME render (disclosed gap: the setting half is not yet wired into runtime.mjs\'s different step-dispatch model)');
+}
+
 // KI-E60: exec-smoke — a populated A.repoProfiles for the smoke batch's own target ("X") must not
 // disturb any existing lane's behaviour. execSmoke's stub harness only records {label, model} per
 // call, never the prompt string, so this cannot assert the injected TEXT itself (the static grep
@@ -1657,6 +1697,12 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
   const dsrc20 = readFileSync(join(import.meta.dirname, '..', 'driver.mjs'), 'utf8');
   ok(dsrc20.includes("case 'recover'") && dsrc20.includes('recovery_prepared') && dsrc20.includes('mutation-proof.txt'), 'KI-E20: driver wires recover + telemetry + the evidence contract');
   ok(dsrc20.includes("case 'decisions-digest'") && dsrc20.includes('Rule-together bundles'), 'KI-E24: driver wires the ranked owner-decision digest');
+  // KI-E74: decisions-digest reuses the SAME clustering cluster.mjs already trusts for the SWEEP
+  // report (clusterBySimilarity/sharedLabel) instead of a second, target-only classifier — and the
+  // bundle is framed as a VERIFY-worthy candidate (chain-transitive clustering can loop in an
+  // outlier via a shared boilerplate word), never asserted as certain.
+  ok(dsrc20.includes('crossServiceBundles = clusterBySimilarity(clusterInput)') && dsrc20.includes('b.targets.length >= 2'), 'KI-E74: decisions-digest bundles cross-SERVICE duplicates via the shared clusterer, filtered to genuinely cross-target clusters');
+  ok(dsrc20.includes('Candidate cross-service question bundles') && dsrc20.includes('VERIFY before ruling, do not assume'), 'KI-E74: the cross-service bundle is framed as a candidate to verify, not an assertion (chain-transitive clustering can merge a tangential outlier)');
   ok(dsrc20.includes("'FAILED', 'ESCALATED', 'BLOCKED'"), 'KI-E34: cmdRecover accepts BLOCKED (owner-ruling recovery)');
   ok(dsrc20.includes('COMMITTED DELIVERY') && dsrc20.includes('MAIN-TREE CONTAMINATION'), 'KI-E35: fold splits human-committed delivery from agent contamination');
   ok(dsrc20.includes('possibly DELIVERED in HEAD (KI-E36)'), 'KI-E36: escalations queue carries the delivered-in-HEAD hint');
@@ -1869,6 +1915,47 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
   ok(/telemetry\/claude-code-telemetry\.env\.example|CLAUDE_CODE_ENABLE_TELEMETRY/.test(readFileSync(join(import.meta.dirname, '..', 'driver.mjs'), 'utf8')), 'KI-E33: driver preflight surfaces the cost-telemetry cue');
 }
 
+// KI-E72: dotnetAvailable() also credits the verify/build-test.local.sh host PATH shim (KI-E17) —
+// a controller session's own raw PATH lacking dotnet (e.g. a non-interactive shell that never
+// sources ~/.zshrc) must not misreport ABSENT when the shim every real verify call uses is present.
+{
+  const execShim = join(dir, 'fake-build-test.local.sh');
+  fsWrite(execShim, '#!/usr/bin/env bash\nexit 0\n');
+  chmodSync(execShim, 0o755);
+  ok(shimAvailable(execShim), 'KI-E72: shimAvailable is true for an existing, executable shim path');
+  const nonExecShim = join(dir, 'fake-build-test-noexec.local.sh');
+  fsWrite(nonExecShim, '#!/usr/bin/env bash\nexit 0\n');
+  chmodSync(nonExecShim, 0o644);
+  ok(!shimAvailable(nonExecShim), 'KI-E72: shimAvailable is false for a present but non-executable file (mode bit checked, not just existence)');
+  ok(!shimAvailable(join(dir, 'does-not-exist.sh')), 'KI-E72: shimAvailable is false for a nonexistent path');
+  ok(!shimAvailable(''), 'KI-E72: shimAvailable degrades to false, never throws, on an empty path');
+  ok(dotnetAvailable(execShim), 'KI-E72: dotnetAvailable(shimPath) is true when an injected shim resolves, independent of raw dotnet on THIS process PATH');
+}
+
+// KI-E73: deriveUnfoldedCycle — shared by cmdResume (checkpoint visibility) and cmdReconstruct
+// (KI-L63 parallel-lane derivation). Live bug shape: an item checkpoints at resultId "<id>#N" where
+// N === ledger.cycle (the KI-E69 `resume --reuse` relaunch shape — items keep their OWN claim's
+// cycle rather than getting a freshly-bumped one) — the naive "always ledger.cycle+1" guess misses
+// this entirely.
+{
+  const itemsRoot73 = join(dir, 'ki-e73-items');
+  mkdirSync(itemsRoot73, { recursive: true });
+  eq(deriveUnfoldedCycle(itemsRoot73, { cycle: 5, folded: {} }), 6, 'KI-E73: empty items dir -> falls back to ledger.cycle + 1');
+  mkdirSync(join(itemsRoot73, 'FOO'), { recursive: true });
+  fsWrite(join(itemsRoot73, 'FOO', 'result.json'), JSON.stringify({ id: 'FOO', resultId: 'FOO#5', toState: 'CLOSED' }));
+  eq(deriveUnfoldedCycle(itemsRoot73, { cycle: 5, folded: {} }), 5, 'KI-E73 (the live ITEM-H1-class bug): a same-cycle checkpoint (resultId ends #5, ledger.cycle is ALSO 5 — the --reuse relaunch shape) is found, NOT blindly guessed as 6');
+  eq(deriveUnfoldedCycle(itemsRoot73, { cycle: 5, folded: { 'FOO#5': true } }), 6, 'KI-E73: an ALREADY-FOLDED checkpoint is excluded — falls back to ledger.cycle + 1 with nothing else on disk');
+  mkdirSync(join(itemsRoot73, 'BAR'), { recursive: true });
+  fsWrite(join(itemsRoot73, 'BAR', 'result.json'), JSON.stringify({ id: 'BAR', resultId: 'BAR#7', toState: 'FAILED' }));
+  eq(deriveUnfoldedCycle(itemsRoot73, { cycle: 5, folded: { 'FOO#5': true } }), 7, 'KI-E73 (KI-L63 parallel-lane shape): the MAX unfolded cycle across items wins — BAR#7 found even though FOO#5 is already folded');
+  mkdirSync(join(itemsRoot73, 'BAD'), { recursive: true });
+  fsWrite(join(itemsRoot73, 'BAD', 'result.json'), '{ not valid json');
+  eq(deriveUnfoldedCycle(itemsRoot73, { cycle: 5, folded: { 'FOO#5': true } }), 7, 'KI-E73: an unparseable result.json is skipped gracefully, never throws, never poisons the max');
+  const drvText73 = readFileSync(join(import.meta.dirname, '..', 'driver.mjs'), 'utf8');
+  ok(/deriveUnfoldedCycle\(abs\(cfg\.paths\.items\), ledger\)/.test(drvText73), 'KI-E73: cmdResume calls the SHARED deriveUnfoldedCycle (no local re-inlined copy to drift again)');
+  ok((drvText73.match(/deriveUnfoldedCycle\(/g) || []).length === 2, 'KI-E73: exactly 2 call sites (cmdResume + cmdReconstruct) — the old inline duplicate in cmdReconstruct is gone');
+}
+
 // KI-E43: integrate/verify baseline parity — the effective baseline is the LARGER of the
 // run-reported array and the RED-time baseline-raw.txt transcript (pure; the cycle-47
 // ITEM-H15 false regression — 6 pre-existing Docker-unavailable failures vs baseline [] —
@@ -1897,6 +1984,13 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
   const junk = T42.nonCanonicalArtifacts(['RESULT.md', 'COMPLETION.md', 'notes.txt', 'plan.md', 'gate-developer.md', 'review-adversarial.md', 'feedback.md', 'result.json', 'verify-raw.txt', 'main-snapshot.json', 'baseline-raw.txt', 'review-pack.md', 'last-failure.md']);
   eq(junk, ['RESULT.md', 'COMPLETION.md', 'notes.txt'], 'KI-E42: exactly the improvised artifacts classify non-canonical (the cycle-47 stray RESULT.md class); stage + control files never do');
   eq(T42.nonCanonicalArtifacts([]), [], 'KI-E42: empty artifact dir -> nothing to quarantine');
+  // KI-E71 (live 2026-08-07): leftover-raw.txt is the KI-D12 probe's OWN artifact (factory.js writes
+  // res.artifacts['probe:leftover-scan'] to exactly this filename) and must never classify as debris
+  // — it was missing from STAGE_ARTIFACTS and false-positived "from the dead attempt" on every item
+  // that reached that stage, live run or not. leftover-final.txt has ZERO references anywhere in
+  // factory.js/agents/*.md — it genuinely IS agent improvisation and must stay flagged.
+  eq(T42.nonCanonicalArtifacts(['leftover-raw.txt', 'leftover-final.txt', 'plan.md']), ['leftover-final.txt'], 'KI-E71: leftover-raw.txt is canonical (KI-D12 probe output); leftover-final.txt is genuine improvisation and still flags');
+  eq(T42.stageForArtifact('leftover-raw.txt'), 'probe:leftover-scan', 'KI-E71: leftover-raw.txt maps to the probe:leftover-scan stage');
   const drvText42 = readFileSync(join(import.meta.dirname, '..', 'driver.mjs'), 'utf8');
   ok(/resume --quarantine/.test(drvText42) && /flags\.quarantine/.test(drvText42), 'KI-E42: resume detects debris always, moves only on --quarantine');
   ok(/MAIN-GUARD/.test(drvText42) && /KI-E41/.test(drvText42), 'KI-E41: resume diffs main-snapshot.json for relaunch candidates before printing the launch lines');
@@ -2105,6 +2199,120 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
   const drvText67 = readFileSync(join(import.meta.dirname, '..', 'driver.mjs'), 'utf8');
   ok(drvText67.includes('detectNarrativeVerdictContradiction') && drvText67.includes('NARRATIVE-VERDICT-MISMATCH'), 'KI-E67: cmdFold wires the detector and prints the WARN with the KI tag');
   ok(/toState !== 'FAILED' && r\.toState !== 'ESCALATED'\) continue/.test(drvText67), 'KI-E67: the fold wiring is gated to FAILED/ESCALATED results only, matching the pure function\'s own contract');
+}
+
+// KI-E74C (2026-08-07): the MIRROR of KI-E67 — a CLOSED verdict contradicted by an artifact that
+// itself admits something is NOT resolved. Found live on ITEM-H1: the runner's own verify.json
+// admitted a prior review round's 5 findings were unaddressed; all 8 gates approved anyway.
+{
+  const N74 = await import('./narrative-check.mjs');
+  const itemH1Text = "Re-confirmation verify of the round-1 re-fix. NOTE: review-edgecase.md was re-scanned AFTER that fix (round 2) and returned CHANGES_REQUIRED again. No fixer round has touched the worktree since. Build+targeted-test green here does NOT mean round 2's findings are resolved — they are not, and are unaddressed in this worktree as of this pass.";
+  eq(N74.detectUnresolvedCaveatOnClose('CLOSED', { 'verify.json': itemH1Text }), [{ file: 'verify.json', marker: "does NOT mean round 2's findings are resolved — they are not, and are unaddressed" }], 'KI-E74C: the live ITEM-H1 verify.json admission is detected on a CLOSED result');
+  eq(N74.detectUnresolvedCaveatOnClose('FAILED', { 'verify.json': itemH1Text }), [], 'KI-E74C: the SAME admission on a FAILED result is not flagged — an accurate description, not a contradiction (mirrors KI-E67\'s own CLOSED exemption)');
+  eq(N74.detectUnresolvedCaveatOnClose('CLOSED', {}), [], 'KI-E74C: no artifact text at all -> no hit');
+  eq(N74.detectUnresolvedCaveatOnClose('CLOSED', { 'plan.md': 'Approach: read the ledger entry and add the tag.' }), [], 'KI-E74C: ordinary neutral prose on a CLOSED item -> no false positive');
+  eq(N74.detectUnresolvedCaveatOnClose('CLOSED', { 'gate-qa.md': 'one LOW finding about comment style remains unresolved but is accepted as non-blocking per PO sign-off' }), [], 'KI-E74C: a legitimately-accepted minor deferral does not false-positive');
+  // Every individual marker phrase is independently covered.
+  const markerFixtures = [
+    'this pass does not mean the bug is addressed at all here',
+    'the reported findings here remain unaddressed for now',
+    'this leaves the item unaddressed in the worktree for later review',
+    'the ticket looks resolved — they are not actually done though',
+  ];
+  for (const phrase of markerFixtures) {
+    ok(N74.detectUnresolvedCaveatOnClose('CLOSED', { 'f.md': phrase }).length === 1, `KI-E74C: marker phrase "${phrase}" is independently detected`);
+  }
+  // Fold wiring: the driver calls the detector inside cmdFold for CLOSED results, scanning .md
+  // files PLUS verify.json (the proven real source of this admission — broader than the KI-E67
+  // loop's .md-only scan, deliberately, since that check already ships and works).
+  const drvText74c = readFileSync(join(import.meta.dirname, '..', 'driver.mjs'), 'utf8');
+  ok(drvText74c.includes('detectUnresolvedCaveatOnClose') && drvText74c.includes('UNRESOLVED-CAVEAT-ON-CLOSE'), 'KI-E74C: cmdFold wires the mirror detector and prints the WARN with the KI tag');
+  ok(/toState !== 'CLOSED'\) continue/.test(drvText74c), 'KI-E74C: the fold wiring is gated to CLOSED results only, matching the pure function\'s own contract');
+  ok(/f\.endsWith\('\.md'\) && f !== 'verify\.json'\) continue/.test(drvText74c), 'KI-E74C: the scan includes verify.json alongside .md files (the proven real source of the admission)');
+}
+
+// KI-E68 (2026-08-03): cmdGroup's concurrency default was a bare hardcoded 2, disconnected from
+// config/factory.config.json's documented concurrency.{throttled,normal,max,default} tiers (never
+// read by any code path). No pure-function harness exists for cmdGroup itself (it is a CLI command
+// wired to filesystem/ledger state), so — matching the existing KI-E14/KI-E29 cmdGroup source-pin
+// style — this is a source-text pin confirming the fix, not a runtime-behavior test.
+{
+  const drvText68 = readFileSync(join(import.meta.dirname, '..', 'driver.mjs'), 'utf8');
+  ok(drvText68.includes('(cfg.concurrency && cfg.concurrency.default) || 6'), 'KI-E68: cmdGroup\'s concurrency default reads cfg.concurrency.default (config-driven) instead of a bare disconnected literal, with a 6 fallback');
+  ok(!/concurrency: flags\.conc \? parseInt\(flags\.conc, 10\) : 2,/.test(drvText68), 'KI-E68: the old disconnected hardcoded-2 default is gone from cmdGroup');
+  const cfg68 = JSON.parse(readFileSync(join(import.meta.dirname, '..', '..', 'config', 'factory.config.json'), 'utf8'));
+  eq(cfg68.concurrency.default, 6, 'KI-E68: config.concurrency.default raised 3->6 (== normal tier) so the documented default and the code-read default agree');
+}
+
+// KI-E69 (2026-08-03): cross-session prior-attempt reuse. Witnessed live: a 12-item stuck batch
+// (killed run, no checkpoints) included items with 50/42/32 real changed files already complete in
+// their worktrees — the sanctioned relaunch ("relaunch the same run-script verbatim") would have
+// re-run plan/test-author/fixer from scratch for all of them. Scope is deliberately narrow: verify
+// is NEVER reused (a real on-disk verify.json was found to carry rich {result,errors,...} objects
+// where runItem() reads a plain pass/fail string — reusing it would have silently misclassified a
+// passing build) and nothing from the editorial pass onward changes at all.
+{
+  const P = await import('./prior-attempt.mjs');
+  const pdir = mkdtempSync(join(tmpdir(), 'factory-priorattempt-'));
+  const beforeWrite = Date.now() - 5000; // a claim timestamp strictly BEFORE any fixture file below is written
+
+  // Empty dir -> nothing to reuse, never throws.
+  eq(P.loadPriorAttempt(join(pdir, 'nope'), beforeWrite), { plan: null, test: null, fix: null }, 'KI-E69: a nonexistent item dir -> all-null, no throw');
+
+  // test.json alone (fixer never got that far) -> test reused, fix stays null, plan stays null
+  // (plan.md itself is not on disk, so the safe stand-in is correctly withheld too).
+  const d1 = join(pdir, 'd1'); mkdirSync(d1, { recursive: true });
+  fsWrite(join(d1, 'test.json'), JSON.stringify({ red: true, testFiles: ['a.cs'] }));
+  const pa1 = P.loadPriorAttempt(d1, beforeWrite);
+  ok(pa1.test && pa1.test.red === true, 'KI-E69: test.json alone is reused when fresh (mtime after the claim)');
+  eq(pa1.fix, null, 'KI-E69: fix stays null when fix.json is absent');
+  eq(pa1.plan, null, 'KI-E69: plan stand-in is withheld when plan.md itself is not on disk, even though test.json reused');
+  eq(P.priorAttemptStages(pa1), ['test'], 'KI-E69: priorAttemptStages reports exactly the reused stages');
+
+  // plan.md + test.json + fix.json all present and fresh -> all three reused; plan is the safe
+  // {recommendScopeStop:false, recommendEscalate:false} stand-in, never a parse of the prose file.
+  const d2 = join(pdir, 'd2'); mkdirSync(d2, { recursive: true });
+  fsWrite(join(d2, 'plan.md'), '# Plan\nproceed.');
+  fsWrite(join(d2, 'test.json'), JSON.stringify({ red: false, verificationOnly: true }));
+  fsWrite(join(d2, 'fix.json'), JSON.stringify({ applied: true, scopeStop: false, summary: 'did it' }));
+  const pa2 = P.loadPriorAttempt(d2, beforeWrite);
+  eq(pa2.plan, { recommendScopeStop: false, recommendEscalate: false }, 'KI-E69: plan reuses the safe stand-in (never a plan.md prose parse) once test.json is ALSO present');
+  eq(pa2.test.verificationOnly, true, 'KI-E69: test.json reused verbatim');
+  eq(pa2.fix.applied, true, 'KI-E69: fix.json reused verbatim');
+  eq(P.priorAttemptStages(pa2), ['plan', 'test', 'fix'], 'KI-E69: all three stages report reused');
+
+  // Stale artifacts (mtime BEFORE the current claim) are a prior cycle's leftovers, never reused —
+  // a claim timestamp set strictly AFTER these already-written files simulates exactly that (this
+  // item was re-claimed for a NEW attempt since these files were last written).
+  const afterWrite = Date.now() + 5000;
+  const paStale = P.loadPriorAttempt(d2, afterWrite);
+  eq(paStale, { plan: null, test: null, fix: null }, 'KI-E69: artifacts older than the current claim timestamp are never reused (stale prior-cycle guard)');
+
+  // Malformed JSON -> null for that stage, never a throw, never a crash for siblings.
+  const d3 = join(pdir, 'd3'); mkdirSync(d3, { recursive: true });
+  fsWrite(join(d3, 'test.json'), '{ not valid json');
+  fsWrite(join(d3, 'fix.json'), JSON.stringify({ applied: true }));
+  const pa3 = P.loadPriorAttempt(d3, beforeWrite);
+  eq(pa3.test, null, 'KI-E69: malformed test.json -> null, never a throw');
+  ok(pa3.fix && pa3.fix.applied === true, 'KI-E69: a sibling malformed file never poisons an otherwise-valid one');
+
+  // Wiring: factory.js consults item.priorAttempt at exactly the plan/test/fix call sites, never at
+  // verify (which must ALWAYS run fresh — the shape-mismatch risk above is exactly why).
+  const facText69 = readFileSync(join(import.meta.dirname, '..', 'factory.js'), 'utf8');
+  ok(facText69.includes("(item.priorAttempt && item.priorAttempt.plan) ||"), 'KI-E69: runItem() plan stage consults item.priorAttempt.plan');
+  ok(facText69.includes("(item.priorAttempt && item.priorAttempt.test) ||"), 'KI-E69: runItem() test stage consults item.priorAttempt.test');
+  ok(facText69.includes("(item.priorAttempt && item.priorAttempt.fix) ||"), 'KI-E69: runItem() fix stage consults item.priorAttempt.fix');
+  ok(!facText69.includes('item.priorAttempt.verify') && !facText69.includes('item.priorAttempt && item.priorAttempt.verify'), 'KI-E69: verify is NEVER read from item.priorAttempt — always runs fresh (unsafe on-disk shape)');
+  ok(facText69.includes('res.priorAttemptReuse'), 'KI-E69: the result always carries priorAttemptReuse (empty array when nothing was reused) — never silently absent');
+
+  const drvText69 = readFileSync(join(import.meta.dirname, '..', 'driver.mjs'), 'utf8');
+  ok(drvText69.includes("if (flags.reuse) {") && drvText69.includes('loadPriorAttempt(itemDir'), 'KI-E69: cmdResume gates the regeneration behind an explicit --reuse flag (never a silent default-behavior change)');
+  ok(drvText69.includes('priorAttemptReuse: (r.priorAttemptReuse'), 'KI-E69: item_folded telemetry surfaces priorAttemptReuse whenever a relaunch reused a killed run\'s artifacts');
+  // Live-caught review fix (same day, cutting the actual cycle-58 recovery): run-args.json is a
+  // group-time snapshot that does not see a LATER hand-edit to the emitted run-script (exactly what
+  // KI-E68 did — concurrency 2 -> 6 directly in state/run-script.js) or a config fix landed after the
+  // original group. A naive regenerate-from-snapshot would have silently UNDONE that fix.
+  ok(drvText69.includes('freshConc') && drvText69.includes('runArgs.concurrency = freshConc'), 'KI-E69: --reuse refreshes concurrency from the CURRENT config default rather than blindly replaying the group-time snapshot (review fix — would have silently undone a later hand-edit or config fix, e.g. KI-E68)');
 }
 
 console.log(`\nself-test: ${pass} passed, ${fail} failed`);
