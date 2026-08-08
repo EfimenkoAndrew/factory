@@ -33,6 +33,7 @@ import { extractHeadings, buildDocMap, readRoleBriefs, readRepoProfiles, PROFILE
 import { loadPolicies, renderPolicies, POLICY_TEXT } from './policy.mjs'; // PR#9 review — host-policy seam
 import { githubIssueToItem, markdownChecklistToItems, extractSection, severityFromLabels, themeFromLabels, ingestReport, enforceIngestTier, countCheckedBoxes } from './ingest.mjs';
 import { costTelemetryReady, shimAvailable, dotnetAvailable } from './preflight.mjs';
+import { shouldRunArchaeology } from './archaeology.mjs'; // KI-E75
 import { chmodSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
@@ -1549,18 +1550,19 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
 // PR#9 review — the host-policy seam itself: lib/policy.mjs loader + the driver/factory wiring.
 {
   const pd = mkdtempSync(join(tmpdir(), 'pol-'));
-  eq(loadPolicies(pd), { noNewComments: false, noSchemaChanges: false }, 'policy: no config at all -> both OFF (shipped-engine default)');
+  eq(loadPolicies(pd), { noNewComments: false, noSchemaChanges: false, archaeology: false }, 'policy: no config at all -> all OFF (shipped-engine default)');
   mkdirSync(join(pd, 'config'), { recursive: true });
   fsWrite(join(pd, 'config', 'factory.config.json'), JSON.stringify({ policies: { noNewComments: false, noSchemaChanges: false } }));
   fsWrite(join(pd, 'config', 'factory.config.local.json'), JSON.stringify({ policies: { noNewComments: true } }));
-  eq(loadPolicies(pd), { noNewComments: true, noSchemaChanges: false }, 'policy: gitignored local overlay flips a policy per host (KI-E17 seam)');
+  eq(loadPolicies(pd), { noNewComments: true, noSchemaChanges: false, archaeology: false }, 'policy: gitignored local overlay flips a policy per host (KI-E17 seam)');
   fsWrite(join(pd, 'config', 'factory.config.local.json'), '{ broken json');
-  eq(loadPolicies(pd), { noNewComments: false, noSchemaChanges: false }, 'policy: an unreadable overlay never throws — falls back to the committed config');
-  eq(renderPolicies({ noNewComments: true }), 'noNewComments=on noSchemaChanges=off', 'policy: renderPolicies one-liner for the driver status prints');
-  // Committed config ships BOTH policies OFF — a public engine must not default to one owner's rules.
+  eq(loadPolicies(pd), { noNewComments: false, noSchemaChanges: false, archaeology: false }, 'policy: an unreadable overlay never throws — falls back to the committed config');
+  eq(renderPolicies({ noNewComments: true }), 'noNewComments=on noSchemaChanges=off archaeology=off', 'policy: renderPolicies one-liner for the driver status prints');
+  // Committed config ships ALL policies OFF — a public engine must not default to one owner's rules.
   const shipped = JSON.parse(readFileSync(join(import.meta.dirname, '..', '..', 'config', 'factory.config.json'), 'utf8'));
   eq(!!(shipped.policies && shipped.policies.noNewComments), false, 'policy: shipped config has noNewComments OFF');
   eq(!!(shipped.policies && shipped.policies.noSchemaChanges), false, 'policy: shipped config has noSchemaChanges OFF');
+  eq(!!(shipped.policies && shipped.policies.archaeology), false, 'policy: shipped config has archaeology OFF (KI-E75)');
   // factory.js cannot import policy.mjs (sandboxed) — its inlined HOST POLICY strings must stay
   // byte-identical to POLICY_TEXT, in BOTH compose() and sweepCompose() (2 sites each).
   const fsrcP = readFileSync(join(import.meta.dirname, '..', 'factory.js'), 'utf8');
@@ -2313,6 +2315,67 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
   // KI-E68 did — concurrency 2 -> 6 directly in state/run-script.js) or a config fix landed after the
   // original group. A naive regenerate-from-snapshot would have silently UNDONE that fix.
   ok(drvText69.includes('freshConc') && drvText69.includes('runArgs.concurrency = freshConc'), 'KI-E69: --reuse refreshes concurrency from the CURRENT config default rather than blindly replaying the group-time snapshot (review fix — would have silently undone a later hand-edit or config fix, e.g. KI-E68)');
+}
+
+// KI-E75 — archaeologist (research phase): a host-opt-in role that establishes validated ground
+// truth for a doc-less target BEFORE planning, then writes that ground truth into the host's own
+// conventional doc files. Reuses buildDocMap's existing doc-less-target signal (an empty DOC MAP)
+// rather than inventing a second "does this repo have docs" detector. Enrichment only — never
+// blocks the item.
+{
+  // Pure gate coverage — lib/archaeology.mjs shouldRunArchaeology, the canonical copy factory.js's
+  // routesFor() inlines byte-for-byte (KI-E2).
+  ok(shouldRunArchaeology({ policies: { archaeology: true }, fixType: 'critical', docMap: [] }) === true,
+    'archaeology: on + non-mechanical + doc-less target -> eligible');
+  ok(shouldRunArchaeology({ policies: { archaeology: false }, fixType: 'critical', docMap: [] }) === false,
+    'archaeology: host policy OFF -> never eligible regardless of doc coverage');
+  ok(shouldRunArchaeology({ policies: { archaeology: true }, fixType: 'mechanical', docMap: [] }) === false,
+    'archaeology: mechanical fixType -> not eligible even on a doc-less target (mirrors planner\'s crit gate)');
+  ok(shouldRunArchaeology({ policies: { archaeology: true }, fixType: 'critical', docMap: ['doc/data-flows/Svc.md :: § API @L1'] }) === false,
+    'archaeology: non-empty DOC MAP (a documented target) -> not eligible');
+  ok(shouldRunArchaeology({ policies: { archaeology: true }, fixType: 'critical', docMap: undefined }) === true,
+    'archaeology: missing docMap treated the same as an empty one (doc-less)');
+  ok(shouldRunArchaeology({ policies: null, fixType: 'critical', docMap: [] }) === false,
+    'archaeology: missing policies object -> safe-default false, never throws');
+
+  // Routing: buildFactoryRouting (routing-drift.mjs RT_MAP) picks up the new route from
+  // config/model-routing.json — proves BOTH files were updated consistently in one check. The
+  // existing KI-B1 drift block (above) re-checks factory.js's inline RT.archaeologist against it.
+  const bfr75 = buildFactoryRouting(routing);
+  eq(bfr75.RT.archaeologist, { model: 'claude-sonnet-5', effort: 'high' }, 'archaeology: model-routing.json archaeologist route (sonnet/high — deliberately off the budget-gated fable-5 tier, KI-E75)');
+
+  // agents/archaeologist.md — the evidence-only contract exists and states its core rule.
+  const archBrief = readFileSync(join(import.meta.dirname, '..', '..', 'agents', 'archaeologist.md'), 'utf8');
+  ok(archBrief.includes('Never assume. Validate.'), 'archaeology: agents/archaeologist.md states the core no-assumptions rule');
+  ok(archBrief.includes('archaeology.md'), 'archaeology: brief instructs writing the state/items/<id>/archaeology.md evidence artifact');
+  ok(/CONTEXT\.md/.test(archBrief) && /data-flows/.test(archBrief), 'archaeology: brief names the real doc conventions it should extend (CONTEXT.md / doc/data-flows)');
+
+  // factory.js wiring — schema, routing, gating, phase ordering, prompt threading.
+  const facText75 = readFileSync(join(import.meta.dirname, '..', 'factory.js'), 'utf8');
+  ok(facText75.includes('const ARCHAEOLOGY_SCHEMA ='), 'archaeology: ARCHAEOLOGY_SCHEMA defined');
+  ok(facText75.includes("archaeologist: { model: 'claude-sonnet-5', effort: 'high' }"), 'archaeology: RT.archaeologist inline entry present (drift-guard source)');
+  ok(facText75.includes('const archEligible = archOn && crit && docLess'), 'archaeology: routesFor() computes the 3-condition eligibility gate');
+  ok(facText75.includes('archaeologist: archEligible ? RT.archaeologist : null'), 'archaeology: routesFor() returns the gated route');
+  ok(facText75.includes("call('archaeologist', R.archaeologist, ARCHAEOLOGY_SCHEMA"), 'archaeology: runItem() invokes the archaeologist role');
+  ok(facText75.includes("item.archaeologyFindings = findingsText"), 'archaeology: runItem() threads findings onto item.archaeologyFindings');
+  ok(facText75.includes('ARCHAEOLOGY FINDINGS (validated ground truth'), 'archaeology: compose() renders archaeologyFindings into the shared prompt prefix');
+  // Never-blocks invariant: the archaeologist call site must NOT early-return FAILED the way
+  // test-author/fixer/runner do on a null result — a null/thin result is enrichment loss only.
+  const archCallBlock = facText75.slice(facText75.indexOf("phase('Research')"), facText75.indexOf("phase('Plan')"));
+  ok(!/finish\('FAILED'/.test(archCallBlock), 'archaeology: the Research phase never FAILs the item — enrichment only, exactly like a missing item.verifyNote never blocked anything before it');
+  // Ordering: Research runs strictly before Plan, so a validated-ground-truth item's findings are
+  // already on `item` by the time planner's own call() composes its prompt.
+  ok(facText75.indexOf("phase('Research')") > 0 && facText75.indexOf("phase('Research')") < facText75.indexOf("phase('Plan')"), 'archaeology: Research phase precedes Plan phase in runItem()');
+
+  // Downstream consistency: runner's fix-manifest cross-check knows archaeology-written docs are
+  // expected tracked changes, not debris (mirrors how it already expects the test file(s)).
+  const runnerBrief = readFileSync(join(import.meta.dirname, '..', '..', 'agents', 'runner.md'), 'utf8');
+  ok(runnerBrief.includes('KI-E75'), 'archaeology: runner.md fix-manifest cross-check accounts for archaeology-written docs');
+
+  // lib/policy.mjs — the archaeology policy loads/renders/merges through the SAME generic machinery
+  // as the other two (already proven by the updated policy-seam block above); pin the DEFAULTS shape
+  // directly here too so a future DEFAULTS edit that drops the key is caught at this file as well.
+  eq(loadPolicies(mkdtempSync(join(tmpdir(), 'pol75-'))).archaeology, false, 'archaeology: loadPolicies default is OFF on a host with no config at all');
 }
 
 console.log(`\nself-test: ${pass} passed, ${fail} failed`);

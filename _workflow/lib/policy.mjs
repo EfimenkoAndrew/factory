@@ -15,10 +15,18 @@
 // prints the effective policy state at every `group`/`sweep` so an unset overlay is visible, never
 // silent. Every enforcement layer keys off this single loader: factory.js probe + prompt injection
 // (via runArgs.policies), the opencode runtime's mechanical gate, and driver fold's WARN backstop.
+//
+// KI-E75: `archaeology` is a THIRD policy of a different kind — not a per-prompt restriction (there
+// is no POLICY_TEXT entry for it), but a STAGE-GATING capability toggle: when on, a non-mechanical
+// item whose target has no discoverable reference docs (empty DOC MAP) gets an archaeologist research
+// pass before planning. It lives in this same loader/merge/render machinery because that machinery is
+// already fully generic over Object.keys(DEFAULTS) — a doc-less-legacy-host opt-in costs nothing extra
+// here. Default OFF for the same "shipped engine must not assume one host's shape" reason as the other
+// two; a host like a large undocumented enterprise monolith turns it on in its local overlay.
 import { readFileSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 
-const DEFAULTS = Object.freeze({ noNewComments: false, noSchemaChanges: false });
+const DEFAULTS = Object.freeze({ noNewComments: false, noSchemaChanges: false, archaeology: false });
 
 function readJsonSafe(p) {
   try { return JSON.parse(readFileSync(p, 'utf8')); } catch { return null; }

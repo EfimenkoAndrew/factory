@@ -32,7 +32,7 @@ function evalLiteral(lit, scope) {
 const RT_MAP = {
   fixerMech: 'fixer.mechanical', fixerCrit: 'fixer.critical',
   testMech: 'test_author.mechanical', testCrit: 'test_author.critical',
-  planner: 'planner', runner: 'runner',
+  planner: 'planner', archaeologist: 'archaeologist', runner: 'runner',
   gArch: 'gate.architect', gDev: 'gate.developer', gQa: 'gate.qa', gSec: 'gate.security', gPo: 'gate.po',
   rCode: 'review.code', rAdv: 'review.adversarial', rEdge: 'review.edgecase', rTest: 'review.testreview',
   refuter: 'refuter', reauditor: 'reauditor', integrator: 'integrator', adjudicator: 'adjudicator', decisionFramer: 'decision_framer',

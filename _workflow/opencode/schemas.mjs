@@ -15,6 +15,14 @@
 
 export const FINDING = { type: 'object', additionalProperties: false, required: ['severity', 'title'], properties: { severity: { type: 'string' }, title: { type: 'string' }, file: { type: 'string' }, fix: { type: 'string' } } };
 
+// KI-E75: schema-parity ONLY (the mechanical selftest gate that every factory.js schema — except the
+// grandfathered COMMENT_SCHEMA — must also exist here, byte/structure-identical). The opencode
+// RUNTIME does not yet invoke the archaeologist role (routing/compose/phase-gating logic lives only
+// in the primary Workflow-based factory.js) — the same disclosed-gap shape KI-E69 and KI-E74B left
+// for this alternate runtime; a future port pass should wire runtime.mjs's dispatcher + compose the
+// same way it will need to for those two.
+export const ARCHAEOLOGY_SCHEMA = { type: 'object', additionalProperties: false, required: ['validated', 'findings'], properties: { validated: { type: 'boolean' }, findings: { type: 'string' }, openQuestions: { type: 'string' }, docsUpdated: { type: 'array', items: { type: 'string' } }, evidence: { type: 'string' }, note: { type: 'string' } } };
+
 export const PLAN_SCHEMA = { type: 'object', additionalProperties: false, required: ['rootCause', 'approach', 'recommendScopeStop', 'recommendEscalate'], properties: { rootCause: { type: 'string' }, approach: { type: 'string' }, files: { type: 'array', items: { type: 'string' } }, testStrategy: { type: 'string' }, blastRadius: { type: 'string' }, ruleRisks: { type: 'string' }, recommendEscalate: { type: 'boolean' }, recommendScopeStop: { type: 'boolean' } } };
 
 export const TEST_SCHEMA = { type: 'object', additionalProperties: false, required: ['red', 'note'], properties: { red: { type: 'boolean' }, verificationOnly: { type: 'boolean' }, testFiles: { type: 'array', items: { type: 'string' } }, runCmd: { type: 'string' }, baselineFailures: { type: 'array', items: { type: 'string' } }, evidence: { type: 'string' }, note: { type: 'string' } } };
@@ -59,7 +67,7 @@ export const CHECKPOINT_SCHEMA = { type: 'object', additionalProperties: false, 
 
 // Registry keyed by the same schema-name string the runtime.mjs CLI accepts on `submit --schema <name>`.
 export const SCHEMAS = {
-  PLAN_SCHEMA, TEST_SCHEMA, FIX_SCHEMA, VERIFY_SCHEMA, GATE_SCHEMA, REFUTE_SCHEMA, REAUDIT_SCHEMA,
+  ARCHAEOLOGY_SCHEMA, PLAN_SCHEMA, TEST_SCHEMA, FIX_SCHEMA, VERIFY_SCHEMA, GATE_SCHEMA, REFUTE_SCHEMA, REAUDIT_SCHEMA,
   INTEG_SCHEMA, ADJUDICATE_SCHEMA, DECISION_SCHEMA, ACCEPT_SCHEMA, LEFTOVER_SCHEMA, PROBE_SCHEMA,
   SWEEP_DESIGN_SCHEMA, CHECKPOINT_SCHEMA,
 };

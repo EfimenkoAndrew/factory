@@ -59,6 +59,13 @@ function splitAcceptanceClauses(text, cap) {
 
 // ---- schemas (compact structured returns; the full artifact is written to disk) ----
 const FINDING = { type: 'object', additionalProperties: false, required: ['severity', 'title'], properties: { severity: { type: 'string' }, title: { type: 'string' }, file: { type: 'string' }, fix: { type: 'string' } } }
+// KI-E75: archaeologist (research phase) — runs BEFORE planning, ONLY when host-enabled
+// (policies.archaeology) AND this item's target has an empty DOC MAP (buildDocMap found none of
+// doc/data-flows/<target>.md, <target>/CONTEXT.md, <target>/AGENTS.md). `findings` is threaded
+// onto item.archaeologyFindings and rides into every later role's shared prompt prefix, the same
+// channel KI-E74B built for verify.json's `note`. Never blocks the item — a null/low-confidence
+// result just means the item proceeds on the raw work-item spec, exactly as it always has.
+const ARCHAEOLOGY_SCHEMA = { type: 'object', additionalProperties: false, required: ['validated', 'findings'], properties: { validated: { type: 'boolean' }, findings: { type: 'string' }, openQuestions: { type: 'string' }, docsUpdated: { type: 'array', items: { type: 'string' } }, evidence: { type: 'string' }, note: { type: 'string' } } }
 const PLAN_SCHEMA = { type: 'object', additionalProperties: false, required: ['rootCause', 'approach', 'recommendScopeStop', 'recommendEscalate'], properties: { rootCause: { type: 'string' }, approach: { type: 'string' }, files: { type: 'array', items: { type: 'string' } }, testStrategy: { type: 'string' }, blastRadius: { type: 'string' }, ruleRisks: { type: 'string' }, recommendEscalate: { type: 'boolean' }, recommendScopeStop: { type: 'boolean' } } }
 // KI-L37: verificationOnly (reFix only) — the test-author attests every prior finding is already
 // addressed in the CURRENT tree (or explicitly out of scope) and no NEW red is possible; the item
@@ -130,6 +137,11 @@ const RT = {
   // the hardest call in the factory (a disputed FULL-band split). The opus fallback means a fable outage
   // (credit/access — the KI-L49 class) degrades to the prior opus routing, never sinks the item.
   planner: { model: 'claude-fable-5', effort: 'high', fallback: { model: 'claude-opus-4-8', effort: 'high' } }, runner: { model: 'claude-sonnet-5', effort: 'low' },
+  // KI-E75: archaeologist stays OFF the experimental fable-5 tier deliberately — on a genuinely
+  // doc-less legacy host this role can fire on close to every non-mechanical item's FIRST touch of
+  // each target, so it needs a cost-predictable default rather than the budget-gated tier planner
+  // uses. sonnet/high is well within the "careful reading + citing" demand this role makes.
+  archaeologist: { model: 'claude-sonnet-5', effort: 'high' },
   gArch: { model: 'claude-opus-4-8', effort: 'high' }, gDev: { model: 'claude-sonnet-5', effort: 'medium' },
   gQa: { model: 'claude-sonnet-5', effort: 'medium' }, gSec: { model: 'claude-opus-4-8', effort: 'high' }, gPo: { model: 'claude-opus-4-8', effort: 'medium' },
   rCode: { model: 'claude-opus-4-8', effort: 'high' }, rAdv: { model: 'claude-opus-4-8', effort: 'high' },
@@ -169,9 +181,17 @@ function flowsFor(item) {
 }
 function routesFor(item) {
   const crit = item.fixType !== 'mechanical'
+  // KI-E75: archaeology-eligible = host opted in (policies.archaeology) AND item is non-mechanical
+  // AND this target's DOC MAP (buildDocMap, driver-side, item.docMap) is empty — a doc-less target.
+  // Canonical pure copy: lib/archaeology.mjs shouldRunArchaeology (inlined byte-for-byte per KI-E2 —
+  // the Workflow runtime cannot import; change both together, selftest pins the shapes match).
+  const archOn = !!(A && A.policies && A.policies.archaeology)
+  const docLess = !(item.docMap && item.docMap.length)
+  const archEligible = archOn && crit && docLess
   const flows = {}
   for (const f of flowsFor(item)) flows[f.routeKey] = FLOW_RT[f.routeKey] || RT.rAdv
   return {
+    archaeologist: archEligible ? RT.archaeologist : null,
     planner: crit ? RT.planner : null, testAuthor: crit ? RT.testCrit : RT.testMech, fixer: crit ? RT.fixerCrit : RT.fixerMech,
     runner: RT.runner, gates: { architect: RT.gArch, developer: RT.gDev, qa: RT.gQa, security: RT.gSec, po: RT.gPo },
     refuter: RT.refuter, reauditor: RT.reauditor, integrator: RT.integrator, adjudicator: RT.adjudicator, decisionFramer: RT.decisionFramer, reviewFlows: flows,
@@ -276,6 +296,12 @@ function compose(role, item, extra) {
         lines.push('    ^ THIS path is ALSO in your files[] touch-set above. The line just shown is the REPO-ROOT read-only copy — do NOT Edit it. Your edit target for ' + rel + ' is: ' + wtPath + '/' + rel)
       }
     }
+  }
+  // KI-E75 — archaeology findings ride the shared prefix (same channel KI-E74B built for verify.json's
+  // `note`): visible to EVERY role for this item, not just review roles, since planner/fixer benefit
+  // from validated ground truth exactly as much as a reviewer checking the fix against real behavior.
+  if (item.archaeologyFindings) {
+    lines.push('', 'ARCHAEOLOGY FINDINGS (validated ground truth for this item\'s area, established via direct code inspection and, where possible, actually running things — NOT assumed. Treat this as authoritative over any stale comment or doc that disagrees with it; it is still a hypothesis to independently spot-check against the worktree, never a conclusion to copy forward blindly):', item.archaeologyFindings)
   }
   // Similarity batch (owner directive 2026-07-04): the driver stamps batchPattern per qualifying
   // similarity clique (KI-E62) — either the whole batch is one cluster, or, in a mixed batch, each
@@ -520,6 +546,24 @@ async function runItem(item) {
   // to the test-author + fixer so the re-attempt COMPLETES the fix instead of repeating the same omission
   // (cycle-6 learning: ITEM-FIND-H10 did half the finding; without the feedback a re-fix loops to the bound).
   const reFixNote = item.reFix ? ('RE-FIX — a PRIOR attempt FAILED. FIRST read the prior feedback at ' + itemsDir(id) + '/ in THIS order: (1) feedback.md if present — the AUTHORITATIVE driver-written digest of the prior attempt\'s returned verdicts + findings (KI-L31; when any other file disagrees with it, feedback.md wins), (2) last-failure.md (the exact fail reason, incl. test/verify/fold-stage fails where NO gate ran, and any STALE-artifact warnings), (3) gate-*.md + review-*.md + adjudication.md for full prose — but treat any file last-failure.md flags as STALE as the PRIOR attempt\'s content, not current feedback. The prior fix is ALREADY in this worktree but was INCOMPLETE/WRONG/rejected — CORRECT it (do not just repeat it). ') : ''
+
+  // 0. archaeologist (research phase — HOST-POLICY-GATED, doc-less targets only; KI-E75). Runs
+  // BEFORE planning so a validated-ground-truth item threads its findings into planner's own call.
+  phase('Research')
+  if (R.archaeologist) {
+    const arch = await call('archaeologist', R.archaeologist, ARCHAEOLOGY_SCHEMA, null, 'Research')
+    res.artifacts.archaeology = 'state/items/' + id + '/archaeology.md'
+    // Enrichment only — NEVER blocks the item. A null/thin result just means planner/fixer/gates
+    // proceed on the raw work-item spec, exactly as every item did before this role existed.
+    if (arch && arch.findings && String(arch.findings).trim()) {
+      let findingsText = String(arch.findings).trim()
+      // docsUpdated rides in the SAME text channel (rather than a second compose() block) so the
+      // runner's fix-manifest cross-check and every other role see it with zero extra plumbing.
+      if (Array.isArray(arch.docsUpdated) && arch.docsUpdated.length) findingsText += '\n\nDocs updated in this pass (expected tracked changes, not debris): ' + arch.docsUpdated.join(', ')
+      item.archaeologyFindings = findingsText
+      res.archaeologyDocsUpdated = arch.docsUpdated || []
+    }
+  }
 
   // 1. plan (non-trivial / escalate only)
   phase('Plan')

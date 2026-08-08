@@ -4,6 +4,7 @@
   "routes": {
     "normalizer":            { "model": "claude-haiku-4-5",  "effort": "low" },
     "planner":               { "model": "claude-fable-5",    "effort": "high",   "when": "tier=critical|cross-service", "fallback": { "model": "claude-opus-4-8", "effort": "high" }, "_ki_d11": "fable-5 experiment 2026-07-19 (FABLE-PROBE-OK re-verified access, reversing KI-C8). Sets each non-trivial item's whole approach; opus/high fallback (KI-D10) preserves prior routing on a fable outage." },
+    "archaeologist":         { "model": "claude-sonnet-5", "effort": "high", "when": "policies.archaeology=true & fixType!=mechanical & docMap=empty", "_ki_e75": "research phase — establishes validated ground truth for a doc-less legacy target BEFORE planning. Deliberately off the budget-gated fable-5 tier: on a genuinely doc-less host this can fire on close to every non-mechanical item's first touch of each target, so it needs a cost-predictable default, not an experimental one." },
     "fixer.mechanical":      { "model": "claude-sonnet-5", "effort": "medium" },
     "fixer.critical":        { "model": "claude-opus-4-8",   "effort": "high",   "escalate_effort": "xhigh" },
     "test_author.mechanical":{ "model": "claude-sonnet-5", "effort": "medium" },

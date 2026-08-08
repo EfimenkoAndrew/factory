@@ -59,9 +59,11 @@ Report exactly what the markers say — never round a failure up to "pass".
    diff (cache-strategic prompts, 2026-07-18).
 
 **Fix-manifest cross-check:** compare the worktree's ACTUAL tracked changes (`git -C <worktree>
-status --porcelain` — read-only) against `fix.json`'s `filesChanged` + the test file(s). Any tracked
-change NOT accounted for by either MUST be named in your `note` (it may be a late/undocumented edit
-— the gates need to know the diff and the fix rationale disagree).
+status --porcelain` — read-only) against `fix.json`'s `filesChanged` + the test file(s) + (KI-E75,
+if the shared prompt prefix carries an ARCHAEOLOGY FINDINGS block naming docs it updated) those doc
+path(s) — those are EXPECTED tracked changes, not debris. Any tracked change NOT accounted for by any
+of these MUST be named in your `note` (it may be a late/undocumented edit — the gates need to know
+the diff and the fix rationale disagree).
 
 **Known-unresolved-findings check (KI-E74B — read `feedback.md`/`last-failure.md` if present, even
 on a re-confirmation pass):** a green build + a green targetedTest are NOT the same claim as "this
