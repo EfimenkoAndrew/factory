@@ -1,8 +1,8 @@
 // Ledger — atomic, resumable state for every work item. The filesystem checkpoint.
 // Single writer (the driver). Agents never touch this file; they write
 // state/items/<id>/<stage>.json and the driver folds those results in here.
-import { readFileSync, writeFileSync, renameSync, existsSync, mkdirSync } from 'node:fs';
-import { dirname } from 'node:path';
+import { readFileSync, writeFileSync, renameSync, existsSync, mkdirSync, readdirSync } from 'node:fs';
+import { dirname, join } from 'node:path';
 
 // ---- state machine ------------------------------------------------------------
 // Forward happy path, in order:
@@ -54,6 +54,33 @@ export function canTransition(from, to) {
 // ---- atomic JSON I/O ----------------------------------------------------------
 export function readJson(path) {
   return JSON.parse(readFileSync(path, 'utf8'));
+}
+// KI-E73 — the relevant "unfolded" cycle number, derived from on-disk checkpoints (the MAX cycle
+// among itemsRoot/<id>/result.json files whose resultId is not yet in ledger.folded), falling back
+// to ledger.cycle + 1 only when none exist. Originally KI-L63's fix for cmdReconstruct (parallel
+// lanes: the first sibling's fold bumps ledger.cycle to the shared cycle N, so a blind +1 guesses
+// N+1 and misses every remaining lane's checkpoint). cmdResume's OWN prior comment said "same rule
+// as reconstruct" but never actually shared the logic — it silently drifted back to a hardcoded
+// ledger.cycle+1, which is exactly the SAME parallel-lanes blind spot KI-L63 already fixed for
+// reconstruct: any item whose checkpoint lands at exactly ledger.cycle (not cycle+1) — the shared-
+// cycle shape KI-L63 describes — sits invisible to a check that only ever looks for cycle+1.
+// Live-witnessed 2026-08-07: several items in a multi-item batch sat fully done — each a complete,
+// valid result.json — for tens of minutes apiece before a manual `reconstruct` surfaced them;
+// `resume` never once flagged any of them as checkpointed. Extracted here (was inlined twice, once
+// per call site, silently drifting) so cmdResume and cmdReconstruct share ONE implementation and
+// cannot diverge again.
+export function deriveUnfoldedCycle(itemsRoot, ledger) {
+  let best = 0;
+  for (const id of (existsSync(itemsRoot) ? readdirSync(itemsRoot) : [])) {
+    const p0 = join(itemsRoot, id, 'result.json');
+    if (!existsSync(p0)) continue;
+    let r0; try { r0 = readJson(p0); } catch { continue; }
+    const m = r0 && typeof r0.resultId === 'string' ? r0.resultId.match(/#(\d+)(?:r\d*)?$/) : null;
+    if (!m) continue;
+    if (ledger.folded && ledger.folded[r0.resultId]) continue; // already folded — inert
+    best = Math.max(best, parseInt(m[1], 10));
+  }
+  return best || ledger.cycle + 1;
 }
 // KI-E31: unwrap the Workflow harness envelope so `fold <task-output>` works without hand-extraction.
 // The runtime wraps the factory's return as {summary, agentCount, logs, result:{mode,cycle,results}}, so a

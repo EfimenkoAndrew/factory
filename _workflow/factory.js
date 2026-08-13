@@ -328,6 +328,13 @@ function compose(role, item, extra) {
     // after doc edits (KI-L34). Reviewers read the pack FIRST instead of each re-running its own
     // exploratory diff + file reads (telemetry: 8-21 duplicated Reads per reviewer, x10+ per band).
     lines.push('', 'REVIEW PACK: Read ' + itemsDir(item.id) + '/review-pack.md FIRST — a machine-generated snapshot (git status + full diff vs HEAD + new-file contents) of the exact change under review. Use it as your primary view instead of re-running your own exploratory diff/file reads; then independently spot-verify IN THE WORKTREE the specific facts your verdict depends on (the pack ACCELERATES verification, it never replaces it — your verdict must rest on the worktree, not the pack alone). If the pack is missing or disagrees with `git -C <worktree> status`, regenerate it first: `bash ' + FDIR + '/verify/build-test.sh pack ' + wtPath + ' ' + itemsDir(item.id) + '/review-pack.md`.')
+    // KI-E74B — the runner's own honest caveat (VERIFY_SCHEMA's `note` field), previously captured
+    // and then silently dropped by every downstream stage. review-pack.md is a pure git-diff
+    // snapshot with ZERO narrative (its own header says so) — this is the ONLY channel a verify pass
+    // has to warn you that green build+test does not mean everything is actually resolved. Treat
+    // this as a HYPOTHESIS to independently re-verify against the CURRENT worktree (it may describe
+    // a stale/historical state), never as something to rubber-stamp past OR dismiss unread.
+    if (item.verifyNote) lines.push('', 'VERIFY-STAGE NOTE (from the runner\'s own verification pass — READ THIS, do not approve past it unverified): ' + item.verifyNote)
     // KI-D7 — live-probe etiquette for the PARALLEL review stage. Cycle 35: several reviewers ran
     // live add/revert probes in the SHARED per-item worktree concurrently; one gate observed a
     // sibling's probe file mid-review + the harness's standard "file changed externally" reminder
@@ -458,6 +465,9 @@ async function runItem(item) {
     return { id: id, attemptsDelta: 0, transitions: [], toState: 'CLAIMED', artifacts: {}, gates: {}, cost: {}, worktree: wtPath, branch: (item.worktree && item.worktree.branch) || (WT && WT.branch), budgetStopped: true, note: 'BUDGET-STOPPED before start: remaining ' + budget.remaining() + ' tokens < reserve ' + BUDGET_RESERVE + ' — item NOT attempted (still CLAIMED, no attempt burned; relaunch or re-group it next cycle)' }
   }
   const res = { id: id, resultId: id + '#' + (A.cycle || 0), attemptsDelta: 1, transitions: [], toState: 'FAILED', band: band, artifacts: {}, gates: {}, cost: {}, worktree: wtPath, branch: (item.worktree && item.worktree.branch) || (WT && WT.branch), note: '' } // attemptsDelta:1 — every run counts one attempt so the maxItemRetries bound fires; resultId = id#cycle for fold idempotency (KI-B4); band rides for the fold's telemetry stamp + KI-E19 manifest rule (KI-E23)
+  // KI-E69: which stages (if any) this attempt reused from a prior killed run — always present
+  // (an empty array IS the "nothing reused" signal), never silently absent.
+  res.priorAttemptReuse = (item.priorAttempt ? ['plan', 'test', 'fix'].filter(function (k) { return !!item.priorAttempt[k] }) : [])
   const cost = function (route) { const m = (route && route.model) || 'inherit'; res.cost[m] = (res.cost[m] || 0) + 1 }
   // Shared command constants (hoisted 2026-07-19 so the fixer/editorial claims self-check can cite them).
   const BT = 'bash ' + FDIR + '/verify/build-test.sh'
@@ -514,7 +524,9 @@ async function runItem(item) {
   // 1. plan (non-trivial / escalate only)
   phase('Plan')
   if (R.planner) {
-    const plan = await call('planner', R.planner, PLAN_SCHEMA, null, 'Plan')
+    // KI-E69: reuse a prior (killed) attempt's plan when its two control-flow fields are provably
+    // safe to stand in for (lib/prior-attempt.mjs) — skips the planner call entirely on a relaunch.
+    const plan = (item.priorAttempt && item.priorAttempt.plan) || await call('planner', R.planner, PLAN_SCHEMA, null, 'Plan')
     res.artifacts.plan = 'state/items/' + id + '/plan.md'
     if (plan && plan.recommendScopeStop) return await frameAndBlock('planner scope-stop — ' + (plan.ruleRisks || plan.approach || ''))
     if (plan && plan.recommendEscalate) item._escalate = true
@@ -544,7 +556,9 @@ async function runItem(item) {
   const testVoHint = item.reFix ? '' : (pureCoverage
     ? ' PURE TEST-COVERAGE ITEM: the deliverable IS the new tests — correct production code has no red state, so do NOT fabricate a failing variant. Write the missing tests (they should PASS against the current code), RUN them, tee the raw output + a `FACTORY::RED::<exitcode>` marker (0 expected) to the SAME verify-red-raw.txt path, and return red=false + verificationOnly=true with the coverage delta (targets covered, test counts) in evidence.'
     : ' STALE-FINDING PROTOCOL: if you determine the finding is ALREADY RESOLVED on the current tree (the acceptance criterion demonstrably holds — trace the actual wiring, do not stop at the cited lines), do NOT fabricate a red. Write a PASSING pinning test that empirically proves the acceptance holds, RUN it, tee the raw output + `FACTORY::RED::0` to verify-red-raw.txt, and return red=false + verificationOnly=true with file:line + provenance evidence in note. The full gate band adjudicates the claim — a wrong stale-claim will be CHANGES_REQUIRED\'d.')
-  const test = await call('test-author', R.testAuthor, TEST_SCHEMA, (item.reFix ? (reFixNote + 'Write the red proof for what is STILL broken per that feedback — do NOT duplicate an already-passing test; the proof MUST fail on the current worktree state. If NOTHING is still broken (you re-verified every prior finding against the CURRENT tree and each is fixed with an already-passing pinning test, or explicitly out of scope), return red=false + verificationOnly=true and document the full re-verification (files read, suites run, counts) in evidence/note — do NOT invent a vacuous duplicate test just to produce a red. ') : '') + redHint + testVoHint + testRealInfraHint, 'Test')
+  // KI-E69: reuse a prior (killed) attempt's test-author output when test.json already exists and
+  // is fresh (from THIS claim, not a stale prior cycle) — skips the test-author call entirely.
+  const test = (item.priorAttempt && item.priorAttempt.test) || await call('test-author', R.testAuthor, TEST_SCHEMA, (item.reFix ? (reFixNote + 'Write the red proof for what is STILL broken per that feedback — do NOT duplicate an already-passing test; the proof MUST fail on the current worktree state. If NOTHING is still broken (you re-verified every prior finding against the CURRENT tree and each is fixed with an already-passing pinning test, or explicitly out of scope), return red=false + verificationOnly=true and document the full re-verification (files read, suites run, counts) in evidence/note — do NOT invent a vacuous duplicate test just to produce a red. ') : '') + redHint + testVoHint + testRealInfraHint, 'Test')
   res.artifacts.test = 'state/items/' + id + '/test.json'
   // KI-L53: a null stage agent (retries exhausted / skipped) is an INFRA failure, not a quality
   // verdict — mark infraSuspect so the fold's auto-infra-retry does not burn the item's attempt.
@@ -568,7 +582,10 @@ async function runItem(item) {
   // 3. fixer — skipped on a verification-only reFix (there is nothing to change; the runner + gates verify)
   if (!verificationOnly) {
     phase('Fix')
-    const fix = await call('fixer', R.fixer, FIX_SCHEMA, reFixNote + 'The red regression test is already in the worktree. Make it green with the minimal correct fix' + (item.reFix ? ', addressing EVERY CHANGES_REQUIRED finding — the prior fix is PARTIAL, so COMPLETE it (do not just repeat it).' : '.') + claimsHint, 'Fix')
+    // KI-E69: reuse a prior (killed) attempt's fixer output when fix.json already exists and is
+    // fresh (from THIS claim) — skips the fixer call; the worktree's own diff IS the expensive,
+    // already-done work this exists to preserve.
+    const fix = (item.priorAttempt && item.priorAttempt.fix) || await call('fixer', R.fixer, FIX_SCHEMA, reFixNote + 'The red regression test is already in the worktree. Make it green with the minimal correct fix' + (item.reFix ? ', addressing EVERY CHANGES_REQUIRED finding — the prior fix is PARTIAL, so COMPLETE it (do not just repeat it).' : '.') + claimsHint, 'Fix')
     res.artifacts.fix = 'state/items/' + id + '/fix.json'
     if (!fix) { res.infraSuspect = true; return finish('FAILED', 'fixer agent UNAVAILABLE (null after retries — possible infra/credit failure, NOT a quality verdict)') } // KI-L53
     if (fix.scopeStop) return await frameAndBlock('fixer scope-stop — ' + (fix.summary || ''))
@@ -618,6 +635,17 @@ async function runItem(item) {
   const verify = await call('runner', R.runner, VERIFY_SCHEMA, verifyHint + realInfraHint + mainCheckHint + (item.reFix ? ' RE-FIX: the PRIOR attempt\'s test file(s) are EXPECTED in this worktree alongside the new one — do NOT report them as debris; only flag genuine scratch/diagnostic/duplicate files.' : ''), 'Verify')
   res.artifacts.verify = 'state/items/' + id + '/verify.json'
   if (!verify) { res.infraSuspect = true; return finish('FAILED', 'runner agent UNAVAILABLE (null after retries — possible infra/credit failure, NOT a quality verdict)') } // KI-L53
+  // KI-E74B — VERIFY_SCHEMA's `note` field was captured here and then silently dropped: never read
+  // again by any later stage. A runner's own honest caveat (e.g. "build+test green here does NOT
+  // mean a prior review round's findings are resolved — they are not, and are unaddressed") sat in
+  // this variable with nowhere to go, while every downstream gate/review agent only ever saw
+  // review-pack.md (a pure git-diff snapshot with zero narrative — `build-test.sh pack`'s own header
+  // says so explicitly) — so 8 independent gates could approve a worktree the runner ITSELF had
+  // already flagged as not addressing known issues (ITEM-H1 live, 2026-08-07: exactly this; only the
+  // UNRELATED fold-time deterministic transcript check happened to catch it, via a different test
+  // class entirely — see KI-E70). Threaded onto `item` (not `extra`) so it survives into every
+  // review-role compose() call for the rest of this item's run, not just the next one.
+  if (verify.note && String(verify.note).trim()) item.verifyNote = String(verify.note).trim()
   if (!/^pass/i.test(String(verify.build))) return finish('FAILED', 'build failed: ' + (verify.evidence || ''))
   if (!/^pass/i.test(String(verify.targetedTest))) return finish('FAILED', 'targeted test not green')
   // Debris and fix-introduced NEW failures fail the item; a pre-existing environmental failure

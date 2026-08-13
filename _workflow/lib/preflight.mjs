@@ -3,13 +3,36 @@
 // in-memory green as a real-infra pass. These probes let the driver LABEL a run's environment up front so
 // "why did my realInfra item park?" is answerable before the run, not after. Shells out; kept off the hot path.
 import { execFileSync } from 'node:child_process';
+import { existsSync, statSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 function probe(cmd, args) {
   try { execFileSync(cmd, args, { stdio: 'ignore' }); return true; } catch { return false; }
 }
 
 export function dockerAvailable() { return probe('docker', ['info']); }
-export function dotnetAvailable() { return probe('dotnet', ['--version']); }
+
+// KI-E72: this probe shells `dotnet --version` directly in the CALLER's OWN process env — but the
+// REAL verify path every subagent uses (verify/build-test.sh) auto-delegates to a per-host
+// verify/build-test.local.sh PATH shim when one exists+is executable (KI-E17 override seam,
+// SETUP.md § 6) — e.g. a host where dotnet lives outside PATH for non-interactive shells
+// (~/.dotnet, PATH'd only in ~/.zshrc, which a non-interactive Bash-tool shell never sources).
+// A controller session whose OWN shell lacks that sourcing reported "dotnet: ABSENT — build/test
+// verify cannot run on this host" while every real verify call in the actual run succeeded via the
+// shim (live 2026-08-07). Pure + injectable (shimPath param) so it's testable without real dotnet.
+export function shimAvailable(shimPath) {
+  try { return existsSync(shimPath) && !!(statSync(shimPath).mode & 0o111); } catch { return false; }
+}
+function defaultShimPath() {
+  return join(dirname(fileURLToPath(import.meta.url)), '..', '..', 'verify', 'build-test.local.sh');
+}
+// True if dotnet resolves on the raw PATH OR via the same host shim the real verify path already
+// trusts — this does not itself re-prove the shim WORKS (a broken shim would still report true
+// here), it reports the same trust boundary build-test.sh already relies on for every real call.
+export function dotnetAvailable(shimPath) {
+  return probe('dotnet', ['--version']) || shimAvailable(shimPath || defaultShimPath());
+}
 
 // KI-E33: the dashboard's cost panels (claude_code_token_usage) are fed by the Claude Code SESSION's
 // OTLP telemetry, not by the factory — so if the session was launched without CLAUDE_CODE_ENABLE_TELEMETRY
@@ -35,5 +58,7 @@ export function costTelemetryReady(env) {
 }
 
 export function preflight() {
-  return { docker: dockerAvailable(), dotnet: dotnetAvailable(), costTelemetry: costTelemetryReady() };
+  const dotnetOnPath = probe('dotnet', ['--version']);
+  const dotnetViaShim = !dotnetOnPath && shimAvailable(defaultShimPath());
+  return { docker: dockerAvailable(), dotnet: dotnetOnPath || dotnetViaShim, dotnetViaShim, costTelemetry: costTelemetryReady() };
 }

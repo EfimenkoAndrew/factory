@@ -7,8 +7,8 @@
     "throttled": 2,
     "normal": 6,
     "max": 8,
-    "default": 3,
-    "note": "ONE workflow at a time. 2-3 under active throttle, 5-8 when quiet. opus throttles harder than sonnet; per-agent retry >= attempts."
+    "default": 6,
+    "note": "KI-E68: default raised 3->6 (== normal) and is now actually READ by cmdGroup (previously a disconnected, unread hardcoded 2 in driver.mjs). ONE workflow at a time. Drop to 2-3 under active throttle (heavy concurrent non-factory work competing for the same session), raise to 8 (max) when quiet. opus throttles harder than sonnet; per-agent retry >= attempts. --conc overrides per-invocation."
   },
   "attempts": 3,
   "controller": {

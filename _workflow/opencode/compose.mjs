@@ -103,6 +103,13 @@ export function compose(role, item, extra, ctx) {
   const isReviewRole = /^(gate-|review-|refuter|re-auditor)/.test(role);
   if (isReviewRole) {
     lines.push('', 'REVIEW PACK: Read ' + itemsDir(ctx, item.id) + '/review-pack.md FIRST — a machine-generated snapshot (git status + full diff vs HEAD + new-file contents) of the exact change under review. Use it as your primary view instead of re-running your own exploratory diff/file reads; then independently spot-verify IN THE WORKTREE the specific facts your verdict depends on (the pack ACCELERATES verification, it never replaces it — your verdict must rest on the worktree, not the pack alone). If the pack is missing or disagrees with `git -C <worktree> status`, regenerate it first: `bash ' + FDIR + '/verify/build-test.sh pack ' + wtPath + ' ' + itemsDir(ctx, item.id) + '/review-pack.md`.');
+    // KI-E74B parity (factory.js compose, review-role tail): render-side only — this port's
+    // step-dispatch runtime.mjs does not yet WIRE item.verifyNote from the runner's actual return
+    // (a deeper architectural difference: runtime.mjs drives mechanics via external `mech verify`
+    // invocations, not factory.js's direct `await call('runner', ...)`, so there is no single
+    // insertion point to mirror blind). Disclosed gap, same posture as KI-E69's opencode note — a
+    // future port pass should wire the setting half; this line is ready the moment it does.
+    if (item.verifyNote) lines.push('', 'VERIFY-STAGE NOTE (from the runner\'s own verification pass — READ THIS, do not approve past it unverified): ' + item.verifyNote);
     // KI-D7 parity (factory.js compose, review-role tail): the port drives its review calls one
     // phase at a time but the operator MAY still dispatch a band's calls concurrently against the
     // same worktree — the probe-etiquette contract must ride along, verbatim.

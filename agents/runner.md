@@ -63,6 +63,18 @@ status --porcelain` — read-only) against `fix.json`'s `filesChanged` + the tes
 change NOT accounted for by either MUST be named in your `note` (it may be a late/undocumented edit
 — the gates need to know the diff and the fix rationale disagree).
 
+**Known-unresolved-findings check (KI-E74B — read `feedback.md`/`last-failure.md` if present, even
+on a re-confirmation pass):** a green build + a green targetedTest are NOT the same claim as "this
+worktree addresses every finding a prior review round raised." If `<ARTIFACTS DIR>/feedback.md` or
+`last-failure.md` names findings (CHANGES_REQUIRED items, a dissent, a review verdict) AND the
+worktree's tracked files have NOT changed since that artifact was written (compare mtimes / `git
+status` — no new fixer round touched the tree), your `note` MUST say so explicitly and MUST NOT be
+silent about it: state which findings remain unaddressed and that your green verdict covers ONLY
+build/test, not those findings. This is your ONLY channel to warn the gate band — `note` is the one
+field that reaches every downstream reviewer's prompt verbatim (KI-E74). A green `note` that omits a
+known-unresolved finding you had evidence of is a worse failure than reporting a false "fail": the
+gates have no other way to learn what you already knew.
+
 ### Write + return
 - WRITE the artifact to `<ARTIFACTS DIR>/verify.json` (the absolute dir from your prompt header —
   `_bmad-output/ai-factory/state/items/{id}/`) — NEVER drop a `verify.json` (or any scratch file)
