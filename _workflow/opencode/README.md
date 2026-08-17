@@ -1,11 +1,13 @@
 # `_workflow/opencode/` — OpenCode runtime binding (KI-O1)
 
 An alternate runtime binding for a controlling session that has **no native Claude Code
-`Workflow` tool** (e.g. an OpenCode session). `factory.js` cannot run outside Claude Code's
-sandboxed Workflow runtime — it needs that runtime's `agent()` primitive to invoke subagents.
-This directory re-implements the deterministic half of `factory.js`'s `runItem()` as a real
-Node CLI, and lets the controlling session supply the `agent()` calls itself (via whatever
-subagent-launch tool it has — e.g. OpenCode's `Task`).
+`Workflow` tool** (e.g. an OpenCode session, VS Code Copilot Chat in agent mode, or the GitHub
+Copilot coding agent). `factory.js` cannot run outside Claude Code's sandboxed Workflow runtime
+— it needs that runtime's `agent()` primitive to invoke subagents. This directory re-implements
+the deterministic half of `factory.js`'s `runItem()` as a real Node CLI, and lets the controlling
+session supply the `agent()` calls itself (via whatever subagent-launch tool it has — e.g.
+OpenCode's `Task`, or its own terminal/edit tools playing each role directly — see "Using this
+binding from GitHub Copilot" below).
 
 Read `KNOWN-ISSUES.md`'s **KI-O1** entry first — it lists the documented fidelity gaps
 (no per-call model tiering, no sweep-mode, one item at a time; the decision-framer, PO gate,
@@ -74,6 +76,28 @@ does that wrapping for you:
 node _workflow/opencode/runtime.mjs finalize <id>
 node _workflow/driver.mjs fold state/results-cycle-<N>-<id>.json --controller <token>
 ```
+
+## Using this binding from GitHub Copilot
+
+This same CLI contract works unchanged from a GitHub Copilot controller — VS Code Copilot Chat
+in agent mode, or the GitHub Copilot coding agent (both have a terminal/run tool). Point the
+session at `.github/copilot-instructions.md` (which links here) and it can drive the exact
+"Usage protocol" sequence above: `init` → loop `next` / do the work / `submit` → `mech ...
+checkpoint` → `finalize`.
+
+One fidelity gap is new for this controller class, and is NOT a bug to fix here — it's an
+accepted limitation, same posture as KI-O1's other documented gaps (KI-O4):
+
+- **No independent subagent dispatch.** OpenCode's `Task` tool spawns a genuinely separate
+  subagent session per role. Copilot has no equivalent documented "spawn an independent
+  subagent" primitive — a Copilot controller session must play every role `next` hands it
+  (`architect`, `developer`, `qa`, `security`, `po`, the review-flow roles, etc.) itself,
+  sequentially, in the same conversation. This weakens `PLAN.md`'s "the review stage is
+  separate adversarial subagents — never nested in the doing agent" invariant: the reviewer is
+  no longer independent of the implementer's own reasoning trail. Treat any GATED/REFUTE_OK
+  verdict produced this way as weaker evidence than the native Claude Code or OpenCode paths
+  produce, and weigh that when deciding whether an item needs a human second look before
+  `INTEGRATED`.
 
 ## `--fixture` (self-test only)
 

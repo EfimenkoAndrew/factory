@@ -2,7 +2,8 @@
 // AI Implementation Factory — host-repo initializer (KI-E17, SETUP.md).
 //
 // Run this ONCE after mounting the factory in a host repo (submodule or clone, any path):
-//   node <mount>/setup/init.mjs [--fresh [--yes]] [--hooks] [--no-claude-assets] [--repo-root <path>]
+//   node <mount>/setup/init.mjs [--fresh [--yes]] [--hooks] [--no-claude-assets]
+//                                [--no-copilot-assets] [--repo-root <path>]
 //
 // What it does:
 //   1. Detects the host repo root + the factory's mount path (walk-up; --repo-root overrides).
@@ -11,6 +12,8 @@
 //      telemetry/data, reports/, queue/).
 //   4. Installs the /ai-factory controller skill into the host's .claude/skills/ (the agent
 //      briefs in agents/ need NO host install — the driver inlines them at group time).
+//   4b. Installs copilot-assets/copilot-instructions.md into the host's
+//      .github/copilot-instructions.md (KI-O4) — skip with --no-copilot-assets.
 //   5. --fresh: resets factory state (empty findings-graph, rebuilt
 //      ledger, emptied decision queue) so a NEW host starts from zero. Guarded by --yes.
 //   6. --hooks: installs the pre-push build-time audit gate (ci/install-hooks.sh).
@@ -37,7 +40,7 @@ for (let i = 0; i < argv.length; i++) {
   if (k === 'repo-root' && i + 1 < argv.length) { flags[k] = argv[++i]; } else { flags[k] = true; }
 }
 if (flags.help) {
-  console.log('usage: node setup/init.mjs [--fresh [--yes]] [--hooks] [--no-claude-assets] [--repo-root <path>]');
+  console.log('usage: node setup/init.mjs [--fresh [--yes]] [--hooks] [--no-claude-assets] [--no-copilot-assets] [--repo-root <path>]');
   process.exit(0);
 }
 const say = (m) => console.log('[init] ' + m);
@@ -116,6 +119,15 @@ if (!standalone && !flags['no-claude-assets']) {
   const copied = copyTree(src, dst);
   say('claude skill : ' + (copied.length ? copied.map((p) => toPosix(relative(repoRoot, p))).join(', ') + ' installed' : '.claude/skills/ai-factory up to date'));
   say('agents       : agents/*.md need no host install (inlined into every batch at group time)');
+}
+
+// ---- 4b. Copilot assets (host .github/copilot-instructions.md) — KI-O4 -------------
+if (!standalone && !flags['no-copilot-assets']) {
+  const src = join(FACTORY_ROOT, 'copilot-assets');
+  const dst = join(repoRoot, '.github');
+  mkdirSync(dst, { recursive: true });
+  const copied = copyTree(src, dst);
+  say('copilot      : ' + (copied.length ? copied.map((p) => toPosix(relative(repoRoot, p))).join(', ') + ' installed' : '.github/copilot-instructions.md up to date'));
 }
 
 // ---- 5. --fresh: reset factory state ----------------------------------

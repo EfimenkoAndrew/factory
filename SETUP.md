@@ -182,6 +182,7 @@ Outputs land in: `state/PROGRESS.md`, `reports/burndown.md`, `reports/cost-lates
 | **Repo style profiles** | an optional `agents/repo-profiles/<target>.md` is layered onto (never in place of) the universal `agents/*.md` briefs for that target (KI-E60), on every prompt-composing lane (group/sweep/select/recover + the opencode runtime), capped at `PROFILE_CAP` (30k chars) in both runtimes | HOST-LOCAL data: the dir is gitignored except `README.md` + the fictional `_example.Contoso.Widgets.md` — write real profiles per host mount (see the README); a target with no profile file behaves exactly as if this convention did not exist |
 | **Audit ingestion** | `driver ingest` ships github / json / markdown adapters (KI-E27) | extend the pure mappers in `_workflow/lib/ingest.mjs` for a new source; the graph contract (`schema/work-item.schema.json`) is the only interface, so you can also emit items however you like |
 | **Cost telemetry** | dashboard cost panels need session OTLP (KI-E28) | source `telemetry/claude-code-telemetry.env.example` in the session shell; see `telemetry/README.md` |
+| **Copilot conventions** | `init` installs `copilot-assets/copilot-instructions.md` to the host's `.github/copilot-instructions.md` (KI-O4) | skip with `--no-copilot-assets`; once installed it's a normal host file — edit in place (re-running `init` never clobbers a locally-edited copy, same `*.factory-new` no-clobber behavior as the `.claude/skills/` install) |
 
 ## 7. Invariants you must not break (see `KNOWN-ISSUES.md` § E)
 
