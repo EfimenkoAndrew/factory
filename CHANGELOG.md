@@ -40,6 +40,11 @@ History before the first tagged release lives in `KNOWN-ISSUES.md` (the KI regis
 merged PRs.
 
 ## [Unreleased]
+- OpenCode as a first-class installed controller + a no-bash installer (KI-O5): `opencode-assets/`
+  (host `AGENTS.md`, `.opencode/ai-factory.md`, `.opencode/skill/ai-factory/`, and a MERGE into the
+  host's own `opencode.json`), `_workflow/lib/hostinstall.mjs` (pure, selftest-pinned config merge +
+  release-tag resolution), `setup/init.mjs --no-opencode-assets`, and `setup/install.mjs` — the Node
+  twin of `install.sh` for hosts with no usable bash.
 - Versioned install/upgrade/release tooling (`setup/install.sh`, `setup/release.sh`, `VERSION`,
   this file) + per-developer telemetry bootstrap (KI-E52).
 - Deep-review hardening wave over the installer/release tooling (transactional install,

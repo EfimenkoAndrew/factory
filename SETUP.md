@@ -55,13 +55,38 @@ tag + a `release/vX.Y.Z` branch + a PR instead. `setup/_e2e.sh` is the hermetic 
 harness for all of this (local fixture remote, no network) — run it before cutting.
 The sections below are the manual path and the details.
 
+### 0b. No bash? Use the Node installer (KI-O5)
+
+`install.sh` needs bash. On a host without one (Windows with no Git Bash/WSL, locked-down CI
+images) use `setup/install.mjs` — same contracts (strict `vX.Y.Z` resolution, selftest gate on
+install AND upgrade, rollback on a red upgrade, transactional cleanup of a failed install),
+zero bash. Clone the engine anywhere, then point it at your host repo:
+
+```bash
+git clone https://github.com/EfimenkoAndrew/factory.git /tmp/factory
+node /tmp/factory/setup/install.mjs install --host /path/to/host-repo [--submodule] [--hooks]
+```
+
+Day-2, from the installed mount:
+
+```bash
+node <mount>/setup/install.mjs status        # installed vs latest release + per-controller state
+node <mount>/setup/install.mjs upgrade       # selftest-gated, rolls back on red
+node <mount>/setup/install.mjs controllers   # re-install ONLY the host controller assets
+```
+
+It delegates every host-side install to `setup/init.mjs`, so the three controller seams have
+exactly one implementation. It does **not** bootstrap telemetry — that stack is docker +
+shell-profile work with no meaningful Windows story, and a second implementation of it would
+only drift; run `bash <mount>/setup/install.sh telemetry-up` on a POSIX host.
+
 ## 1. Prerequisites
 
 | Requirement | Why | Hard? |
 |---|---|---|
 | Node.js **>= 20.11** | driver / orchestrator / selftest (built-ins only, no `npm install`) | yes |
 | git **2.30+** | worktree isolation per item | yes |
-| **Claude Code** session at the host repo root | the worker plane is a Claude Code **Workflow** script (`_workflow/factory.js`) | yes (interactive or `claude -p` headless) |
+| A **controller session** at the host repo root | Claude Code (native `Workflow` worker plane), OpenCode or GitHub Copilot (both drive `_workflow/opencode/`) | yes |
 | .NET SDK | the DEFAULT verify runner (`verify/build-test.sh`) builds/tests with `dotnet` | only for .NET hosts — see § 6 |
 | Docker | `realInfra` items (money/security/concurrency) close only with Testcontainers proof | recommended |
 
@@ -94,17 +119,40 @@ time. Host-specific config overrides go in the gitignored
 ## 3. Initialize
 
 ```bash
-node <mount>/setup/init.mjs --fresh --yes --hooks   # new host: scaffold state, install skill + pre-push gate
+node <mount>/setup/init.mjs --fresh --yes --hooks   # new host: scaffold state, install controllers + pre-push gate
 node <mount>/setup/init.mjs                         # existing host / keep shipped state
 ```
 
 What it does: detects root+mount → checks prerequisites → scaffolds `state/`,
-`telemetry/data/`, `reports/`, `queue/` → installs the **`/ai-factory` controller skill**
-into the host's `.claude/skills/` (the `agents/*.md` role briefs need NO host install —
-the driver inlines them into every batch at group time) → `--fresh` empties the
-findings-graph (backing up the old one), rebuilds the ledger, resets the decision queue →
-`--hooks` installs the pre-push build-time audit gate → runs the lib selftest +
+`telemetry/data/`, `reports/`, `queue/` → installs the **host controller assets** (below) →
+`--fresh` empties the findings-graph (backing up the old one), rebuilds the ledger, resets the
+decision queue → `--hooks` installs the pre-push build-time audit gate → runs the lib selftest +
 `driver preflight` + `driver status` as smoke.
+
+The `agents/*.md` role briefs need NO host install — the driver inlines them into every batch at
+group time. What DOES get installed is one pointer per controller (KI-O4, KI-O5):
+
+| Controller | Host paths | Skip with |
+|---|---|---|
+| **Claude Code** | `.claude/skills/ai-factory/SKILL.md` | `--no-claude-assets` |
+| **GitHub Copilot** | `.github/copilot-instructions.md` | `--no-copilot-assets` |
+| **OpenCode** | `AGENTS.md`, `.opencode/ai-factory.md`, `.opencode/skill/ai-factory/SKILL.md`, + a merge into your `opencode.json` | `--no-opencode-assets` |
+
+All of it is no-clobber and re-runnable: a byte-identical file is a silent no-op, an absent one
+is created, and a **locally edited** one is never overwritten — the new version lands alongside
+as `*.factory-new` with a warning. Only the OpenCode `opencode.json` is *merged* rather than
+copied (it is your file, carrying your model/provider/MCP settings): the factory appends its
+`instructions` entry and re-appends its `permission` rules at the END of each tool's rule object,
+because opencode evaluates the **last** matching pattern. A host config that is not strict JSON,
+or whose top-level `permission` is the bare-string form, is **refused** rather than rewritten —
+the factory block is written as `opencode.json.factory-new` for you to merge.
+
+Those permission rules are the one place a factory invariant becomes a machine gate rather than
+a sentence in a brief: mutating git verbs (`commit`/`add`/`checkout`/`restore`/`stash`/`reset`/
+`clean`/`push`) are **`ask`** — ordinary OpenCode-assisted development in your repo still works,
+but "the human authors every commit" becomes a prompt you have to answer — while the same verbs
+aimed at a **factory worktree**, deleting `state/STOP_REQUESTED.md`, and editing
+`state/ledger.json` are hard **`deny`**. See `opencode-assets/README.md` for the full rationale.
 
 ## 4. Feed it work
 
@@ -148,9 +196,16 @@ Then build the ledger: `node <mount>/_workflow/driver.mjs init`
 
 ## 5. Operate
 
-Open a Claude Code session at the **host repo root** and say “run the factory” — the
-installed `/ai-factory` skill carries the controller manual (lease discipline, the loop,
-recovery, what goes to the human). The loop it runs:
+Open a session at the **host repo root** and say "run the factory" — the installed controller
+asset carries the manual (lease discipline, the loop, recovery, what goes to the human):
+
+| Controller | What drives the worker plane |
+|---|---|
+| **Claude Code** | the `/ai-factory` skill → the native `Workflow` tool runs `_workflow/factory.js`, the full batch pipeline with real subagents |
+| **OpenCode** | the `ai-factory` skill → `_workflow/opencode/runtime.mjs`, one item at a time, with `Task` supplying each role as an independent subagent |
+| **GitHub Copilot** | `.github/copilot-instructions.md` → the same `runtime.mjs` protocol, but every role is played by the one session (a disclosed fidelity gap, KI-O4) |
+
+The control plane is identical for all three. The Claude Code loop:
 
 ```bash
 DRV="node <mount>/_workflow/driver.mjs"
@@ -160,6 +215,10 @@ $DRV cycle --max 4                # pick a batch -> per-item worktrees + state/r
 $DRV fold <mount>/state/results-cycle-<N>.json
 $DRV progress && $DRV burndown && $DRV escalations
 ```
+
+The OpenCode/Copilot loop swaps the middle step for the runtime binding (`init` → loop
+`next` / do the work / `submit` → `mech ... checkpoint` → `finalize`, then fold the finalized
+envelope). See `_workflow/opencode/README.md` for the exact protocol.
 
 Or mechanize the loop: `node <mount>/orchestrator/orchestrate.mjs run`
 (backends: interactive / claude-headless / dry — see `orchestrator/ORCHESTRATOR.md`).
@@ -183,6 +242,7 @@ Outputs land in: `state/PROGRESS.md`, `reports/burndown.md`, `reports/cost-lates
 | **Audit ingestion** | `driver ingest` ships github / json / markdown adapters (KI-E27) | extend the pure mappers in `_workflow/lib/ingest.mjs` for a new source; the graph contract (`schema/work-item.schema.json`) is the only interface, so you can also emit items however you like |
 | **Cost telemetry** | dashboard cost panels need session OTLP (KI-E28) | source `telemetry/claude-code-telemetry.env.example` in the session shell; see `telemetry/README.md` |
 | **Copilot conventions** | `init` installs `copilot-assets/copilot-instructions.md` to the host's `.github/copilot-instructions.md` (KI-O4) | skip with `--no-copilot-assets`; once installed it's a normal host file — edit in place (re-running `init` never clobbers a locally-edited copy, same `*.factory-new` no-clobber behavior as the `.claude/skills/` install) |
+| **OpenCode conventions** | `init` copies `opencode-assets/root/**` onto the host root (`AGENTS.md`, `.opencode/ai-factory.md`, `.opencode/skill/ai-factory/`) and MERGES `opencode-assets/opencode.config.json` into the host's own `opencode.json` (KI-O5) | skip with `--no-opencode-assets`; loosen or drop individual `permission` rules by editing the host `opencode.json` — re-running `init` re-appends only the factory's own keys and never touches the rest of your config. `AGENTS.md` is the one likely collision, which is why it is only a pointer: the substance lives in `.opencode/ai-factory.md`, loaded via `instructions`, so keeping your own `AGENTS.md` costs you nothing |
 
 ## 7. Invariants you must not break (see `KNOWN-ISSUES.md` § E)
 

@@ -1,0 +1,41 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "instructions": [
+    ".opencode/ai-factory.md"
+  ],
+  "permission": {
+    "bash": {
+      "git commit*": "ask",
+      "git add*": "ask",
+      "git checkout*": "ask",
+      "git restore*": "ask",
+      "git stash*": "ask",
+      "git reset*": "ask",
+      "git clean*": "ask",
+      "git push*": "ask",
+      "git -C * commit*": "ask",
+      "git -C * add*": "ask",
+      "git -C * checkout*": "ask",
+      "git -C * restore*": "ask",
+      "git -C * stash*": "ask",
+      "git -C * reset*": "ask",
+      "git -C * clean*": "ask",
+      "git -C * push*": "ask",
+      "git -C *worktrees* commit*": "deny",
+      "git -C *worktrees* add*": "deny",
+      "git -C *worktrees* checkout*": "deny",
+      "git -C *worktrees* restore*": "deny",
+      "git -C *worktrees* stash*": "deny",
+      "git -C *worktrees* reset*": "deny",
+      "git -C *worktrees* clean*": "deny",
+      "git -C *worktrees* push*": "deny",
+      "rm *STOP_REQUESTED*": "deny",
+      "del *STOP_REQUESTED*": "deny",
+      "Remove-Item *STOP_REQUESTED*": "deny"
+    },
+    "edit": {
+      "**/state/ledger.json": "deny",
+      "*state/ledger.json": "deny"
+    }
+  }
+}
