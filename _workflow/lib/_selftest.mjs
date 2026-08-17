@@ -2382,5 +2382,162 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
     'KI-E82: the sweep does NOT reimplement drift classification — it reuses the existing imported driftAgainstSnapshot/splitDriftByStatus, only widening which ids get checked');
 }
 
+// KI-O5 (2026-08-17): the third controller seam. `setup/init.mjs` installed host pointers for
+// Claude Code (KI-E17) and Copilot (KI-O4), but an OpenCode controller in a host repo had NO
+// installed pointer at all — `_workflow/opencode/` was reachable only by a session that already
+// knew to look for it. Adds `opencode-assets/` (a copied `root/` tree + a MERGED opencode.json
+// fragment) and `setup/install.mjs`, the Node twin of install.sh for hosts with no usable bash.
+// The merge is the part with real failure modes, so it is a pure, injectable helper rather than
+// an object spread at the call site: opencode evaluates the LAST matching permission pattern, so
+// a factory rule left wherever a PREVIOUS install put it can be silently outranked by a broad
+// host rule declared after it — the exact class of bug a `{...host, ...factory}` spread creates,
+// since JS keeps an existing key in its ORIGINAL insertion position on overwrite.
+{
+  const HI = await import('./hostinstall.mjs');
+  const ROOT5 = join(import.meta.dirname, '..', '..');
+  const fragment = JSON.parse(readFileSync(join(ROOT5, 'opencode-assets', 'opencode.config.json'), 'utf8'));
+
+  // --- appendRulesLast: the ordering invariant, stated directly ---
+  eq(Object.keys(HI.appendRulesLast({ 'a *': 'allow', 'git commit*': 'allow', 'z *': 'ask' }, { 'git commit*': 'ask' })),
+    ['a *', 'z *', 'git commit*'],
+    'KI-O5: a factory rule already present is MOVED to the end, not overwritten in place (a plain spread would leave it at index 1, behind the host\'s later rules — last match wins)');
+  eq(HI.appendRulesLast({ 'git *': 'allow' }, { 'git commit*': 'ask' }), { 'git *': 'allow', 'git commit*': 'ask' },
+    'KI-O5: host rules keep their relative order and the factory block lands after them');
+  eq(HI.appendRulesLast({}, {}), {}, 'KI-O5: empty in, empty out');
+  const frozen5 = { 'git commit*': 'allow' };
+  HI.appendRulesLast(frozen5, { 'git commit*': 'ask' });
+  eq(frozen5, { 'git commit*': 'allow' }, 'KI-O5: appendRulesLast never mutates its inputs');
+
+  // --- appendInstructions: idempotent union, host order preserved ---
+  eq(HI.appendInstructions(['docs/style.md'], ['.opencode/ai-factory.md']), ['docs/style.md', '.opencode/ai-factory.md'], 'KI-O5: the factory instructions entry appends after the host\'s');
+  eq(HI.appendInstructions(['.opencode/ai-factory.md'], ['.opencode/ai-factory.md']), ['.opencode/ai-factory.md'], 'KI-O5: re-installing never duplicates the instructions entry');
+  eq(HI.appendInstructions(undefined, ['.opencode/ai-factory.md']), ['.opencode/ai-factory.md'], 'KI-O5: a host with no instructions array gets one');
+
+  // --- mergeOpencodeConfig: fresh host ---
+  const fresh5 = HI.mergeOpencodeConfig({}, fragment);
+  ok(fresh5.refused === null && fresh5.changed, 'KI-O5: a host with no opencode.json gets the whole factory block');
+  eq(fresh5.config.instructions, ['.opencode/ai-factory.md'], 'KI-O5: the always-on rules file is registered via instructions (a factory-owned path that cannot collide with the host\'s AGENTS.md)');
+  ok(fresh5.config.$schema === 'https://opencode.ai/config.json', 'KI-O5: $schema is filled in so the host\'s editor validates the file');
+
+  // --- idempotency: the property every re-run and every `upgrade` depends on ---
+  const again5 = HI.mergeOpencodeConfig(fresh5.config, fragment);
+  ok(!again5.changed, 'KI-O5: merging into an already-merged config is a no-op — init.mjs is re-runnable and `upgrade` refreshes host scaffolding on every release');
+  eq(again5.config, fresh5.config, 'KI-O5: the no-op merge is byte-identical, so no spurious diff lands in the host repo');
+
+  // --- the live failure this exists to prevent: a broad host rule declared AFTER a factory rule ---
+  const shadowed5 = HI.mergeOpencodeConfig({ permission: { bash: { 'git commit*': 'deny', 'git *': 'allow' } } }, fragment);
+  const bashKeys5 = Object.keys(shadowed5.config.permission.bash);
+  ok(bashKeys5.indexOf('git *') < bashKeys5.indexOf('git commit*'),
+    'KI-O5: an existing factory-owned rule is re-appended AFTER the host\'s broad `git *` allow — without the move, the host rule would win and the invariant would be silently off');
+  ok(bashKeys5[bashKeys5.length - 1] === 'Remove-Item *STOP_REQUESTED*', 'KI-O5: the factory block occupies the tail of the rule object in fragment order');
+  ok(shadowed5.notes.some((n) => /re-appended/.test(n)), 'KI-O5: the re-append is REPORTED, never a silent reordering of the host\'s file');
+
+  // --- per-tool string shorthand is documented-equivalent, so promoting it is safe ---
+  const shorthand5 = HI.mergeOpencodeConfig({ permission: { bash: 'allow' } }, fragment);
+  ok(shorthand5.refused === null && shorthand5.config.permission.bash['*'] === 'allow',
+    'KI-O5: `bash: "allow"` expands to {"*":"allow"} (its documented meaning) and keeps the catch-all FIRST, so the factory rules still win');
+  eq(Object.keys(shorthand5.config.permission.bash)[0], '*', 'KI-O5: the promoted catch-all leads the object — broad first, narrow last');
+
+  // --- a BARE top-level string covers tools the factory names no rules for: refuse, never narrow ---
+  const bare5 = HI.mergeOpencodeConfig({ permission: 'allow' }, fragment);
+  ok(bare5.refused && !bare5.changed, 'KI-O5: a bare-string top-level `permission` is REFUSED — expanding it would silently change read/glob/grep/list/task posture too (same no-silent-damage posture as install.sh\'s settings.local.json guard)');
+  eq(bare5.config, { permission: 'allow' }, 'KI-O5: a refused merge returns the host config untouched');
+
+  // --- host settings the factory says nothing about are preserved verbatim ---
+  const rich5 = HI.mergeOpencodeConfig({ model: 'anthropic/claude-sonnet-4-6', mcp: { pw: { type: 'local', command: ['npx'] } }, permission: { edit: { 'secrets/**': 'deny' } } }, fragment);
+  ok(rich5.config.model === 'anthropic/claude-sonnet-4-6' && rich5.config.mcp.pw.type === 'local', 'KI-O5: the host\'s own model/mcp settings survive the merge — the factory merges INTO their file, it does not own it');
+  ok(rich5.config.permission.edit['secrets/**'] === 'deny', 'KI-O5: an unrelated host permission rule is preserved');
+
+  // --- the shipped fragment satisfies opencode's own Config schema constraints ---
+  eq(Object.keys(fragment).sort(), ['$schema', 'instructions', 'permission'], 'KI-O5: the fragment carries ONLY keys opencode\'s Config allows (its schema sets additionalProperties:false — an unknown key is a hard startup failure, not a warning)');
+  for (const [tool, rules] of Object.entries(fragment.permission)) {
+    ok(Object.values(rules).every((v) => ['allow', 'ask', 'deny'].includes(v)), 'KI-O5: every ' + tool + ' rule value is one of allow/ask/deny');
+  }
+  // The shape of the policy itself: repo-wide `deny` on bare git would block ordinary
+  // OpenCode-assisted development in the host repo, which the factory's own rules explicitly
+  // permit — so bare verbs ASK (the human authors every commit) and only worktree-scoped
+  // mutations are a hard DENY.
+  for (const verb of ['commit', 'add', 'checkout', 'restore', 'stash', 'reset', 'clean', 'push']) {
+    eq(fragment.permission.bash['git ' + verb + '*'], 'ask', 'KI-O5: bare `git ' + verb + '` asks — a visible human decision, not a broken host repo');
+    eq(fragment.permission.bash['git -C *worktrees* ' + verb + '*'], 'deny', 'KI-O5: `git ' + verb + '` against a factory worktree is a hard deny — there is no legitimate case for it');
+  }
+  ok(!Object.keys(fragment.permission.bash).some((k) => /^git worktree/.test(k)),
+    'KI-O5: `git worktree add` is NOT denied — lib/worktree.mjs invokes it WITHOUT -C, and every factory pattern is anchored on `git -C ` or a bare mutating verb, so the factory can still create its own worktrees');
+  ok(Object.keys(fragment.permission.bash).filter((k) => /STOP_REQUESTED/.test(k)).length >= 3
+    && Object.entries(fragment.permission.bash).filter(([k]) => /STOP_REQUESTED/.test(k)).every(([, v]) => v === 'deny'),
+    'KI-O5: deleting the owner-controlled drain marker is denied for rm/del/Remove-Item alike (POSIX and PowerShell hosts)');
+  ok(Object.values(fragment.permission.edit).every((v) => v === 'deny') && Object.keys(fragment.permission.edit).some((k) => /ledger\.json$/.test(k)),
+    'KI-O5: state/ledger.json is edit-denied — the single-writer invariant becomes a machine gate, not just a sentence in a brief');
+
+  // --- the three controller asset trees exist at exactly the paths init.mjs maps them to ---
+  for (const [ctl, p] of [
+    ['claude', ['claude-assets', 'skills', 'ai-factory', 'SKILL.md']],
+    ['copilot', ['copilot-assets', 'copilot-instructions.md']],
+    ['opencode(agents)', ['opencode-assets', 'root', 'AGENTS.md']],
+    ['opencode(rules)', ['opencode-assets', 'root', '.opencode', 'ai-factory.md']],
+    ['opencode(skill)', ['opencode-assets', 'root', '.opencode', 'skill', 'ai-factory', 'SKILL.md']],
+    ['opencode(config)', ['opencode-assets', 'opencode.config.json']],
+  ]) ok(existsSync(join(ROOT5, ...p)), 'KI-O5: the ' + ctl + ' host asset ships in-tree at ' + p.join('/'));
+  const ocSkill5 = readFileSync(join(ROOT5, 'opencode-assets', 'root', '.opencode', 'skill', 'ai-factory', 'SKILL.md'), 'utf8');
+  ok(/^---\nname: ai-factory\n/.test(ocSkill5) && /^description: /m.test(ocSkill5),
+    'KI-O5: the OpenCode skill carries the frontmatter opencode\'s loader requires — a skill with no description is filtered out and never surfaced to the model, i.e. installed but permanently invisible');
+  ok(/runtime\.mjs/.test(ocSkill5) && !/Workflow tool/.test(ocSkill5),
+    'KI-O5: the OpenCode skill drives the _workflow/opencode/ binding — it must NOT tell a session with no Workflow tool to launch a run-script (the Claude skill\'s loop is not portable)');
+  ok(/Task/.test(ocSkill5) && /never played inline/.test(ocSkill5),
+    'KI-O5: the skill mandates independent Task subagents per role — the invariant KI-O4 records Copilot as unable to honour, and the reason OpenCode is a stronger controller than Copilot for this engine');
+
+  // --- init.mjs actually wires step 4c (a lib nobody calls installs nothing) ---
+  const init5 = readFileSync(join(ROOT5, 'setup', 'init.mjs'), 'utf8');
+  ok(init5.includes("flags['no-opencode-assets']") && init5.includes("join(src, 'root'), repoRoot"),
+    'KI-O5: init.mjs installs opencode-assets/root onto the HOST ROOT and honours --no-opencode-assets');
+  ok(init5.includes('mergeOpencodeConfig') && init5.includes('OPENCODE_CONFIG_CANDIDATES'),
+    'KI-O5: init.mjs merges the fragment through the pinned helper rather than re-implementing the ordering rule at the call site');
+  ok(/REFUSING to touch/.test(init5) && init5.includes(".factory-new'"),
+    'KI-O5: an unparseable or unmergeable host opencode.json is refused with the factory block written alongside — never clobbered');
+  ok(init5.includes('--no-opencode-assets') && init5.includes('--no-copilot-assets') && init5.includes('--no-claude-assets'),
+    'KI-O5: all three controller seams are independently skippable, and --help says so');
+
+  // --- BOM tolerance: live-caught before shipping, on a host file this repo's own test wrote ---
+  // readFileSync(p,'utf8') does not strip a UTF-8 BOM and JSON.parse rejects one, so a host
+  // opencode.json saved by PowerShell 5.1 / older Visual Studio / Notepad read as "unparseable"
+  // and got the REFUSING-to-touch path — the factory's OpenCode policy would then silently never
+  // install on exactly the Windows hosts install.mjs exists to serve.
+  eq(HI.stripBom('\uFEFF{"a":1}'), '{"a":1}', 'KI-O5: stripBom removes a leading UTF-8 BOM');
+  eq(HI.stripBom('{"a":1}'), '{"a":1}', 'KI-O5: stripBom is identity on a BOM-less body');
+  eq(HI.parseJsonFile('\uFEFF{"model":"x"}'), { model: 'x' }, 'KI-O5: a BOM-prefixed host config parses instead of being refused as corrupt');
+  ok((() => { try { HI.parseJsonFile('{nope'); return false; } catch { return true; } })(),
+    'KI-O5: genuinely malformed JSON still THROWS — BOM tolerance must not swallow a real parse failure into a silent clobber');
+  ok(readFileSync(join(ROOT5, 'setup', 'init.mjs'), 'utf8').includes('parseJsonFile(readFileSync(found'),
+    'KI-O5: init.mjs reads the HOST config through the BOM-tolerant parser (the fix has to be at the call site that actually reads host files)');
+
+  // --- pickLatestReleaseTag: the resolution install.mjs shares with install.sh's grep|sort -V ---
+  const refs5 = ['abc\trefs/tags/v1.0.0', 'abc\trefs/tags/v1.10.0', 'abc\trefs/tags/v1.9.0', 'abc\trefs/tags/v2.0.0-rc1', 'abc\trefs/tags/v20250101', 'abc\trefs/tags/1.2.3'].join('\n');
+  eq(HI.pickLatestReleaseTag(refs5), 'v1.10.0', 'KI-O5: strict vX.Y.Z only, semver-ordered — v1.10.0 beats v1.9.0 (a lexical sort would not), and a pre-release / date-like / unprefixed tag never wins (KI-E52 parity)');
+  eq(HI.pickLatestReleaseTag(''), null, 'KI-O5: no strict release tags -> null (the caller falls back to main with a notice, never to a guess)');
+  eq(HI.pickLatestReleaseTag('abc\trefs/tags/v2.0.0-rc1'), null, 'KI-O5: a repo with ONLY pre-releases resolves to null, not to the rc');
+  ok(HI.compareSemver('v1.2.0', 'v1.10.0') < 0 && HI.compareSemver('v2.0.0', 'v1.99.99') > 0 && HI.compareSemver('v1.2.3', 'v1.2.3') === 0,
+    'KI-O5: compareSemver orders by numeric component, which is what the upgrade downgrade-guard keys off');
+
+  // --- install.mjs: the Node twin keeps install.sh's safety contracts ---
+  const inst5 = readFileSync(join(ROOT5, 'setup', 'install.mjs'), 'utf8');
+  ok(inst5.includes('runSelftest(mount)') && (inst5.match(/runSelftest\(mount\)/g) || []).length >= 2,
+    'KI-O5: install AND upgrade are both selftest-gated (install.sh parity)');
+  ok(inst5.includes('ROLLING BACK') && inst5.includes("'checkout', '--quiet', prev"),
+    'KI-O5: a red selftest on upgrade ROLLS BACK to the previous ref rather than leaving the host on a broken engine');
+  ok(inst5.includes('VENDORED'), 'KI-O5: a vendored (.git-less) mount is refused, never half-upgraded');
+  ok(inst5.includes('already installed at') && inst5.includes('rmSync(created'),
+    'KI-O5: a failed install removes the mount it created, so the "already installed" check cannot block the corrective re-run');
+  ok(inst5.includes('runInit(mount, hostOfMount(mount))'),
+    'KI-O5: upgrade re-runs init.mjs — an engine upgrade that skipped it would leave every host on new code behind old controller pointers');
+  ok(inst5.includes("if (flags.host)") && /never the tree it happens to live in/.test(inst5),
+    'KI-O5: an explicit --host beats the script\'s own location (the E2E-caught redirect bug install.sh documents)');
+  ok(!/execFileSync\(\s*['"]bash/.test(inst5) && !inst5.includes("run('bash'"),
+    'KI-O5: install.mjs never shells bash — that is the entire reason it exists (Windows hosts without Git Bash/WSL)');
+  ok(inst5.includes("'--no-claude-assets'") && inst5.includes("'--no-copilot-assets'") && inst5.includes("'--no-opencode-assets'"),
+    'KI-O5: install.mjs delegates every host-side install to init.mjs — one implementation of the three controller seams, not two that can drift');
+  ok(/telemetry/i.test(inst5) && inst5.includes('install.sh telemetry-up'),
+    'KI-O5: the telemetry gap is DISCLOSED and points at the bash path, rather than silently omitted (KI-E40 posture: a missing capability must announce itself)');
+}
+
 console.log(`\nself-test: ${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

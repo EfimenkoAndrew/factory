@@ -39,9 +39,10 @@ accepted fidelity gap — not something to silently work around.
 ## Layout
 
 `config/` knobs + model routing · `schema/` item/ledger schemas · `_workflow/` driver + Workflow +
-libs · `agents/` role briefs · `verify/` build-test runner (host-stack seam) · `setup/init.mjs`
-host initializer · `claude-assets/` host-installable `/ai-factory` skill · `copilot-assets/`
-host-installable `.github/copilot-instructions.md` template · `templates/` example
-findings-graph · `queue/` human decisions · `state/` + `reports/` runtime + generated ·
-`telemetry/` observational event stream + compose stack · `orchestrator/` mechanized loop ·
-`ci/` pre-push audit gate.
+libs · `agents/` role briefs · `verify/` build-test runner (host-stack seam) · `setup/` host
+initializer (`init.mjs`) + installers (`install.sh` bash, `install.mjs` no-bash) · the three
+host-installable controller pointers: `claude-assets/` (`/ai-factory` skill), `copilot-assets/`
+(`.github/copilot-instructions.md`), `opencode-assets/` (`AGENTS.md` + `.opencode/` + an
+`opencode.json` permission merge) · `templates/` example findings-graph · `queue/` human
+decisions · `state/` + `reports/` runtime + generated · `telemetry/` observational event stream +
+compose stack · `orchestrator/` mechanized loop · `ci/` pre-push audit gate.

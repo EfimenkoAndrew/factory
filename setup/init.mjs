@@ -3,7 +3,8 @@
 //
 // Run this ONCE after mounting the factory in a host repo (submodule or clone, any path):
 //   node <mount>/setup/init.mjs [--fresh [--yes]] [--hooks] [--no-claude-assets]
-//                                [--no-copilot-assets] [--repo-root <path>]
+//                                [--no-copilot-assets] [--no-opencode-assets]
+//                                [--repo-root <path>]
 //
 // What it does:
 //   1. Detects the host repo root + the factory's mount path (walk-up; --repo-root overrides).
@@ -14,10 +15,16 @@
 //      briefs in agents/ need NO host install — the driver inlines them at group time).
 //   4b. Installs copilot-assets/copilot-instructions.md into the host's
 //      .github/copilot-instructions.md (KI-O4) — skip with --no-copilot-assets.
+//   4c. Installs opencode-assets/root/** onto the host root (AGENTS.md, .opencode/ai-factory.md,
+//      .opencode/skill/ai-factory/) and MERGES opencode-assets/opencode.config.json into the
+//      host's own opencode.json (KI-O5) — skip with --no-opencode-assets.
 //   5. --fresh: resets factory state (empty findings-graph, rebuilt
 //      ledger, emptied decision queue) so a NEW host starts from zero. Guarded by --yes.
 //   6. --hooks: installs the pre-push build-time audit gate (ci/install-hooks.sh).
 //   7. Smoke: runs the lib selftest + driver preflight/status.
+//
+// Steps 4/4b/4c are the three controller seams — Claude Code, GitHub Copilot and OpenCode all
+// drive the SAME engine; only the host-side pointer differs. All three are no-clobber.
 //
 // Zero npm dependencies. Never runs mutating git (KI-E1). Idempotent — safe to re-run.
 import { existsSync, mkdirSync, readFileSync, writeFileSync, readdirSync, statSync, rmSync } from 'node:fs';
@@ -25,6 +32,7 @@ import { execFileSync } from 'node:child_process';
 import { dirname, join, resolve, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { findRepoRoot, STOCK_MOUNT, toPosix } from '../_workflow/lib/rootfind.mjs';
+import { mergeOpencodeConfig, OPENCODE_CONFIG_CANDIDATES, parseJsonFile } from '../_workflow/lib/hostinstall.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const FACTORY_ROOT = resolve(HERE, '..');
@@ -40,7 +48,7 @@ for (let i = 0; i < argv.length; i++) {
   if (k === 'repo-root' && i + 1 < argv.length) { flags[k] = argv[++i]; } else { flags[k] = true; }
 }
 if (flags.help) {
-  console.log('usage: node setup/init.mjs [--fresh [--yes]] [--hooks] [--no-claude-assets] [--no-copilot-assets] [--repo-root <path>]');
+  console.log('usage: node setup/init.mjs [--fresh [--yes]] [--hooks] [--no-claude-assets] [--no-copilot-assets] [--no-opencode-assets] [--repo-root <path>]');
   process.exit(0);
 }
 const say = (m) => console.log('[init] ' + m);
@@ -130,6 +138,45 @@ if (!standalone && !flags['no-copilot-assets']) {
   say('copilot      : ' + (copied.length ? copied.map((p) => toPosix(relative(repoRoot, p))).join(', ') + ' installed' : '.github/copilot-instructions.md up to date'));
 }
 
+// ---- 4c. OpenCode assets (host AGENTS.md + .opencode/ + opencode.json) — KI-O5 ------
+// Two halves with two ownership stories: opencode-assets/root/** are factory-owned FILES that
+// copyTree installs onto the host root (same no-clobber contract as 4/4b), while the host's
+// opencode.json is THEIRS — it carries their model/provider/mcp settings — so the factory's
+// controller policy is MERGED into it. Rule order is load-bearing (opencode evaluates the LAST
+// matching permission pattern), which is why the merge lives in a selftest-pinned pure helper.
+if (!standalone && !flags['no-opencode-assets']) {
+  const src = join(FACTORY_ROOT, 'opencode-assets');
+  const copied = copyTree(join(src, 'root'), repoRoot);
+  say('opencode     : ' + (copied.length ? copied.map((p) => toPosix(relative(repoRoot, p))).join(', ') + ' installed' : 'AGENTS.md + .opencode/ up to date'));
+  const fragment = parseJsonFile(readFileSync(join(src, 'opencode.config.json'), 'utf8'));
+  const found = OPENCODE_CONFIG_CANDIDATES.map((c) => join(repoRoot, c)).find((p) => existsSync(p));
+  const target = found || join(repoRoot, 'opencode.json');
+  const rel2 = toPosix(relative(repoRoot, target));
+  const sidecar = () => writeFileSync(target + '.factory-new', JSON.stringify(fragment, null, 2) + '\n');
+  let hostCfg = {};
+  let parsed = true;
+  if (found) { try { hostCfg = parseJsonFile(readFileSync(found, 'utf8')); } catch { parsed = false; } }
+  if (!parsed) {
+    // Same posture as install.sh's settings.local.json guard: an existing-but-unparseable config
+    // (jsonc comments, trailing commas, or genuinely broken) is never rewritten — a blind
+    // JSON.stringify would silently drop the host's comments or their whole file.
+    sidecar();
+    warn('REFUSING to touch ' + rel2 + ' — it is not strict JSON (comments / trailing commas?); the factory block was written alongside as ' + rel2 + '.factory-new — merge by hand');
+  } else {
+    const merge = mergeOpencodeConfig(hostCfg, fragment);
+    if (merge.refused) {
+      sidecar();
+      warn('REFUSING to touch ' + rel2 + ' — ' + merge.refused + '; the factory block was written alongside as ' + rel2 + '.factory-new — merge by hand');
+    } else if (merge.changed) {
+      mkdirSync(dirname(target), { recursive: true });
+      writeFileSync(target, JSON.stringify(merge.config, null, 2) + '\n');
+      say('opencode cfg : ' + rel2 + ' — ' + (merge.notes.join('; ') || 'updated'));
+    } else {
+      say('opencode cfg : ' + rel2 + ' up to date');
+    }
+  }
+}
+
 // ---- 5. --fresh: reset factory state ----------------------------------
 const graphPath = join(FACTORY_ROOT, 'state', 'findings-graph.json');
 const ledgerPath = join(FACTORY_ROOT, 'state', 'ledger.json');
@@ -196,8 +243,11 @@ console.log(`
 [init]   1. Feed it work: author ${m}/state/findings-graph.json per schema/work-item.schema.json
 [init]      (templates/findings-graph.example.json is a working 3-item example), then:
 [init]        node ${m}/_workflow/driver.mjs init
-[init]   2. Drive it from a Claude Code session opened at the HOST repo root — say "run the factory"
-[init]      (the /ai-factory skill installed above knows the loop), or mechanize with
+[init]   2. Drive it from a session opened at the HOST repo root — say "run the factory":
+[init]        Claude Code : the /ai-factory skill (.claude/skills/) knows the loop
+[init]        OpenCode    : the ai-factory skill (.opencode/skill/) drives the runtime binding
+[init]        Copilot     : .github/copilot-instructions.md routes to the same binding
+[init]      or mechanize with
 [init]        node ${m}/orchestrator/orchestrate.mjs run
 [init]   3. The factory NEVER commits: finished fixes wait on factory/<id> worktree branches;
 [init]      review + commit them yourself (queue/decisions.md holds what needs a human ruling).`);

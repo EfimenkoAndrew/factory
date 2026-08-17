@@ -29,19 +29,31 @@ curl -fsSL https://raw.githubusercontent.com/EfimenkoAndrew/factory/main/setup/i
 # later: <mount>/setup/install.sh upgrade --yes   (selftest-gated; auto-rollback on red)
 ```
 
+No bash on the host (Windows without Git Bash/WSL, locked-down CI)? Same contracts, zero bash
+(KI-O5):
+
+```bash
+git clone https://github.com/EfimenkoAndrew/factory.git /tmp/factory
+node /tmp/factory/setup/install.mjs install --host /path/to/host-repo
+# later: node <mount>/setup/install.mjs upgrade   ·   node <mount>/setup/install.mjs status
+```
+
 Manual mount (the same thing, by hand):
 
 ```bash
 git submodule add https://github.com/EfimenkoAndrew/factory.git _bmad-output/ai-factory
-node _bmad-output/ai-factory/setup/init.mjs --fresh --yes --hooks   # new host (scaffolds state, installs the skill + pre-push gate)
+node _bmad-output/ai-factory/setup/init.mjs --fresh --yes --hooks   # new host (scaffolds state, installs controllers + pre-push gate)
 node _bmad-output/ai-factory/setup/init.mjs                         # existing host / keep current state
 ```
 
 [`SETUP.md`](./SETUP.md) is the full onboarding guide (prerequisites, mount shapes, host
 adaptation seams, the operating loop). `setup/init.mjs` detects the host repo root + mount
-path (any depth — KI-E17), scaffolds runtime state, and installs the `/ai-factory`
-controller skill into the host's `.claude/skills/`. The agent briefs in `agents/` need no
-host install — the driver inlines them into every batch.
+path (any depth — KI-E17), scaffolds runtime state, and installs one pointer per controller —
+Claude Code (`.claude/skills/ai-factory/`), GitHub Copilot
+(`.github/copilot-instructions.md`), and OpenCode (`AGENTS.md` + `.opencode/` + a merge into
+the host's `opencode.json`, KI-O5). Each is skippable (`--no-claude-assets` /
+`--no-copilot-assets` / `--no-opencode-assets`) and none is ever clobbered. The agent briefs in
+`agents/` need no host install — the driver inlines them into every batch.
 
 ## How it runs (two halves)
 
@@ -137,7 +149,8 @@ _workflow/{factory.js, driver.mjs, cluster.mjs (triage), audit-diff.mjs (build-t
 agents/*.md   verify/   state/{findings-graph.json, ledger.json, PROGRESS.md, normalized/, items/, worktrees/}
 queue/decisions.md   reports/{burndown.md, cost-latest.md, cycle-NN.md, telemetry-latest.md}
 telemetry/{docker-compose.yml, exporter/, grafana/, data/events.jsonl (git-ignored)}   orchestrator/{orchestrate.mjs, ORCHESTRATOR.md}
-setup/init.mjs (host initializer)   claude-assets/skills/ai-factory/ (host /ai-factory skill)   templates/findings-graph.example.json   SETUP.md
+setup/{init.mjs (host initializer), install.sh (bash installer), install.mjs (no-bash installer)}   templates/findings-graph.example.json   SETUP.md
+claude-assets/skills/ai-factory/   copilot-assets/copilot-instructions.md   opencode-assets/{root/**, opencode.config.json}   (host controller pointers)
 ```
 
 ## Telemetry & observability (KI-E7 — observational, never evidentiary)
