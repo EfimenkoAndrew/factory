@@ -53,6 +53,10 @@ export const LEFTOVER_SCHEMA = { type: 'object', additionalProperties: false, re
 
 export const PROBE_SCHEMA = { type: 'object', additionalProperties: false, required: ['markerFound'], properties: { markerFound: { type: 'boolean' }, line: { type: 'string' } } };
 
+// KI-E83 — schema-parity only (mechanical selftest gate); the opencode runtime's own routing/
+// dispatch of this probe is NOT yet ported, same disclosed-gap posture as KI-E75/KI-E69.
+export const RED_PROOF_SCHEMA = { type: 'object', additionalProperties: false, required: ['markerFound', 'exitCode'], properties: { markerFound: { type: 'boolean' }, exitCode: { type: 'number' }, line: { type: 'string' } } };
+
 export const SWEEP_DESIGN_SCHEMA = { type: 'object', additionalProperties: false, required: ['pattern', 'headline'], properties: { pattern: { type: 'string' }, applicationNotes: { type: 'string' }, conformanceCheck: { type: 'string' }, headline: { type: 'string' } } };
 
 export const CHECKPOINT_SCHEMA = { type: 'object', additionalProperties: false, required: ['written'], properties: { written: { type: 'boolean' }, note: { type: 'string' } } };

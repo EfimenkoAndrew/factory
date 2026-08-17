@@ -35,7 +35,7 @@ import { parseVerifyRaw, verdictFromParse, debrisFiles, parseRedRaw, hasRealInfr
 import { preflight, dockerAvailable } from './lib/preflight.mjs';
 import { classifyFilesEntry, buildBasenameIndex, acceptanceSurfaceGaps } from './lib/graphaudit.mjs';
 import { renderFeedback } from './lib/feedback.mjs';
-import { dissentersFrom, roleForGateKey, recoveryFoldSkeleton, priorCycleOf } from './lib/recover.mjs'; // KI-E20 — the direct-recovery scaffold
+import { dissentersFrom, roleForGateKey, recoveryFoldSkeleton, priorCycleOf, missingStageFrom } from './lib/recover.mjs'; // KI-E20 — the direct-recovery scaffold; KI-E81 — missing-stage auto-detection
 import { applyConvergenceBonus, effectiveRetryBound } from './lib/convergence.mjs';
 import { clusterBySimilarity, sharedLabel, perCliqueBatchPatterns, bestClosedPrecedent, sig as simSig, similarSigs } from './lib/similarity.mjs';
 import { loadController, isStale as controllerStale, claimController, verifyController, releaseController, DEFAULT_TTL_MINUTES } from './lib/controller.mjs';
@@ -718,6 +718,15 @@ function cmdFold(file, flags) {
         + (reachedGate ? '' : '\n> This attempt FAILED at the test/verify/fold stage — NO review gates ran, so there is no gate-*.md. Read THIS file for what to fix.\n')
         + staleNote
         + `\n**Gate verdicts (if any):** ${JSON.stringify(r.gates || {})}\n`);
+      // KI-E81: the SAME facts last-failure.md just rendered to prose, also as machine-readable
+      // JSON — `cmdRecover` reads this (not state/items/<id>/result.json, which a checkpoint-writer
+      // that died to the SAME infra outage as everything else in the band never gets to write) to
+      // auto-detect a narrow missing-single-stage recovery shape. Purely additive: a new sidecar
+      // file, written unconditionally alongside last-failure.md, read by nothing else.
+      writeFileSync(join(dir, 'last-failure.json'), JSON.stringify({
+        id: r.id, cycle: cyc, transitions: r.transitions || [], gates: r.gates || {},
+        infraSuspect: !!r.infraSuspect, note: r.note || '',
+      }, null, 2));
     } catch { /* best-effort feedback artifact — never block the fold on it */ }
   }
   // F2 (analysis 2026-07-17) — phantom doc-path detection: lint ADDED doc-diff lines in each
@@ -2063,10 +2072,73 @@ function cmdRecover(flags, rest) {
     ].join('\n'));
     prompts.push({ key: d.key, role, file: pfile, findings: d.findings.length });
   }
+  // KI-E81: the pure-infra "missing stage" shape — no structured dissent (nothing was rejected;
+  // the stage simply never ran), but the item died on exactly ONE recognizable late-pipeline
+  // stage with everything before it already APPROVED. Hand-recovered repeatedly by the controller
+  // before this existed — every one required pulling the finding spec by hand, writing
+  // near-identical boilerplate, and remembering the exact evidence-tee paths. This auto-generates
+  // that prompt.
+  let stagePrompt = null;
+  if (!dissent.length) {
+    let lastFailure = null;
+    try { lastFailure = JSON.parse(readFileSync(join(itemDir, 'last-failure.json'), 'utf8')); } catch { /* pre-KI-E81 item, or never failed this way */ }
+    const missing = lastFailure ? missingStageFrom(lastFailure.transitions, lastFailure.gates) : { stage: null, lenses: [] };
+    if (missing.stage) {
+      const sfile = join(recDir, `recover-stage-${missing.stage}.md`);
+      const sln = solutionFor(wi.target || '');
+      const filesList = Array.isArray(wi.files) ? wi.files.join(', ') : '(see the worktree diff)';
+      const lensLine = missing.stage === 're-auditor'
+        ? `Apply ONLY the "${missing.lenses[0]}" audit lens${missing.lenses.length > 1 ? ' (this item actually needs ' + missing.lenses.length + ' lenses: ' + missing.lenses.join(', ') + ' — run one agent PER lens, each with this same prompt but its own lens name substituted)' : ''}.`
+        : '';
+      writeFileSync(sfile, [
+        `# MISSING-STAGE RECOVERY — ${missing.stage} — work item ${id}`,
+        '',
+        `Run this prompt as ONE separate agent (Agent tool) per lens listed. The prior attempt did NOT fail review — everything up to and including ${lastFailure.transitions[lastFailure.transitions.length - 1]} was already APPROVED; this stage simply never ran (${lastFailure.infraSuspect ? 'an infra/credit outage' : 'see last-failure.md'}). Do NOT re-plan, re-fix, or re-review anything else.`,
+        '',
+        '---',
+        '',
+        `TARGET: ${wi.target || '?'}   WORK ITEM: ${id}  (${wi.severity || '?'} / ${wi.fixType || '?'})`,
+        `TITLE: ${wi.title || ''}`,
+        `ACCEPTANCE: ${wi.acceptance || ''}`,
+        `ALREADY-APPLIED, ALREADY-REVIEWED FIX TOUCHES: ${filesList}`,
+        `WORKTREE (operate ONLY inside this directory; NEVER touch the main repo tree; NEVER run any mutating git command — the human commits later): ${wtAbs || '<worktree missing>'}`,
+        missing.stage === 'integrator' ? `SOLUTION (relative to the worktree root above): ${sln}` : '',
+        `ARTIFACTS DIR (absolute): ${itemDir}`,
+        '',
+        missing.stage === 're-auditor' ? [
+          `YOUR ROLE — re-auditor (scoped re-audit). ${lensLine}`,
+          '1. Read the finding above so you know exactly what was wrong and where.',
+          '2. Re-examine the now-fixed code in the worktree. Confirm the defect is genuinely gone — cite the now-correct content (file:line), not any test.',
+          `3. Apply your lens to the diff (\`git -C ${wtAbs || '<worktree>'} diff\` — read-only) and its immediate blast radius: did the fix introduce any new CRITICAL or HIGH issue? Do NOT re-audit the whole service.`,
+          `4. WRITE ${join(itemDir, 'reaudit.md')} documenting your findings in prose.`,
+          '',
+          'End your final response with EXACTLY one line: VERDICT: converged=<true|false> findingGone=<true|false> headline="<one sentence>"',
+        ].join('\n') : [
+          'YOUR ROLE — integrator (finalize a verified item for human hand-off).',
+          `1. Confirm the worktree diff (\`git -C ${wtAbs || '<worktree>'} diff\` / \`status --porcelain\` — read-only) is exactly the intended change set — no stray edits.`,
+          `2. Run the global regression sweep, teeing to the EXACT path below (the fold re-greps it for FACTORY::BUILD/FACTORY::TEST::SUITE markers — a self-report with no transcript is rejected):`,
+          `   \`bash ${btAbs} build ${wtAbs ? join(wtAbs, sln) : '<worktree>/' + sln} 2>&1 | tee ${join(itemDir, 'integrate-raw.txt')}\``,
+          `   \`bash ${btAbs} suite ${wtAbs ? join(wtAbs, sln) : '<worktree>/' + sln} 2>&1 | tee -a ${join(itemDir, 'integrate-raw.txt')}\``,
+          '   It MUST stay green with zero new failures. If dotnet is not on PATH: `export DOTNET_ROOT="$HOME/.dotnet"; export PATH="$HOME/.dotnet:$HOME/.dotnet/tools:$PATH"` then retry. A pure DOC/CONFIG item (no .cs in the diff) skips dotnet — confirm the acceptance criterion holds in the current file content instead, and say so plainly.',
+          `3. WRITE ${join(itemDir, 'integrate.md')} — branch name, changed files, the carried-forward gate verdicts (you are not re-judging them), one paragraph handoff note.`,
+          '4. Do NOT copy into the main tree, stage, commit, or create/delete branches.',
+          '',
+          'End your final response with EXACTLY one line: VERDICT: globalGreen=<true|false> regressionDelta=<integer> handoff="<one sentence>"',
+        ].join('\n'),
+        '',
+        briefs[missing.stage] ? 'YOUR ROLE BRIEF (inlined — authoritative):\n\n' + briefs[missing.stage] : '',
+        '',
+      ].filter(Boolean).join('\n'));
+      stagePrompt = { stage: missing.stage, lenses: missing.lenses, file: sfile };
+    }
+  }
   writeFileSync(join(recDir, 'README.md'), [
     `# Direct-recovery protocol — ${id} (from ${row.state}, fold as #${cyc}r)`,
     '',
     `1. READ the prior round: ${join(itemDir, 'feedback.md')} (the AUTHORITATIVE digest) + last-failure.md + the regate-*.md prompts here${dissent.length ? '' : ' (no structured dissent found — read last-failure.md for the fail reason)'}.`,
+    stagePrompt
+      ? `1b. MISSING-STAGE SHORTCUT (KI-E81): this looks like a pure infra death with nothing to remediate — everything up to the last-reached stage was already APPROVED, only \`${stagePrompt.stage}\`${stagePrompt.lenses.length > 1 ? ` (${stagePrompt.lenses.length} lenses: ${stagePrompt.lenses.join(', ')})` : ''} never ran. Read ${stagePrompt.file} first — if it fits (no remedy actually needed), dispatch it as-is via the Agent tool and skip step 2 entirely; you still owe the EVIDENCE CONTRACT and FOLD steps below.`
+      : '',
     `2. APPLY the reviewer-converged remedy IN THE WORKTREE (${wtAbs || '<none recorded>'}) — never the main tree; NO mutating git.`,
     '3. EVIDENCE CONTRACT (KI-E20 — the fold re-derives the verdict from these files, never from prose):',
     `   - machine green (code items): \`bash ${btAbs} build <solution> 2>&1 | tee -a ${join(itemDir, 'integrate-raw.txt')}\` then \`bash ${btAbs} suite <solution> 2>&1 | tee -a ${join(itemDir, 'integrate-raw.txt')}\` — the keyed FACTORY::SUMMARY markers (KI-E19) make append order safe.`,
@@ -2084,6 +2156,7 @@ function cmdRecover(flags, rest) {
   console.log(`recover ${id} (${row.state}, cycle #${cyc}r): scaffold -> ${recDir}`);
   console.log(`  dissent digest: ${dissent.length ? dissent.map((d) => d.key + ' (' + d.findings.length + ' finding(s))').join(', ') : '(none in the checkpoint — verify/fold-stage fail; read last-failure.md)'}`);
   for (const p of prompts) console.log(`  re-gate prompt: ${p.file}`);
+  if (stagePrompt) console.log(`  MISSING-STAGE prompt (KI-E81 — likely nothing to remediate, just dispatch it): ${stagePrompt.file}`);
   console.log(`  fold skeleton:  ${foldFile}`);
   console.log(`  protocol:       ${join(recDir, 'README.md')}`);
 }
@@ -2466,10 +2539,28 @@ function cmdController(flags, rest) {
 // it exists. WARN-ONLY, same posture as the fold/resume checks: the verdict concerns the
 // WORKTREE, repairing main is operator judgment, and the parked KI-L65 prevention ruling
 // (sandbox / fail-fast / accept) is deliberately untouched. Always exits 0.
-function cmdMainCheck(rest) {
+function cmdMainCheck(rest, flags) {
   const cfg = loadConfig();
-  const ids = (rest || []).filter(Boolean);
-  if (!ids.length) { console.log('usage: driver main-check <itemId> [...] — re-hash each item\'s claim-time main-snapshot against the MAIN tree (read-only, warn-only)'); return; }
+  let ids = (rest || []).filter(Boolean);
+  // KI-E82: fold's own KI-L65 auto-repair only ever inspects the items in the CURRENT fold
+  // batch — contamination an EARLIER round's item leaked into the main tree, that no LATER
+  // fold's batch happens to include, is never re-checked by anything automatic. `--all` (or
+  // bare `main-check` with no ids at all) removes the need to already know which ids to
+  // suspect: it lists every item directory that ever recorded a claim-time
+  // `main-snapshot.json` (i.e. every item the factory has EVER claimed, regardless of which
+  // cycle) and checks all of them in one pass — still fully read-only/warn-only, same
+  // contract as the targeted form.
+  if (!ids.length || flags?.all) {
+    try {
+      const itemsRoot = abs(cfg.paths.items);
+      ids = readdirSync(itemsRoot, { withFileTypes: true })
+        .filter((d) => d.isDirectory() && existsSync(join(itemsRoot, d.name, 'main-snapshot.json')))
+        .map((d) => d.name).sort();
+    } catch { ids = []; }
+    if (!ids.length) { console.log('main-check --all: no item carries a main-snapshot.json yet (nothing has been claimed under KI-L65) — nothing to check'); return; }
+    console.log(`main-check --all: sweeping ${ids.length} item(s) with a recorded claim-time snapshot (every id the factory has ever claimed, any cycle) —`);
+  }
+  if (!ids.length) { console.log('usage: driver main-check <itemId> [...] | driver main-check --all — re-hash each item\'s claim-time main-snapshot against the MAIN tree (read-only, warn-only)'); return; }
   for (const id of ids) {
     const snapPath = abs(join(cfg.paths.items, id, 'main-snapshot.json'));
     if (!existsSync(snapPath)) { console.log(`MAIN-CHECK ${id}: no main-snapshot.json (unclaimed or pre-KI-L65 claim) — nothing to compare`); continue; }
@@ -2585,7 +2676,7 @@ function dispatch(cmd, flags, rest) {
     case 'worktree-add': case 'worktree-remove': case 'worktree-list': return cmdWorktree(cmd, rest);
     case 'controller': return cmdController(flags, rest); // KI-C11 — lease management: status | claim | release | heartbeat
     case 'telemetry-report': return cmdTelemetryReport(flags); // KI-E7 / spine AD-9 — evaluation report from events.jsonl
-    case 'main-check': return cmdMainCheck(rest); // KI-E50 — mid-band main-drift check (read-only, warn-only)
+    case 'main-check': return cmdMainCheck(rest, flags); // KI-E50 — mid-band main-drift check (read-only, warn-only); KI-E82 — --all sweep
     default:
       console.log('commands: init | status | select | claim | reset | fold | reconstruct | recover | resume | progress | burndown | cost | escalations | decisions-digest | group | suggest | cycle | sweep | sweep-fold | gc | preflight | graph-audit | realinfra-lint | report-cycle | ingest | merge-graph | controller | telemetry-report | main-check | worktree-add|remove|list');
   }

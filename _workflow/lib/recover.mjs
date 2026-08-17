@@ -84,3 +84,36 @@ export function recoveryFoldSkeleton(id, row, prior, cycle) {
   if (!prior || prior.codeChange === undefined) r.codeChange = '<FILL: true|false — REQUIRED: true demands RED proof + machine green at the fold override>';
   return r;
 }
+
+// KI-E81: the stage sequence a factory.js item transitions through, in order. Mirrors factory.js's
+// own res.transitions.push(...) call sites exactly, so a mismatch here is a mismatch there. Kept
+// as an ordered list (not a Set) because "which stage is NEXT" is positional.
+const STAGE_SEQUENCE = ['CLAIMED', 'RED', 'GREEN', 'BUILT', 'TESTED', 'GATED', 'REFUTE_OK', 'REAUDITED', 'INTEGRATED'];
+
+// KI-E81: given a FAILED result's own `transitions` array (the authoritative stage-reached
+// record — see last-failure.md's "Stage reached" line, also state/items/<id>/last-failure.json)
+// and its `gates` map (which carries a `reaudit` string like "code=ok edge-case=ok" or
+// "code=NULL" the moment the re-audit stage is REACHED, independent of whether it ultimately
+// converged), decide whether this is the narrow "died on exactly ONE late-pipeline stage, with
+// gates/refuter already APPROVED" shape a pure infra-outage death repeatedly produces.
+//
+// Deliberately narrow: only the two cleanest, most common shapes are recognized —
+//   - reached REAUDITED, nothing past it -> only `integrator` is missing.
+//   - reached REFUTE_OK, nothing past it -> only `re-auditor` is missing; lenses come directly
+//     from the ALREADY-RECORDED `gates.reaudit` string (e.g. "code=NULL" -> ['code']), never
+//     re-derived — this sidesteps needing to port factory.js's theme/band-based lens-selection
+//     logic (reauditLenses()) into driver.mjs, which the Workflow-runtime split (KI-E2) makes
+//     awkward to share safely. A multi-lens FULL-band re-audit death, or a death BEFORE
+//     REFUTE_OK (refuter itself missing, or no gate ever ran), returns stage:null — the caller
+//     falls back to a normal re-group for those.
+export function missingStageFrom(transitions, gates) {
+  const stages = Array.isArray(transitions) ? transitions : [];
+  const last = stages.length ? stages[stages.length - 1] : null;
+  if (last === 'REAUDITED') return { stage: 'integrator', lenses: [] };
+  if (last === 'REFUTE_OK') {
+    const reaudit = gates && typeof gates.reaudit === 'string' ? gates.reaudit : '';
+    const lenses = reaudit.split(/\s+/).filter(Boolean).map((pair) => pair.split('=')[0]).filter(Boolean);
+    if (lenses.length) return { stage: 're-auditor', lenses };
+  }
+  return { stage: null, lenses: [] };
+}
