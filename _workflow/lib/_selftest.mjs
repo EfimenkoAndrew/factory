@@ -28,7 +28,7 @@ import { execSmoke, smokeBatch } from './_execsmoke.mjs';
 import { classifyLine as loClassify, firstLexeme as loLexeme, findLeftovers } from './leftover-scan.mjs';
 import { classifyCommentLine as csClassify, findComments } from './comment-scan.mjs';
 import { splitAcceptanceClauses } from './acceptance.mjs';
-import { dissentersFrom, roleForGateKey, recoveryTransitions, recoveryFoldSkeleton, priorCycleOf } from './recover.mjs';
+import { dissentersFrom, roleForGateKey, recoveryTransitions, recoveryFoldSkeleton, priorCycleOf, missingStageFrom } from './recover.mjs';
 import { extractHeadings, buildDocMap, readRoleBriefs, readRepoProfiles, PROFILE_CAP } from './promptpack.mjs';
 import { loadPolicies, renderPolicies, POLICY_TEXT } from './policy.mjs'; // PR#9 review — host-policy seam
 import { githubIssueToItem, markdownChecklistToItems, extractSection, severityFromLabels, themeFromLabels, ingestReport, enforceIngestTier, countCheckedBoxes } from './ingest.mjs';
@@ -2313,6 +2313,73 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
   // KI-E68 did — concurrency 2 -> 6 directly in state/run-script.js) or a config fix landed after the
   // original group. A naive regenerate-from-snapshot would have silently UNDONE that fix.
   ok(drvText69.includes('freshConc') && drvText69.includes('runArgs.concurrency = freshConc'), 'KI-E69: --reuse refreshes concurrency from the CURRENT config default rather than blindly replaying the group-time snapshot (review fix — would have silently undone a later hand-edit or config fix, e.g. KI-E68)');
+}
+
+// KI-E81 (2026-08-16): auto-detect the narrow "died on exactly one late-pipeline stage, nothing
+// to remediate" recovery shape and generate its prompt — the manual work a controller session did
+// repeatedly by hand (pull the finding spec, write near-identical boilerplate, remember the tee
+// paths) after a spend-limit outage killed a review band mid-run for several items needing only a
+// fresh re-auditor, and several others needing only a fresh integrator.
+{
+  // -- pure missingStageFrom: the decision table --
+  eq(missingStageFrom(['CLAIMED', 'RED', 'GREEN', 'BUILT', 'TESTED', 'GATED', 'REFUTE_OK', 'REAUDITED'], {}).stage,
+    'integrator', 'KI-E81: last stage reached is REAUDITED -> only integrator is missing');
+  eq(missingStageFrom(['CLAIMED', 'RED', 'GREEN', 'BUILT', 'TESTED', 'GATED', 'REFUTE_OK'], { reaudit: 'code=NULL' }).stage,
+    're-auditor', 'KI-E81: last stage reached is REFUTE_OK -> re-auditor is missing');
+  eq(missingStageFrom(['CLAIMED', 'RED', 'GREEN', 'BUILT', 'TESTED', 'GATED', 'REFUTE_OK'], { reaudit: 'code=NULL' }).lenses,
+    ['code'], 'KI-E81: the single-lens case reads the lens name directly from the already-recorded gates.reaudit string, never re-derived');
+  eq(missingStageFrom(['CLAIMED', 'RED', 'GREEN', 'BUILT', 'TESTED', 'GATED', 'REFUTE_OK'], { reaudit: 'code=ok edge-case=NULL' }).lenses,
+    ['code', 'edge-case'], 'KI-E81: a multi-lens reaudit string parses every lens name, in order, not just the first');
+  eq(missingStageFrom(['CLAIMED', 'RED', 'GREEN', 'BUILT', 'TESTED', 'GATED', 'REFUTE_OK'], {}).stage,
+    null, 'KI-E81: reached REFUTE_OK but gates.reaudit was never even started (no string at all) -> refuses to guess, stage:null (falls back to a normal re-group)');
+  eq(missingStageFrom(['CLAIMED', 'RED', 'GREEN', 'BUILT', 'TESTED', 'GATED'], {}).stage,
+    null, 'KI-E81: died at GATED (refuter/reaudit both still missing) -> stage:null, deliberately NOT auto-recovered (too much needed, a normal re-group is the honest choice)');
+  eq(missingStageFrom(['CLAIMED', 'RED', 'GREEN', 'BUILT', 'TESTED'], {}).stage,
+    null, 'KI-E81: died before any gate ran -> stage:null (full re-group is correct, not wasteful, since the review band never even started)');
+  eq(missingStageFrom([], {}).stage, null, 'KI-E81: empty/missing transitions never throws, just returns stage:null');
+  eq(missingStageFrom(undefined, undefined).stage, null, 'KI-E81: undefined transitions/gates never throws, just returns stage:null');
+
+  // -- wiring: cmdFold writes the structured last-failure.json sidecar cmdRecover reads (NOT
+  // result.json, which a checkpoint-writer that died to the SAME infra outage never gets to write) --
+  const dsrc81 = readFileSync(join(import.meta.dirname, '..', 'driver.mjs'), 'utf8');
+  ok(dsrc81.includes("join(dir, 'last-failure.json')"), 'KI-E81: cmdFold writes state/items/<id>/last-failure.json alongside last-failure.md');
+  ok(dsrc81.includes('id: r.id, cycle: cyc, transitions: r.transitions'),
+    'KI-E81: the sidecar carries transitions + gates + infraSuspect — exactly what missingStageFrom needs');
+  ok(dsrc81.indexOf("join(dir, 'last-failure.json')") > dsrc81.indexOf("join(dir, 'last-failure.md')"),
+    'KI-E81: the JSON sidecar is written in the SAME loop right after last-failure.md, not a separate untested pass');
+
+  // -- wiring: cmdRecover actually calls missingStageFrom and gates the auto-generated prompt
+  // behind "no structured dissent" (never fires alongside a real regate-*.md prompt) --
+  ok(dsrc81.includes('missingStageFrom(lastFailure.transitions, lastFailure.gates)'), 'KI-E81: cmdRecover calls missingStageFrom with the last-failure.json fields');
+  ok(dsrc81.includes('if (!dissent.length) {') && dsrc81.indexOf('if (!dissent.length) {') < dsrc81.indexOf('missingStageFrom(lastFailure.transitions'),
+    'KI-E81: the missing-stage detection is gated behind "no dissent" — never overrides a real regate-*.md prompt with a stage-prompt guess');
+  ok(dsrc81.includes("join(recDir, `recover-stage-${missing.stage}.md`)"), 'KI-E81: the generated prompt file is named recover-stage-<role>.md, distinct from regate-<role>.md');
+  ok(dsrc81.includes('solutionFor(wi.target'), 'KI-E81: the integrator prompt reuses the EXISTING solutionFor() resolver (services.json + <Target>/<Target>.sln convention) rather than a second, divergent lookup');
+  ok(dsrc81.includes('VERDICT: converged=<true|false> findingGone=<true|false>') && dsrc81.includes('VERDICT: globalGreen=<true|false> regressionDelta=<integer>'),
+    'KI-E81: both generated prompt shapes end with the same parseable VERDICT line convention');
+  ok(dsrc81.includes('stagePrompt.file'), 'KI-E81: cmdRecover surfaces the generated stage-prompt path in both the README and the console summary, not just silently on disk');
+}
+
+// KI-E82 (2026-08-16): `main-check <id>` already existed (KI-E50) but required the caller to
+// already know which ids to suspect. fold's KI-L65 auto-repair is scoped to "items in THIS fold,"
+// never a sweep of everything the factory has ever touched, so contamination left by an EARLIER
+// round's item — that no LATER fold's batch happens to include — is never re-checked by anything
+// automatic. `--all` (or a bare `main-check` with no ids) removes the "already know which ids"
+// precondition: it lists every item directory carrying a claim-time `main-snapshot.json` (any
+// cycle, ever) and checks all of them in one read-only pass, reusing the EXACT SAME
+// `driftAgainstSnapshot`/`splitDriftByStatus` decision logic the targeted form already used — no
+// new drift-classification logic, purely a wider id list.
+{
+  const dsrc82 = readFileSync(join(import.meta.dirname, '..', 'driver.mjs'), 'utf8');
+  ok(dsrc82.includes('function cmdMainCheck(rest, flags)'), 'KI-E82: cmdMainCheck now receives flags (for --all), not just the positional id list');
+  ok(dsrc82.includes('flags?.all') || dsrc82.includes('flags.all'), 'KI-E82: an explicit --all flag triggers the sweep');
+  ok(dsrc82.includes('!ids.length || flags'), 'KI-E82: a BARE `main-check` with no ids ALSO sweeps (not just --all) — matches the live incident, where nobody thought to pass any ids at all');
+  ok(dsrc82.includes("existsSync(join(itemsRoot, d.name, 'main-snapshot.json'))"),
+    'KI-E82: the sweep set is derived from which item directories actually carry a claim-time snapshot — never a guess, never the full findings-graph (an item that was never claimed has nothing to compare against)');
+  ok(dsrc82.includes('cmdMainCheck(rest, flags)') && dsrc82.indexOf("case 'main-check': return cmdMainCheck(rest, flags)") > 0,
+    'KI-E82: the CLI dispatch actually threads flags through to cmdMainCheck (not just a function signature nobody calls with the new arg)');
+  ok(!/function driftAgainstSnapshot|function splitDriftByStatus/.test(dsrc82.slice(dsrc82.indexOf('function cmdMainCheck'), dsrc82.indexOf('function cmdMainCheck') + 2500)),
+    'KI-E82: the sweep does NOT reimplement drift classification — it reuses the existing imported driftAgainstSnapshot/splitDriftByStatus, only widening which ids get checked');
 }
 
 console.log(`\nself-test: ${pass} passed, ${fail} failed`);

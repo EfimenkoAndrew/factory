@@ -1,6 +1,6 @@
 export const meta = {
   name: 'impl-factory',
-  description: 'AI Implementation Factory control plane. Receives a batch of READY work items (audit findings / stories) + agent templates + per-item model routing via args (emitted by driver.mjs select), then drives each item through the implement-and-auto-evaluate lifecycle: (plan) -> test-author(red) -> fixer -> verify(build+test) -> early edge-scan (pre-band edge-case hunt + one bounded amend, every code item) -> acceptance-scan (pre-band clause-coverage probe + one bounded amend, KI-E18) -> cheap haiku leftover-scan (pre-band deferral/tech-debt lint, KI-D12) -> the review stage (5 role gates + applicable BMAD review-named flows: code/adversarial/testreview + editorial) as separate adversarial subagents -> refuter -> scoped re-audit -> integrate. Worktree-isolated, model-routed, low-concurrency under throttle. Each agent writes its artifact to disk; the factory returns compact per-item results (a transition path) the driver folds into the ledger (single writer, resumable). NEVER runs mutating git — fixes stay on a factory/<id> branch in a worktree for the human to commit.',
+  description: 'AI Implementation Factory control plane. Receives a batch of READY work items (audit findings / stories) + agent templates + per-item model routing via args (emitted by driver.mjs select), then drives each item through the implement-and-auto-evaluate lifecycle: (plan) -> test-author(red) -> fixer -> verify(build+test) -> RED-proof marker probe (disk-authoritative FACTORY::RED:: re-check, pre-band, KI-E83) -> early edge-scan (pre-band edge-case hunt + one bounded amend, every code item) -> acceptance-scan (pre-band clause-coverage probe + one bounded amend, KI-E18) -> cheap haiku leftover-scan (pre-band deferral/tech-debt lint, KI-D12) -> the review stage (5 role gates + applicable BMAD review-named flows: code/adversarial/testreview + editorial) as separate adversarial subagents -> refuter -> scoped re-audit -> integrate. Worktree-isolated, model-routed, low-concurrency under throttle. Each agent writes its artifact to disk; the factory returns compact per-item results (a transition path) the driver folds into the ledger (single writer, resumable). NEVER runs mutating git — fixes stay on a factory/<id> branch in a worktree for the human to commit.',
   phases: [
     { title: 'Plan' }, { title: 'Test' }, { title: 'Fix' }, { title: 'Verify' },
     { title: 'EdgeScan' }, // KI-E12: the edge-case hunter runs EARLY (pre-band) for every code item; findings feed one bounded amend
@@ -87,6 +87,8 @@ const CHECKPOINT_SCHEMA = { type: 'object', additionalProperties: false, require
 // the probe reads the DISK (same file the fold greps) so a genuinely marker-less realInfra item fails fast
 // BEFORE the expensive gate band instead of at fold (ITEM-C7B cycle 39 burned a full band this way).
 const PROBE_SCHEMA = { type: 'object', additionalProperties: false, required: ['markerFound'], properties: { markerFound: { type: 'boolean' }, line: { type: 'string' } } }
+// KI-E83 — RED-proof marker probe: same shape as PROBE_SCHEMA plus the parsed exit code.
+const RED_PROOF_SCHEMA = { type: 'object', additionalProperties: false, required: ['markerFound', 'exitCode'], properties: { markerFound: { type: 'boolean' }, exitCode: { type: 'number' }, line: { type: 'string' } } }
 // KI-D12 — LeftoverScan probe: a haiku agent runs the deterministic `build-test.sh leftovers` linter,
 // then classifies each FACTORY::LEFTOVER-HIT candidate as a genuine fixer PUNT (incomplete work deferred —
 // execution-policy.md §4) vs LEGIT (UI placeholder attr, a test asserting the behaviour, a
@@ -707,6 +709,39 @@ async function runItem(item) {
     ? test.baselineFailures
     : (Array.isArray(verify.baselineFailures) ? verify.baselineFailures : [])
   res.transitions.push('GREEN', 'BUILT', 'TESTED')
+
+  // TESTED-pre. RED-PROOF MARKER PROBE (KI-E83) — the KI-E10 realInfra-marker-probe pattern applied
+  //     to the sibling FACTORY::RED:: marker. The self-reported `test.red` check a few lines above
+  //     (`if (!test.red && !verificationOnly) return finish('FAILED', ...)`) trusts the AGENT's OWN
+  //     claim; KI-E10 already proved a returned field can diverge from what the agent's own artifact
+  //     shows on disk for the SAME shape of marker (realInfra) — nothing re-checked verify-red-raw.txt
+  //     disk-side for THIS marker before now. driver.mjs's fold-time P1 check (deterministicVerifyOverride)
+  //     already greps it — but only AFTER the entire gate band (4-5 gates + refuter + reaudit +
+  //     integrator) has already run. This probe re-derives the SAME verdict disk-side, cheap (one
+  //     haiku call, one grep), BEFORE the band — failing fast instead of burning the full band on an
+  //     item already doomed at fold. Gated on codeChange only (mirrors P1's own gate); the fold-time
+  //     grep REMAINS the authority regardless (this is a fail-fast optimization, never a replacement
+  //     for the deterministic backstop).
+  if (codeChange) {
+    const redProbe = await call('red-proof-probe', { model: 'claude-haiku-4-5', effort: 'low' }, RED_PROOF_SCHEMA,
+      'Run EXACTLY this ONE command via Bash: `grep "FACTORY::RED::" ' + itemsDir(id) + '/verify-red-raw.txt | tail -1` — if it prints a line, parse the trailing integer after the LAST `::` and return markerFound=true, exitCode=<that integer>, line=<the printed line verbatim>; if it prints nothing (grep exit 1) or the file does not exist, return markerFound=false, exitCode=0. Do NOTHING else: no edits, no other commands, no interpretation of whether the exit code is "good" or "bad" — that judgment is made by the caller, not you.', 'Verify')
+    if (redProbe && redProbe.markerFound === false) {
+      return finish('FAILED', 'RED-proof marker probe (KI-E83): verify-red-raw.txt has NO FACTORY::RED:: marker on disk — cannot machine-prove the regression test ' + (verificationOnly ? 'ran against the current tree' : 'fails on old code') + '. Failing BEFORE the gate band (cheap); the fold-time grep remains the close authority.')
+    }
+    if (redProbe && redProbe.markerFound === true) {
+      // verificationOnly's contract is INVERTED (KI-L55): the pinning/coverage test must PASS
+      // (exit 0) against the CURRENT tree, proving the acceptance already holds — a non-zero exit
+      // is the failure there. A normal item's red proof must be non-zero (it failed on old code);
+      // exit 0 is the vacuous-test failure there.
+      const exitIsZero = redProbe.exitCode === 0
+      const probeFail = verificationOnly ? !exitIsZero : exitIsZero
+      if (probeFail) {
+        return finish('FAILED', 'RED-proof marker probe (KI-E83): verify-red-raw.txt shows exit=' + redProbe.exitCode + ' — ' + (verificationOnly ? 'the pinning/coverage test did NOT pass on the current tree (verificationOnly requires exit=0)' : 'the regression test PASSED on old code (vacuous test — passes on both old and new code)') + '. Failing BEFORE the gate band (cheap); the fold-time grep remains the close authority.')
+      }
+    }
+    // redProbe null (infra failure / agent unavailable) -> proceed; the fold-time deterministic
+    // P1 check is the backstop either way, same fail-open posture as every sibling pre-band probe.
+  }
 
   // Editorial (Band C) — advisory, doc items only; applies doc fixes in the worktree, NEVER blocks.
   // KI-L34: runs BEFORE the gate band (it used to run after) so the gates review the editorial

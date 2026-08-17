@@ -1,16 +1,16 @@
-# AI Implementation Factory — repo guide (for sessions opened IN this repo)
+# AI Implementation Factory — repo guide (for Copilot sessions opened IN this repo)
 
-This repo is an in-project agentic **implement-and-auto-evaluate** engine: `_workflow/driver.mjs`
-(Node control plane — ledger, scheduling, folds) + `_workflow/factory.js` (a Claude Code Workflow
-script — the agent pipeline) + `agents/*.md` (role briefs). `README.md` explains the halves;
-`SETUP.md` is host onboarding; `PLAN.md` is the architecture.
+This repo IS the AI Implementation Factory: `_workflow/driver.mjs` (Node control plane — ledger,
+scheduling, folds) + `_workflow/factory.js` (a Claude Code Workflow script — the agent pipeline) +
+`agents/*.md` (role briefs). `README.md` explains the halves; `SETUP.md` is host onboarding;
+`PLAN.md` is the architecture.
 
 ## Working on the factory itself
 
 - **Read `KNOWN-ISSUES.md` first.** It is the append-only KI registry. Any change that adds a
   limitation, constraint, or fix MUST append/update a `KI-*` row in the SAME change.
-- **Keep the selftest green**: `node _workflow/lib/_selftest.mjs` (currently 876 asserts) after
-  every change to `_workflow/`, `verify/`, or `agents/` contracts it pins.
+- **Keep the selftest green**: `node _workflow/lib/_selftest.mjs` after every change to
+  `_workflow/`, `verify/`, or `agents/` contracts it pins.
 - **Zero npm dependencies** — Node built-ins only, everywhere (driver, orchestrator, setup, libs).
 - **`factory.js` runs in the Workflow runtime**: no filesystem, no `require()`, no
   `Date.now()`/`Math.random()`/argless `new Date()`. Pure helpers used there are INLINED
@@ -26,6 +26,15 @@ script — the agent pipeline) + `agents/*.md` (role briefs). `README.md` explai
   branches; **the human authors every commit**.
 - `state/STOP_REQUESTED.md` is an owner-controlled drain marker — never delete it from inference.
 - Product-scope red-lines are hard stops (`scope-stop` → BLOCKED), never "fixed".
+
+## Driving a factory work item yourself
+
+You have no native equivalent of Claude Code's `Workflow` tool. Use `_workflow/opencode/` instead
+— it's a controller-agnostic binding (KI-O4) despite the directory name. See its `README.md`'s
+"Usage protocol" and "Using this binding from GitHub Copilot" sections for the exact
+`init`/`next`/`submit`/`mech`/`status`/`finalize` sequence, and its "no independent subagent
+dispatch" caveat: you'll be playing every review role yourself in one conversation, a known,
+accepted fidelity gap — not something to silently work around.
 
 ## Layout
 
