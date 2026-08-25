@@ -2559,28 +2559,48 @@ function cmdMainCheck(rest, flags) {
   // `main-snapshot.json` (i.e. every item the factory has EVER claimed, regardless of which
   // cycle) and checks all of them in one pass — still fully read-only/warn-only, same
   // contract as the targeted form.
+  // Fix (multi-lens review, 2026-08-25, ported from the origin host-mount session): this
+  // full-inventory scan now ALWAYS runs (previously only under --all/bare) because claimedPaths
+  // (below) MUST reflect every item the factory has ever claimed, independent of which specific
+  // id(s) THIS invocation was asked to re-hash. The pre-fix code built claimedPaths only from the
+  // requested `ids` — correct under --all (ids WAS already the full set) but wrong on the far more
+  // common single-id call every item's own mid-band Verify stage makes (never --all): any OTHER
+  // item's legitimately snapshot-backed but not-yet-committed change sitting in main at that moment
+  // was misreported as unclaimed/leaked contamination, because its snapshot was never loaded for a
+  // call that only asked about a different id — even though unclaimedMainDrift's own
+  // dirtyMainPaths(REPO_ROOT) input has always scanned the WHOLE main tree, not just files touched
+  // by the requested id(s).
+  let allClaimedIds = [];
+  try {
+    const itemsRoot = abs(cfg.paths.items);
+    allClaimedIds = readdirSync(itemsRoot, { withFileTypes: true })
+      .filter((d) => d.isDirectory() && existsSync(join(itemsRoot, d.name, 'main-snapshot.json')))
+      .map((d) => d.name).sort();
+  } catch { allClaimedIds = []; }
   if (!ids.length || flags?.all) {
-    try {
-      const itemsRoot = abs(cfg.paths.items);
-      ids = readdirSync(itemsRoot, { withFileTypes: true })
-        .filter((d) => d.isDirectory() && existsSync(join(itemsRoot, d.name, 'main-snapshot.json')))
-        .map((d) => d.name).sort();
-    } catch { ids = []; }
+    // `--all`/bare reuses the SAME full inventory as the id list to re-hash, not a second scan.
+    ids = allClaimedIds;
     if (!ids.length) { console.log('main-check --all: no item carries a main-snapshot.json yet (nothing has been claimed under KI-L65) — nothing to check'); return; }
     console.log(`main-check --all: sweeping ${ids.length} item(s) with a recorded claim-time snapshot (every id the factory has ever claimed, any cycle) —`);
   }
   if (!ids.length) { console.log('usage: driver main-check <itemId> [...] | driver main-check --all — re-hash each item\'s claim-time main-snapshot against the MAIN tree (read-only, warn-only)'); return; }
   // KI-E89 (ported): every path any item has EVER claimed (its snapshot's files[] keys), regardless
-  // of drift status — this is the exact ceiling of what the per-id loop below is even CAPABLE of
-  // checking. Accumulated up front so the unclaimed-path sweep after the loop knows precisely
-  // what NOT to re-report (a claimed-but-undrifted path stays silent there too — same as today).
+  // of drift status — this is the exact ceiling of what the unclaimed-path sweep below is even
+  // CAPABLE of seeing. Seeded from allClaimedIds (every claimed item, full stop), NOT from the
+  // per-id loop below (which only re-hashes the ids THIS invocation targeted) — see the fix note
+  // above allClaimedIds for why that distinction matters.
   const claimedPaths = new Set();
+  for (const id of allClaimedIds) {
+    try {
+      const snapFiles = (readJson(abs(join(cfg.paths.items, id, 'main-snapshot.json'))) || {}).files || {};
+      for (const f of Object.keys(snapFiles)) claimedPaths.add(f);
+    } catch { /* a corrupt snapshot just contributes nothing to claimedPaths here — the per-id loop below still reports it via its own catch if this id is also being re-hashed */ }
+  }
   for (const id of ids) {
     const snapPath = abs(join(cfg.paths.items, id, 'main-snapshot.json'));
     if (!existsSync(snapPath)) { console.log(`MAIN-CHECK ${id}: no main-snapshot.json (unclaimed or pre-KI-L65 claim) — nothing to compare`); continue; }
     try {
       const snapFiles = (readJson(snapPath) || {}).files || {};
-      for (const f of Object.keys(snapFiles)) claimedPaths.add(f);
       const drifted = driftAgainstSnapshot(REPO_ROOT, snapFiles);
       if (!drifted.length) { console.log(`MAIN-CHECK ${id}: clean — no main-tree drift on the snapshot set`); continue; }
       const { committed, dirty } = splitDriftByStatus(REPO_ROOT, drifted);

@@ -62,7 +62,7 @@ function splitAcceptanceClauses(text, cap) {
 function hasPlanCommitmentLanguage(text) {
   if (!text || typeof text !== 'string') return false
   if (/\bMUST\b/.test(text)) return true
-  if (/\bmust[\s-]+(?:include|contain|add|update|ensure|handle|cover|also|not|provide|document|note|remove|keep|preserve)\b/i.test(text)) return true
+  if (/\bmust[\s-]+\w+/i.test(text)) return true
   if (/\bis\s+required\s+to\b|\brequired\s+to\s+\w+/i.test(text)) return true
   return false
 }
@@ -844,8 +844,18 @@ async function runItem(item) {
         // ONE bounded amend (mirrors the edge-scan amend), then ONE re-probe; the re-probe's verdict is final.
         const amend = await call('fixer', R.fixer, FIX_SCHEMA, 'ACCEPTANCE-GAP AMEND (KI-E18): a pre-band probe found acceptance clause(s) with NO evidence in your diff — the gate band would FAIL the item at full price for exactly this (the #1 recent FAIL cause). Address EVERY gap below with the minimal correct change (or state in note precisely why a clause is already satisfied or out of this item\'s scope). Then re-verify the touched surface (code: `' + BT + ' build <touched .csproj> 2>&1 | tee -a ' + RAW + '` + `' + BT + ' filter <test .csproj> "<TestClassName>" 2>&1 | tee -a ' + RAW + '`; doc/config: the spec\'s grep) and REGENERATE the review pack: `' + PACKCMD + '`. GAPS: ' + JSON.stringify(ac.gaps.slice(0, 8)) + claimsHint, 'EdgeScan')
         if (amend && amend.scopeStop) return await frameAndBlock('fixer scope-stop during acceptance amend — ' + (amend.summary || ''))
-        if (amend && amend.applied) {
-          const re = await call('acceptance-probe', { model: 'claude-haiku-4-5', effort: 'low' }, ACCEPT_SCHEMA, acceptPrompt + '\nRE-SCAN: an amend just addressed the prior gaps — judge the AMENDED diff fresh; prior gaps are hypotheses to re-verify, never conclusions to copy forward.', 'EdgeScan')
+        // Fix (multi-lens review, 2026-08-25): the prompt above explicitly OFFERS the fixer a
+        // note-only response ("or state in note precisely why a clause is already satisfied or out
+        // of this item's scope") but the re-probe used to fire ONLY on `amend.applied` — a fixer
+        // taking that offered option (applied:false, a real note) got the item failed anyway on the
+        // STALE pre-amend verdict, never re-evaluated. Fix: also re-probe on a genuine note-only
+        // response (non-empty `note`, no code change), feeding the probe that explanation explicitly
+        // and instructing it to judge the explanation critically rather than rubber-stamp it — a
+        // malformed/empty amend (neither applied nor a real note) still correctly skips the re-probe
+        // and falls through to the stale verdict.
+        if (amend && (amend.applied || (amend.note && String(amend.note).trim()))) {
+          const noteHint = amend.applied ? '' : ('\nFIXER\'S EXPLANATION (no code change was applied — the diff is UNCHANGED from the first scan; judge whether this explanation genuinely justifies every gap as already-satisfied or legitimately out of scope, do NOT rubber-stamp a bare assertion with no evidence): ' + amend.note)
+          const re = await call('acceptance-probe', { model: 'claude-haiku-4-5', effort: 'low' }, ACCEPT_SCHEMA, acceptPrompt + '\nRE-SCAN: an amend just addressed the prior gaps — judge the AMENDED diff fresh; prior gaps are hypotheses to re-verify, never conclusions to copy forward.' + noteHint, 'EdgeScan')
           if (re && typeof re.covered === 'boolean') ac = re
         }
       }
@@ -878,13 +888,32 @@ async function runItem(item) {
     const commitmentText = (plan.approach || '') + '\n' + (plan.blastRadius || '')
     if (hasPlanCommitmentLanguage(commitmentText)) {
       phase('EdgeScan')
+      // Cross-repo note (review-caught, 2026-08-25): this prompt's wording was independently
+      // authored here rather than ported byte-for-byte from the origin host-mount session's copy —
+      // unlike the deterministic logic around it (hasPlanCommitmentLanguage, PLAN_COMMITMENT_SCHEMA,
+      // the `let plan = null` hoisting, the fail-open structure), which ARE byte-identical between
+      // the two repos and selftest-pinned as such. This is an ACCEPTED, now-documented adaptation:
+      // LLM-facing prompt text has no byte-parity convention anywhere else in this file (every
+      // pre-band probe's prompt is phrased independently at its own call site), so forcing this one
+      // prompt to match a sibling repo's exact wording would be inconsistent with how every other
+      // prompt in this file is treated — the SEMANTIC contract (same schema, same gate condition,
+      // same amend/re-probe safety valve) is what selftest pins, not the prose.
       const planPrompt = 'PLAN-COMMITMENT SCAN (KI-E87 — pre-band plan-vs-diff self-consistency probe). Before implementing, this item\'s OWN plan stated the commitment language below (its approach/blast-radius fields). STEP 1: Read ' + itemsDir(id) + '/review-pack.md (the machine snapshot of this change). STEP 2: for each "MUST"/"must include/add/…"/"required to" commitment in the text below, decide whether the CHANGE (the diff / new files) contains CONCRETE evidence the commitment was honored. Judge whether the plan\'s own promise was kept — not general quality (the review band judges that). Return honored=true ONLY if EVERY commitment is evidenced; otherwise honored=false with each unhonored commitment in gaps (quote the commitment + why no evidence). Do NOT edit anything.\nPLAN TEXT:\n' + commitmentText
       let pc = await call('plan-commitment-probe', { model: 'claude-haiku-4-5', effort: 'low' }, PLAN_COMMITMENT_SCHEMA, planPrompt, 'EdgeScan')
       if (pc && pc.honored === false && Array.isArray(pc.gaps) && pc.gaps.length) {
         const amend = await call('fixer', R.fixer, FIX_SCHEMA, 'PLAN-COMMITMENT AMEND (KI-E87): a pre-band probe found commitment(s) your OWN plan made with NO evidence in your diff — the re-audit would FAIL the item at full band price for exactly this. Address EVERY gap below with the minimal correct change (or state in note precisely why a commitment is already satisfied or no longer applicable). Then re-verify the touched surface (code: `' + BT + ' build <touched .csproj> 2>&1 | tee -a ' + RAW + '` + `' + BT + ' filter <test .csproj> "<TestClassName>" 2>&1 | tee -a ' + RAW + '`; doc/config: the spec\'s grep) and REGENERATE the review pack: `' + PACKCMD + '`. GAPS: ' + JSON.stringify(pc.gaps.slice(0, 8)) + claimsHint, 'EdgeScan')
         if (amend && amend.scopeStop) return await frameAndBlock('fixer scope-stop during plan-commitment amend — ' + (amend.summary || ''))
-        if (amend && amend.applied) {
-          const re = await call('plan-commitment-probe', { model: 'claude-haiku-4-5', effort: 'low' }, PLAN_COMMITMENT_SCHEMA, planPrompt + '\nRE-SCAN: an amend just addressed the prior gaps — judge the AMENDED diff fresh; prior gaps are hypotheses to re-verify, never conclusions to copy forward.', 'EdgeScan')
+        // Fix (multi-lens review, 2026-08-25): the prompt above explicitly OFFERS the fixer a
+        // note-only response ("or state in note precisely why the commitment is already satisfied
+        // or no longer applicable") but the re-probe used to fire ONLY on `amend.applied` — a fixer
+        // taking that offered option got the item failed anyway on the STALE pre-amend verdict,
+        // never re-evaluated. Fix mirrors the acceptance-scan sibling above: also re-probe on a
+        // genuine note-only response (non-empty `note`, no code change), feeding the probe that
+        // explanation explicitly and instructing it to judge it critically rather than rubber-stamp
+        // it — a malformed/empty amend still correctly skips the re-probe.
+        if (amend && (amend.applied || (amend.note && String(amend.note).trim()))) {
+          const noteHint = amend.applied ? '' : ('\nFIXER\'S EXPLANATION (no code change was applied — the diff is UNCHANGED from the first scan; judge whether this explanation genuinely justifies every commitment as already-honored or legitimately superseded, do NOT rubber-stamp a bare assertion with no evidence): ' + amend.note)
+          const re = await call('plan-commitment-probe', { model: 'claude-haiku-4-5', effort: 'low' }, PLAN_COMMITMENT_SCHEMA, planPrompt + '\nRE-SCAN: an amend just addressed the prior gaps — judge the AMENDED diff fresh; prior gaps are hypotheses to re-verify, never conclusions to copy forward.' + noteHint, 'EdgeScan')
           if (re && typeof re.honored === 'boolean') pc = re
         }
       }

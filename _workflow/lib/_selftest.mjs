@@ -852,6 +852,13 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
   eq(unclaimedMainDrift({ paths: ['_bmad-output/ai-factory'], dirs: [] }, '_bmad-output/ai-factory', new Set()).length, 0, 'KI-E89: exact-equal mount path (no trailing slash) is excluded, not just prefix matches');
   eq(unclaimedMainDrift({ paths: [], dirs: [] }, '_bmad-output/ai-factory', new Set()).length, 0, 'KI-E89: nothing dirty -> nothing unclaimed');
   eq(unclaimedMainDrift(null, '_bmad-output/ai-factory', null).length, 0, 'KI-E89: null dirty/claimedPaths never throws, resolves to empty');
+  // Fix (multi-lens review, 2026-08-25, ported): the `dirs` branch used to ignore claimedPaths
+  // entirely (only `underMount` gated it) — a directory an item legitimately declared in its own
+  // files[] (e.g. a new untracked test-project subfolder, which git reports at the DIRECTORY level
+  // per its own shallowest-untracked-boundary convention — see the live-repo proof below) was
+  // permanently reported as unclaimed, contradicting this function's own header comment.
+  eq(unclaimedMainDrift({ paths: [], dirs: ['Svc/NewFeature/'] }, '_bmad-output/ai-factory', new Set(['Svc/NewFeature/File.cs'])).length, 0, 'KI-E89 fix: a dirty untracked DIRECTORY is excluded when a claimed FILE lives inside it — the dirs branch now consults claimedPaths, mirroring filesOverlapDirty\'s reversed-direction check');
+  eq(unclaimedMainDrift({ paths: [], dirs: ['Svc/NewFeature/'] }, '_bmad-output/ai-factory', new Set(['Svc/Unrelated/Other.cs'])).join(','), 'Svc/NewFeature/', 'KI-E89 fix: a claimed path that does NOT live under the dirty dir still leaves that dir correctly reported as unclaimed (the fix does not over-exclude)');
   // live-repo proof: a mount dir with its own dirty bookkeeping, an outside-mount CLAIMED modified
   // file, and an outside-mount UNCLAIMED new dir
   const rootF = mkF(jF(tdF(), 'unclaimedmain-'));
@@ -872,13 +879,42 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
   const unclaimedLiveF = unclaimedMainDrift(dirtyLiveF, '_bmad-output/ai-factory', new Set(['Svc/tracked.cs']));
   eq(unclaimedLiveF.join(','), 'Svc/Tests/Helpers/', 'KI-E89 live repro: the claimed tracked-file edit and the mount\'s own bookkeeping churn both stay silent; only the never-claimed leaked directory surfaces');
   rmF(rootF, { recursive: true, force: true });
-  // driver wiring pins (this repo's cmdMainCheck already had KI-E82's --all sweep before this port)
+  // Fix (multi-lens review, 2026-08-25, ported): dirtyMainPaths stripped only the OUTER quotes git
+  // wraps around a path containing a quote/backslash/non-ASCII byte, leaving the C-style \NNN octal
+  // escapes literally in the string — verified live against real git output before writing the fix.
+  const rootQ = mkF(jF(tdF(), 'quotepath-'));
+  exF('git', ['-C', rootQ, 'init', '-q']);
+  wfF(jF(rootQ, 'café.cs'), 'utf8 filename');
+  wfF(jF(rootQ, 'weird"quote.cs'), 'embedded quote');
+  wfF(jF(rootQ, 'back\\slash.cs'), 'embedded backslash');
+  const dirtyQ = dmpF(rootQ);
+  ok(dirtyQ.paths.includes('café.cs'), 'KI-E89 fix: a non-ASCII (UTF-8) filename decodes back to its real form, not the raw \\NNN octal escapes git emits');
+  ok(dirtyQ.paths.includes('weird"quote.cs'), 'KI-E89 fix: an embedded double-quote decodes correctly');
+  ok(dirtyQ.paths.includes('back\\slash.cs'), 'KI-E89 fix: an embedded backslash decodes correctly (not doubled, not dropped)');
+  rmF(rootQ, { recursive: true, force: true });
+  // driver wiring pins
   const dsrc89 = readFileSync(new URL('../driver.mjs', import.meta.url), 'utf8');
   ok(dsrc89.includes("import { snapshotMainFiles, driftAgainstSnapshot, dirtyMainPaths, filesOverlapDirty, splitDriftByStatus, repairDirtyDrift, unclaimedMainDrift } from './lib/mainguard.mjs';"), 'KI-E89: driver.mjs imports unclaimedMainDrift alongside its KI-E14/E61 siblings');
-  const cmcBody = dsrc89.slice(dsrc89.indexOf('function cmdMainCheck'), dsrc89.indexOf('function cmdMainCheck') + 6000);
-  ok(cmcBody.includes('const claimedPaths = new Set();') && cmcBody.includes('for (const f of Object.keys(snapFiles)) claimedPaths.add(f);'), 'KI-E89: claimedPaths is accumulated from every checked id\'s snapshot files, not just the drifted ones — the true ceiling of what the loop can see, incl. under KI-E82\'s --all widening');
+  const cmcBody = dsrc89.slice(dsrc89.indexOf('function cmdMainCheck'), dsrc89.indexOf('function cmdMainCheck') + 9000);
+  ok(cmcBody.includes('const claimedPaths = new Set();') && cmcBody.includes('for (const f of Object.keys(snapFiles)) claimedPaths.add(f);'), 'KI-E89: claimedPaths is accumulated from every claimed item\'s snapshot files — the true ceiling of what the unclaimed sweep can see');
   ok(cmcBody.includes('unclaimedMainDrift(dirtyMainPaths(REPO_ROOT), MOUNT_REL, claimedPaths)'), 'KI-E89: cmdMainCheck wires the real REPO_ROOT/MOUNT_REL/claimedPaths into the pure helper — reuses dirtyMainPaths (KI-E14), does not hand-roll a fresh git call');
   ok(cmcBody.includes('MAIN-DRIFT unclaimed (KI-E89)'), 'KI-E89: the new warning is labeled distinctly from KI-E50/E82\'s per-item warning so a reader/grep can tell which mechanism found it');
+  // Fix (multi-lens review, 2026-08-25, ported): claimedPaths used to be built ONLY from the
+  // requested `ids` — correct under --all (ids WAS already every claimed item) but wrong on a
+  // targeted, narrow call (the common case: every item's own mid-band Verify stage runs
+  // `main-check <id>` for exactly one id, never --all), where any OTHER already-claimed item's
+  // legitimate change sitting in the repo-wide dirtyMainPaths(REPO_ROOT) scan got misreported as
+  // unclaimed. Fix: allClaimedIds is computed UNCONDITIONALLY (moved out of the
+  // `if (!ids.length || flags?.all)` branch — it now happens BEFORE that branch, which just reuses
+  // it for `ids` instead of re-scanning), and the claimedPaths-seeding loop iterates
+  // allClaimedIds, not `ids`.
+  const allClaimedIdx = cmcBody.indexOf('let allClaimedIds = [];');
+  const idsWideningIdx = cmcBody.indexOf('if (!ids.length || flags?.all)');
+  const claimedSeedLoopIdx = cmcBody.indexOf('for (const id of allClaimedIds) {');
+  const perIdLoopIdx = cmcBody.indexOf('for (const id of ids) {');
+  ok(allClaimedIdx >= 0 && idsWideningIdx >= 0 && allClaimedIdx < idsWideningIdx, 'KI-E89 fix: allClaimedIds is computed BEFORE (unconditionally, not inside) the --all/bare widening branch');
+  ok(claimedSeedLoopIdx >= 0 && perIdLoopIdx > claimedSeedLoopIdx, 'KI-E89 fix: the claimedPaths-seeding loop iterates allClaimedIds (the FULL inventory) and runs BEFORE the separate per-id drift-recheck loop, which still correctly iterates the narrower, targeted `ids`');
+  ok(!cmcBody.slice(claimedSeedLoopIdx, perIdLoopIdx).includes('driftAgainstSnapshot'), 'KI-E89 fix: the claimedPaths-seeding pass over allClaimedIds does ONLY path collection, never a drift re-hash (that stays the per-id loop\'s job, scoped to the requested ids)');
 }
 
 // KI-E88 (2026-08-24, ported from a host-mount session, adapted to this repo's cluster-based
@@ -895,6 +931,13 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
   eq(bandFor({ theme: 'doc-drift' }).toString(), 'LIGHT', 'KI-E88: doc-drift theme classifies LIGHT');
   eq(bandFor({ fixType: 'mechanical' }).toString(), 'LIGHT', 'KI-E88: mechanical fixType classifies LIGHT');
   eq(bandFor({ theme: 'something-else', fixType: 'code' }).toString(), 'LIGHT', 'KI-E88: the unconditional default (anything not FULL-themed) is LIGHT');
+  // Fix (multi-lens review, 2026-08-25, ported): no case above combines a BAND_FULL_THEMES theme
+  // WITH fixType:'mechanical' in one call — bandFor's own P5 safety comment names exactly this
+  // interaction ("a mechanical authz/HMAC/tenant-filter edit is still a security change whose
+  // load-bearing reviewer must NOT be dropped"), but nothing pinned it: a future edit swapping the
+  // order of the two `if`s would silently downgrade a security-themed mechanical item from FULL to
+  // LIGHT with zero test failures.
+  for (const t of BAND_FULL_THEMES) eq(bandFor({ theme: t, fixType: 'mechanical' }).toString(), 'FULL', 'KI-E88 fix: BAND_FULL_THEMES theme "' + t + '" COMBINED with fixType:\'mechanical\' still derives FULL — theme dominates fixType (P5), never the reverse');
   // factory.js <-> band.mjs byte-parity: both the function body and the themes array
   const bandSrc = readFileSync(new URL('./band.mjs', import.meta.url), 'utf8');
   const fsrc88 = readFileSync(new URL('../factory.js', import.meta.url), 'utf8');
@@ -902,6 +945,11 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
   ok(bodyOf(bandSrc, 'bandFor') !== null, 'KI-E88: band.mjs carries bandFor');
   eq(bodyOf(bandSrc, 'bandFor'), bodyOf(fsrc88, 'bandFor'), 'KI-E88: band.mjs\'s bandFor is byte-identical to factory.js\'s canonical definition');
   const themesOf = (s) => { const m = s.match(/const BAND_FULL_THEMES = (\[[^\]]*\])/); return m ? m[1] : null; };
+  // Fix (multi-lens review, 2026-08-25, ported): this extraction had no null-guard, unlike the
+  // sibling bodyOf check above — if BOTH files' array-literal formatting changed identically at
+  // once, the regex would return null for both and eq(null, null) would silently pass through a
+  // genuine content divergence.
+  ok(themesOf(fsrc88) !== null, 'KI-E88 fix: factory.js\'s BAND_FULL_THEMES extraction actually matched something (a null here would let the eq() below silently pass on two unrelated failures)');
   eq(themesOf(bandSrc), themesOf(fsrc88), 'KI-E88: BAND_FULL_THEMES array is byte-identical between band.mjs and factory.js');
   // driver wiring pins — adapted target: this repo's cluster-based cmdSuggest, not a mixed-batch fallback
   const dsrc88 = readFileSync(new URL('../driver.mjs', import.meta.url), 'utf8');
@@ -926,8 +974,18 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
   ok(!hasPlanCommitmentLanguage(''), 'KI-E87: empty text -> false');
   ok(!hasPlanCommitmentLanguage(null), 'KI-E87: null text -> false, never throws');
   ok(!hasPlanCommitmentLanguage(undefined), 'KI-E87: undefined text -> false, never throws');
-  ok(!hasPlanCommitmentLanguage('Custom must-have widgets ship in the mustard package.'), 'KI-E87: "must" as a substring of an unrelated word never false-fires — word-boundary matched');
+  ok(!hasPlanCommitmentLanguage('Ship widgets in the mustard package.'), 'KI-E87: "must" as a substring of an unrelated word never false-fires — no separator at all between "must" and the following letters');
   ok(!hasPlanCommitmentLanguage('A mustache is not a commitment.'), 'KI-E87: "mustache" never false-fires — no separator at all between "must" and the following letters');
+  // Fix (multi-lens review, 2026-08-25, ported): the "must + verb" pattern used to be a CLOSED
+  // 14-word verb allowlist. Independently verified: 13 of 14 realistic plan-commitment sentences
+  // using OTHER ordinary verbs were silently missed — every one of these represents a real gap the
+  // narrow allowlist left open.
+  ok(hasPlanCommitmentLanguage('The fix must verify the tenant claim before returning data.'), 'KI-E87 fix: "must verify" (verb not on the old 14-word allowlist) is now detected');
+  ok(hasPlanCommitmentLanguage('The handler must implement retry with backoff.'), 'KI-E87 fix: "must implement" is now detected');
+  ok(hasPlanCommitmentLanguage('The consumer must reject duplicate deliveries.'), 'KI-E87 fix: "must reject" is now detected');
+  ok(hasPlanCommitmentLanguage('The endpoint must enforce the CustomerOnly policy.'), 'KI-E87 fix: "must enforce" is now detected');
+  ok(hasPlanCommitmentLanguage('The diff must set the Status field to Approved.'), 'KI-E87 fix: "must set" is now detected');
+  ok(hasPlanCommitmentLanguage('Custom must-have widgets ship in the package.'), 'KI-E87 fix: "must-have" (hyphenated noun-modifier, not a verb-list member) now matches too — the widened net catches the whole "must + word" shape, not just the two-incident allowlist');
   // factory.js inline-copy byte-parity
   const fsrcPC = readFileSync(new URL('../factory.js', import.meta.url), 'utf8');
   const asrcPC = readFileSync(new URL('./plan-commitment.mjs', import.meta.url), 'utf8');
@@ -939,8 +997,21 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
   ok(fsrcPC.includes('let plan = null') && fsrcPC.includes('if (R.planner) {'), 'KI-E87: plan is hoisted to function scope (was block-scoped) so the later probe can read it');
   ok(fsrcPC.includes('if (!verificationOnly && plan) {') && fsrcPC.includes('if (hasPlanCommitmentLanguage(commitmentText)) {'), 'KI-E87: the scan is gated on verificationOnly + plan existing AND the deterministic commitment-language pre-filter');
   ok(fsrcPC.includes("res.gates['probe:plan-commitment-scan']"), 'KI-E87: the probe writes a distinctly-named gate key');
+  ok(fsrcPC.slice(0, 2000).includes('plan-commitment scan'), 'KI-E87: factory.js\'s own meta.description names the plan-commitment scan stage, matching what the code actually runs');
   const planCommitBlock = fsrcPC.slice(fsrcPC.indexOf('4c-bis. PLAN-COMMITMENT SCAN'), fsrcPC.indexOf('4d-pre. COMMENT SCAN'));
   eq((planCommitBlock.match(/finish\('FAILED'/g) || []).length, 1, 'KI-E87: fail-open — exactly one finish(\'FAILED\', ...) call site in the whole plan-commitment block');
+  // Fix (multi-lens review, 2026-08-25, ported) — KI-E10 gap this repo specifically lacked: the
+  // PLAN-COMMITMENT AMEND prompt explicitly offers the fixer a note-only response, but the re-probe
+  // used to fire ONLY on `amend.applied` — a fixer taking that option got failed anyway on the
+  // stale pre-amend verdict, never re-evaluated.
+  ok(!planCommitBlock.includes('if (amend && amend.applied) {'), 'KI-E87 fix: the re-probe gate is no longer applied-only (the exact pre-fix condition text is gone)');
+  ok(planCommitBlock.includes('if (amend && (amend.applied || (amend.note && String(amend.note).trim()))) {'), 'KI-E87 fix: the re-probe now also fires on a genuine note-only response (no code change, non-empty note)');
+  ok(planCommitBlock.includes('judge whether this explanation genuinely justifies every commitment'), 'KI-E87 fix: the re-probe prompt explicitly instructs the probe to critically judge a note-only explanation, not rubber-stamp it');
+  // Same fix, sibling acceptance-scan block (the pre-existing KI-E18 bug this repo also had,
+  // inherited when KI-E87 mirrored its pattern) — verified fixed here too, not just KI-E87's copy.
+  const acceptBlockStandalone = fsrcPC.slice(fsrcPC.indexOf('ACCEPTANCE-GAP AMEND'), fsrcPC.indexOf('4c-bis. PLAN-COMMITMENT SCAN'));
+  ok(!acceptBlockStandalone.includes('if (amend && amend.applied) {'), 'KI-E18 fix (ported): the acceptance-scan re-probe gate is no longer applied-only');
+  ok(acceptBlockStandalone.includes('if (amend && (amend.applied || (amend.note && String(amend.note).trim()))) {'), 'KI-E18 fix (ported): the acceptance-scan re-probe now also fires on a genuine note-only response');
 }
 
 // KI-E35 (review fix): splitDriftByStatus — behavioral, throwaway real-git repo: only COMMITTED drift
@@ -2381,16 +2452,29 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
   eq(P.priorAttemptStages(pa1), ['test'], 'KI-E69: priorAttemptStages reports exactly the reused stages');
 
   // plan.md + test.json + fix.json all present and fresh -> all three reused; plan is the safe
-  // {recommendScopeStop:false, recommendEscalate:false} stand-in, never a parse of the prose file.
+  // {recommendScopeStop:false, recommendEscalate:false} stand-in for the two structured flags
+  // (never a PARSE of the prose file — no attempt to extract structured fields from markdown), PLUS
+  // (fix, multi-lens review 2026-08-25, ported) the raw plan.md text carried verbatim as `approach`
+  // so the KI-E87 PLAN-COMMITMENT SCAN has real text to check on a relaunch, instead of silently
+  // never firing (see lib/prior-attempt.mjs's fix comment).
   const d2 = join(pdir, 'd2'); mkdirSync(d2, { recursive: true });
   fsWrite(join(d2, 'plan.md'), '# Plan\nproceed.');
   fsWrite(join(d2, 'test.json'), JSON.stringify({ red: false, verificationOnly: true }));
   fsWrite(join(d2, 'fix.json'), JSON.stringify({ applied: true, scopeStop: false, summary: 'did it' }));
   const pa2 = P.loadPriorAttempt(d2, beforeWrite);
-  eq(pa2.plan, { recommendScopeStop: false, recommendEscalate: false }, 'KI-E69: plan reuses the safe stand-in (never a plan.md prose parse) once test.json is ALSO present');
+  eq(pa2.plan, { recommendScopeStop: false, recommendEscalate: false, approach: '# Plan\nproceed.' }, 'KI-E69/E87: plan reuses the safe scope/escalate stand-in PLUS the verbatim plan.md text as approach (not a structured-field parse) once test.json is ALSO present');
   eq(pa2.test.verificationOnly, true, 'KI-E69: test.json reused verbatim');
   eq(pa2.fix.applied, true, 'KI-E69: fix.json reused verbatim');
   eq(P.priorAttemptStages(pa2), ['plan', 'test', 'fix'], 'KI-E69: all three stages report reused');
+  // KI-E87 fix regression proof: a plan.md carrying real commitment language IS now visible to
+  // hasPlanCommitmentLanguage through the reused stand-in — this is the exact gap that was silently
+  // open before (the pre-fix stand-in had no text fields at all).
+  const { hasPlanCommitmentLanguage: hpclE69 } = await import('./plan-commitment.mjs');
+  const dCommit = join(pdir, 'd-commit'); mkdirSync(dCommit, { recursive: true });
+  fsWrite(join(dCommit, 'plan.md'), '# Plan\nThe fix MUST include the brownfield note.');
+  fsWrite(join(dCommit, 'test.json'), JSON.stringify({ red: true, testFiles: ['a.cs'] }));
+  const paCommit = P.loadPriorAttempt(dCommit, beforeWrite);
+  ok(hpclE69(paCommit.plan.approach), 'KI-E87 fix: a relaunched item\'s reused plan stand-in carries real plan.md commitment language the pre-fix stub would have silently hidden from hasPlanCommitmentLanguage');
 
   // Stale artifacts (mtime BEFORE the current claim) are a prior cycle's leftovers, never reused —
   // a claim timestamp set strictly AFTER these already-written files simulates exactly that (this

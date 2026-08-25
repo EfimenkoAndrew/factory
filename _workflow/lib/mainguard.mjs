@@ -99,6 +99,32 @@ export function repairDirtyDrift(repoRoot, dirty) {
 // `group` hard-excludes such items until the user commits (file-level precision — same-service
 // items on disjoint files still group). Pure helpers here; the driver owns the UX.
 
+// Fix (multi-lens review, 2026-08-25, ported from the origin host-mount session): git's porcelain
+// output C-quotes (double-quote wrapped, C-style-escaped) any path containing a quote, backslash,
+// control character, or — under the default `core.quotePath=true` — any non-ASCII byte (so a UTF-8
+// filename like "café.cs" comes out as `"caf\303\251.cs"`, one \NNN octal escape per raw byte). The
+// pre-fix `push` stripped only the OUTER quotes and left every `\NNN`/`\\`/`\"` literally in the
+// string — that string can never string-match the real on-disk path (claimedPaths.has(p),
+// filesOverlapDirty's f.startsWith(dir), etc.), so any dirty path with such a character was
+// permanently, silently unmatchable against anything claiming it. decodeGitQuotedPath reverses the
+// FULL escape grammar (verified live against real git output: a backslash, an embedded double-quote,
+// and a non-ASCII filename all round-trip correctly) back to raw bytes, then UTF-8-decodes them.
+function decodeGitQuotedPath(p) {
+  const bytes = []
+  for (let i = 0; i < p.length; i++) {
+    const c = p[i]
+    if (c !== '\\') { bytes.push(c.charCodeAt(0)); continue }
+    const n = p[i + 1]
+    if (n === 'n') { bytes.push(10); i++ }
+    else if (n === 't') { bytes.push(9); i++ }
+    else if (n === '\\') { bytes.push(92); i++ }
+    else if (n === '"') { bytes.push(34); i++ }
+    else if (n >= '0' && n <= '7') { bytes.push(parseInt(p.slice(i + 1, i + 4), 8) & 0xff); i += 3 }
+    else { bytes.push(c.charCodeAt(0)) } // unrecognized escape — keep the backslash literally, never throw
+  }
+  try { return Buffer.from(bytes).toString('utf8') } catch { return p }
+}
+
 /** Uncommitted paths in the main tree: { paths: [file...], dirs: [dir.../] } (porcelain v1; rename sources included; untracked dirs listed with a trailing slash). */
 export function dirtyMainPaths(repoRoot) {
   let out = ''
@@ -106,7 +132,7 @@ export function dirtyMainPaths(repoRoot) {
   const paths = []; const dirs = []
   const push = (p) => {
     if (!p) return
-    if (p.startsWith('"') && p.endsWith('"')) p = p.slice(1, -1)
+    if (p.startsWith('"') && p.endsWith('"')) p = decodeGitQuotedPath(p.slice(1, -1))
     ;(p.endsWith('/') ? dirs : paths).push(p)
   }
   for (const raw of out.split('\n')) {
@@ -144,11 +170,22 @@ export function filesOverlapDirty(files, dirty) {
 // throughout) surfaces it as a nudge to eyeball, never a silent miss and never an auto-repair
 // target (KI-E61's auto-repair stays scoped to the snapshot-confirmed case — an unclaimed path has
 // no snapshot to prove what "repair" would even mean).
+// Fix (multi-lens review, 2026-08-25, ported from the origin host-mount session): the `dirs` branch
+// below used to filter ONLY on `underMount`, never consulting `claimed` at all — so a directory an
+// item legitimately declared in its own files[] (e.g. a new test-project subfolder, which `git
+// status --porcelain` reports at the DIRECTORY level when the whole thing is untracked, per git's
+// own shallowest-untracked-boundary convention — see the live-repo fixture test) was unconditionally,
+// permanently reported as unclaimed drift on every future main-check run, directly contradicting
+// this function's own header comment ("the union of every path any item has EVER claimed").
+// `dirClaimed` mirrors the pre-existing `filesOverlapDirty` helper's reversed direction: a claimed
+// FILE path starting with a dirty DIR path means that dir is accounted for.
 export function unclaimedMainDrift(dirty, mountRel, claimedPaths) {
   const d = dirty || { paths: [], dirs: [] }
   const claimed = claimedPaths || new Set()
+  const claimedArr = [...claimed]
   const underMount = (p) => p === mountRel || p.startsWith(mountRel + '/')
+  const dirClaimed = (dir) => claimedArr.some((c) => c.startsWith(dir))
   const files = d.paths.filter((p) => !underMount(p) && !claimed.has(p))
-  const dirs = d.dirs.filter((p) => !underMount(p))
+  const dirs = d.dirs.filter((p) => !underMount(p) && !dirClaimed(p))
   return [...files, ...dirs]
 }

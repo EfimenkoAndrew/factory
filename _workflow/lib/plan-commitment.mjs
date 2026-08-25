@@ -30,10 +30,25 @@
 // here: a hyphenated title-case compound ("Must-cover checklist") defeats both the all-caps-only
 // bare check and a whitespace-only "must + verb" pattern — proven live in the origin session against
 // the exact specimen text before widening the separator.
+//
+// Fix (multi-lens review, 2026-08-25, ported from the origin host-mount session): the "must + verb"
+// pattern was a CLOSED 14-word verb allowlist. Independently verified against 14 realistic
+// commitment sentences a planner would actually write ("the fix must verify the tenant claim", "the
+// handler must implement retry with backoff", "the diff must set the Status field to Approved", …)
+// — 13 of 14 were silently missed, because none of their verbs happened to be on the list the two
+// known incidents produced. Since this function is the SOLE gate deciding whether the probe runs at
+// all, every miss meant zero plan-vs-diff cross-check — the exact EGS-2-2 failure class, one verb
+// away. Widened to `\bmust[\s-]+\w+` (any word, not a fixed list): the pre-filter's job is only to
+// decide "does this text contain SOME checkable commitment at all" — the haiku probe does the actual
+// judgment — so a broader net costs at most one extra cheap, bounded probe call on a false-trigger,
+// never a wrong FAILURE. "mustache"/"mustard" still correctly never match (zero separator between
+// "must" and the following letters). "must-have widgets" now matches too (previously an explicit
+// negative case) — accepted: a planner writing "must-have X" is unusual, and if it appears is far
+// more likely to be a genuine borderline commitment worth one cheap look than a false alarm.
 export function hasPlanCommitmentLanguage(text) {
   if (!text || typeof text !== 'string') return false
   if (/\bMUST\b/.test(text)) return true
-  if (/\bmust[\s-]+(?:include|contain|add|update|ensure|handle|cover|also|not|provide|document|note|remove|keep|preserve)\b/i.test(text)) return true
+  if (/\bmust[\s-]+\w+/i.test(text)) return true
   if (/\bis\s+required\s+to\b|\brequired\s+to\s+\w+/i.test(text)) return true
   return false
 }
