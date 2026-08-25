@@ -123,3 +123,32 @@ export function filesOverlapDirty(files, dirty) {
   const d = dirty || { paths: [], dirs: [] }
   return (files || []).filter((f) => d.paths.includes(f) || d.dirs.some((dir) => f.startsWith(dir)))
 }
+
+// KI-E89 (2026-08-24, ported from a host-mount session) — the inverse gap from KI-E14/KI-L65 above:
+// EVERY check on this page (the pre-claim overlap guard, the post-fold snapshot drift check,
+// main-check's per-id sweep, incl. its KI-E82 --all widening) can only ever evaluate a path that is
+// PART OF SOME ITEM'S declared files[]. A brand-new leaked path that no item ever claimed has no
+// snapshot to diff against and is structurally invisible to all of them — live-caught on the host
+// mount: a batch sweep found real leaked contamination (one tracked-file edit + two new untracked
+// paths) sitting clean through both the closing item's own auto-repair AND a fresh `main-check --all`
+// sweep; only a manual `git status --short` surfaced it.
+//
+// This is the missing net: given the raw dirty/untracked state of the main tree (`dirtyMainPaths`),
+// the factory's own mount (repo-root-relative, e.g. `_bmad-output/ai-factory` — its bookkeeping,
+// ledger/reports/queue/state, is ALWAYS legitimately dirty during active use and must never be
+// reported here), and the union of every path any item has EVER claimed (regardless of drift
+// status — the exact ceiling of what the snapshot-based checks above are even capable of seeing),
+// return whatever main-tree dirt remains: content with no claim and no mount-bookkeeping excuse.
+// This can NOT distinguish unclaimed factory-worktree contamination from a human's own unrelated
+// work-in-progress sitting in the same tree — the caller (`main-check`, read-only/warn-only
+// throughout) surfaces it as a nudge to eyeball, never a silent miss and never an auto-repair
+// target (KI-E61's auto-repair stays scoped to the snapshot-confirmed case — an unclaimed path has
+// no snapshot to prove what "repair" would even mean).
+export function unclaimedMainDrift(dirty, mountRel, claimedPaths) {
+  const d = dirty || { paths: [], dirs: [] }
+  const claimed = claimedPaths || new Set()
+  const underMount = (p) => p === mountRel || p.startsWith(mountRel + '/')
+  const files = d.paths.filter((p) => !underMount(p) && !claimed.has(p))
+  const dirs = d.dirs.filter((p) => !underMount(p))
+  return [...files, ...dirs]
+}

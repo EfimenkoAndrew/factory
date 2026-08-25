@@ -832,6 +832,117 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
   ok(dsrc.includes('force-dirty-overlap') && dsrc.includes('dirtyMainPaths(REPO_ROOT)'), 'KI-E14: cmdGroup wires the dirty-overlap guard with a --force-dirty-overlap escape');
 }
 
+// KI-E89 (2026-08-24, ported from a host-mount session) — main-check's per-item snapshot loop
+// (incl. its own KI-E82 --all widening) can only ever check a path that is part of some CHECKED
+// item's claim-time files[] — a brand-new leaked path no item ever declared has no snapshot to diff
+// against. unclaimedMainDrift (lib/mainguard.mjs) closes that gap: given raw main-tree dirt
+// (dirtyMainPaths), the factory's own mount prefix, and the union of every path any CHECKED item has
+// ever claimed, it returns whatever dirt remains unexplained.
+{
+  const { unclaimedMainDrift } = await import('./mainguard.mjs');
+  const { mkdtempSync: mkF, writeFileSync: wfF, mkdirSync: mdF, rmSync: rmF } = await import('node:fs');
+  const { tmpdir: tdF } = await import('node:os');
+  const { join: jF } = await import('node:path');
+  const { execFileSync: exF } = await import('node:child_process');
+  // pure predicate first (no git needed)
+  const dirtyF = { paths: ['Svc/src/Leak.cs', '_bmad-output/ai-factory/state/ledger.json'], dirs: ['Svc/tests/Leaked/'] };
+  eq(unclaimedMainDrift(dirtyF, '_bmad-output/ai-factory', new Set()).sort().join(','), 'Svc/src/Leak.cs,Svc/tests/Leaked/', 'KI-E89: an unclaimed outside-mount file AND an unclaimed outside-mount dir both surface; the mount bookkeeping file never does');
+  eq(unclaimedMainDrift(dirtyF, '_bmad-output/ai-factory', new Set(['Svc/src/Leak.cs'])).join(','), 'Svc/tests/Leaked/', 'KI-E89: a claimed outside-mount file is excluded (some item DOES have a snapshot to check it against) — only the still-unclaimed dir remains');
+  eq(unclaimedMainDrift({ paths: ['_bmad-output/ai-factory/reports/burndown.md'], dirs: [] }, '_bmad-output/ai-factory', new Set()).length, 0, 'KI-E89: mount-internal dirt (driver bookkeeping) is ALWAYS excluded regardless of claim status');
+  eq(unclaimedMainDrift({ paths: ['_bmad-output/ai-factory'], dirs: [] }, '_bmad-output/ai-factory', new Set()).length, 0, 'KI-E89: exact-equal mount path (no trailing slash) is excluded, not just prefix matches');
+  eq(unclaimedMainDrift({ paths: [], dirs: [] }, '_bmad-output/ai-factory', new Set()).length, 0, 'KI-E89: nothing dirty -> nothing unclaimed');
+  eq(unclaimedMainDrift(null, '_bmad-output/ai-factory', null).length, 0, 'KI-E89: null dirty/claimedPaths never throws, resolves to empty');
+  // live-repo proof: a mount dir with its own dirty bookkeeping, an outside-mount CLAIMED modified
+  // file, and an outside-mount UNCLAIMED new dir
+  const rootF = mkF(jF(tdF(), 'unclaimedmain-'));
+  exF('git', ['-C', rootF, 'init', '-q']);
+  mdF(jF(rootF, '_bmad-output', 'ai-factory', 'state'), { recursive: true });
+  wfF(jF(rootF, '_bmad-output', 'ai-factory', 'state', 'ledger.json'), '{}');
+  mdF(jF(rootF, 'Svc', 'Tests'), { recursive: true }); // the outer test-project dir already exists and is tracked
+  wfF(jF(rootF, 'Svc', 'Tests', 'Existing.cs'), 'pre-existing tracked test file');
+  wfF(jF(rootF, 'Svc', 'tracked.cs'), 'original');
+  exF('git', ['-C', rootF, 'add', '.']);
+  exF('git', ['-C', rootF, '-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-q', '-m', 'x', '--no-gpg-sign', '--no-verify']);
+  wfF(jF(rootF, '_bmad-output', 'ai-factory', 'state', 'ledger.json'), '{"cycle":72}'); // driver's own legit churn
+  wfF(jF(rootF, 'Svc', 'tracked.cs'), 'CLAIMED CHANGE'); // an item's own approved delivery
+  mdF(jF(rootF, 'Svc', 'Tests', 'Helpers'), { recursive: true }); // the only genuinely NEW, untracked leaf
+  wfF(jF(rootF, 'Svc', 'Tests', 'Helpers', 'Skip.cs'), 'leaked'); // nobody claimed this
+  const { dirtyMainPaths: dmpF } = await import('./mainguard.mjs');
+  const dirtyLiveF = dmpF(rootF);
+  const unclaimedLiveF = unclaimedMainDrift(dirtyLiveF, '_bmad-output/ai-factory', new Set(['Svc/tracked.cs']));
+  eq(unclaimedLiveF.join(','), 'Svc/Tests/Helpers/', 'KI-E89 live repro: the claimed tracked-file edit and the mount\'s own bookkeeping churn both stay silent; only the never-claimed leaked directory surfaces');
+  rmF(rootF, { recursive: true, force: true });
+  // driver wiring pins (this repo's cmdMainCheck already had KI-E82's --all sweep before this port)
+  const dsrc89 = readFileSync(new URL('../driver.mjs', import.meta.url), 'utf8');
+  ok(dsrc89.includes("import { snapshotMainFiles, driftAgainstSnapshot, dirtyMainPaths, filesOverlapDirty, splitDriftByStatus, repairDirtyDrift, unclaimedMainDrift } from './lib/mainguard.mjs';"), 'KI-E89: driver.mjs imports unclaimedMainDrift alongside its KI-E14/E61 siblings');
+  const cmcBody = dsrc89.slice(dsrc89.indexOf('function cmdMainCheck'), dsrc89.indexOf('function cmdMainCheck') + 6000);
+  ok(cmcBody.includes('const claimedPaths = new Set();') && cmcBody.includes('for (const f of Object.keys(snapFiles)) claimedPaths.add(f);'), 'KI-E89: claimedPaths is accumulated from every checked id\'s snapshot files, not just the drifted ones — the true ceiling of what the loop can see, incl. under KI-E82\'s --all widening');
+  ok(cmcBody.includes('unclaimedMainDrift(dirtyMainPaths(REPO_ROOT), MOUNT_REL, claimedPaths)'), 'KI-E89: cmdMainCheck wires the real REPO_ROOT/MOUNT_REL/claimedPaths into the pure helper — reuses dirtyMainPaths (KI-E14), does not hand-roll a fresh git call');
+  ok(cmcBody.includes('MAIN-DRIFT unclaimed (KI-E89)'), 'KI-E89: the new warning is labeled distinctly from KI-E50/E82\'s per-item warning so a reader/grep can tell which mechanism found it');
+}
+
+// KI-E88 (2026-08-24, ported from a host-mount session, adapted to this repo's cluster-based
+// suggest — the origin session's mixed-batch-fallback target does not exist here) — band-mix
+// surfacing: a FULL-band item runs the full 5-gate opus panel + planner; LIGHT skips 3 of those 5
+// gates and the planner entirely — roughly 4x the gate-panel size. Item COUNT alone gives zero
+// signal for what a batch actually costs.
+{
+  const { bandFor, BAND_FULL_THEMES } = await import('./band.mjs');
+  eq(bandFor({ band: 'LIGHT', theme: 'money-correctness' }).toString(), 'LIGHT', 'KI-E88: an explicit item.band=LIGHT wins even over a FULL-themed item');
+  eq(bandFor({ band: 'FULL', theme: 'doc-drift' }).toString(), 'FULL', 'KI-E88: an explicit item.band=FULL wins even over a LIGHT-themed item');
+  eq(bandFor({ band: 'garbage', theme: 'doc-drift' }).toString(), 'LIGHT', 'KI-E88: a non-LIGHT/FULL item.band value falls through to theme-based classification');
+  for (const t of BAND_FULL_THEMES) eq(bandFor({ theme: t }).toString(), 'FULL', 'KI-E88: BAND_FULL_THEMES member "' + t + '" always classifies FULL');
+  eq(bandFor({ theme: 'doc-drift' }).toString(), 'LIGHT', 'KI-E88: doc-drift theme classifies LIGHT');
+  eq(bandFor({ fixType: 'mechanical' }).toString(), 'LIGHT', 'KI-E88: mechanical fixType classifies LIGHT');
+  eq(bandFor({ theme: 'something-else', fixType: 'code' }).toString(), 'LIGHT', 'KI-E88: the unconditional default (anything not FULL-themed) is LIGHT');
+  // factory.js <-> band.mjs byte-parity: both the function body and the themes array
+  const bandSrc = readFileSync(new URL('./band.mjs', import.meta.url), 'utf8');
+  const fsrc88 = readFileSync(new URL('../factory.js', import.meta.url), 'utf8');
+  const bodyOf = (s, name) => { const m = s.match(new RegExp('function ' + name + '[\\s\\S]*?\\n\\}')); return m ? m[0] : null; };
+  ok(bodyOf(bandSrc, 'bandFor') !== null, 'KI-E88: band.mjs carries bandFor');
+  eq(bodyOf(bandSrc, 'bandFor'), bodyOf(fsrc88, 'bandFor'), 'KI-E88: band.mjs\'s bandFor is byte-identical to factory.js\'s canonical definition');
+  const themesOf = (s) => { const m = s.match(/const BAND_FULL_THEMES = (\[[^\]]*\])/); return m ? m[1] : null; };
+  eq(themesOf(bandSrc), themesOf(fsrc88), 'KI-E88: BAND_FULL_THEMES array is byte-identical between band.mjs and factory.js');
+  // driver wiring pins — adapted target: this repo's cluster-based cmdSuggest, not a mixed-batch fallback
+  const dsrc88 = readFileSync(new URL('../driver.mjs', import.meta.url), 'utf8');
+  ok(dsrc88.includes("import { bandFor } from './lib/band.mjs';"), 'KI-E88: driver.mjs imports bandFor');
+  const suggestBody = dsrc88.slice(dsrc88.indexOf('function cmdSuggest'), dsrc88.indexOf('function cmdSuggest') + 4000);
+  ok(suggestBody.includes('band mix (KI-E88'), 'KI-E88: cmdSuggest prints the whole-pool band-mix line');
+  ok(suggestBody.includes('band mix of the') && suggestBody.includes('batchLight'), 'KI-E88: cmdSuggest prints a per-cluster band-mix tally on each cluster header');
+}
+
+// KI-E87 (2026-08-24, ported from a host-mount session) — PlanCommitmentScan: the deterministic
+// hasPlanCommitmentLanguage pre-filter (skip the haiku probe entirely when the plan makes no
+// checkable MUST-style promise), plus the factory.js inline-copy parity pin and pipeline-wiring pins.
+{
+  const { hasPlanCommitmentLanguage } = await import('./plan-commitment.mjs');
+  ok(hasPlanCommitmentLanguage('The fix MUST include the brownfield note in the runbook.'), 'KI-E87: all-caps MUST is detected');
+  ok(hasPlanCommitmentLanguage('The diff must include a migration for the new column.'), 'KI-E87: lowercase "must include" is detected');
+  ok(hasPlanCommitmentLanguage('This change must also update the data-flow doc.'), 'KI-E87: "must also" is detected');
+  ok(hasPlanCommitmentLanguage('The handler is required to validate the tenant claim first.'), 'KI-E87: "is required to" is detected');
+  ok(hasPlanCommitmentLanguage('Must-cover checklist (all four): (1) both immutable fields named.'), 'KI-E87: hyphenated title-case "Must-cover" is detected ([\\s-]+ separator, not whitespace-only)');
+  ok(!hasPlanCommitmentLanguage('This approach should be straightforward and low-risk.'), 'KI-E87: soft "should" language is NOT a commitment');
+  ok(!hasPlanCommitmentLanguage('The fix touches Program.cs and adds a null check.'), 'KI-E87: plain descriptive prose with no commitment language is NOT flagged');
+  ok(!hasPlanCommitmentLanguage(''), 'KI-E87: empty text -> false');
+  ok(!hasPlanCommitmentLanguage(null), 'KI-E87: null text -> false, never throws');
+  ok(!hasPlanCommitmentLanguage(undefined), 'KI-E87: undefined text -> false, never throws');
+  ok(!hasPlanCommitmentLanguage('Custom must-have widgets ship in the mustard package.'), 'KI-E87: "must" as a substring of an unrelated word never false-fires — word-boundary matched');
+  ok(!hasPlanCommitmentLanguage('A mustache is not a commitment.'), 'KI-E87: "mustache" never false-fires — no separator at all between "must" and the following letters');
+  // factory.js inline-copy byte-parity
+  const fsrcPC = readFileSync(new URL('../factory.js', import.meta.url), 'utf8');
+  const asrcPC = readFileSync(new URL('./plan-commitment.mjs', import.meta.url), 'utf8');
+  const bodyOfPC = (s) => { const m = s.match(/function hasPlanCommitmentLanguage[\s\S]*?\n\}/); return m ? m[0] : null; };
+  ok(bodyOfPC(fsrcPC) !== null, 'KI-E87: factory.js carries an inlined hasPlanCommitmentLanguage');
+  eq(bodyOfPC(fsrcPC), bodyOfPC(asrcPC.replace('export function hasPlanCommitmentLanguage', 'function hasPlanCommitmentLanguage')), 'KI-E87: factory.js inline copy is byte-identical to lib/plan-commitment.mjs');
+  // full pipeline wiring pins
+  ok(fsrcPC.includes("const PLAN_COMMITMENT_SCHEMA = { type: 'object'") && fsrcPC.includes("required: ['honored']"), 'KI-E87: PLAN_COMMITMENT_SCHEMA is defined in factory.js');
+  ok(fsrcPC.includes('let plan = null') && fsrcPC.includes('if (R.planner) {'), 'KI-E87: plan is hoisted to function scope (was block-scoped) so the later probe can read it');
+  ok(fsrcPC.includes('if (!verificationOnly && plan) {') && fsrcPC.includes('if (hasPlanCommitmentLanguage(commitmentText)) {'), 'KI-E87: the scan is gated on verificationOnly + plan existing AND the deterministic commitment-language pre-filter');
+  ok(fsrcPC.includes("res.gates['probe:plan-commitment-scan']"), 'KI-E87: the probe writes a distinctly-named gate key');
+  const planCommitBlock = fsrcPC.slice(fsrcPC.indexOf('4c-bis. PLAN-COMMITMENT SCAN'), fsrcPC.indexOf('4d-pre. COMMENT SCAN'));
+  eq((planCommitBlock.match(/finish\('FAILED'/g) || []).length, 1, 'KI-E87: fail-open — exactly one finish(\'FAILED\', ...) call site in the whole plan-commitment block');
+}
+
 // KI-E35 (review fix): splitDriftByStatus — behavioral, throwaway real-git repo: only COMMITTED drift
 // reads as human delivery; an uncommitted edit AND an untracked stray (the live ITEM-H5 shape,
 // invisible to `git diff HEAD`) both stay in the contamination bucket.

@@ -57,6 +57,11 @@ export const PROBE_SCHEMA = { type: 'object', additionalProperties: false, requi
 // dispatch of this probe is NOT yet ported, same disclosed-gap posture as KI-E75/KI-E69.
 export const RED_PROOF_SCHEMA = { type: 'object', additionalProperties: false, required: ['markerFound', 'exitCode'], properties: { markerFound: { type: 'boolean' }, exitCode: { type: 'number' }, line: { type: 'string' } } };
 
+// KI-E87 (ported from a host-mount session) — schema-parity only, same disclosed-gap posture as
+// KI-E83/KI-E75/KI-E69 above: the opencode runtime's own routing/dispatch of the
+// plan-commitment-probe stage is NOT yet ported.
+export const PLAN_COMMITMENT_SCHEMA = { type: 'object', additionalProperties: false, required: ['honored'], properties: { honored: { type: 'boolean' }, gaps: { type: 'array', items: { type: 'object', additionalProperties: false, required: ['commitment', 'why'], properties: { commitment: { type: 'string' }, why: { type: 'string' } } } } } };
+
 export const SWEEP_DESIGN_SCHEMA = { type: 'object', additionalProperties: false, required: ['pattern', 'headline'], properties: { pattern: { type: 'string' }, applicationNotes: { type: 'string' }, conformanceCheck: { type: 'string' }, headline: { type: 'string' } } };
 
 export const CHECKPOINT_SCHEMA = { type: 'object', additionalProperties: false, required: ['written'], properties: { written: { type: 'boolean' }, note: { type: 'string' } } };

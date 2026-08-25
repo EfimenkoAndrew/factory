@@ -1,6 +1,6 @@
 export const meta = {
   name: 'impl-factory',
-  description: 'AI Implementation Factory control plane. Receives a batch of READY work items (audit findings / stories) + agent templates + per-item model routing via args (emitted by driver.mjs select), then drives each item through the implement-and-auto-evaluate lifecycle: (plan) -> test-author(red) -> fixer -> verify(build+test) -> RED-proof marker probe (disk-authoritative FACTORY::RED:: re-check, pre-band, KI-E83) -> early edge-scan (pre-band edge-case hunt + one bounded amend, every code item) -> acceptance-scan (pre-band clause-coverage probe + one bounded amend, KI-E18) -> cheap haiku leftover-scan (pre-band deferral/tech-debt lint, KI-D12) -> the review stage (5 role gates + applicable BMAD review-named flows: code/adversarial/testreview + editorial) as separate adversarial subagents -> refuter -> scoped re-audit -> integrate. Worktree-isolated, model-routed, low-concurrency under throttle. Each agent writes its artifact to disk; the factory returns compact per-item results (a transition path) the driver folds into the ledger (single writer, resumable). NEVER runs mutating git — fixes stay on a factory/<id> branch in a worktree for the human to commit.',
+  description: 'AI Implementation Factory control plane. Receives a batch of READY work items (audit findings / stories) + agent templates + per-item model routing via args (emitted by driver.mjs select), then drives each item through the implement-and-auto-evaluate lifecycle: (plan) -> test-author(red) -> fixer -> verify(build+test) -> RED-proof marker probe (disk-authoritative FACTORY::RED:: re-check, pre-band, KI-E83) -> early edge-scan (pre-band edge-case hunt + one bounded amend, every code item) -> acceptance-scan (pre-band clause-coverage probe + one bounded amend, KI-E18) -> plan-commitment scan (pre-band plan-vs-diff self-consistency probe + one bounded amend, KI-E87) -> cheap haiku leftover-scan (pre-band deferral/tech-debt lint, KI-D12) -> the review stage (5 role gates + applicable BMAD review-named flows: code/adversarial/testreview + editorial) as separate adversarial subagents -> refuter -> scoped re-audit -> integrate. Worktree-isolated, model-routed, low-concurrency under throttle. Each agent writes its artifact to disk; the factory returns compact per-item results (a transition path) the driver folds into the ledger (single writer, resumable). NEVER runs mutating git — fixes stay on a factory/<id> branch in a worktree for the human to commit.',
   phases: [
     { title: 'Plan' }, { title: 'Test' }, { title: 'Fix' }, { title: 'Verify' },
     { title: 'EdgeScan' }, // KI-E12: the edge-case hunter runs EARLY (pre-band) for every code item; findings feed one bounded amend
@@ -57,6 +57,16 @@ function splitAcceptanceClauses(text, cap) {
   return clauses.slice(0, cap - 1).concat(clauses.slice(cap - 1).join('; '))
 }
 
+// ---- inlined pure helper (byte-equivalent to _workflow/lib/plan-commitment.mjs — the runtime cannot
+//      import; change both copies together, the selftest pins their parity) ----
+function hasPlanCommitmentLanguage(text) {
+  if (!text || typeof text !== 'string') return false
+  if (/\bMUST\b/.test(text)) return true
+  if (/\bmust[\s-]+(?:include|contain|add|update|ensure|handle|cover|also|not|provide|document|note|remove|keep|preserve)\b/i.test(text)) return true
+  if (/\bis\s+required\s+to\b|\brequired\s+to\s+\w+/i.test(text)) return true
+  return false
+}
+
 // ---- schemas (compact structured returns; the full artifact is written to disk) ----
 const FINDING = { type: 'object', additionalProperties: false, required: ['severity', 'title'], properties: { severity: { type: 'string' }, title: { type: 'string' }, file: { type: 'string' }, fix: { type: 'string' } } }
 const PLAN_SCHEMA = { type: 'object', additionalProperties: false, required: ['rootCause', 'approach', 'recommendScopeStop', 'recommendEscalate'], properties: { rootCause: { type: 'string' }, approach: { type: 'string' }, files: { type: 'array', items: { type: 'string' } }, testStrategy: { type: 'string' }, blastRadius: { type: 'string' }, ruleRisks: { type: 'string' }, recommendEscalate: { type: 'boolean' }, recommendScopeStop: { type: 'boolean' } } }
@@ -104,6 +114,7 @@ const COMMENT_SCHEMA = { type: 'object', additionalProperties: false, required: 
 // full price). A haiku probe answers per deterministic clause "does the diff carry evidence?";
 // gaps feed ONE bounded fixer amend; a malformed/unavailable probe never sinks the item.
 const ACCEPT_SCHEMA = { type: 'object', additionalProperties: false, required: ['covered'], properties: { covered: { type: 'boolean' }, gaps: { type: 'array', items: { type: 'object', additionalProperties: false, required: ['clause', 'why'], properties: { clause: { type: 'string' }, why: { type: 'string' } } } } } }
+const PLAN_COMMITMENT_SCHEMA = { type: 'object', additionalProperties: false, required: ['honored'], properties: { honored: { type: 'boolean' }, gaps: { type: 'array', items: { type: 'object', additionalProperties: false, required: ['commitment', 'why'], properties: { commitment: { type: 'string' }, why: { type: 'string' } } } } } }
 // Sweep-designer: the canonical fix pattern for a whole root-cause cluster (designed once, applied N times).
 const SWEEP_DESIGN_SCHEMA = { type: 'object', additionalProperties: false, required: ['pattern', 'headline'], properties: { pattern: { type: 'string' }, applicationNotes: { type: 'string' }, conformanceCheck: { type: 'string' }, headline: { type: 'string' } } }
 
@@ -525,10 +536,15 @@ async function runItem(item) {
 
   // 1. plan (non-trivial / escalate only)
   phase('Plan')
+  // KI-E87 (ported): hoisted to function scope (was block-scoped to this `if`) so the PLAN-COMMITMENT
+  // SCAN pre-band probe (below, after acceptance-scan) can read the planner's own stated approach/
+  // blastRadius against the FINAL diff. `null` for a mechanical item (R.planner falsy — the planner
+  // is skipped entirely), which naturally gates the new probe off for that whole class at zero cost.
+  let plan = null
   if (R.planner) {
     // KI-E69: reuse a prior (killed) attempt's plan when its two control-flow fields are provably
     // safe to stand in for (lib/prior-attempt.mjs) — skips the planner call entirely on a relaunch.
-    const plan = (item.priorAttempt && item.priorAttempt.plan) || await call('planner', R.planner, PLAN_SCHEMA, null, 'Plan')
+    plan = (item.priorAttempt && item.priorAttempt.plan) || await call('planner', R.planner, PLAN_SCHEMA, null, 'Plan')
     res.artifacts.plan = 'state/items/' + id + '/plan.md'
     if (plan && plan.recommendScopeStop) return await frameAndBlock('planner scope-stop — ' + (plan.ruleRisks || plan.approach || ''))
     if (plan && plan.recommendEscalate) item._escalate = true
@@ -844,6 +860,45 @@ async function runItem(item) {
         if (!ac.covered) {
           const gapNote = (ac.gaps || []).slice(0, 6).map(function (g) { return String(g.clause || '').slice(0, 90) }).join(' | ')
           return finish('FAILED', 'acceptance-scan (KI-E18): acceptance clause(s) with NO evidence in the diff after one bounded amend — ' + (gapNote || 'see gateDetails') + '. Pre-band fail (cheap — no gate band was spent); the fix must address EVERY acceptance clause.')
+        }
+      }
+    }
+  }
+
+  // 4c-bis. PLAN-COMMITMENT SCAN (KI-E87, ported from a host-mount session) — a cheap haiku pass that
+  //     cross-checks the diff against the PLANNER's OWN stated commitments (approach/blastRadius),
+  //     a different axis from the acceptance-scan above (which checks the diff against the ITEM's
+  //     external acceptance criteria). Gated by the deterministic hasPlanCommitmentLanguage prefilter
+  //     (lib/plan-commitment.mjs) so the common case (a plan with no checkable "MUST"-style promise)
+  //     never spends a call. `plan` is null for a mechanical item (planner skipped) — naturally gates
+  //     this off too. Positioned AFTER the acceptance-scan (probes the FINAL diff, post any
+  //     acceptance-scan amend) and BEFORE the comment-scan, mirroring the bounded-amend-then-reprobe
+  //     shape of acceptance-scan exactly. Fail-open: a null/malformed probe never sinks the item.
+  if (!verificationOnly && plan) {
+    const commitmentText = (plan.approach || '') + '\n' + (plan.blastRadius || '')
+    if (hasPlanCommitmentLanguage(commitmentText)) {
+      phase('EdgeScan')
+      const planPrompt = 'PLAN-COMMITMENT SCAN (KI-E87 — pre-band plan-vs-diff self-consistency probe). Before implementing, this item\'s OWN plan stated the commitment language below (its approach/blast-radius fields). STEP 1: Read ' + itemsDir(id) + '/review-pack.md (the machine snapshot of this change). STEP 2: for each "MUST"/"must include/add/…"/"required to" commitment in the text below, decide whether the CHANGE (the diff / new files) contains CONCRETE evidence the commitment was honored. Judge whether the plan\'s own promise was kept — not general quality (the review band judges that). Return honored=true ONLY if EVERY commitment is evidenced; otherwise honored=false with each unhonored commitment in gaps (quote the commitment + why no evidence). Do NOT edit anything.\nPLAN TEXT:\n' + commitmentText
+      let pc = await call('plan-commitment-probe', { model: 'claude-haiku-4-5', effort: 'low' }, PLAN_COMMITMENT_SCHEMA, planPrompt, 'EdgeScan')
+      if (pc && pc.honored === false && Array.isArray(pc.gaps) && pc.gaps.length) {
+        const amend = await call('fixer', R.fixer, FIX_SCHEMA, 'PLAN-COMMITMENT AMEND (KI-E87): a pre-band probe found commitment(s) your OWN plan made with NO evidence in your diff — the re-audit would FAIL the item at full band price for exactly this. Address EVERY gap below with the minimal correct change (or state in note precisely why a commitment is already satisfied or no longer applicable). Then re-verify the touched surface (code: `' + BT + ' build <touched .csproj> 2>&1 | tee -a ' + RAW + '` + `' + BT + ' filter <test .csproj> "<TestClassName>" 2>&1 | tee -a ' + RAW + '`; doc/config: the spec\'s grep) and REGENERATE the review pack: `' + PACKCMD + '`. GAPS: ' + JSON.stringify(pc.gaps.slice(0, 8)) + claimsHint, 'EdgeScan')
+        if (amend && amend.scopeStop) return await frameAndBlock('fixer scope-stop during plan-commitment amend — ' + (amend.summary || ''))
+        if (amend && amend.applied) {
+          const re = await call('plan-commitment-probe', { model: 'claude-haiku-4-5', effort: 'low' }, PLAN_COMMITMENT_SCHEMA, planPrompt + '\nRE-SCAN: an amend just addressed the prior gaps — judge the AMENDED diff fresh; prior gaps are hypotheses to re-verify, never conclusions to copy forward.', 'EdgeScan')
+          if (re && typeof re.honored === 'boolean') pc = re
+        }
+      }
+      if (pc && typeof pc.honored === 'boolean') {
+        res.gates['probe:plan-commitment-scan'] = pc.honored ? 'APPROVED' : 'CHANGES_REQUIRED'
+        res.gateDetails = res.gateDetails || {}
+        res.gateDetails['probe:plan-commitment-scan'] = {
+          verdict: pc.honored ? 'APPROVED' : 'CHANGES_REQUIRED',
+          headline: pc.honored ? 'every plan commitment evidenced in the diff' : ((pc.gaps || []).length + ' plan commitment(s) with NO evidence in the diff'),
+          findings: (pc.gaps || []).slice(0, 12).map(function (g) { return { severity: 'HIGH', title: 'unhonored plan commitment: ' + String(g.commitment || '').slice(0, 140), fix: String(g.why || '') } }),
+        }
+        if (!pc.honored) {
+          const gapNote = (pc.gaps || []).slice(0, 6).map(function (g) { return String(g.commitment || '').slice(0, 90) }).join(' | ')
+          return finish('FAILED', 'plan-commitment-scan (KI-E87): the plan\'s own commitment(s) have NO evidence in the diff after one bounded amend — ' + (gapNote || 'see gateDetails') + '. Pre-band fail (cheap — no gate band was spent); the fix must honor every commitment the plan itself made.')
         }
       }
     }

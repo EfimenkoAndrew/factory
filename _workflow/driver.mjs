@@ -28,6 +28,7 @@ import {
   reconcileToStateAndTransitions, deriveUnfoldedCycle,
 } from './lib/ledger.mjs';
 import { loadGraph, computeReady, waitingOnDeps, byId } from './lib/graph.mjs';
+import { bandFor } from './lib/band.mjs';
 import { loadRouting, resolve as routeResolve, concurrencyFor } from './lib/router.mjs';
 import { addWorktree, removeWorktree, listWorktrees, changedFiles, pruneWorktrees, isFactoryWorktreePath, parseComposeLs, strayComposeProjects } from './lib/worktree.mjs';
 import { acquireLock, releaseLock } from './lib/lock.mjs';
@@ -41,7 +42,7 @@ import { clusterBySimilarity, sharedLabel, perCliqueBatchPatterns, bestClosedPre
 import { loadController, isStale as controllerStale, claimController, verifyController, releaseController, DEFAULT_TTL_MINUTES } from './lib/controller.mjs';
 import { buildFactoryRouting } from './lib/routing-drift.mjs';
 import { githubIssueToItem, markdownChecklistToItems, ingestReport, enforceIngestTier, countCheckedBoxes } from './lib/ingest.mjs'; // KI-E27 — multi-source issue ingestion
-import { snapshotMainFiles, driftAgainstSnapshot, dirtyMainPaths, filesOverlapDirty, splitDriftByStatus, repairDirtyDrift } from './lib/mainguard.mjs';
+import { snapshotMainFiles, driftAgainstSnapshot, dirtyMainPaths, filesOverlapDirty, splitDriftByStatus, repairDirtyDrift, unclaimedMainDrift } from './lib/mainguard.mjs';
 import { buildDocMap, readRoleBriefs, readRepoProfiles } from './lib/promptpack.mjs';
 import { loadPolicies, renderPolicies, POLICY_TEXT } from './lib/policy.mjs'; // PR#9 review — host-policy gating (no-comments / no-schema-changes are per-host, never universal)
 // KI-E7 — telemetry is OBSERVATIONAL ONLY (ai-factory-observability spine AD-1..3/AD-11): emit()
@@ -1307,6 +1308,13 @@ function cmdSuggest(flags) {
   const lines = [];
   const say = (s) => { lines.push(s); console.log(s); };
   say(`suggest: ${ready.length} schedulable item(s) -> ${clusters.length} similarity cluster(s) of size >= ${min}`);
+  // KI-E88 (2026-08-24, ported from a host-mount session, adapted to this repo's cluster-based
+  // suggest — the origin session's mixed-batch-fallback target this feature was built for does not
+  // exist here): band-mix surfacing — a FULL-band item runs ~4x the gate panel of LIGHT, so item
+  // COUNT alone gives zero signal for what a batch actually costs. Whole-pool line here; a per-
+  // cluster tally is appended to each cluster's own header below.
+  const wholeLight = ready.filter((wi) => bandFor(wi) === 'LIGHT').length;
+  say(`  band mix (KI-E88, cost signal — FULL runs ~4x the gate panel of LIGHT): ${wholeLight} LIGHT / ${ready.length - wholeLight} FULL across the whole pool`);
   let n = 0;
   for (const c of clusters) {
     n++;
@@ -1329,7 +1337,8 @@ function cmdSuggest(flags) {
     };
     let { batch, rest: collided } = pick(true);
     if (batch.length < min) ({ batch, rest: collided } = pick(false));
-    say(`\n#${n} [${c[0].theme || '?'}] ${sharedLabel(c)} — ${c.length} item(s) across ${[...new Set(c.map((w) => w.target))].length} target(s)`);
+    const batchLight = batch.filter((wi) => bandFor(wi) === 'LIGHT').length; // KI-E88 (ported)
+    say(`\n#${n} [${c[0].theme || '?'}] ${sharedLabel(c)} — ${c.length} item(s) across ${[...new Set(c.map((w) => w.target))].length} target(s)${batch.length ? ` (band mix of the ${batch.length}-item pick: ${batchLight} LIGHT / ${batch.length - batchLight} FULL)` : ''}`);
     for (const wi of batch) say(`  ${wi.id} (${wi.severity}/${wi.fixType}) @ ${wi.target}`);
     if (collided.length) say(`  next-wave (file-collision, >max, or outside the clique — stay READY): ${collided.join(', ')}`);
     // KI-E21 (improvement-analysis P3): a LARGE homogeneous cluster is a SWEEP, not pair lanes —
@@ -2561,16 +2570,33 @@ function cmdMainCheck(rest, flags) {
     console.log(`main-check --all: sweeping ${ids.length} item(s) with a recorded claim-time snapshot (every id the factory has ever claimed, any cycle) —`);
   }
   if (!ids.length) { console.log('usage: driver main-check <itemId> [...] | driver main-check --all — re-hash each item\'s claim-time main-snapshot against the MAIN tree (read-only, warn-only)'); return; }
+  // KI-E89 (ported): every path any item has EVER claimed (its snapshot's files[] keys), regardless
+  // of drift status — this is the exact ceiling of what the per-id loop below is even CAPABLE of
+  // checking. Accumulated up front so the unclaimed-path sweep after the loop knows precisely
+  // what NOT to re-report (a claimed-but-undrifted path stays silent there too — same as today).
+  const claimedPaths = new Set();
   for (const id of ids) {
     const snapPath = abs(join(cfg.paths.items, id, 'main-snapshot.json'));
     if (!existsSync(snapPath)) { console.log(`MAIN-CHECK ${id}: no main-snapshot.json (unclaimed or pre-KI-L65 claim) — nothing to compare`); continue; }
     try {
-      const drifted = driftAgainstSnapshot(REPO_ROOT, (readJson(snapPath) || {}).files || {});
+      const snapFiles = (readJson(snapPath) || {}).files || {};
+      for (const f of Object.keys(snapFiles)) claimedPaths.add(f);
+      const drifted = driftAgainstSnapshot(REPO_ROOT, snapFiles);
       if (!drifted.length) { console.log(`MAIN-CHECK ${id}: clean — no main-tree drift on the snapshot set`); continue; }
       const { committed, dirty } = splitDriftByStatus(REPO_ROOT, drifted);
       if (dirty.length) console.log(`⚠ MAIN-DRIFT ${id} (KI-E50/KI-L65): main-tree file(s) changed mid-run — an agent likely wrote outside its worktree. Do NOT edit or repair main yourself; report this line verbatim:\n` + dirty.map((d) => `    ${d.file} (${d.was} -> ${d.now})`).join('\n'));
       if (committed.length) console.log(`ℹ MAIN-CHECK ${id}: committed drift (human delivery, KI-E35) — verify intent, no repair needed:\n` + committed.map((d) => `    ${d.file}`).join('\n'));
     } catch (e) { console.log(`MAIN-CHECK ${id}: check failed (${e && e.message}) — treat as unknown, not clean`); }
+  }
+  // KI-E89 (2026-08-24, ported from a host-mount session): the snapshot-based loop above can only
+  // ever check a path that was PART OF SOME ITEM'S claim-time files[] — a brand-new leaked path
+  // that no item ever declared has no snapshot to diff against and is structurally invisible to it,
+  // even under this function's own KI-E82 --all widening. See lib/mainguard.mjs's
+  // unclaimedMainDrift header for the full reasoning; this call site just wires
+  // REPO_ROOT/MOUNT_REL/claimedPaths.
+  const unclaimed = unclaimedMainDrift(dirtyMainPaths(REPO_ROOT), MOUNT_REL, claimedPaths);
+  if (unclaimed.length) {
+    console.log(`⚠ MAIN-DRIFT unclaimed (KI-E89): main-tree path(s) dirty outside the factory mount with NO item snapshot to check against — could be leaked factory-worktree contamination (no item has ever claimed this path) OR your own unrelated work-in-progress; main-check cannot tell which, so it surfaces it rather than silently missing the contamination case. Eyeball each:\n` + unclaimed.map((p) => `    ${p}`).join('\n'));
   }
 }
 

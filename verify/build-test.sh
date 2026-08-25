@@ -16,6 +16,15 @@
 # NEVER runs git. Read-only against the repo except for build artifacts in the worktree.
 set -uo pipefail
 
+# KI-E86 (2026-08-24, ported from a host-mount session): disable MSBuild node reuse for every
+# dotnet build/test invocation below. Concurrent items run in SIBLING worktrees on the SAME host
+# (`group --conc N`), and by default `dotnet build`/`dotnet test` leave persistent MSBuild worker
+# processes running for reuse by the NEXT invocation — a well-documented source of intermittent
+# cross-invocation contention/staleness under concurrent CI-style builds, independent of the code
+# under test. Exporting this once, here, covers every dotnet call site in this script (present and
+# future) without touching each one.
+export MSBUILDDISABLENODEREUSE=1
+
 # Engine-owned diff lints run BEFORE the host-override seam below: leftovers/comments are
 # stack-agnostic (pure git-diff + node — no dotnet), so a host's build-test.local.sh never needs to
 # implement them, and a pre-existing override that predates a lint subcommand must not swallow it
