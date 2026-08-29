@@ -74,11 +74,24 @@ export function claimResolves(claim, entries) {
   return false;
 }
 
+// Ported from a host-mount session (2026-08-29) — a line HONESTLY stating a path does not exist YET
+// (a common, legitimate "deferred/planned/Wave N" prose pattern in the origin session's host
+// codebase, and plausible in any codebase with a phased rollout) must not be flagged as a
+// fabricated-path claim: the whole point of such a sentence is to correctly say the path is absent,
+// the opposite of the false-existence claim this linter exists to catch. Origin evidence: a doc-drift
+// fix's own added line — "**No K8s manifest yet**: `k8s/.../a-service.yaml` is Wave 5 (deploy gates
+// the full sprint)." — a true statement about the current tree, was flagged anyway because the linter
+// only checked "does this path resolve", never whether the surrounding prose asserts existence or
+// absence. Deliberately line-granular (a genuine phantom-path claim on a DIFFERENT line in the same
+// call still catches; only the matching line itself is skipped).
+const NOT_YET_EXISTS_RE = /\bno\b[^.\n]{0,40}\byet\b|\bnot yet\b|\bdoes(?:n't| not) exist\b|\byet to (?:be|exist)\b|\bto be (?:built|created|added|implemented)\b|\bnot (?:yet )?(?:built|created|implemented)\b|\bis wave \d/i;
+
 // Pure core (selftest-covered): missing claims from added diff lines against an entry set.
 export function findMissingClaims(addedLines, entries, cap = 10) {
   const missing = [];
   const seen = new Set();
   for (const line of addedLines || []) {
+    if (NOT_YET_EXISTS_RE.test(line)) continue; // the line itself says the path is honestly absent
     for (const claim of extractPathClaims(line)) {
       if (seen.has(claim)) continue;
       seen.add(claim);

@@ -25,9 +25,10 @@ export const SKILL_ROLE = {
 };
 
 // Intended-routing table (metadata only — see fidelity-gap note above). Verbatim from factory.js RT.
+// KI-E92 (2026-08-28): fixerMech/testMech routed to claude-sonnet-4-6 — see factory.js RT's KI-E92 comment.
 export const RT = {
-  fixerMech: { model: 'claude-sonnet-5', effort: 'medium' }, fixerCrit: { model: 'claude-opus-4-8', effort: 'high' },
-  testMech: { model: 'claude-sonnet-5', effort: 'medium' }, testCrit: { model: 'claude-opus-4-8', effort: 'high' },
+  fixerMech: { model: 'claude-sonnet-4-6', effort: 'medium' }, fixerCrit: { model: 'claude-opus-4-8', effort: 'high' },
+  testMech: { model: 'claude-sonnet-4-6', effort: 'medium' }, testCrit: { model: 'claude-opus-4-8', effort: 'high' },
   planner: { model: 'claude-fable-5', effort: 'high', fallback: { model: 'claude-opus-4-8', effort: 'high' } },
   runner: { model: 'claude-sonnet-5', effort: 'low' },
   gArch: { model: 'claude-opus-4-8', effort: 'high' }, gDev: { model: 'claude-sonnet-5', effort: 'medium' },

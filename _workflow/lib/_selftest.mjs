@@ -118,7 +118,7 @@ eq(back.items['WI-A'].state, 'CLOSED', 'atomic write/read round-trip preserves s
 
 // Router resolves mechanical vs critical + escalate.
 const routing = loadRouting(join(import.meta.dirname, '..', '..', 'config', 'model-routing.json'));
-eq(resolve(routing, 'fixer.mechanical').model, 'claude-sonnet-5', 'mechanical fixer -> sonnet');
+eq(resolve(routing, 'fixer.mechanical').model, 'claude-sonnet-4-6', 'mechanical fixer -> sonnet-4-6 (KI-E92 2026-08-28 re-adoption)');
 eq(resolve(routing, 'fixer.critical').model, 'claude-opus-4-8', 'critical fixer -> opus');
 eq(resolve(routing, 'fixer.critical', { escalate: true }).effort, 'xhigh', 'critical fixer escalate -> xhigh');
 eq(resolve(routing, 'gate.security').model, 'claude-opus-4-8', 'security gate -> opus');
@@ -353,6 +353,63 @@ try {
   console.log('  SKIP changedFiles git-integration test (git unavailable: ' + (e && e.message) + ')');
 }
 
+// Ported from a host-mount session (2026-08-29) — removeWorktree (worktree.mjs) drops the worktree
+// directory + git's worktree-admin entry but leaves the `factory/<id>` branch ref standing at its
+// stale creation commit. Origin evidence: refreshing drifted worktrees required a MANUAL
+// `git branch -D factory/<id>` after `worktree-remove` before a subsequent `addWorktree` call actually
+// started fresh — because addWorktree's OWN fallback path (`git worktree add -b` failing "already
+// exists" -> falls back to plain `git worktree add <path> <existing-branch>`) silently attaches the
+// new worktree to the OLD branch tip instead of cutting a new one from current HEAD.
+// `pruneStaleBranch` closes the gap: called right after `removeWorktree`, gated on `git merge-base
+// --is-ancestor <branch> HEAD` — per the file's own header invariant (the factory NEVER commits), a
+// factory/<id> branch has, by construction, zero commits beyond its base, so one that IS an ancestor
+// of HEAD carries no unique value and is safe to discard; one that is NOT (an unexpected commit landed
+// on it, which the hard rule forbids but this function must not blindly trust) is left standing for
+// manual review, never silently discarded.
+try {
+  const wtdir = mkdtempSync(join(tmpdir(), 'factory-prunebranch-'));
+  const wg = (...a) => execFileSync('git', ['-C', wtdir, '-c', 'user.email=t@t', '-c', 'user.name=t', ...a], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+  wg('init', '-q');
+  fsWrite(join(wtdir, 'f.txt'), 'a\n');
+  wg('add', 'f.txt'); wg('commit', '-qm', 'base');
+  const defaultBranch = wg('symbolic-ref', '--short', 'HEAD').toString().trim(); // host-agnostic — init.defaultBranch varies (master/main)
+  wg('branch', 'factory/safe'); // no unique commits beyond base — safe to delete
+  wg('branch', 'factory/unsafe');
+  wg('checkout', '-q', 'factory/unsafe');
+  fsWrite(join(wtdir, 'g.txt'), 'b\n');
+  wg('add', 'g.txt'); wg('commit', '-qm', 'unexpected extra commit — the hard rule forbids this but the function must not trust that');
+  wg('checkout', '-q', defaultBranch);
+  const { pruneStaleBranch: PSB } = await import('./worktree.mjs');
+  const safe = PSB('factory/safe', wtdir);
+  eq(safe, { deleted: true, branch: 'factory/safe' }, 'KI-E100: a branch with zero commits beyond HEAD is deleted');
+  let branchesAfterSafeDelete = wg('branch').toString();
+  ok(!branchesAfterSafeDelete.includes('factory/safe'), 'KI-E100: the deleted branch no longer appears in `git branch`');
+  const unsafe = PSB('factory/unsafe', wtdir);
+  eq(unsafe.deleted, false, 'KI-E100: a branch with a commit NOT reachable from HEAD is left standing, never silently discarded');
+  ok(/not reachable from HEAD/.test(unsafe.reason), 'KI-E100: the left-standing reason names why, for a human to review');
+  ok(wg('branch').toString().includes('factory/unsafe'), 'KI-E100: the unsafe branch still exists after the declined delete');
+  eq(PSB(null, wtdir), { deleted: false, reason: 'no-branch-given' }, 'KI-E100: no branch given -> short-circuits, never touches git');
+  const missing = PSB('factory/does-not-exist', wtdir);
+  eq(missing.deleted, false, 'KI-E100: a nonexistent branch is never mistaken for a deletable one');
+  ok(/does not exist/.test(missing.reason), 'KI-E100: the nonexistent-branch reason is distinguishable from the has-unique-commits reason (not conflated)');
+  // refs/heads/ prefix form is accepted identically to the bare name (both are real call shapes:
+  // listWorktrees() porcelain output returns the refs/heads/ form; the ledger's r.branch is bare).
+  wg('branch', 'factory/prefixtest');
+  eq(PSB('refs/heads/factory/prefixtest', wtdir), { deleted: true, branch: 'factory/prefixtest' }, 'KI-E100: a refs/heads/-prefixed branch name is stripped and handled identically to the bare form');
+} catch (e) {
+  console.log('  SKIP pruneStaleBranch git-integration test (git unavailable: ' + (e && e.message) + ')');
+}
+{
+  // Driver wiring: both removeWorktree call sites (the CLI worktree-remove subcommand and gc's
+  // CLOSED-item sweep) now call pruneStaleBranch right after removing the worktree — closing the
+  // staleness trap at its source instead of relying on a human to notice and hand-delete the branch.
+  const drvTextE100 = readFileSync(join(import.meta.dirname, '..', 'driver.mjs'), 'utf8');
+  ok(/import \{ addWorktree, removeWorktree, pruneStaleBranch,/.test(drvTextE100), 'KI-E100: driver.mjs imports pruneStaleBranch alongside removeWorktree');
+  ok(/sub === 'worktree-remove'[\s\S]{0,400}listWorktrees\(\)\.find/.test(drvTextE100), 'KI-E100: the worktree-remove subcommand resolves the attached branch via listWorktrees() BEFORE removing (branch info is gone once the worktree is gone)');
+  ok(/sub === 'worktree-remove'[\s\S]{0,700}pruneStaleBranch\(branch, REPO_ROOT\)/.test(drvTextE100), 'KI-E100: the worktree-remove subcommand calls pruneStaleBranch after removeWorktree');
+  ok(/if \(r\.branch\) \{[\s\S]{0,200}pruneStaleBranch\(r\.branch, REPO_ROOT\)/.test(drvTextE100), 'KI-E100: cmdGc calls pruneStaleBranch using the ledger\'s own r.branch for every CLOSED item it sweeps');
+}
+
 // KI-L27: graph files[] path classifier — ok / creation-target / stale(rewrite) / ambiguous.
 // Stale paths defeat the within-batch file-lock (KI-L23's root cause class); only a UNIQUE
 // basename match (target-dir-unique preferred) may be auto-rewritten.
@@ -439,6 +496,48 @@ try {
     'KI-L44: Docker-absent still PARKS (BLOCKED) — never a silent in-memory close');
   ok(src.includes('const needsRealInfra = filesHaveCs && realInfraLikely'),
     'KI-L45: needsRealInfra keys on filesHaveCs (fix surface), not codeChange (test language)');
+}
+
+// Ported from a host-mount session (2026-08-29) — REALINFRA_SIGNAL's bare `concurren` catch-all
+// matched plain-English uses of "concurrent" with zero relation to a real concurrency defect, forcing
+// needsRealInfra:true (an unnecessary Testcontainers demand). Origin evidence: 5 live false-positive
+// incidents, fixed by narrowing the catch-all with noun/preposition exclusions plus a preceding
+// are/is lookbehind and a close-paren exclusion, WITHOUT losing any of 11 confirmed-genuine
+// concurrency-defect matches (several of which depend ENTIRELY on this regex since their own graph
+// entry declares realInfra:false). Fixture text below is quoted VERBATIM from the origin session's
+// live incidents — never paraphrased, so the pin tracks the actual incident shape, not a
+// reconstruction of it; none of it names an origin-specific item id or service.
+{
+  const src = readFileSync(join(import.meta.dirname, '..', 'factory.js'), 'utf8');
+  const sigMatch = src.match(/const REALINFRA_SIGNAL = (\/[^;\n]+\/)/);
+  ok(!!sigMatch, 'KI-E97: factory.js defines REALINFRA_SIGNAL as a single-line regex literal');
+  const re = new RegExp(sigMatch[1].slice(1, sigMatch[1].lastIndexOf('/')));
+
+  // Confirmed false positives (must NOT match) — verbatim origin-incident phrasing.
+  eq(re.test('ystream on every download and scan path; ~10 concurrent 100mb downloads cause oom | s3objectstore.cs'), false,
+    'KI-E97: "concurrent downloads" (an OOM/volume concern) is not a concurrency defect');
+  eq(re.test('guards in the same controller. do not group concurrently with item-h8 or other-c7a/c7b (sh'), false,
+    'KI-E97: a file-lock scheduling note ("concurrently with X"), not a defect description');
+  eq(re.test('rface — file-lock will serialize against any concurrent loki work.'), false,
+    'KI-E97: "concurrent … work" is scheduling prose, not a defect');
+  eq(re.test('ct http calls are observed (or that they are concurrent). | at orderscontroller.cs:275-291 and helpe'), false,
+    'KI-E97: "they are concurrent" excluded by the are/is lookbehind');
+  eq(re.test('henall with a semaphoreslim cap (e.g. max 10 concurrent). add an input cap (reject or chunk at e.g.'), false,
+    'KI-E97 follow-up: a bare throttle-cap aside with no following noun; only the close-paren exclusion (?!\\)) catches this, and it is what made the first-pass fix insufficient on its own');
+
+  // Confirmed genuine (must still match) — includes cases whose OWN graph entry says
+  // realInfra:false, so they depend entirely on this regex as the safety net.
+  eq(re.test('concurrent cps-webhook redeliveries double-gr'), true, 'KI-E97: a real double-grant race, still caught');
+  eq(re.test('riants | auditchaintests.cs adds a concurrent-append-under-advisory-lock test (t'), true, 'KI-E97: concurrent-append test coverage, still caught');
+  eq(re.test('ire 200-row batch on a single xmin optimistic-concurrency conflict — breach notifications'), true, 'KI-E97: optimistic-concurrency conflict, still caught');
+  eq(re.test('t exceed the cap on any replica. | concurrent test (real redis via testcontainer'), true, 'KI-E97: concurrent-guard test, still caught');
+  eq(re.test('no optimistic-concurrency token on any aggregate (order, d'), true, 'KI-E97: optimistic-concurrency token gap, still caught');
+  eq(re.test('ips the tick body. a test with two concurrent job invocations confirms only one'), true, 'KI-E97: "two concurrent job invocations" (a genuine leader-election test) stays caught; "job" was deliberately kept OUT of the noun-exclusion list for exactly this case');
+  eq(re.test('in exception — the 4 most critical concurrency regressions fail instead of skippi'), true, 'KI-E97: concurrency regression tests, still caught');
+  eq(re.test('avechangesasync can throw a second concurrencyconflictexception, stranding processedevent in proce'), true, 'KI-E97: realInfra:false in the graph — depends entirely on the concurrencyexception alternative');
+  eq(re.test('k.savechangesasync missing dbupdateconcurrencyexception -> concurrencyexception mapping —'), true, 'KI-E97: realInfra:false in the graph — depends entirely on the concurrencyexception alternative');
+  eq(re.test('ersisted record will throw dbupdateconcurrencyexception on the next savechanges - the iden'), true, 'KI-E97: realInfra:false in the graph — depends entirely on the concurrencyexception alternative');
+  eq(re.test("al same-month burst traffic | when advisory lock acquisition returns 'already held'"), true, 'KI-E97: realInfra:false in the graph — depends entirely on the advisory-lock alternative');
 }
 
 // KI-L41: convergence-bonus round — deterministic narrower-trajectory detection from gateDetails.
@@ -1270,6 +1369,26 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
   eq(D.findMissingClaims([], entries), [], 'doclint: no added lines -> no findings');
 }
 
+// Ported from a host-mount session (2026-08-29) — findMissingClaims flagged a line HONESTLY stating a
+// path does NOT exist yet as if it were a fabricated-existence claim, the opposite of what the linter
+// exists to catch. Origin evidence: a doc-drift fix's own added line — "**No K8s manifest yet**:
+// `k8s/base/services/a-service.yaml` is Wave 5 (deploy gates the full sprint)." — a true statement
+// about the current tree, flagged anyway because the linter only checked "does this path resolve",
+// never whether the surrounding prose asserts existence or absence.
+{
+  const D99 = await import('./doclint.mjs');
+  const notYetLine = '6. **No K8s manifest yet**: `k8s/base/services/a-service.yaml` is Wave 5 (deploy gates the full sprint).';
+  const entries99 = new Set(['scripts/services.json', 'scripts/', 'scripts']); // deliberately does NOT contain the k8s manifest — it genuinely doesn't exist yet
+  eq(D99.findMissingClaims([notYetLine], entries99), [], 'KI-E99: origin-incident line — honestly-absent path is not flagged as fabricated');
+  // Line-granularity check: a "not yet" line does not blind the linter to a genuine phantom claim on
+  // a SEPARATE line in the same call — NOT_YET_EXISTS_RE only skips the line it actually matches.
+  eq(D99.findMissingClaims([notYetLine, 'wired up in `Api/Controllers/Support/`'], entries99), ['Api/Controllers/Support/'],
+    'KI-E99: a genuine phantom-path claim on a DIFFERENT line still catches, even in the same call as a not-yet-exists line');
+  // Other real phrasings the same regex is designed to cover (not yet built/created/implemented, is Wave N).
+  eq(D99.findMissingClaims(['The retry queue does not exist yet in this service.'], entries99), [], 'KI-E99: "does not exist yet" phrasing is recognized');
+  eq(D99.findMissingClaims(['`Infra/dr-failover.yaml` is not yet built; tracked for Wave 3.'], entries99), [], 'KI-E99: "not yet built" phrasing is recognized');
+}
+
 // Exporter pure core (telemetry/exporter/lib/aggregate.mjs — spine AD-5/AD-12/AD-13 + review
 // findings #3/#6/#11): ingest reducer, derived-only histograms, nested label maps (space-safe),
 // one-span-per-stage assembly with buffer consumption, valid Prometheus exposition.
@@ -1556,7 +1675,7 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
 // KI-D12: build-test.sh leftovers subcommand -> CLI; CLI emits the marker from the SAME lib the probe reads.
 {
   const bts = readFileSync(new URL('../../verify/build-test.sh', import.meta.url), 'utf8');
-  ok(bts.includes('leftovers|comments)') && bts.includes('leftover-lint.mjs'), 'KI-D12: build-test.sh leftovers subcommand wired to the CLI (engine-owned dispatch BEFORE the local-override seam — PR#9)');
+  ok(bts.includes('leftovers|comments|ledger-anchor)') && bts.includes('leftover-lint.mjs'), 'KI-D12: build-test.sh leftovers subcommand wired to the CLI (engine-owned dispatch BEFORE the local-override seam — PR#9; case pattern extended by KI-E91, same dispatch)');
   ok(bts.indexOf('leftovers|comments)') < bts.indexOf('build-test.local.sh"') , 'PR#9: the diff-lint dispatch precedes the build-test.local.sh override exec (a stale host override can never swallow the lints)');
   const lcli = readFileSync(new URL('../leftover-lint.mjs', import.meta.url), 'utf8');
   ok(lcli.includes('FACTORY::LEFTOVER::') && lcli.includes('findLeftovers'), 'KI-D12: leftover CLI emits the machine marker from the SAME leftover-scan lib the probe + fold read');
@@ -1637,7 +1756,7 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
 // KI-E59: build-test.sh comments subcommand -> CLI; CLI emits the marker from the SAME lib the probe reads.
 {
   const bts = readFileSync(new URL('../../verify/build-test.sh', import.meta.url), 'utf8');
-  ok(bts.includes('comments)') && bts.includes('comment-lint.mjs'), 'KI-E59: build-test.sh comments subcommand wired to the CLI');
+  ok(bts.includes('comments|ledger-anchor)') && bts.includes('comment-lint.mjs'), 'KI-E59: build-test.sh comments subcommand wired to the CLI (case pattern extended by KI-E91, same dispatch)');
   const ccli = readFileSync(new URL('../comment-lint.mjs', import.meta.url), 'utf8');
   ok(ccli.includes('FACTORY::COMMENT::') && ccli.includes('findComments'), 'KI-E59: comment CLI emits the machine marker from the SAME comment-scan lib the probe + fold read');
 }
@@ -1896,6 +2015,13 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
   eq(closedDepsWithLiveWorktree([{ id: 'B', dependsOn: ['A'] }], { A: { state: 'CLOSED', worktree: null } }, () => true).length, 0, 'KI-E29 (review fix): gc nulls row.worktree -> no warn (dep committed + collected)');
   eq(closedDepsWithLiveWorktree([{ id: 'B', dependsOn: ['A'] }], { A: { state: 'CLOSED', worktree: 'state/worktrees/sweep-3' } }, (w) => w.includes('sweep')), [{ id: 'B', dep: 'A', worktree: 'state/worktrees/sweep-3' }], 'KI-E29 (review fix): a SWEEP-closed dep is covered — the row path, not an assumed <id> dir');
   ok(dsrc20.includes('closedDepsWithLiveWorktree(picked, ledger.items'), 'KI-E29 (review fix): cmdGroup wires the pure warn core');
+  const { sameTargetPairs } = await import('./ledger.mjs');
+  eq(sameTargetPairs([{ id: 'A', target: 'Svc1' }, { id: 'B', target: 'Svc1' }]), [{ target: 'Svc1', ids: ['A', 'B'] }], 'KI-E90: two picked items on the same target -> one pair, ids in pick order');
+  eq(sameTargetPairs([{ id: 'A', target: 'Svc1' }, { id: 'B', target: 'Svc2' }]).length, 0, 'KI-E90: disjoint targets -> no pair');
+  eq(sameTargetPairs([{ id: 'A', target: 'Svc1' }, { id: 'B' }, { id: 'C', target: 'Svc1' }]), [{ target: 'Svc1', ids: ['A', 'C'] }], 'KI-E90: an item with no target is ignored, not grouped under undefined');
+  eq(sameTargetPairs([]), [], 'KI-E90: empty batch -> no pairs');
+  eq(sameTargetPairs(null), [], 'KI-E90: null picked -> no throw, empty result');
+  ok(dsrc20.includes('sameTargetPairs(picked)') && dsrc20.includes('KI-E90 WARN'), 'KI-E90: cmdGroup wires the pure same-target warn core');
   ok(dsrc20.includes('unwrapResultEnvelope(readJson(foldPath)') && dsrc20.includes('payload carried ZERO results'), 'KI-E31 (review fix): cmdFold wires the unwrap AND stops loudly on a zero-result payload (no success affect)');
   ok(readFileSync(join(import.meta.dirname, '..', 'factory.js'), 'utf8').includes('means EXACTLY a product-scope.md red-line'), 'KI-E30: the shared gate prompt carries the scopeViolation clarification');
   ok(/return `## \$\{id\} — \$\{r\.state\}\\n\\n- \$\{lastNote\(r\)\}/.test(dsrc20), 'KI-E53: escalations per-item line renders lastNote(r) (the real last-transition reason) — not the never-populated static r.note field');
@@ -2413,6 +2539,31 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
   ok(/f\.endsWith\('\.md'\) && f !== 'verify\.json'\) continue/.test(drvText74c), 'KI-E74C: the scan includes verify.json alongside .md files (the proven real source of the admission)');
 }
 
+// Ported from a host-mount session (2026-08-29) — neither KI-E67's nor KI-E74C's marker match
+// understood negation: a phrase preceded by "No"/"Not"/"Zero"/"None" asserts the OPPOSITE of what the
+// bare marker text implies, but neither detector's match logic ever looked at what preceded the
+// match. Origin evidence: an item's own verify.json wrote "No findings from the prior round remain
+// unaddressed." — a genuine, correct completion claim on a CLOSED result — and
+// detectUnresolvedCaveatOnClose's `findings…remain unaddressed` marker fired anyway, reading a
+// correct claim as an admission of failure. The negation guard must NOT suppress the real ITEM-H1
+// admission this detector exists to catch (see the KI-E74C block above) — its outer "does NOT mean X"
+// negates a different clause than the inner "findings…remain unaddressed" marker, so the two must be
+// told apart, not both suppressed by a blanket negation scan.
+{
+  const N98 = await import('./narrative-check.mjs');
+  const itemH2Note = 'GREEN now. No findings from the prior round remain unaddressed. FIX-MANIFEST CROSS-CHECK: git status shows 3 tracked changes.';
+  const itemH1Note = "Build+targeted-test green here does NOT mean round 2's findings are resolved — they are not, and are unaddressed in this worktree as of this pass";
+  eq(N98.detectUnresolvedCaveatOnClose('CLOSED', { 'verify.json': itemH2Note }), [], 'KI-E98: a negated admission ("No findings … remain unaddressed") is NOT flagged — it is a correct completion claim');
+  eq(N98.detectUnresolvedCaveatOnClose('CLOSED', { 'verify.json': itemH1Note }), [{ file: 'verify.json', marker: "does NOT mean round 2's findings are resolved — they are not, and are unaddressed" }], 'KI-E98: the ITEM-H1 admission still fires — its outer negation targets a different clause than the inner "findings…remain unaddressed" marker, so blanket suppression must not eat it too');
+  // Direct unit coverage of the negation primitive itself, independent of which detector calls it.
+  ok(/const NEGATION_BEFORE_RE = \/\\b\(no\|not\|zero\|none\|never\|nothing\)\\s\*\$\/i;/.test(readFileSync(join(import.meta.dirname, 'narrative-check.mjs'), 'utf8')),
+    'KI-E98: narrative-check.mjs defines the shared negation-lookbehind window used by both detectors');
+  // KI-E67's forward detector: pre-emptive hardening, no live incident, but same mechanism — a
+  // negated strong-completion marker on a FAILED/ESCALATED item must not misfire either.
+  eq(N98.detectNarrativeVerdictContradiction('FAILED', { 'x.md': 'Status is not yet complete; 3 findings remain open.' }), [], 'KI-E67/KI-E98: a negated completion marker ("not … complete") does not false-positive on a FAILED item');
+  ok(N98.detectNarrativeVerdictContradiction('FAILED', { 'x.md': 'Status: fully complete' }).length === 1, 'KI-E67/KI-E98: the un-negated genuine marker still fires (regression guard against the E98 fix over-suppressing E67)');
+}
+
 // KI-E68 (2026-08-03): cmdGroup's concurrency default was a bare hardcoded 2, disconnected from
 // config/factory.config.json's documented concurrency.{throttled,normal,max,default} tiers (never
 // read by any code path). No pure-function harness exists for cmdGroup itself (it is a CLI command
@@ -2732,6 +2883,70 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
     'KI-O5: install.mjs delegates every host-side install to init.mjs — one implementation of the three controller seams, not two that can drift');
   ok(/telemetry/i.test(inst5) && inst5.includes('install.sh telemetry-up'),
     'KI-O5: the telemetry gap is DISCLOSED and points at the bash path, rather than silently omitted (KI-E40 posture: a missing capability must announce itself)');
+}
+
+// KI-E91 (2026-08-28, ported from a host-mount session) — LedgerAnchor pure-function coverage +
+// pipeline wiring pins. This repo has no schema-parity forcing test and no registration-drift
+// precedent (KI-E77 was never ported here), so the opencode side ships as a disclosed gap
+// (LEDGER_ANCHOR_SCHEMA exported for documentation, not routed) — see schemas.mjs's own comment.
+{
+  const { extractAddedAnchors, findAnchorBody, findDuplicateAnchors, extractTagClaims, fileHasStandardsEvolutionTag, findLedgerAnchorCandidates } = await import('./ledger-anchor.mjs');
+  eq(extractAddedAnchors('+### cps-in-suite-host\n+some prose\n').map((a) => a.anchor), ['cps-in-suite-host'], 'KI-E91: extractAddedAnchors finds a top-level (###) added heading');
+  eq(extractAddedAnchors('+#### cps-stub\n').map((a) => a.level), [4], 'KI-E91: a #### heading is level 4 (a per-service stub, never compared against a top-level entry)');
+  eq(extractAddedAnchors('-### removed-one\n unchanged line\n').length, 0, 'KI-E91: only + (added) lines count — a removed or unchanged heading is not "added or edited"');
+  eq(extractAddedAnchors('+++ b/some/STANDARDS-DIVERGENCE-LEDGER.md\n+### real-anchor\n').map((a) => a.anchor), ['real-anchor'], 'KI-E91: the diff\'s own "+++ b/file" header line is never mistaken for a heading');
+  const LEDGER_A = '# Ledger A\n\n### cps-ef-persistence-row-poco\n\n- **Created:** 2026-06-03\n- **Standard:** rule-a\n\n---\n';
+  const LEDGER_B = '# Ledger B\n\n### cps-ef-persistence-row-poco\n\n- **Created:** 2026-06-05\n- **Standard:** rule-b\n\n---\n';
+  eq(findAnchorBody(LEDGER_A, 'cps-ef-persistence-row-poco', 3).includes('2026-06-03'), true, 'KI-E91: findAnchorBody extracts the full body from the heading to the next heading/EOF');
+  eq(findAnchorBody(LEDGER_A, 'no-such-anchor', 3), null, 'KI-E91: an absent anchor returns null, not an empty string or throw');
+  eq(findAnchorBody(LEDGER_A, 'cps-ef-persistence-row-poco', 4), null, 'KI-E91: a level mismatch (### vs ####) is treated as absent — the sanctioned stub-vs-top-level pattern is never a candidate');
+  const dupCPS = findDuplicateAnchors('A.md', extractAddedAnchors('+### cps-ef-persistence-row-poco\n'), { 'A.md': LEDGER_A, 'B.md': LEDGER_B }, ['A.md', 'B.md']);
+  eq(dupCPS, [{ anchor: 'cps-ef-persistence-row-poco', level: 3, fileA: 'A.md', fileB: 'B.md' }], 'KI-E91: live-incident-shaped repro — the same anchor added as a top-level entry in one ledger, already present at the same level in the sibling, IS a duplicate candidate');
+  eq(findDuplicateAnchors('A.md', extractAddedAnchors('+### cps-ef-persistence-row-poco\n'), { 'A.md': LEDGER_A }, ['A.md']), [], 'KI-E91: a SINGLE configured ledger path always yields zero duplicate candidates (this repo\'s current reality — correct degrade, not a bug)');
+  const stubBody = '#### cps-per-service-stub\n\nSee `### cps-ef-persistence-row-poco` above.\n';
+  eq(findDuplicateAnchors('A.md', [{ anchor: 'cps-ef-persistence-row-poco', level: 4 }], { 'A.md': stubBody, 'B.md': LEDGER_B }, ['A.md', 'B.md']), [], 'KI-E91: a #### stub in one file vs a ### top-level entry in the sibling (different levels) is the SANCTIONED pattern, never a duplicate candidate');
+  const legacySitesBody = '### some-entry\n\n- **Legacy sites:** `saas/Foo/Bar.cs:12` and `saas/Foo/Baz.cs`\n- **Status:** all call-site references carry the `standards-evolution:` tag\n';
+  eq(extractTagClaims(legacySitesBody).sort(), ['saas/Foo/Bar.cs', 'saas/Foo/Baz.cs'], 'KI-E91: extractTagClaims pulls path tokens from a Legacy sites bullet, stripping a trailing :line');
+  eq(extractTagClaims('### x\n\nNo claim here, just prose about `some/file.cs` in passing.\n'), [], 'KI-E91: a bare backtick-quoted path with no Legacy-sites context and no "carries the tag" claim phrase is NOT extracted (avoids over-triggering on incidental file mentions)');
+  eq(extractTagClaims(''), [], 'KI-E91: empty body -> no claims, no throw');
+  eq(fileHasStandardsEvolutionTag('/// EF Core (ADR-CPS-11 / ledger cps-x). Append-only.'), false, 'KI-E91: a narrative XML-doc mention is NOT the canonical tag (this IS the live CPS-H-15 defect: prose citing an anchor is not the same as the standards-evolution: tag)');
+  eq(fileHasStandardsEvolutionTag('// standards-evolution: legacy of code-style.md — see LEDGER.md#x'), true, 'KI-E91: the real canonical tag string is detected');
+  eq(fileHasStandardsEvolutionTag(null), false, 'KI-E91: a missing/unreadable file (null text) reads as tag-absent, never throws');
+  const orch = findLedgerAnchorCandidates('A.md', '+### cps-ef-persistence-row-poco\n', { 'A.md': LEDGER_A, 'B.md': LEDGER_B }, ['A.md', 'B.md']);
+  eq(orch.dup.length, 1, 'KI-E91: findLedgerAnchorCandidates orchestrates dup-finding end to end');
+  eq(orch.tagClaims, [], 'KI-E91: the synthetic LEDGER_A fixture makes no tag claim in this entry, so tagClaims is empty — not a false positive');
+
+  const fsrc91 = readFileSync(join(import.meta.dirname, '..', 'factory.js'), 'utf8');
+  ok(fsrc91.includes('const LEDGER_ANCHOR_SCHEMA') && fsrc91.includes("call('ledger-anchor-probe'"), 'KI-E91: factory declares LEDGER_ANCHOR_SCHEMA + runs the haiku ledger-anchor-probe');
+  ok(fsrc91.includes("' ledger-anchor ' + wtPath"), 'KI-E91: the probe invokes build-test.sh ledger-anchor on the worktree');
+  ok(fsrc91.includes('typeof la.clean'), 'KI-E91: only an EXPLICIT boolean verdict acts (a malformed/unavailable probe never sinks an item)');
+  ok(fsrc91.indexOf("call('leftover-probe'") < fsrc91.indexOf("call('ledger-anchor-probe'"), 'KI-E91: the ledger-anchor probe call runs AFTER the leftover-probe call');
+  ok(fsrc91.indexOf("call('ledger-anchor-probe'") < fsrc91.indexOf('// 5. REVIEW band'), 'KI-E91: the ledger-anchor probe runs strictly BEFORE the review/gate band');
+  ok(fsrc91.includes('const ledgerTouch = (item.files || []).some'), 'KI-E91: ledgerTouch is computed from declared item.files, gating the probe off for non-ledger-touching items at zero cost');
+
+  const btsrc91 = readFileSync(join(import.meta.dirname, '..', '..', 'verify', 'build-test.sh'), 'utf8');
+  ok(btsrc91.includes('ledger-anchor-lint.mjs'), 'KI-E91: build-test.sh wires the ledger-anchor subcommand to the CLI');
+  ok(/leftovers\|comments\|ledger-anchor\)/.test(btsrc91), 'KI-E91: ledger-anchor joins the engine-owned lint case (runs before the host-override seam, same as leftovers/comments)');
+
+  const schsrc91 = readFileSync(join(import.meta.dirname, '..', 'opencode', 'schemas.mjs'), 'utf8');
+  ok(schsrc91.includes('export const LEDGER_ANCHOR_SCHEMA') && schsrc91.includes('NOT yet ported'), 'KI-E91: opencode schemas.mjs exports LEDGER_ANCHOR_SCHEMA for documentation, disclosed (not silently assumed) as not yet routed');
+}
+
+// KI-E93/94/95/96 (2026-08-28, ported from a host-mount session) — five defect classes that
+// shipped past every gate/probe currently in the pipeline get a PREVENTION self-check in the
+// authoring briefs, not just another detection layer. Pin the new guidance text so it can't
+// silently regress out of the briefs.
+{
+  const fixerMd93 = readFileSync(join(import.meta.dirname, '..', '..', 'agents', 'fixer.md'), 'utf8');
+  const testAuthorMd93 = readFileSync(join(import.meta.dirname, '..', '..', 'agents', 'test-author.md'), 'utf8');
+  ok(testAuthorMd93.includes('MULTI-TARGET COVERAGE SELF-CHECK (KI-E93)'), 'KI-E93: test-author brief carries the multi-target coverage self-check');
+  ok(fixerMd93.includes('SIBLING-PATTERN SWEEP (KI-E94)'), 'KI-E94: fixer brief carries the sibling-pattern sweep');
+  ok(fixerMd93.includes('DEAD-CODE SELF-CHECK (KI-E94)'), 'KI-E94: fixer brief carries the dead-code self-check');
+  ok(fixerMd93.includes('NO-INVENTION SELF-CHECK (KI-E95)'), 'KI-E95: fixer brief carries the no-invention self-check');
+  ok(fixerMd93.includes('ADJACENT-CLAIM RE-CHECK (KI-E95)'), 'KI-E95: fixer brief carries the adjacent-claim re-check');
+  ok(fixerMd93.includes('CANCELLATIONTOKEN CHAIN SELF-CHECK (KI-E96)'), 'KI-E96: fixer brief carries the CancellationToken chain self-check');
+  ok(fixerMd93.indexOf('9. **RE-FIX') < fixerMd93.indexOf('10. **SIBLING-PATTERN SWEEP'), 'KI-E94: sibling-pattern sweep is numbered AFTER the existing RE-FIX step, not spliced ahead of it');
+  ok(fixerMd93.indexOf('10. **SIBLING-PATTERN SWEEP') < fixerMd93.indexOf('11. **CANCELLATIONTOKEN'), 'KI-E96: CancellationToken self-check follows the sibling-pattern sweep in list order');
 }
 
 console.log(`\nself-test: ${pass} passed, ${fail} failed`);

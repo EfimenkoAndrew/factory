@@ -109,6 +109,8 @@ const LEFTOVER_SCHEMA = { type: 'object', additionalProperties: false, required:
 // owner directive (2026-07-30) has zero legitimate exceptions: any new or reworded comment is a hard
 // violation. `count>0` fails the item PRE-BAND (cheap, before the opus gates).
 const COMMENT_SCHEMA = { type: 'object', additionalProperties: false, required: ['count'], properties: { count: { type: 'number' }, hits: { type: 'array', items: { type: 'string' } } } }
+// KI-E91 — duplicate/contradictory standards-evolution ledger anchors + false standards-evolution: tag claims.
+const LEDGER_ANCHOR_SCHEMA = { type: 'object', additionalProperties: false, required: ['clean'], properties: { clean: { type: 'boolean' }, findings: { type: 'array', items: { type: 'object', additionalProperties: false, required: ['anchor', 'file', 'why'], properties: { anchor: { type: 'string' }, file: { type: 'string' }, why: { type: 'string' } } } } } }
 // KI-E18 — AcceptanceScan probe: pre-band acceptance-clause coverage (the KI-D12 pattern applied to
 // the #1 recent FAIL cause: 4/4 last band FAILs were acceptance-clause gaps the opus band found at
 // full price). A haiku probe answers per deterministic clause "does the diff carry evidence?";
@@ -132,8 +134,10 @@ const SKILL_ROLE = {
 //      read files AND this session caps args size, so per-item run-args OMIT the verbose `routes`;
 //      factory.js derives them here from fixType. item.routes, when present, still wins (Phase 2/3 compat). ----
 const RT = {
-  fixerMech: { model: 'claude-sonnet-5', effort: 'medium' }, fixerCrit: { model: 'claude-opus-4-8', effort: 'high' },
-  testMech: { model: 'claude-sonnet-5', effort: 'medium' }, testCrit: { model: 'claude-opus-4-8', effort: 'high' },
+  // KI-E92 (2026-08-28): re-routed to claude-sonnet-4-6 — see config/model-routing.json
+  // fixer.mechanical._note for the full rationale.
+  fixerMech: { model: 'claude-sonnet-4-6', effort: 'medium' }, fixerCrit: { model: 'claude-opus-4-8', effort: 'high' },
+  testMech: { model: 'claude-sonnet-4-6', effort: 'medium' }, testCrit: { model: 'claude-opus-4-8', effort: 'high' },
   // KI-L64: runner pinned haiku→sonnet — haiku's 200k ceiling dies terminal ("Prompt is too long")
   // on big-solution verify runs (ITEM-H7 + ITEM-H5 cycle 35 burned ALL runner retries; ITEM-H-14
   // survived on retry luck). Same KI-L56 context-ceiling class + KI-L58 pin precedent.
@@ -222,7 +226,40 @@ const BAND_FULL_THEMES = ['security-multitenancy', 'money-correctness', 'idempot
 // hardcoded-zeros aggregate fix whose correctness is fully in-memory-expressible.) The normalizer's per-item
 // `item.realInfra` stays the PRIMARY signal; this keyword floor is the safety net for a MIS-TRIAGED item whose
 // own text betrays a real-infra need the normalizer missed (the ITEM-M1/M20 case P2 was created for).
-const REALINFRA_SIGNAL = /concurren|race condition|\brace\b|lost update|toctou|isolation level|serializable|deadlock|advisory lock|unique (constraint|index)|23505|fromsql|raw sql|rowversion|optimistic concurren|pessimistic|\bfor update\b|interleav|double-?spend|idempoten.*(dup|race|concurrent)/
+// Ported from a host-mount session (2026-08-29) — the bare `concurren` catch-all had accumulated two
+// classes of bug on the origin session's own graph, both fixed there and carried here verbatim (the
+// regex is a general text-classification heuristic, not tied to any specific host's item content):
+// (1) The two more-specific alternatives requiring a literal SPACE ("optimistic concurren",
+// "unique (constraint|index)") never matched real prose's hyphenated form ("optimistic-concurrency",
+// "unique-constraint"), silently falling through to depend on the unrelated bare-`concurren` fallback
+// instead. Normalized both to `[\s-]+`. Deliberately did NOT hyphen-normalize "advisory lock" the same
+// way: origin evidence showed it newly matched several runbook/observability items that merely
+// DOCUMENT "advisory-lock" as a monitored concept rather than describing a live defect; the one
+// origin-confirmed-genuine case using the hyphenated form matched independently via its own bare
+// "concurrent" text regardless, so the space-only form lost nothing. Also added an explicit
+// `concurrencyexception` alternative (catches `DbUpdateConcurrencyException`/`ConcurrencyConflictException`
+// by name) so EF-concurrency-conflict items whose graph entry under-declares realInfra:false no longer
+// depend on the narrowed catch-all either.
+// (2) The bare `concurren` catch-all matched the plain-English word regardless of context,
+// force-escalating items whose text used "concurrent" as a load/scheduling descriptor, not a
+// database-transaction-concurrency claim. Origin evidence (5 confirmed false positives, all
+// realInfra:false in the graph, all correctly written by the test-author as in-memory tests per this
+// file's own already-correct DEFECT-SHAPE judgment above, then overruled by this regex): a "~10
+// concurrent 100MB downloads" load descriptor; two "do NOT group concurrently with X" batch-scheduling
+// instructions TO THE FACTORY itself, not defect content; a "serialize against any concurrent … work"
+// file-lock scheduling note; and an item with TWO separate false-trigger occurrences in its own text —
+// "or that they are concurrent" (verifying HTTP-call parallelization for a perf/N+1 fix, not a DB
+// race) AND, missed by the first-pass fix since `.test()` only needs one survivor, a bare throttle-cap
+// aside "…SemaphoreSlim cap (e.g. max 10 concurrent)." with no following noun at all. Fixed by
+// excluding these confirmed non-DB shapes at the `concurren` alternative itself (a word-boundary lock
+// prevents the greedy `\w*` from backtracking around the exclusions, and a close-paren exclusion
+// `(?!\))` catches the dangling-adjective throttle-cap shape) rather than requiring a positive DB-word
+// match, which would risk missing a genuine case phrased differently than any case seen so far.
+// Verified this does NOT regress any of 11 origin-confirmed-genuine cases, 4 of which depend ENTIRELY
+// on this regex since their own graph entry declares realInfra:false — including 2 that only worked
+// via the bare-concurren fallback because the more specific alternatives needed the space-vs-hyphen
+// fix in (1) above.
+const REALINFRA_SIGNAL = /race condition|\brace\b|lost update|toctou|isolation level|serializable|deadlock|advisory lock|unique[\s-]+(constraint|index)|23505|fromsql|raw sql|rowversion|optimistic[\s-]+concurren|pessimistic|\bfor update\b|interleav|double-?spend|idempoten.*(dup|race|concurrent)|concurrencyexception|(?<!\bare\s)(?<!\bis\s)concurren\w*\b(?!\))(?!\s+\d)(?!(ly)?\s+(with|to|against)\b)(?!\s+(\w+\s+)?(downloads?|requests?|clients?|users?|sessions?|connections?|tabs?|calls?|work)\b)/
 const SONNET = { model: 'claude-sonnet-5', effort: 'medium' }
 function bandFor(item) {
   if (item.band === 'LIGHT' || item.band === 'FULL') return item.band
@@ -452,6 +489,11 @@ async function runItem(item) {
   const R = item.routes || routesFor(item)
   const band = bandFor(item) // LIGHT | FULL — decided up front (drives the verify mode AND the gate band)
   const filesHaveCs = (item.files || []).some(function (f) { return /\.cs$/.test(f) })
+  // KI-E91 gating signal (ported from a host-mount session) — declared files[] naming a
+  // STANDARDS-DIVERGENCE-LEDGER.md path is sufficient to trigger the probe below: its own STEP 1
+  // does a live `git diff --name-only` against the worktree, so it independently discovers a
+  // ledger file touched but never declared.
+  const ledgerTouch = (item.files || []).some(function (f) { return /STANDARDS-DIVERGENCE-LEDGER\.md$/.test(f) })
   // P2 real-infra FLOOR — `realInfraLikely` is known early (it drives the test-author: write a Testcontainers
   // test when the normalizer flagged it OR the defect text betrays a real-DB-dependent shape). The binding
   // `needsRealInfra` (= realInfraLikely ∧ codeChange) is finalised at the verify stage.
@@ -994,6 +1036,39 @@ async function runItem(item) {
       if (!lo.clean) {
         const punts = (lo.punts || []).slice(0, 8).map(function (p) { return (p.file || '?') + ': ' + (p.why || p.line || '') }).join(' | ')
         return finish('FAILED', 'leftover-scan (KI-D12): fixer-introduced deferral(s)/tech-debt not ledgered — ' + (punts || 'see leftover-raw.txt') + '. execution-policy.md §4: no leftovers.')
+      }
+    }
+  }
+
+  // LEDGER-ANCHOR CONSISTENCY SCAN (KI-E91, ported from a host-mount session, cycle-73
+  //     post-mortem) — a cheap haiku pass that mechanizes standards-evolution.md §3.4's own
+  //     documented "ripple check" (grep for the tag, confirm the ledger anchor exists, confirm the
+  //     entry isn't self-contradictory) instead of leaving it to a human/reviewer's memory. Origin
+  //     evidence: a doc-drift item authored the SAME anchor slug as a top-level entry in TWO
+  //     sibling ledger files with materially different Created dates / Standard citations /
+  //     Legacy-sites content for what is presented as the SAME divergence, and separately asserted
+  //     a standards-evolution: call-site tag was present in five files that grep proved did NOT
+  //     carry it — both caught only after a full expensive adversarial review + adjudication. Gated
+  //     on ledgerTouch — declared item.files naming a STANDARDS-DIVERGENCE-LEDGER.md path
+  //     (sufficient: the mechanical lint's own live worktree diff/grep independently discovers a
+  //     ledger file touched but never declared). This repo has a single configured ledger path
+  //     (see ledger-anchor-lint.mjs's LEDGER_PATHS), so the duplicate-anchor half of the mechanical
+  //     lint always returns zero candidates here — the false-tag-claim half stays fully active.
+  //     Deterministic candidate-finding lives in build-test.sh ledger-anchor (mirrors
+  //     leftover-scan's STEP-1-mechanical/STEP-2-classify split); fail-open, same posture as
+  //     leftover-scan: only acts on an explicit boolean; a malformed/unavailable probe never sinks
+  //     an item on its own.
+  if (ledgerTouch) {
+    phase('EdgeScan')
+    const LARAW = itemsDir(id) + '/ledger-anchor-raw.txt'
+    const la = await call('ledger-anchor-probe', { model: 'claude-haiku-4-5', effort: 'low' }, LEDGER_ANCHOR_SCHEMA,
+      'LEDGER-ANCHOR CONSISTENCY SCAN (KI-E91). STEP 1 — run EXACTLY this via Bash and TEE the output: `' + BT + ' ledger-anchor ' + wtPath + ' 2>&1 | tee ' + LARAW + '`. It prints `FACTORY::LEDGER-ANCHOR-DUP-HIT::<anchor>::<level>::<fileA>::<fileB>` for a NEW/edited anchor that also exists at the same heading level in a sibling ledger, `FACTORY::LEDGER-ANCHOR-TAG-HIT::<anchor>::<claimedFile>::<tagFound>` for a file an entry claims carries a standards-evolution: tag (tagFound already grep-verified) per candidate + a final `FACTORY::LEDGER-ANCHOR::<count>`. STEP 2 — for EACH DUP hit, read both entries bodies in the worktree (`' + wtPath + '/<fileA>` and `' + wtPath + '/<fileB>`, the heading `#{level} <anchor>` to the next heading) and compare their `Created:`/`Standard:`/`Legacy sites:` lines: a pair whose content materially disagrees (different dates, different cited rule, different site list) about what is presented as the SAME divergence is a finding (contradictory-duplicate); an identical or clearly-intentional cross-post (e.g. one entry explicitly says "see the other ledger") is NOT a finding. For EACH TAG hit, tagFound=false means the entry claims claimedFile carries the tag but it does not (a finding, false-tag-claim) UNLESS the claim was misextracted (re-read the entry body to confirm it genuinely asserts THIS file carries the tag before flagging). Return clean=true ONLY if ZERO genuine findings (or the marker shows 0 candidates). Do NOT edit anything.', 'EdgeScan')
+    res.artifacts['probe:ledger-anchor-scan'] = 'state/items/' + id + '/ledger-anchor-raw.txt'
+    if (la && typeof la.clean === 'boolean') {
+      res.gates['probe:ledger-anchor-scan'] = la.clean ? 'APPROVED' : 'CHANGES_REQUIRED'
+      if (!la.clean) {
+        const hits = (la.findings || []).slice(0, 8).map(function (f) { return (f.anchor || '?') + ' [' + (f.file || '?') + ']: ' + (f.why || '') }).join(' | ')
+        return finish('FAILED', 'ledger-anchor-scan (KI-E91): contradictory-duplicate or false-tag-claim ledger entry — ' + (hits || 'see ledger-anchor-raw.txt') + '. standards-evolution.md §3.4: a single authoritative entry per anchor, and prose claims must match grep-verifiable reality.')
       }
     }
   }

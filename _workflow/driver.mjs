@@ -24,13 +24,13 @@ import { resolveRepoRoot, swapMountPrefix, toPosix, STOCK_MOUNT } from './lib/ro
 import {
   emptyLedger, loadLedger, syncFromGraph, transition, foldResults,
   countByState, writeJsonAtomic, readJson, unwrapResultEnvelope, ACTIVE, OFFRAMPS, FORWARD,
-  parkedAtMs, allCommittedAfter, closedDepsWithLiveWorktree, lastHistoryNote,
+  parkedAtMs, allCommittedAfter, closedDepsWithLiveWorktree, sameTargetPairs, lastHistoryNote,
   reconcileToStateAndTransitions, deriveUnfoldedCycle,
 } from './lib/ledger.mjs';
 import { loadGraph, computeReady, waitingOnDeps, byId } from './lib/graph.mjs';
 import { bandFor } from './lib/band.mjs';
 import { loadRouting, resolve as routeResolve, concurrencyFor } from './lib/router.mjs';
-import { addWorktree, removeWorktree, listWorktrees, changedFiles, pruneWorktrees, isFactoryWorktreePath, parseComposeLs, strayComposeProjects } from './lib/worktree.mjs';
+import { addWorktree, removeWorktree, pruneStaleBranch, listWorktrees, changedFiles, pruneWorktrees, isFactoryWorktreePath, parseComposeLs, strayComposeProjects } from './lib/worktree.mjs';
 import { acquireLock, releaseLock } from './lib/lock.mjs';
 import { parseVerifyRaw, verdictFromParse, debrisFiles, parseRedRaw, hasRealInfraMarker, touchedRootCause, effectiveBaseline, decodeTranscript } from './lib/verify.mjs';
 import { preflight, dockerAvailable } from './lib/preflight.mjs';
@@ -1497,6 +1497,19 @@ function cmdGroup(flags) {
   });
   if (deferred.length) console.log('group: deferred (same-file collision within batch — stay READY for a later batch):', deferred.join(', '));
   if (!picked.length) { console.log('group: no schedulable items for the filter'); return; }
+  // KI-E90 (2026-08-28, ported from the host-mount session) — advisory same-target pairing warning:
+  // two items in one batch sharing the same `target` service can collide even when their declared
+  // files[] are disjoint, because a fixer is allowed to touch files OUTSIDE its declared lock-set
+  // when "strictly required" (fix.json's own documented escape hatch). Live incident on the sibling
+  // host-mount session (cycle 73, both CryptoPaymentService): two same-target items had ZERO
+  // declared files[] overlap, both cleared the file-lock check above, yet one item's fixer
+  // discovered mid-run it also needed a file the other item held, and FAILED on a pure
+  // batch-scheduling collision neither item's own content caused. WARN, don't exclude (KI-E29
+  // posture): nothing is clobbered by pairing them, and same-target items are often fine together —
+  // but the odds of a hidden-dependency lock collision are highest within one target, so flag it for
+  // the operator to judge (split the batch, or accept the risk knowingly).
+  const sameTarget90 = sameTargetPairs(picked);
+  if (sameTarget90.length) console.log('  KI-E90 WARN: batch pairs multiple items on the same target — a fixer may touch files OUTSIDE its declared lock-set and collide with a same-target sibling even with zero declared files[] overlap: ' + sameTarget90.map((p) => p.target + ': ' + p.ids.join('+')).join('; '));
   // KI-E22 (improvement-analysis P4) — advisory acceptance-surface check on the picked batch: warn
   // when an item's acceptance names a real repo file its files[] (the lock set) does not carry —
   // the fixer would be lock-forbidden from meeting acceptance (the ITEM-M7 controller-clause
@@ -1750,7 +1763,20 @@ function cmdWorktree(sub, rest) {
     console.log(JSON.stringify(wt));
     return;
   }
-  if (sub === 'worktree-remove') { removeWorktree(rest[0], true); console.log('removed', rest[0]); return; }
+  if (sub === 'worktree-remove') {
+    const target = abs(rest[0]);
+    // Resolve the branch attached to this worktree BEFORE removing it (listWorktrees reads live
+    // git state; once the worktree is gone there is nothing left to look up).
+    let branch = null;
+    try { branch = (listWorktrees().find((w) => abs(w.worktree || '') === target) || {}).branch || null; } catch { /* best effort */ }
+    removeWorktree(rest[0], true);
+    console.log('removed', rest[0]);
+    if (branch) {
+      const r = pruneStaleBranch(branch, REPO_ROOT);
+      console.log(r.deleted ? `  branch ${r.branch} deleted (fresh checkout guaranteed next time)` : `  branch left standing: ${r.reason}`);
+    }
+    return;
+  }
 }
 
 // KI-L27 — audit (and with --fix, repair) stale files[] paths in the findings graph. A stale path
@@ -1851,7 +1877,15 @@ function cmdGc(flags) {
     let removed = 0;
     for (const [id, r] of closed) {
       const wtAbs = presolve(REPO_ROOT, r.worktree);
-      try { if (existsSync(wtAbs)) removeWorktree(wtAbs, true); r.worktree = null; r.branch = null; removed++; }
+      try {
+        if (existsSync(wtAbs)) removeWorktree(wtAbs, true);
+        // The same stale-branch gap as the CLI worktree-remove subcommand — close it identically.
+        if (r.branch) {
+          const pr = pruneStaleBranch(r.branch, REPO_ROOT);
+          if (!pr.deleted) console.log(`  ! ${id}: ${pr.reason}`);
+        }
+        r.worktree = null; r.branch = null; removed++;
+      }
       catch (e) { console.log(`  ! could not remove ${id}: ${String((e && e.message) || e)}`); }
     }
     try { pruneWorktrees(); } catch { /* best effort */ }

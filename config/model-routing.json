@@ -4,9 +4,9 @@
   "routes": {
     "normalizer":            { "model": "claude-haiku-4-5",  "effort": "low" },
     "planner":               { "model": "claude-fable-5",    "effort": "high",   "when": "tier=critical|cross-service", "fallback": { "model": "claude-opus-4-8", "effort": "high" }, "_ki_d11": "fable-5 experiment 2026-07-19 (FABLE-PROBE-OK re-verified access, reversing KI-C8). Sets each non-trivial item's whole approach; opus/high fallback (KI-D10) preserves prior routing on a fable outage." },
-    "fixer.mechanical":      { "model": "claude-sonnet-5", "effort": "medium" },
+    "fixer.mechanical":      { "model": "claude-sonnet-4-6", "effort": "medium", "_note": "KI-E92 (2026-08-28): re-routed from claude-sonnet-5 to claude-sonnet-4-6 — ledger cost-bucket evidence on the sibling host-mount session confirmed claude-sonnet-4-6 was the mechanical fixer/test-author default before a routine current-gen swap to sonnet-5, never shown worse. See the sibling repo's KNOWN-ISSUES.md KI-E92 for the full rationale." },
     "fixer.critical":        { "model": "claude-opus-4-8",   "effort": "high",   "escalate_effort": "xhigh" },
-    "test_author.mechanical":{ "model": "claude-sonnet-5", "effort": "medium" },
+    "test_author.mechanical":{ "model": "claude-sonnet-4-6", "effort": "medium", "_note": "KI-E92 (2026-08-28) — see fixer.mechanical._note." },
     "test_author.critical":  { "model": "claude-opus-4-8",   "effort": "high" },
     "runner":                { "model": "claude-sonnet-5",   "effort": "low", "_ki_l64": "pinned haiku->sonnet 2026-07-16: haiku 200k ceiling dies 'Prompt is too long' on big-solution verify (ITEM-H7/ITEM-H5 cycle 35); KI-L56 class, KI-L58 pin precedent" },
     "gate.architect":        { "model": "claude-opus-4-8",   "effort": "high" },

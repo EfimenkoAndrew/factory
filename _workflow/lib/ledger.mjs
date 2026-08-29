@@ -116,6 +116,21 @@ export function closedDepsWithLiveWorktree(picked, rows, hasWorktree) {
   }
   return out;
 }
+// KI-E90 (2026-08-28, ported from the host-mount session): the pure core of the group-time
+// same-target WARN. A fixer may touch files OUTSIDE its declared lock-set when "strictly required"
+// (fix.json's own documented escape hatch), so two picked items sharing a target CAN collide on a
+// file lock even with zero declared files[] overlap. Returns [{target, ids}] for every target with
+// 2+ picked items — advisory (WARN), never excludes; same-target pairing is often fine, just
+// higher-risk.
+export function sameTargetPairs(picked) {
+  const byTarget = new Map();
+  for (const wi of picked || []) {
+    if (!wi || !wi.target) continue;
+    if (!byTarget.has(wi.target)) byTarget.set(wi.target, []);
+    byTarget.get(wi.target).push(wi.id);
+  }
+  return [...byTarget.entries()].filter(([, ids]) => ids.length > 1).map(([target, ids]) => ({ target, ids }));
+}
 // KI-E36 (review fix): TRUE when EVERY file has a commit strictly newer than sinceMs. lastCommitIso is
 // an injected lookup (file -> ISO committer date, '' when never committed) so the git edge stays in
 // the driver (KI-E2) while this date logic is pure + selftest-pinned. Empty/unknown inputs -> false.

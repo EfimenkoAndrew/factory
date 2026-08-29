@@ -11,6 +11,7 @@
 #   build-test.sh claims    <worktree-path>       # KI-E11: phantom doc-path lint (FACTORY::CLAIMS::<n>)
 #   build-test.sh leftovers <worktree-path>       # KI-D12: deferral/tech-debt lexicon lint (FACTORY::LEFTOVER::<n>) — engine-owned, runs BEFORE the local-override seam
 #   build-test.sh comments  <worktree-path>       # KI-E59: no-new-comments lint (FACTORY::COMMENT::<n>) — engine-owned, runs BEFORE the local-override seam
+#   build-test.sh ledger-anchor <worktree-path>   # KI-E91: STANDARDS-DIVERGENCE-LEDGER.md duplicate-anchor/false-tag-claim lint (FACTORY::LEDGER-ANCHOR::<n>) — engine-owned, runs BEFORE the local-override seam
 #   build-test.sh pack      <worktree-path> <out> # review pack snapshot for the gate band
 #
 # NEVER runs git. Read-only against the repo except for build artifacts in the worktree.
@@ -34,12 +35,16 @@ export MSBUILDDISABLENODEREUSE=1
 #   leftovers — KI-D12 deferral-lexicon candidate detector (haiku probe classifies punt-vs-legit).
 #   comments  — KI-E59 no-new-comments detector (host-policy `noNewComments` gates the callers; NO
 #               classifier stage — when the policy is on, every hit is a hard violation).
+#   ledger-anchor — KI-E91 STANDARDS-DIVERGENCE-LEDGER.md consistency detector. ADVISORY (never
+#               blocking on its own — the haiku classify step decides): duplicate-anchor +
+#               false-tag-claim candidates, mirroring the leftovers/comments engine-owned shape.
 case "${1:-}" in
-  leftovers|comments)
+  leftovers|comments|ledger-anchor)
     _wt="${2:-}"
     if [ -z "$_wt" ]; then echo "usage: build-test.sh ${1} <worktree>" >&2; exit 64; fi
     _SD=$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)
     if [ "$1" = "leftovers" ]; then exec node "$_SD/../_workflow/leftover-lint.mjs" "$_wt"; fi
+    if [ "$1" = "ledger-anchor" ]; then exec node "$_SD/../_workflow/ledger-anchor-lint.mjs" "$_wt"; fi
     exec node "$_SD/../_workflow/comment-lint.mjs" "$_wt"
     ;;
 esac
@@ -169,7 +174,7 @@ case "$cmd" in
     exit 0
     ;;
   *)
-    echo "usage: build-test.sh build|red|filter|suite|claims|leftovers|comments|pack <target> [filter|outfile]" >&2
+    echo "usage: build-test.sh build|red|filter|suite|claims|leftovers|comments|ledger-anchor|pack <target> [filter|outfile]" >&2
     exit 64
     ;;
 esac

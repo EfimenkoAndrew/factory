@@ -62,6 +62,11 @@ export const RED_PROOF_SCHEMA = { type: 'object', additionalProperties: false, r
 // plan-commitment-probe stage is NOT yet ported.
 export const PLAN_COMMITMENT_SCHEMA = { type: 'object', additionalProperties: false, required: ['honored'], properties: { honored: { type: 'boolean' }, gaps: { type: 'array', items: { type: 'object', additionalProperties: false, required: ['commitment', 'why'], properties: { commitment: { type: 'string' }, why: { type: 'string' } } } } } };
 
+// KI-E91 (2026-08-28, ported from a host-mount session) — schema-parity only, same disclosed-gap
+// posture as KI-E83/KI-E87/KI-E75/KI-E69 above: the opencode runtime's own routing/dispatch of the
+// ledger-anchor-probe stage is NOT yet ported.
+export const LEDGER_ANCHOR_SCHEMA = { type: 'object', additionalProperties: false, required: ['clean'], properties: { clean: { type: 'boolean' }, findings: { type: 'array', items: { type: 'object', additionalProperties: false, required: ['anchor', 'file', 'why'], properties: { anchor: { type: 'string' }, file: { type: 'string' }, why: { type: 'string' } } } } } };
+
 export const SWEEP_DESIGN_SCHEMA = { type: 'object', additionalProperties: false, required: ['pattern', 'headline'], properties: { pattern: { type: 'string' }, applicationNotes: { type: 'string' }, conformanceCheck: { type: 'string' }, headline: { type: 'string' } } };
 
 export const CHECKPOINT_SCHEMA = { type: 'object', additionalProperties: false, required: ['written'], properties: { written: { type: 'boolean' }, note: { type: 'string' } } };
