@@ -39,12 +39,13 @@ export MSBUILDDISABLENODEREUSE=1
 #               blocking on its own — the haiku classify step decides): duplicate-anchor +
 #               false-tag-claim candidates, mirroring the leftovers/comments engine-owned shape.
 case "${1:-}" in
-  leftovers|comments|ledger-anchor)
+  leftovers|comments|ledger-anchor|rootcause)
     _wt="${2:-}"
     if [ -z "$_wt" ]; then echo "usage: build-test.sh ${1} <worktree>" >&2; exit 64; fi
     _SD=$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)
     if [ "$1" = "leftovers" ]; then exec node "$_SD/../_workflow/leftover-lint.mjs" "$_wt"; fi
     if [ "$1" = "ledger-anchor" ]; then exec node "$_SD/../_workflow/ledger-anchor-lint.mjs" "$_wt"; fi
+    if [ "$1" = "rootcause" ]; then exec node "$_SD/../_workflow/rootcause-lint.mjs" "$_wt"; fi
     exec node "$_SD/../_workflow/comment-lint.mjs" "$_wt"
     ;;
 esac
@@ -174,7 +175,7 @@ case "$cmd" in
     exit 0
     ;;
   *)
-    echo "usage: build-test.sh build|red|filter|suite|claims|leftovers|comments|ledger-anchor|pack <target> [filter|outfile]" >&2
+    echo "usage: build-test.sh build|red|filter|suite|claims|leftovers|comments|ledger-anchor|rootcause|pack <target> [filter|outfile]" >&2
     exit 64
     ;;
 esac

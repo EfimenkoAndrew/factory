@@ -1,7 +1,7 @@
 // Ledger — atomic, resumable state for every work item. The filesystem checkpoint.
 // Single writer (the driver). Agents never touch this file; they write
 // state/items/<id>/<stage>.json and the driver folds those results in here.
-import { readFileSync, writeFileSync, renameSync, existsSync, mkdirSync, readdirSync } from 'node:fs';
+import { readFileSync, writeFileSync, renameSync, existsSync, mkdirSync, readdirSync, rmSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 
 // ---- state machine ------------------------------------------------------------
@@ -138,6 +138,14 @@ export function allCommittedAfter(files, sinceMs, lastCommitIso) {
   if (!Array.isArray(files) || !files.length || sinceMs == null) return false;
   return files.every((f) => { const iso = lastCommitIso(f); const t = iso ? Date.parse(iso) : NaN; return !Number.isNaN(t) && t > sinceMs; });
 }
+// KI-E111 (2026-09-02) — a synchronous sleep with no dependency and no busy-wait, for the rename
+// retry below. `Atomics.wait` on a throwaway SharedArrayBuffer is the standard zero-dep way to block
+// a synchronous code path; it is wrapped because some runtimes disallow it on the main thread, and a
+// backoff that cannot sleep must degrade to "retry immediately", never throw.
+function sleepSync(ms) {
+  try { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); } catch { /* no sleep available — fall through to an immediate retry */ }
+}
+
 export function writeJsonAtomic(path, obj) {
   mkdirSync(dirname(path), { recursive: true });
   // KI-B3 (closed 2026-07-12): pid-unique temp name — two processes writing the same target no longer
@@ -145,7 +153,29 @@ export function writeJsonAtomic(path, obj) {
   // just removes the residual footgun for every OTHER writeJsonAtomic target, e.g. reports/args).
   const tmp = path + '.tmp.' + process.pid;
   writeFileSync(tmp, JSON.stringify(obj, null, 2) + '\n');
-  renameSync(tmp, path); // atomic on POSIX
+  // KI-E111 — `renameSync` over an EXISTING target is atomic-and-always-succeeds on POSIX, but on
+  // Windows it is a `MoveFileExW` that fails with a transient sharing violation (EPERM/EACCES/EBUSY)
+  // whenever anything else momentarily holds the destination open — an antivirus scanner, the search
+  // indexer, a concurrent reader. Live-observed on this engine: an intermittent
+  // `EPERM: operation not permitted, rename … opencode-progress.json.tmp -> opencode-progress.json`
+  // that passed on re-run, disclosed in KI-E102. The consequence is not cosmetic: this is the ONLY
+  // durable-write primitive in the engine, so a lost write here is a lost ledger update, a lost
+  // report, or — as observed — a lost opencode checkpoint, which strands an item's in-flight progress.
+  // Bounded retry with a short backoff, ONLY on Windows and ONLY for the three transient codes; any
+  // other error, and every error on POSIX, propagates immediately with the pre-existing behaviour.
+  let lastErr = null;
+  for (let attempt = 0; attempt < 5; attempt++) {
+    try { renameSync(tmp, path); return; } catch (e) {
+      lastErr = e;
+      if (process.platform !== 'win32') break;                                  // POSIX has no such failure mode
+      if (!['EPERM', 'EACCES', 'EBUSY'].includes(e && e.code)) break;            // a REAL error must not be retried into a delay
+      sleepSync(10 * (attempt + 1));                                            // 10/20/30/40ms — total worst case 100ms
+    }
+  }
+  // Never leave the temp behind on failure: a stray `<path>.tmp.<pid>` is exactly the non-canonical
+  // debris KI-E42's relaunch scanner flags, so a failed write would also poison the next resume.
+  try { rmSync(tmp, { force: true }); } catch { /* best-effort cleanup — the throw below is the real signal */ }
+  throw lastErr;
 }
 
 // ---- ledger ops ---------------------------------------------------------------

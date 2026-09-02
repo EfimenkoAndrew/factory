@@ -85,7 +85,17 @@ export function reauditLenses(item) {
 // P5 (gate rigor): these themes ALWAYS get the FULL opus gate panel — never LIGHT.
 export const BAND_FULL_THEMES = ['security-multitenancy', 'money-correctness', 'idempotency-dataflow', 'concurrency'];
 // P2 keyword safety net for a mis-triaged item whose text betrays a real-infra need item.realInfra missed.
-export const REALINFRA_SIGNAL = /concurren|race condition|\brace\b|lost update|toctou|isolation level|serializable|deadlock|advisory lock|unique (constraint|index)|23505|fromsql|raw sql|rowversion|optimistic concurren|pessimistic|\bfor update\b|interleav|double-?spend|idempoten.*(dup|race|concurrent)/;
+// KI-E103 (2026-09-02): this constant had DRIFTED from factory.js's canonical copy — it was still the
+// pre-KI-E97 pattern. KI-E97 (2026-08-29) narrowed the bare `concurren` catch-all after FIVE live
+// false-positive incidents and added the hyphen-normalised separators + `concurrencyexception`, but
+// only factory.js was updated (KI-E97's own row lists no opencode mirror, unlike KI-E92's, which is
+// why the drift went unnoticed). The stale copy both OVER-fired — "~10 concurrent 100MB downloads",
+// "do not group concurrently with X", "serialize against any concurrent work", "max 10 concurrent)"
+// each demanded a Testcontainers marker the item's fix cannot produce, making those items
+// structurally UNCLOSABLE in this port while closable in canon — and UNDER-fired on the hyphenated
+// `unique-constraint` shape, losing its real-infra floor. Now a byte-identical port of factory.js's
+// definition; `lib/port-parity.mjs` + the selftest pin that byte-parity so this class cannot recur.
+export const REALINFRA_SIGNAL = /race condition|\brace\b|lost update|toctou|isolation level|serializable|deadlock|advisory lock|unique[\s-]+(constraint|index)|23505|fromsql|raw sql|rowversion|optimistic[\s-]+concurren|pessimistic|\bfor update\b|interleav|double-?spend|idempoten.*(dup|race|concurrent)|concurrencyexception|(?<!\bare\s)(?<!\bis\s)concurren\w*\b(?!\))(?!\s+\d)(?!(ly)?\s+(with|to|against)\b)(?!\s+(\w+\s+)?(downloads?|requests?|clients?|users?|sessions?|connections?|tabs?|calls?|work)\b)/;
 
 export function bandFor(item) {
   if (item.band === 'LIGHT' || item.band === 'FULL') return item.band;

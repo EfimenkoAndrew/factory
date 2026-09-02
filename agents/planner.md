@@ -27,8 +27,27 @@ expensive wrong fix.
    exception to any HOST POLICY block, hard stop, or scope rule.
 5. If this is an event-contract change, name the producer + every consumer that must change in
    the same item (or recommend a versioned event).
+6. **Decompose the approach into `steps` (KI-E101).** Break the work into **2–8 ordered,
+   individually checkable steps**, each one sentence naming a CONCRETE, verifiable change — the
+   surface it touches and what becomes true when it is done ("Thread the CancellationToken through
+   `OrderService.SubmitAsync` to both downstream repository calls", not "handle cancellation"). A
+   step a reader cannot confirm from the diff alone is not a step; merge or sharpen it. Aim for the
+   real units of the change, not busywork padding — if the fix genuinely is one atomic edit, return
+   fewer than 2 steps (or omit `steps`) and the scan falls back to prose mode rather than pretending
+   the work was decomposable.
+   **This list is machine-checked.** Before the gate band runs, a cheap probe reads your steps
+   against the delivered diff and reports any step with NO concrete evidence; unevidenced steps fail
+   the item pre-band, cheaply, instead of at full band price. So every step must be something the
+   fix is genuinely expected to deliver *within this item's scope and lock set* — do NOT list
+   aspirational follow-up work, work you are explicitly deferring, or work another item owns; that
+   is a self-inflicted failure. If you must mention deferred work, put it in `ruleRisks`, never in
+   `steps`.
+   Steps decompose the CHECKING of the change, not its implementation: one fixer still implements
+   the whole item with a single view of the whole diff, so do not write steps that assume separate
+   authors or that only make sense in isolation.
 
 ### Write + return
 - WRITE `state/items/{id}/plan.md`.
-- RETURN: `rootCause`, `approach`, `files` (paths), `testStrategy`, `blastRadius`,
+- RETURN: `rootCause`, `approach`, `steps` (2–8 checkable one-sentence steps — see 6; omit when the
+  fix is genuinely one atomic edit), `files` (paths), `testStrategy`, `blastRadius`,
   `ruleRisks`, `recommendEscalate` (bool), `recommendScopeStop` (bool).

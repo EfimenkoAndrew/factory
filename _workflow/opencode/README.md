@@ -9,11 +9,22 @@ session supply the `agent()` calls itself (via whatever subagent-launch tool it 
 OpenCode's `Task`, or its own terminal/edit tools playing each role directly — see "Using this
 binding from GitHub Copilot" below).
 
-Read `KNOWN-ISSUES.md`'s **KI-O1** entry first — it lists the documented fidelity gaps
-(no per-call model tiering, no sweep-mode, one item at a time; the decision-framer, PO gate,
-escalate check, and edge-scan verdict splice all mirror `factory.js` exactly). This is not a
-lighter-weight reimplementation of the factory; it is the SAME contract (schemas, fold rules,
-artifact shapes) driven by a different controller.
+**Fidelity gaps — `stage-parity.mjs` is the authoritative list, not this file.** Read
+`KNOWN-ISSUES.md`'s **KI-O1** and **KI-O4** entries for the two structural gaps (no per-call model
+tiering; no independent subagent dispatch under Copilot), and `runtime.mjs`'s own header for the
+out-of-scope note (no sweep-mode; one item at a time). For everything else, read
+[`stage-parity.mjs`](./stage-parity.mjs) — it declares, per stage, which canonical `factory.js`
+agent stages this port implements **mechanically** and which are **genuinely absent**, and the
+selftest FAILS if that manifest disagrees with either file (KI-E103).
+
+> This paragraph used to carry a hand-written gap list instead, and it had rotted: it presented a
+> closed set ("no per-call model tiering, no sweep-mode, one item at a time") that omitted ten real
+> gaps, and asserted this port is "the SAME contract (schemas, fold rules, artifact shapes)" when
+> artifact shapes and gate keys genuinely differ (`reaudit-<lens>.md` vs `reaudit.md`;
+> `mech:comment-scan` vs `probe:comment-scan`). A prose list nothing checks is exactly the
+> silent-divergence failure mode `KNOWN-ISSUES.md` exists to prevent — hence the machine-checked
+> manifest. **What IS guaranteed identical, and mechanically gated: the structured-output schemas,
+> the `result.json` shape `driver.mjs fold` validates, and the shared routing constants.**
 
 Two behaviours worth knowing up front:
 
@@ -33,8 +44,9 @@ Two behaviours worth knowing up front:
 | File | What |
 |---|---|
 | `schemas.mjs` | The structured-output schemas every phase's subagent call must satisfy (verbatim copies of factory.js's `*_SCHEMA` consts) + a minimal zero-dependency validator for the JSON-Schema subset they use. |
-| `routing.mjs` | Verbatim port of `routesFor`/`flowsFor`/`bandFor`/`reauditLenses`/`gateRolesFor`. Pure functions, no model calls — see the model-tiering caveat in the file header. |
-| `compose.mjs` | Verbatim port of `compose(role, item, extra)` — builds the exact prompt text a subagent receives, inlining the real `agents/<role>.md` brief (this module has real disk access, unlike the sandboxed factory.js). |
+| `routing.mjs` | Port of `routesFor`/`flowsFor`/`bandFor`/`reauditLenses`/`gateRolesFor` + the shared `REALINFRA_SIGNAL`/`BAND_FULL_THEMES` constants. Pure functions, no model calls — see the model-tiering caveat in the file header. The constants are byte-parity-gated against `factory.js` (KI-E103) after `REALINFRA_SIGNAL` silently drifted from canon for days (KI-E97 was applied to `factory.js` only). |
+| `compose.mjs` | Port of `compose(role, item, extra)` — builds the exact prompt text a subagent receives, inlining the real `agents/<role>.md` brief (this module has real disk access, unlike the sandboxed factory.js). Two deliberate, documented deviations from `factory.js`: it always inlines the brief, and its GUARDRAILS block tells the session to read `.claude/rules/*.md` itself (canon's copy says the opposite, because the Workflow runtime auto-loads them). |
+| `stage-parity.mjs` | **The machine-checked fidelity manifest (KI-E103).** Declares which `factory.js` agent stages this port implements MECHANICALLY (deterministic Node instead of an agent — often stronger) and which are genuinely UNPORTED, each with a reason, plus the constants that must stay byte-identical. `lib/_selftest.mjs` fails if a canonical stage is neither dispatched nor declared, and also if a declaration is stale or dead. |
 | `buildtest.mjs` | Spawns the **same unmodified** `verify/build-test.sh` via Git Bash (works around the broken default-WSL-bash on some Windows hosts — see `OPENCODE_FACTORY_BASH` to override) and **imports** (does not re-derive) `lib/verify.mjs`'s transcript parsers, so fold-time evidence parsing can never drift from what `driver.mjs fold` actually applies. |
 | `runtime.mjs` | The per-item state machine CLI: `init` / `next` / `submit` / `mech` / `status` / `finalize`. See usage below. |
 | `_selftest.mjs` + `selftest-fixture.json` + `selftest-fixture-fullband.json` | Pure-module assertions, in-process lifecycle pins (runtime.mjs guards its CLI entry point, so its helpers import cleanly), a mechanical schema-parity check against `factory.js`'s `*_SCHEMA` consts, and full CLI state-machine runs against synthetic fixture items (incl. a doc-only run all the way to CLOSED) — zero real agent calls, zero real product code touched, zero git mutations. Run: `node _workflow/opencode/_selftest.mjs`. |

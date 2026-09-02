@@ -62,6 +62,40 @@ export function parseVerifyRaw(text) {
   return out;
 }
 
+// KI-E108 (2026-09-02) — FLAKE SUSPICION. Nothing in the factory distinguished a genuinely-failing
+// test from an intermittently-failing one, and the cost of that confusion is a whole band: a flaky
+// failure re-bands the item (up to maxItemRetries), while a flaky PASS is worse — KI-E65 records an
+// item folded CLOSED while carrying a newly-introduced flaky test, caught only because the operator
+// cross-checked the note against the ledger by hand.
+//
+// The one flake signal that is DETERMINISTIC and free: the SAME test class appearing with BOTH a
+// passing and a failing filter result in the same transcript. `build-test.sh` emits one
+// `FILTER::START <target> :: <class>` + `FILTER::RESULT exit=<n>` pair per invocation, strictly in
+// order (the 1:1 pairing KI-E70 already relies on), so a class carrying two different outcomes has
+// demonstrably behaved non-deterministically on this host, in this run.
+//
+// Deliberately ADVISORY, and this bound is the design: a fail-then-pass sequence is ALSO the
+// legitimate cycle-8 retry shape (fix, re-run, green), which `lastMatch` intentionally resolves as
+// "the last one wins". This must never change that verdict — it only NAMES the class so a human
+// reading the fold output can tell "retried after a fix" from "this test is unstable". Promoting it
+// to a blocking signal would fail the very retry shape the engine explicitly supports.
+export function flakeSuspects(text) {
+  if (!text || typeof text !== 'string') return [];
+  const starts = [...text.matchAll(/FACTORY::TEST::FILTER::START\s+\S+\s*::\s*([^\r\n]+)/g)];
+  const results = [...text.matchAll(/FACTORY::TEST::FILTER::RESULT\s+exit=(-?\d+)/g)];
+  const n = Math.min(starts.length, results.length);
+  const outcomes = new Map(); // class -> Set of 'pass' | 'fail'
+  for (let i = 0; i < n; i++) {
+    const cls = starts[i][1].trim();
+    const ok = parseInt(results[i][1], 10) === 0;
+    if (!outcomes.has(cls)) outcomes.set(cls, new Set());
+    outcomes.get(cls).add(ok ? 'pass' : 'fail');
+  }
+  const out = [];
+  for (const [cls, seen] of outcomes) if (seen.size > 1) out.push(cls);
+  return out.sort();
+}
+
 // Decide PASS/FAIL from a deterministic parse + the agent-reported baseline failure count. A parse with
 // no machine evidence => pass:true reason 'no-machine-evidence' (the caller then trusts the agent verdict).
 export function verdictFromParse(p, baselineFailures) {
@@ -144,10 +178,35 @@ export function decodeTranscript(buf) {
 // the audit files[] are repo-relative while the diff is worktree-relative, and a good fix may legitimately
 // touch an adjacent file the audit did not predict. Debris is filtered by the caller (driver P9 runs AFTER
 // the debris gate), so `changed` here is real work, not junk.
+// KI-E104: the "is this a test file" predicate, defined ONCE. It was previously written out
+// byte-identically inside both `touchedRootCause` and `debrisFiles` below; hoisting it removes the
+// standing risk that a future refinement lands in one copy only — the same silent-divergence class
+// KI-E103 found between factory.js and its opencode port. Both call sites keep their exact prior
+// behaviour (the selftest pins the equivalence).
+export function isTestPath(f) {
+  // KI-E104: the FILENAME arm is case-SENSITIVE on `Test`, the directory arm is not. The filename arm
+  // used to carry /i, which made `[^/]*Tests?\.cs$` match any source file whose name merely ENDS in
+  // those letters — `Contests.cs`, `Manifests.cs`, `Protests.cs` were all classified as tests. That is
+  // a real false-positive in two shipped deterministic checks: P9 would read a fix touching only such
+  // a file as "tests-only" and FAIL a correct fix, and `debrisFiles` (which never flags a test file)
+  // would let a same-named scratch file through. .NET test types are PascalCase by universal
+  // convention (`OrderServiceTests.cs`), so requiring the capital T costs nothing real; a repo using
+  // lowercase test filenames is still covered by the directory arm below, which stays /i because
+  // project-directory casing genuinely varies.
+  return /[^/]*Tests?\.cs$/.test(f) || /(^|\/)[^/]*\.Tests?(\/|$)/i.test(f);
+}
+
+// KI-E104: the non-test subset of a diff. `touchedRootCause` only ever needed the BOOLEAN "is any of
+// this non-test", but the pre-band P9 hoist (below/factory.js) needs to SHOW the operator which
+// files it found — "the diff touched only tests" is far more actionable when it can also say what
+// the diff did touch. One derivation, two consumers, no second isTest predicate.
+export function nonTestChanged(changed) {
+  return (changed || []).filter((f) => !isTestPath(f));
+}
+
 export function touchedRootCause(changed, rootCauseFiles) {
   if (!Array.isArray(rootCauseFiles) || !rootCauseFiles.length) return true; // not a source-file fix (config/doc) -> nothing to assert
-  const isTest = (f) => /[^/]*Tests?\.cs$/i.test(f) || /(^|\/)[^/]*\.Tests?(\/|$)/i.test(f);
-  return (changed || []).some((f) => !isTest(f)); // any non-test file (source OR config) proves the diff isn't test-only
+  return nonTestChanged(changed).length > 0; // any non-test file (source OR config) proves the diff isn't test-only
 }
 
 // Debris (KI-D1): a changed worktree file that is an OBVIOUS factory artifact or scratch file. Deterministic
@@ -165,7 +224,7 @@ export function debrisFiles(changed, expectedFiles) {
   const base = (f) => norm(f).split('/').pop();
   const expectedPaths = new Set((expectedFiles || []).map(norm));
   const expectedBases = new Set((expectedFiles || []).map(base));
-  const isTest = (f) => /[^/]*Tests?\.cs$/i.test(f) || /(^|\/)[^/]*\.Tests?(\/|$)/i.test(f);
+  const isTest = isTestPath; // KI-E104: the shared predicate (was a byte-identical local copy)
   const isArtifactOrScratch = (f) => {
     const n = norm(f), b = base(f);
     if (!n.includes('/')) { // a worktree-ROOT file is never source — a misplaced factory artifact

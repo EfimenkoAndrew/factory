@@ -235,7 +235,7 @@ export function clampAgentEvent(name) {
 export const GAP_FENCE_MS = 4 * 3600 * 1000;
 
 export function aggregateEvents(events) {
-  const agg = { total: 0, byEvent: {}, bySource: {}, outcomes: {}, cycles: {}, gates: {}, stages: {}, agentStages: {}, models: {}, infraSuspect: 0, items: {}, itemFolds: {}, failedAt: {}, gapOutliers: [], agentPairs: {}, usage: [], itemCallCounts: {}, tokenUsageSnapshots: [] };
+  const agg = { total: 0, byEvent: {}, bySource: {}, outcomes: {}, cycles: {}, gates: {}, stages: {}, agentStages: {}, models: {}, infraSuspect: 0, items: {}, itemFolds: {}, failedAt: {}, gapOutliers: [], agentPairs: {}, usage: [], itemCallCounts: {}, tokenUsageSnapshots: [], callsByOutcome: {} };
   for (const e of events || []) {
     if (!e || typeof e !== 'object' || !e.event) continue;
     agg.total++;
@@ -249,6 +249,18 @@ export function aggregateEvents(events) {
       if (e.attrs && e.attrs.gates) for (const [g, v] of Object.entries(e.attrs.gates)) { const gg = agg.gates[g] = agg.gates[g] || {}; gg[String(v)] = (gg[String(v)] || 0) + 1; }
       if (e.attrs && e.attrs.cost) {
         for (const [m, n] of Object.entries(e.attrs.cost)) agg.models[m] = (agg.models[m] || 0) + (Number(n) || 0);
+        // KI-E107 — agent-call spend attributed to the item's OUTCOME. `agg.models` above answers
+        // "which models did we call"; `agg.outcomes` answers "how did items end". Neither answers the
+        // question that actually governs cost: WHAT SHARE OF THE WORK WENT TO ITEMS THAT NEVER
+        // CLOSED. That is the factory's yield, and it was underivable from the report despite both
+        // inputs sitting in the same event. Call counts are the only per-item cost unit that is real
+        // and measured (KI-E66 established per-item TOKENS are structurally unavailable inside the
+        // Workflow runtime), so this is a call-weighted proxy — directional, never billed.
+        const callsHere = Object.values(e.attrs.cost).reduce((a, n) => a + (Number(n) || 0), 0);
+        const st107 = (e.attrs && e.attrs.toState) || e.outcome || '?';
+        const bucket = agg.callsByOutcome[st107] = agg.callsByOutcome[st107] || { calls: 0, items: 0 };
+        bucket.calls += callsHere;
+        bucket.items += 1;
         // KI-E66: per-item call-count total (across all models), KEYED BY CYCLE — the real/accurate
         // share weight apportionTokensByCallShare() divides that SAME cycle's real measured token
         // total across. Never a token count itself, just the existing per-item cost map's own call
@@ -316,6 +328,33 @@ export function aggregateEvents(events) {
     }
   }
   return agg;
+}
+
+// KI-E107 — render the calls-by-outcome table plus the two derived ratios that make it actionable.
+// Pure (string in, string out) so the selftest can pin the arithmetic without a Prometheus or a
+// telemetry stack. Report-side ONLY: this reads the append-only stream and never feeds a verdict
+// (KI-E7 — telemetry is observational, never evidentiary).
+export function renderCallsByOutcome(callsByOutcome) {
+  const entries = Object.entries(callsByOutcome || {}).filter(([, v]) => v && v.calls > 0);
+  if (!entries.length) return '_none — needs item_folded events carrying a cost map (KI-E23)._';
+  const total = entries.reduce((a, [, v]) => a + v.calls, 0);
+  if (!total) return '_none — needs item_folded events carrying a cost map (KI-E23)._';
+  entries.sort((a, b) => b[1].calls - a[1].calls);
+  const rows = entries.map(([st, v]) => `| ${st} | ${v.items} | ${v.calls} | ${((v.calls / total) * 100).toFixed(1)}% | ${(v.calls / v.items).toFixed(1)} |`);
+  const closed = (callsByOutcome.CLOSED && callsByOutcome.CLOSED.calls) || 0;
+  // "Wasted" is deliberately NOT "everything that is not CLOSED": an ESCALATED item reached a human
+  // with its analysis intact and a BLOCKED one surfaced a real scope question — both are the system
+  // working. Only FAILED spend produced no durable output, so only it is counted as waste, and the
+  // label says so rather than letting a reader infer a harsher number.
+  const failed = (callsByOutcome.FAILED && callsByOutcome.FAILED.calls) || 0;
+  return [
+    '| Outcome | Items | Agent calls | Share | Calls/item |',
+    '|---|---|---|---|---|',
+    ...rows,
+    '',
+    `**Yield — calls landing on a CLOSED item: ${((closed / total) * 100).toFixed(1)}%** (${closed}/${total}).`,
+    `**FAILED spend: ${((failed / total) * 100).toFixed(1)}%** (${failed}/${total}) — work that produced no durable output. ESCALATED/BLOCKED spend is deliberately NOT counted here: those reached a human with the analysis intact, which is the system working, not waste.`,
+  ].join('\n');
 }
 
 export function renderTelemetryReport(agg, meta = {}) {
@@ -425,5 +464,9 @@ export function renderTelemetryReport(agg, meta = {}) {
       return rows.length ? ['| Cycle | Item | Apportioned output tokens (est.) |', '|---|---|---|', ...rows].join('\n') : '_none — needs both a fold-time usage event and item_folded cost data for the same cycle_';
     })(), '',
     '## Agent-call volume by model (from fold cost)', '', kv(agg.models, 'Model', 'Calls'), '',
+    // KI-E107 — the yield section. See aggregateEvents for why call-count is the unit.
+    '## Agent-call spend by outcome (KI-E107)', '',
+    '_The share of the factory\'s work that reached a CLOSED item. Call counts are the only per-item cost unit that is real and measured — KI-E66 established that per-item TOKEN counts are structurally unavailable inside the Workflow runtime (`budget` exposes a whole-run counter only, and a direct empirical test confirmed an `agent()` call\'s own cost is not recoverable from outside the sandbox). So this is a call-weighted proxy: directional, never a bill. It is the one number that makes a cost argument settleable — an optimisation that lowers total calls but lowers the CLOSED share is not a saving._', '',
+    renderCallsByOutcome(agg.callsByOutcome), '',
   ].join('\n');
 }

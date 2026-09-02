@@ -28,16 +28,18 @@ import {
   reconcileToStateAndTransitions, deriveUnfoldedCycle,
 } from './lib/ledger.mjs';
 import { loadGraph, computeReady, waitingOnDeps, byId } from './lib/graph.mjs';
+import { unreadyItems } from './lib/readiness.mjs';
 import { bandFor } from './lib/band.mjs';
+import { projectBatch, renderProjection } from './lib/band-cost.mjs';
 import { loadRouting, resolve as routeResolve, concurrencyFor } from './lib/router.mjs';
 import { addWorktree, removeWorktree, pruneStaleBranch, listWorktrees, changedFiles, pruneWorktrees, isFactoryWorktreePath, parseComposeLs, strayComposeProjects } from './lib/worktree.mjs';
 import { acquireLock, releaseLock } from './lib/lock.mjs';
-import { parseVerifyRaw, verdictFromParse, debrisFiles, parseRedRaw, hasRealInfraMarker, touchedRootCause, effectiveBaseline, decodeTranscript } from './lib/verify.mjs';
+import { parseVerifyRaw, verdictFromParse, debrisFiles, parseRedRaw, hasRealInfraMarker, touchedRootCause, effectiveBaseline, decodeTranscript, flakeSuspects } from './lib/verify.mjs';
 import { preflight, dockerAvailable } from './lib/preflight.mjs';
 import { classifyFilesEntry, buildBasenameIndex, acceptanceSurfaceGaps } from './lib/graphaudit.mjs';
 import { renderFeedback } from './lib/feedback.mjs';
 import { dissentersFrom, roleForGateKey, recoveryFoldSkeleton, priorCycleOf, missingStageFrom } from './lib/recover.mjs'; // KI-E20 — the direct-recovery scaffold; KI-E81 — missing-stage auto-detection
-import { applyConvergenceBonus, effectiveRetryBound } from './lib/convergence.mjs';
+import { applyConvergenceBonus, effectiveRetryBound, applyStallDetection, isStalled } from './lib/convergence.mjs';
 import { clusterBySimilarity, sharedLabel, perCliqueBatchPatterns, bestClosedPrecedent, sig as simSig, similarSigs } from './lib/similarity.mjs';
 import { loadController, isStale as controllerStale, claimController, verifyController, releaseController, DEFAULT_TTL_MINUTES } from './lib/controller.mjs';
 import { buildFactoryRouting } from './lib/routing-drift.mjs';
@@ -556,6 +558,16 @@ function deterministicVerifyOverride(cfg, ledger, wi, r) {
     else if (codeChange) console.log(`  KI-E20 ${id}: worktree GONE (${wtRel}) — debris/P9 diff checks SKIPPED (transcripts remain the only evidence)`);
   }
   if (debris.length) return fail('worktree debris: ' + debris.join(', '));
+  // KI-E108 — FLAKE SUSPICION (advisory, never a verdict). A test class that appears with BOTH a
+  // passing and a failing filter result in the same transcript behaved non-deterministically on this
+  // host. This deliberately does NOT change the verdict: fail-then-pass is also the legitimate
+  // cycle-8 retry shape, which `lastMatch` resolves as last-wins by design. It NAMES the class so a
+  // human can tell "retried after a fix" from "this test is unstable" — the distinction KI-E65's
+  // flaky-test-folded-CLOSED incident had no signal for.
+  try {
+    const flaky = [...new Set([...flakeSuspects(vText || ''), ...flakeSuspects(intText || '')])];
+    if (flaky.length) console.log(`  KI-E108 ${id}: FLAKE SUSPECT — test class(es) both PASSED and FAILED in this run: ${flaky.join(', ')}. Advisory only (a fix-then-retry shows the same pattern); if it was not a retry, this test is unstable and will re-band the item.`);
+  } catch { /* advisory only — a flake scan must never affect a fold */ }
   // P9 — the fix must change real (non-test) code; a diff that touched ONLY tests greened the test, not the bug.
   // KI-L55: skipped for verificationOnly — NO fixer ran by design (stale finding / pure coverage), so a
   // tests-only diff is the CORRECT shape there, not a greened-test-unfixed-bug signal.
@@ -581,8 +593,14 @@ function escalateExhausted(ledger, cfg) {
   const out = [];
   for (const [id, row] of Object.entries(ledger.items)) {
     const bound = effectiveRetryBound(cfg.maxItemRetries, row);
-    if (row.state === 'FAILED' && row.attempts > bound &&
-        transition(ledger, id, 'ESCALATED', `auto-escalated: exhausted ${row.attempts} fix attempt(s) (bound ${bound}${row.retryBonus ? ` incl. +${row.retryBonus} convergence bonus` : ''}); needs a human`)) {
+    // KI-E105 — two independent stop conditions, ONE parking decision, so scheduling and parking can
+    // never disagree: the retry budget is spent, OR the trajectory has stalled (consecutive rounds
+    // with no reduction in blocking findings — spending the remaining band is near-certain waste).
+    const stalled = isStalled(cfg, row);
+    if (row.state === 'FAILED' && (row.attempts > bound || stalled) &&
+        transition(ledger, id, 'ESCALATED', stalled
+          ? `auto-escalated: NO-PROGRESS on ${row.stallRounds} consecutive round(s) (blocking findings did not shrink) after ${row.attempts} attempt(s); another band is near-certain waste — needs a human`
+          : `auto-escalated: exhausted ${row.attempts} fix attempt(s) (bound ${bound}${row.retryBonus ? ` incl. +${row.retryBonus} convergence bonus` : ''}); needs a human`)) {
       out.push(id);
       temit({ source: 'driver', event: 'transition', item: id, cycle: ledger.cycle, outcome: 'ESCALATED' }); // KI-E7 finding #12
     }
@@ -846,7 +864,17 @@ function cmdFold(file, flags) {
   // set is strictly narrower than the prior round's (fewer findings, max severity not worse — both
   // from the structured gateDetails, never agent self-assessment) earns ONE bonus attempt past
   // maxItemRetries instead of parking. Deterministic; bounded by maxBonusRounds.
+  // KI-E105 — capture each row's PRIOR convergence summary first: applyConvergenceBonus overwrites
+  // row.convergence with the current round's summary as it goes, so the stall pass that follows it
+  // could not otherwise see what the previous round looked like. One snapshot, two consumers.
+  const priorConvergence = {};
+  for (const r of arr) { const row = ledger.items[r && r.id]; if (row && row.convergence) priorConvergence[r.id] = row.convergence; }
   const bonuses = applyConvergenceBonus(ledger, cfg, arr);
+  // KI-E105 — the opposite direction: two consecutive rounds with NO reduction in blocking findings
+  // means the trajectory is not converging, so the remaining band(s) are near-certain waste. Park it
+  // for a human instead (escalateExhausted below applies the transition).
+  const stalls = applyStallDetection(ledger, cfg, arr, priorConvergence);
+  for (const s of stalls) console.log(`  KI-E105 ${s.id}: NO-PROGRESS streak ${s.stallRounds} (findings ${s.from ? s.from.findings : '?'} -> ${s.to.findings}) — parking for a human instead of spending another band`);
   const escalated = escalateExhausted(ledger, cfg);
   writeJsonAtomic(abs(cfg.paths.ledger), ledger);
   recordCostSnapshot(cfg, ledger); // per-cycle cost snapshot for the trend (observability, not a gate)
@@ -1315,6 +1343,10 @@ function cmdSuggest(flags) {
   // cluster tally is appended to each cluster's own header below.
   const wholeLight = ready.filter((wi) => bandFor(wi) === 'LIGHT').length;
   say(`  band mix (KI-E88, cost signal — FULL runs ~4x the gate panel of LIGHT): ${wholeLight} LIGHT / ${ready.length - wholeLight} FULL across the whole pool`);
+  // KI-E110 — put a NUMBER on that "~4x". The band mix gives the shape; this gives the size, in the
+  // same unit (agent calls) the KI-E107 yield report measures actuals in, so a projection can be
+  // checked against reality instead of becoming folklore.
+  say(`  ${renderProjection(projectBatch(ready, bandFor))}`);
   let n = 0;
   for (const c of clusters) {
     n++;
@@ -1510,6 +1542,25 @@ function cmdGroup(flags) {
   // the operator to judge (split the batch, or accept the risk knowingly).
   const sameTarget90 = sameTargetPairs(picked);
   if (sameTarget90.length) console.log('  KI-E90 WARN: batch pairs multiple items on the same target — a fixer may touch files OUTSIDE its declared lock-set and collide with a same-target sibling even with zero declared files[] overlap: ' + sameTarget90.map((p) => p.target + ': ' + p.ids.join('+')).join('; '));
+  // KI-E106 — ITEM READINESS: the deterministic INPUT-contract gate. Unlike the KI-E29/KI-E90 warns
+  // above (scheduling risks that may or may not bite), an unready item is defective in ITSELF: no
+  // batch composition rescues an acceptance criterion the downstream probes cannot check. Every
+  // stage from the acceptance-scan to gate-po to the re-auditor grades the diff against `acceptance`,
+  // so scheduling an item without a checkable one buys a full band of expensive argument and a
+  // near-certain FAIL. Blocking, because the cost of proceeding is a whole band and the cost of
+  // stopping is one edit to the graph — but with an explicit `--force-unready` for the operator who
+  // knows better (the item's contract may live somewhere this mechanical check cannot see).
+  const unready106 = unreadyItems(picked);
+  if (unready106.length) {
+    console.log('\n  KI-E106 ITEM READINESS: ' + unready106.length + ' of ' + picked.length + ' picked item(s) FAIL the input-contract gate:');
+    for (const u of unready106) for (const p of u.problems) console.log(`    ${u.id} [${p.code}] ${p.detail}`);
+    if (!flags['force-unready']) {
+      console.log('\n  REFUSING to group. Fix the item(s) in the findings-graph (it is hand-editable — schema/work-item.schema.json),');
+      console.log('  then re-run. To schedule anyway (you judge the contract adequate): driver.mjs group --force-unready\n');
+      process.exit(1);
+    }
+    console.log('  --force-unready: proceeding anyway on operator judgment (the band will grade the diff against this contract as-is).\n');
+  }
   // KI-E22 (improvement-analysis P4) — advisory acceptance-surface check on the picked batch: warn
   // when an item's acceptance names a real repo file its files[] (the lock set) does not carry —
   // the fixer would be lock-forbidden from meeting acceptance (the ITEM-M7 controller-clause

@@ -15,7 +15,13 @@
 
 export const FINDING = { type: 'object', additionalProperties: false, required: ['severity', 'title'], properties: { severity: { type: 'string' }, title: { type: 'string' }, file: { type: 'string' }, fix: { type: 'string' } } };
 
-export const PLAN_SCHEMA = { type: 'object', additionalProperties: false, required: ['rootCause', 'approach', 'recommendScopeStop', 'recommendEscalate'], properties: { rootCause: { type: 'string' }, approach: { type: 'string' }, files: { type: 'array', items: { type: 'string' } }, testStrategy: { type: 'string' }, blastRadius: { type: 'string' }, ruleRisks: { type: 'string' }, recommendEscalate: { type: 'boolean' }, recommendScopeStop: { type: 'boolean' } } };
+// KI-E101: `steps` is the OPTIONAL structured decomposition of `approach` (2-8 individually
+// checkable units of work) that the pre-band plan-scan probes one-by-one against the final diff.
+// KI-E112: this port now DISPATCHES that scan (planNext's plancommit trio) and reads this field via
+// normalizePlanSteps, so it is live input rather than — as this comment previously said — a field
+// the port "accepts and validates but never acts on". Optional by design: a planner that omits it,
+// and a plan authored before the field existed, both validate exactly as before.
+export const PLAN_SCHEMA = { type: 'object', additionalProperties: false, required: ['rootCause', 'approach', 'recommendScopeStop', 'recommendEscalate'], properties: { rootCause: { type: 'string' }, approach: { type: 'string' }, steps: { type: 'array', items: { type: 'string' } }, files: { type: 'array', items: { type: 'string' } }, testStrategy: { type: 'string' }, blastRadius: { type: 'string' }, ruleRisks: { type: 'string' }, recommendEscalate: { type: 'boolean' }, recommendScopeStop: { type: 'boolean' } } };
 
 export const TEST_SCHEMA = { type: 'object', additionalProperties: false, required: ['red', 'note'], properties: { red: { type: 'boolean' }, verificationOnly: { type: 'boolean' }, testFiles: { type: 'array', items: { type: 'string' } }, runCmd: { type: 'string' }, baselineFailures: { type: 'array', items: { type: 'string' } }, evidence: { type: 'string' }, note: { type: 'string' } } };
 
@@ -53,19 +59,27 @@ export const LEFTOVER_SCHEMA = { type: 'object', additionalProperties: false, re
 
 export const PROBE_SCHEMA = { type: 'object', additionalProperties: false, required: ['markerFound'], properties: { markerFound: { type: 'boolean' }, line: { type: 'string' } } };
 
-// KI-E83 — schema-parity only (mechanical selftest gate); the opencode runtime's own routing/
-// dispatch of this probe is NOT yet ported, same disclosed-gap posture as KI-E75/KI-E69.
+// KI-E83 — the RED-proof contract. KI-E112: the port now enforces this guard MECHANICALLY in
+// afterVerify (parseRedRaw over verify-red-raw.txt on disk, incl. KI-L55's inverted verificationOnly
+// polarity), so this schema is kept for parity with canon's agent-relay shape rather than because the
+// check is missing. See opencode/stage-parity.mjs, which the selftest enforces against both files.
 export const RED_PROOF_SCHEMA = { type: 'object', additionalProperties: false, required: ['markerFound', 'exitCode'], properties: { markerFound: { type: 'boolean' }, exitCode: { type: 'number' }, line: { type: 'string' } } };
 
-// KI-E87 (ported from a host-mount session) — schema-parity only, same disclosed-gap posture as
-// KI-E83/KI-E75/KI-E69 above: the opencode runtime's own routing/dispatch of the
-// plan-commitment-probe stage is NOT yet ported.
+// KI-E87 + KI-E101 — the plan-commitment/plan-step contract. KI-E112: this stage IS dispatched by the
+// port (the plancommit/plancommit_amend/plancommit_reprobe trio in planNext), so this schema is live,
+// not documentation.
 export const PLAN_COMMITMENT_SCHEMA = { type: 'object', additionalProperties: false, required: ['honored'], properties: { honored: { type: 'boolean' }, gaps: { type: 'array', items: { type: 'object', additionalProperties: false, required: ['commitment', 'why'], properties: { commitment: { type: 'string' }, why: { type: 'string' } } } } } };
 
-// KI-E91 (2026-08-28, ported from a host-mount session) — schema-parity only, same disclosed-gap
-// posture as KI-E83/KI-E87/KI-E75/KI-E69 above: the opencode runtime's own routing/dispatch of the
-// ledger-anchor-probe stage is NOT yet ported.
+// KI-E91 — the ledger-anchor contract. KI-E112: this stage IS dispatched by the port (mechanical
+// STEP-1 via build-test.sh ledger-anchor in `mech leftover`, then the ledger_anchor_classify agent
+// step), so this schema is live, not documentation.
 export const LEDGER_ANCHOR_SCHEMA = { type: 'object', additionalProperties: false, required: ['clean'], properties: { clean: { type: 'boolean' }, findings: { type: 'array', items: { type: 'object', additionalProperties: false, required: ['anchor', 'file', 'why'], properties: { anchor: { type: 'string' }, file: { type: 'string' }, why: { type: 'string' } } } } } };
+
+// KI-E104 — the root-cause-touch contract. KI-E112: the port enforces this guard MECHANICALLY in
+// afterVerify (nonTestChanged over the worktree diff), so this schema is kept for parity with canon's
+// agent-relay shape rather than because the check is missing. Field is `nonTestCount`, not `count`,
+// because zero here means FAILURE while COMMENT_SCHEMA's `count` zero means success.
+export const ROOTCAUSE_SCHEMA = { type: 'object', additionalProperties: false, required: ['nonTestCount'], properties: { nonTestCount: { type: 'number' }, files: { type: 'array', items: { type: 'string' } }, skipped: { type: 'boolean' } } };
 
 export const SWEEP_DESIGN_SCHEMA = { type: 'object', additionalProperties: false, required: ['pattern', 'headline'], properties: { pattern: { type: 'string' }, applicationNotes: { type: 'string' }, conformanceCheck: { type: 'string' }, headline: { type: 'string' } } };
 

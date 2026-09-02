@@ -22,7 +22,22 @@ export function dockerAvailable() { return probe('docker', ['info']); }
 // verify cannot run on this host" while every real verify call in the actual run succeeded via the
 // shim (live 2026-08-07). Pure + injectable (shimPath param) so it's testable without real dotnet.
 export function shimAvailable(shimPath) {
-  try { return existsSync(shimPath) && !!(statSync(shimPath).mode & 0o111); } catch { return false; }
+  // KI-E111 — the POSIX execute bit does not exist on Windows: NTFS has no such attribute, and Node
+  // synthesises `mode` from the read-only flag alone, so `statSync(f).mode & 0o111` is 0 for EVERY
+  // file there (verified against this repo's own shipped verify/build-test.sh: mode 0o666). That made
+  // shimAvailable() unconditionally false on Windows, so dotnetAvailable()/preflight() reported
+  // "dotnet: ABSENT — build/test verify cannot run on this host" on any Windows host relying on the
+  // shim — a byte-for-byte recurrence of the KI-E72 false-negative this function was WRITTEN to fix,
+  // one platform over. It matters concretely because the shim is never exec'd by its mode bit on
+  // Windows anyway: `_workflow/opencode/buildtest.mjs` spawns build-test.sh through Git Bash, which
+  // runs a .sh file regardless of NTFS attributes. So on win32 the honest test is existence-of-a-file;
+  // the POSIX path keeps the mode check byte-for-byte unchanged.
+  try {
+    if (!existsSync(shimPath)) return false;
+    const st = statSync(shimPath);
+    if (!st.isFile()) return false;
+    return process.platform === 'win32' ? true : !!(st.mode & 0o111);
+  } catch { return false; }
 }
 function defaultShimPath() {
   return join(dirname(fileURLToPath(import.meta.url)), '..', '..', 'verify', 'build-test.local.sh');

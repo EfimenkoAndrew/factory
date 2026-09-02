@@ -52,3 +52,63 @@ export function hasPlanCommitmentLanguage(text) {
   if (/\bis\s+required\s+to\b|\brequired\s+to\s+\w+/i.test(text)) return true
   return false
 }
+
+// KI-E101 (2026-09-02) — STEP mode for the same probe. `hasPlanCommitmentLanguage` above is a
+// COARSE prose gate: it decides only "does this plan contain SOME checkable promise at all", and the
+// haiku probe then has to FIND the commitments in free text before it can judge them. That works
+// (it caught the origin session's brownfield-note drift) but it is entirely dependent on the planner
+// happening to phrase a commitment with "MUST"/"required to" — a plan that describes the same work
+// as plain narrative prose is invisible to it, so the plan-vs-diff axis silently does not run at all.
+//
+// This function is the structured half: when the planner returns an explicit `steps[]` (the new
+// optional PLAN_SCHEMA field), the work is ALREADY decomposed into individually checkable units and
+// the probe can check coverage step-by-step — the same shape `splitAcceptanceClauses` gives the
+// KI-E18 AcceptanceScan, which is the proven, in-production version of exactly this check on the
+// acceptance axis. No prose parsing, no phrasing dependency, and each gap the probe reports names a
+// specific step rather than a quoted prose fragment.
+//
+// Deliberately NOT a decomposition of EXECUTION: the fixer still implements the whole item in one
+// call, with one whole-diff view. That is load-bearing, not incidental — `agents/fixer.md`'s
+// SIBLING-PATTERN SWEEP (KI-E94), DEAD-CODE SELF-CHECK (KI-E94), ADJACENT-CLAIM RE-CHECK (KI-E95)
+// and CANCELLATIONTOKEN CHAIN SELF-CHECK (KI-E96) are all whole-item, cross-file consistency checks
+// that a worker holding only its own slice structurally cannot perform, and "fix-introduced defects"
+// (KI-E51) is the #1 rejection class those checks exist to fight. Steps buy COVERAGE checking; they
+// must never buy partitioned implementation.
+//
+// Normalization rules, and why each one:
+//  - non-array / non-string entries are skipped, never thrown on (a malformed plan degrades to
+//    PROSE mode, the pre-KI-E101 behaviour, rather than sinking the item — the same fail-open
+//    posture as every sibling probe).
+//  - a hand-written leading ordinal/bullet is stripped so the probe's own numbering does not render
+//    as "1. 1. …"; planners write both shapes and neither should change what is checked.
+//  - dedupe is case-insensitive: a repeated step would otherwise inflate the gap count and spend
+//    probe budget re-judging the same unit.
+//  - the length floor is 12, NOT splitAcceptanceClauses' 20. That splitter's floor discards
+//    PUNCTUATION NOISE from mechanically splitting a sentence; an entry in this array is an
+//    explicitly authored unit of work, so the same floor would silently drop a genuine short step
+//    ("Update the dataflow doc" is 22, but "Wire the DI seam" is 16 and "Add the null guard" is 18 —
+//    all real). 12 still discards a stub/placeholder entry. Dropping a step is a SILENT MISS, which
+//    is the precise failure class this whole entry exists to close, so the floor errs low.
+//  - the tail MERGES into the last kept step rather than being sliced away (mirroring
+//    splitAcceptanceClauses exactly) — over the cap, every step still reaches the probe, because a
+//    silently-unchecked step is worse than a slightly denser final line.
+//
+// The factory.js copy is INLINED byte-for-byte (the Workflow runtime cannot import) — change both
+// copies together; the selftest pins their parity.
+export function normalizePlanSteps(steps, cap) {
+  if (cap === undefined) cap = 8
+  if (!Array.isArray(steps)) return []
+  const seen = new Set()
+  const out = []
+  for (let i = 0; i < steps.length; i++) {
+    if (typeof steps[i] !== 'string') continue
+    const s = steps[i].replace(/\s+/g, ' ').trim().replace(/^(?:[-*\u2022]|\(?\d{1,2}[.)])\s+/, '').trim()
+    if (s.length < 12) continue
+    const key = s.toLowerCase()
+    if (seen.has(key)) continue
+    seen.add(key)
+    out.push(s)
+  }
+  if (out.length <= cap) return out
+  return out.slice(0, cap - 1).concat(out.slice(cap - 1).join('; '))
+}
