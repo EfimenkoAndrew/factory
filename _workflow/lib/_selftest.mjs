@@ -118,7 +118,7 @@ eq(back.items['WI-A'].state, 'CLOSED', 'atomic write/read round-trip preserves s
 
 // Router resolves mechanical vs critical + escalate.
 const routing = loadRouting(join(import.meta.dirname, '..', '..', 'config', 'model-routing.json'));
-eq(resolve(routing, 'fixer.mechanical').model, 'claude-sonnet-5', 'mechanical fixer -> sonnet');
+eq(resolve(routing, 'fixer.mechanical').model, 'claude-sonnet-4-6', 'mechanical fixer -> sonnet-4-6 (KI-E92 2026-08-28 re-adoption)');
 eq(resolve(routing, 'fixer.critical').model, 'claude-opus-4-8', 'critical fixer -> opus');
 eq(resolve(routing, 'fixer.critical', { escalate: true }).effort, 'xhigh', 'critical fixer escalate -> xhigh');
 eq(resolve(routing, 'gate.security').model, 'claude-opus-4-8', 'security gate -> opus');
@@ -353,6 +353,63 @@ try {
   console.log('  SKIP changedFiles git-integration test (git unavailable: ' + (e && e.message) + ')');
 }
 
+// Ported from a host-mount session (2026-08-29) — removeWorktree (worktree.mjs) drops the worktree
+// directory + git's worktree-admin entry but leaves the `factory/<id>` branch ref standing at its
+// stale creation commit. Origin evidence: refreshing drifted worktrees required a MANUAL
+// `git branch -D factory/<id>` after `worktree-remove` before a subsequent `addWorktree` call actually
+// started fresh — because addWorktree's OWN fallback path (`git worktree add -b` failing "already
+// exists" -> falls back to plain `git worktree add <path> <existing-branch>`) silently attaches the
+// new worktree to the OLD branch tip instead of cutting a new one from current HEAD.
+// `pruneStaleBranch` closes the gap: called right after `removeWorktree`, gated on `git merge-base
+// --is-ancestor <branch> HEAD` — per the file's own header invariant (the factory NEVER commits), a
+// factory/<id> branch has, by construction, zero commits beyond its base, so one that IS an ancestor
+// of HEAD carries no unique value and is safe to discard; one that is NOT (an unexpected commit landed
+// on it, which the hard rule forbids but this function must not blindly trust) is left standing for
+// manual review, never silently discarded.
+try {
+  const wtdir = mkdtempSync(join(tmpdir(), 'factory-prunebranch-'));
+  const wg = (...a) => execFileSync('git', ['-C', wtdir, '-c', 'user.email=t@t', '-c', 'user.name=t', ...a], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+  wg('init', '-q');
+  fsWrite(join(wtdir, 'f.txt'), 'a\n');
+  wg('add', 'f.txt'); wg('commit', '-qm', 'base');
+  const defaultBranch = wg('symbolic-ref', '--short', 'HEAD').toString().trim(); // host-agnostic — init.defaultBranch varies (master/main)
+  wg('branch', 'factory/safe'); // no unique commits beyond base — safe to delete
+  wg('branch', 'factory/unsafe');
+  wg('checkout', '-q', 'factory/unsafe');
+  fsWrite(join(wtdir, 'g.txt'), 'b\n');
+  wg('add', 'g.txt'); wg('commit', '-qm', 'unexpected extra commit — the hard rule forbids this but the function must not trust that');
+  wg('checkout', '-q', defaultBranch);
+  const { pruneStaleBranch: PSB } = await import('./worktree.mjs');
+  const safe = PSB('factory/safe', wtdir);
+  eq(safe, { deleted: true, branch: 'factory/safe' }, 'KI-E100: a branch with zero commits beyond HEAD is deleted');
+  let branchesAfterSafeDelete = wg('branch').toString();
+  ok(!branchesAfterSafeDelete.includes('factory/safe'), 'KI-E100: the deleted branch no longer appears in `git branch`');
+  const unsafe = PSB('factory/unsafe', wtdir);
+  eq(unsafe.deleted, false, 'KI-E100: a branch with a commit NOT reachable from HEAD is left standing, never silently discarded');
+  ok(/not reachable from HEAD/.test(unsafe.reason), 'KI-E100: the left-standing reason names why, for a human to review');
+  ok(wg('branch').toString().includes('factory/unsafe'), 'KI-E100: the unsafe branch still exists after the declined delete');
+  eq(PSB(null, wtdir), { deleted: false, reason: 'no-branch-given' }, 'KI-E100: no branch given -> short-circuits, never touches git');
+  const missing = PSB('factory/does-not-exist', wtdir);
+  eq(missing.deleted, false, 'KI-E100: a nonexistent branch is never mistaken for a deletable one');
+  ok(/does not exist/.test(missing.reason), 'KI-E100: the nonexistent-branch reason is distinguishable from the has-unique-commits reason (not conflated)');
+  // refs/heads/ prefix form is accepted identically to the bare name (both are real call shapes:
+  // listWorktrees() porcelain output returns the refs/heads/ form; the ledger's r.branch is bare).
+  wg('branch', 'factory/prefixtest');
+  eq(PSB('refs/heads/factory/prefixtest', wtdir), { deleted: true, branch: 'factory/prefixtest' }, 'KI-E100: a refs/heads/-prefixed branch name is stripped and handled identically to the bare form');
+} catch (e) {
+  console.log('  SKIP pruneStaleBranch git-integration test (git unavailable: ' + (e && e.message) + ')');
+}
+{
+  // Driver wiring: both removeWorktree call sites (the CLI worktree-remove subcommand and gc's
+  // CLOSED-item sweep) now call pruneStaleBranch right after removing the worktree — closing the
+  // staleness trap at its source instead of relying on a human to notice and hand-delete the branch.
+  const drvTextE100 = readFileSync(join(import.meta.dirname, '..', 'driver.mjs'), 'utf8');
+  ok(/import \{ addWorktree, removeWorktree, pruneStaleBranch,/.test(drvTextE100), 'KI-E100: driver.mjs imports pruneStaleBranch alongside removeWorktree');
+  ok(/sub === 'worktree-remove'[\s\S]{0,400}listWorktrees\(\)\.find/.test(drvTextE100), 'KI-E100: the worktree-remove subcommand resolves the attached branch via listWorktrees() BEFORE removing (branch info is gone once the worktree is gone)');
+  ok(/sub === 'worktree-remove'[\s\S]{0,700}pruneStaleBranch\(branch, REPO_ROOT\)/.test(drvTextE100), 'KI-E100: the worktree-remove subcommand calls pruneStaleBranch after removeWorktree');
+  ok(/if \(r\.branch\) \{[\s\S]{0,200}pruneStaleBranch\(r\.branch, REPO_ROOT\)/.test(drvTextE100), 'KI-E100: cmdGc calls pruneStaleBranch using the ledger\'s own r.branch for every CLOSED item it sweeps');
+}
+
 // KI-L27: graph files[] path classifier — ok / creation-target / stale(rewrite) / ambiguous.
 // Stale paths defeat the within-batch file-lock (KI-L23's root cause class); only a UNIQUE
 // basename match (target-dir-unique preferred) may be auto-rewritten.
@@ -439,6 +496,48 @@ try {
     'KI-L44: Docker-absent still PARKS (BLOCKED) — never a silent in-memory close');
   ok(src.includes('const needsRealInfra = filesHaveCs && realInfraLikely'),
     'KI-L45: needsRealInfra keys on filesHaveCs (fix surface), not codeChange (test language)');
+}
+
+// Ported from a host-mount session (2026-08-29) — REALINFRA_SIGNAL's bare `concurren` catch-all
+// matched plain-English uses of "concurrent" with zero relation to a real concurrency defect, forcing
+// needsRealInfra:true (an unnecessary Testcontainers demand). Origin evidence: 5 live false-positive
+// incidents, fixed by narrowing the catch-all with noun/preposition exclusions plus a preceding
+// are/is lookbehind and a close-paren exclusion, WITHOUT losing any of 11 confirmed-genuine
+// concurrency-defect matches (several of which depend ENTIRELY on this regex since their own graph
+// entry declares realInfra:false). Fixture text below is quoted VERBATIM from the origin session's
+// live incidents — never paraphrased, so the pin tracks the actual incident shape, not a
+// reconstruction of it; none of it names an origin-specific item id or service.
+{
+  const src = readFileSync(join(import.meta.dirname, '..', 'factory.js'), 'utf8');
+  const sigMatch = src.match(/const REALINFRA_SIGNAL = (\/[^;\n]+\/)/);
+  ok(!!sigMatch, 'KI-E97: factory.js defines REALINFRA_SIGNAL as a single-line regex literal');
+  const re = new RegExp(sigMatch[1].slice(1, sigMatch[1].lastIndexOf('/')));
+
+  // Confirmed false positives (must NOT match) — verbatim origin-incident phrasing.
+  eq(re.test('ystream on every download and scan path; ~10 concurrent 100mb downloads cause oom | s3objectstore.cs'), false,
+    'KI-E97: "concurrent downloads" (an OOM/volume concern) is not a concurrency defect');
+  eq(re.test('guards in the same controller. do not group concurrently with item-h8 or other-c7a/c7b (sh'), false,
+    'KI-E97: a file-lock scheduling note ("concurrently with X"), not a defect description');
+  eq(re.test('rface — file-lock will serialize against any concurrent loki work.'), false,
+    'KI-E97: "concurrent … work" is scheduling prose, not a defect');
+  eq(re.test('ct http calls are observed (or that they are concurrent). | at orderscontroller.cs:275-291 and helpe'), false,
+    'KI-E97: "they are concurrent" excluded by the are/is lookbehind');
+  eq(re.test('henall with a semaphoreslim cap (e.g. max 10 concurrent). add an input cap (reject or chunk at e.g.'), false,
+    'KI-E97 follow-up: a bare throttle-cap aside with no following noun; only the close-paren exclusion (?!\\)) catches this, and it is what made the first-pass fix insufficient on its own');
+
+  // Confirmed genuine (must still match) — includes cases whose OWN graph entry says
+  // realInfra:false, so they depend entirely on this regex as the safety net.
+  eq(re.test('concurrent cps-webhook redeliveries double-gr'), true, 'KI-E97: a real double-grant race, still caught');
+  eq(re.test('riants | auditchaintests.cs adds a concurrent-append-under-advisory-lock test (t'), true, 'KI-E97: concurrent-append test coverage, still caught');
+  eq(re.test('ire 200-row batch on a single xmin optimistic-concurrency conflict — breach notifications'), true, 'KI-E97: optimistic-concurrency conflict, still caught');
+  eq(re.test('t exceed the cap on any replica. | concurrent test (real redis via testcontainer'), true, 'KI-E97: concurrent-guard test, still caught');
+  eq(re.test('no optimistic-concurrency token on any aggregate (order, d'), true, 'KI-E97: optimistic-concurrency token gap, still caught');
+  eq(re.test('ips the tick body. a test with two concurrent job invocations confirms only one'), true, 'KI-E97: "two concurrent job invocations" (a genuine leader-election test) stays caught; "job" was deliberately kept OUT of the noun-exclusion list for exactly this case');
+  eq(re.test('in exception — the 4 most critical concurrency regressions fail instead of skippi'), true, 'KI-E97: concurrency regression tests, still caught');
+  eq(re.test('avechangesasync can throw a second concurrencyconflictexception, stranding processedevent in proce'), true, 'KI-E97: realInfra:false in the graph — depends entirely on the concurrencyexception alternative');
+  eq(re.test('k.savechangesasync missing dbupdateconcurrencyexception -> concurrencyexception mapping —'), true, 'KI-E97: realInfra:false in the graph — depends entirely on the concurrencyexception alternative');
+  eq(re.test('ersisted record will throw dbupdateconcurrencyexception on the next savechanges - the iden'), true, 'KI-E97: realInfra:false in the graph — depends entirely on the concurrencyexception alternative');
+  eq(re.test("al same-month burst traffic | when advisory lock acquisition returns 'already held'"), true, 'KI-E97: realInfra:false in the graph — depends entirely on the advisory-lock alternative');
 }
 
 // KI-L41: convergence-bonus round — deterministic narrower-trajectory detection from gateDetails.
@@ -703,6 +802,49 @@ try {
   eq(by['SMOKE-SCOPESTOP'] && by['SMOKE-SCOPESTOP'].toState, 'BLOCKED', 'KI-L57: a CHANGES_REQUIRED gate with scopeViolation still hard-stops (genuine scope-stop path intact)');
   ok(String((by['SMOKE-SCOPESTOP'] && by['SMOKE-SCOPESTOP'].note) || '').includes('gate headline: stub genuine red-line'), 'KI-E30 (review fix): the flagging gate headline reaches the queue-visible block note');
   eq(calls.filter((c) => c.label.endsWith(':checkpoint')).length, 6, 'exec-smoke: every item result checkpointed via a haiku write agent (KI-L40)');
+  // KI-E101: the STEP branch actually EXECUTES here (the planner stub now returns steps[]), not just
+  // pins as source text — this is the KI-L43 reason exec-smoke exists: a TDZ/reference/shape crash in
+  // a newly-added branch is invisible to `node --check` and to every source-text assertion.
+  ok(calls.some((c) => c.label === 'SMOKE-CODE:plan-commitment-probe'), 'KI-E101 exec-smoke: STEP mode dispatches the probe on a planned code lane (the stub approach carries NO commitment language, so PROSE mode alone would never have fired)');
+  ok(calls.some((c) => c.label === 'SMOKE-DISPUTE:plan-commitment-probe'), 'KI-E101 exec-smoke: STEP mode dispatches on the dispute lane too');
+  ok(!calls.some((c) => c.label === 'SMOKE-VONLY:plan-commitment-probe'), 'KI-E101 exec-smoke: the verification-only lane still SKIPS the plan scan (no fix diff to probe by design)');
+  ok(by['SMOKE-CODE'] && by['SMOKE-CODE'].gates && by['SMOKE-CODE'].gates['probe:plan-commitment-scan'] === 'APPROVED', 'KI-E101 exec-smoke: a satisfied STEP-mode probe records APPROVED under the SHARED gate key (no orphaned second key)');
+  ok(by['SMOKE-CODE'].gateDetails['probe:plan-commitment-scan'].headline.includes('[STEP mode]'), 'KI-E101 exec-smoke: the recorded headline stamps STEP mode, so gateDetails says which axis fired');
+  ok(by['SMOKE-CODE'].gateDetails['probe:plan-commitment-scan'].headline.includes('plan step'), 'KI-E101 exec-smoke: the headline renders the STEP-mode `axis` noun, not the PROSE-mode one');
+  eq(calls.filter((c) => c.label === 'SMOKE-CODE:fixer').length, 1, 'KI-E101 scope bound (behavioural): a clean STEP-mode scan spends exactly ONE fixer call — steps never fan the implementation out per step');
+}
+
+// KI-E101 — the STEP-mode FAILURE path, executed end to end. The block above proves a SATISFIED
+// scan is recorded and costs nothing extra; this proves the half the feature actually exists for:
+// an un-evidenced plan step must fail the item PRE-BAND (cheap), after exactly ONE bounded amend,
+// with the step text reaching the operator-visible note. Modelled on the budget-stop lane below —
+// a second execSmoke run with a targeted agentOverride rather than new fixtures.
+{
+  const src = readFileSync(join(import.meta.dirname, '..', 'factory.js'), 'utf8');
+  const gapStep = 'Update the data-flow doc for the endpoint';
+  const { result, calls } = await execSmoke(src, smokeBatch(), {
+    agentOverride: (prompt, opts) => {
+      // Same label covers the probe AND its re-probe, so the gap survives the bounded amend —
+      // the item must then fail rather than loop for a second amend.
+      if ((opts && opts.label) === 'SMOKE-CODE:plan-commitment-probe') return { honored: false, gaps: [{ commitment: gapStep, why: 'no hunk anywhere in the diff touches the data-flow doc' }] };
+      return undefined;
+    },
+  });
+  const byE101 = Object.fromEntries((result.results || []).map((r) => [r.id, r]));
+  const code101 = byE101['SMOKE-CODE'];
+  ok(!(result.results || []).some((r) => String(r.note || '').startsWith('runItem threw')), 'KI-E101 fail-path: no runItem crash on any lane');
+  eq(code101 && code101.toState, 'FAILED', 'KI-E101 fail-path: an un-evidenced plan step FAILS the item');
+  ok(String(code101.note || '').includes('KI-E101 STEP mode'), 'KI-E101 fail-path: the note names STEP mode, so the operator knows which axis rejected it');
+  ok(String(code101.note || '').includes(gapStep), 'KI-E101 fail-path: the un-evidenced step text itself reaches the note (feedback.md gets the actionable detail, not just a code)');
+  ok(String(code101.note || '').includes('no gate band was spent'), 'KI-E101 fail-path: the note states the fail was pre-band — the cost claim the whole probe exists for');
+  eq(code101.gates['probe:plan-commitment-scan'], 'CHANGES_REQUIRED', 'KI-E101 fail-path: the shared gate key records CHANGES_REQUIRED');
+  ok(code101.gateDetails['probe:plan-commitment-scan'].findings.some((f) => f.title.includes('unhonored plan step')), 'KI-E101 fail-path: the gap is rendered as a structured HIGH finding using the STEP-mode axis noun');
+  // the two bounds that keep this cheap and non-looping
+  eq(calls.filter((c) => c.label === 'SMOKE-CODE:fixer').length, 2, 'KI-E101 fail-path: exactly TWO fixer calls (the main fix + ONE bounded amend) — the amend never loops');
+  eq(calls.filter((c) => c.label === 'SMOKE-CODE:plan-commitment-probe').length, 2, 'KI-E101 fail-path: exactly TWO probe calls (initial + ONE re-probe) — the re-probe verdict is final');
+  ok(!calls.some((c) => c.label.startsWith('SMOKE-CODE:gate-')), 'KI-E101 fail-path: the item never reached the gate band — this is the entire economic argument for a pre-band probe (a FULL band is ~5 opus gates + refuter + multi-lens reaudit)');
+  // sibling lanes are unaffected — one item's probe verdict must never leak across lanes
+  eq(byE101['SMOKE-DOC'] && byE101['SMOKE-DOC'].toState, 'CLOSED', 'KI-E101 fail-path: a sibling lane whose own steps ARE evidenced still closes (per-item isolation holds)');
 }
 
 // KI-C2 (closed 2026-07-12): the budget-ACTIVE lane — a launch-turn token budget whose remaining()
@@ -830,6 +972,657 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
   // driver wiring pin: group carries the guard + the escape flag
   const dsrc = readFileSync(new URL('../driver.mjs', import.meta.url), 'utf8');
   ok(dsrc.includes('force-dirty-overlap') && dsrc.includes('dirtyMainPaths(REPO_ROOT)'), 'KI-E14: cmdGroup wires the dirty-overlap guard with a --force-dirty-overlap escape');
+}
+
+// KI-E89 (2026-08-24, ported from a host-mount session) — main-check's per-item snapshot loop
+// (incl. its own KI-E82 --all widening) can only ever check a path that is part of some CHECKED
+// item's claim-time files[] — a brand-new leaked path no item ever declared has no snapshot to diff
+// against. unclaimedMainDrift (lib/mainguard.mjs) closes that gap: given raw main-tree dirt
+// (dirtyMainPaths), the factory's own mount prefix, and the union of every path any CHECKED item has
+// ever claimed, it returns whatever dirt remains unexplained.
+{
+  const { unclaimedMainDrift } = await import('./mainguard.mjs');
+  const { mkdtempSync: mkF, writeFileSync: wfF, mkdirSync: mdF, rmSync: rmF } = await import('node:fs');
+  const { tmpdir: tdF } = await import('node:os');
+  const { join: jF } = await import('node:path');
+  const { execFileSync: exF } = await import('node:child_process');
+  // pure predicate first (no git needed)
+  const dirtyF = { paths: ['Svc/src/Leak.cs', '_bmad-output/ai-factory/state/ledger.json'], dirs: ['Svc/tests/Leaked/'] };
+  eq(unclaimedMainDrift(dirtyF, '_bmad-output/ai-factory', new Set()).sort().join(','), 'Svc/src/Leak.cs,Svc/tests/Leaked/', 'KI-E89: an unclaimed outside-mount file AND an unclaimed outside-mount dir both surface; the mount bookkeeping file never does');
+  eq(unclaimedMainDrift(dirtyF, '_bmad-output/ai-factory', new Set(['Svc/src/Leak.cs'])).join(','), 'Svc/tests/Leaked/', 'KI-E89: a claimed outside-mount file is excluded (some item DOES have a snapshot to check it against) — only the still-unclaimed dir remains');
+  eq(unclaimedMainDrift({ paths: ['_bmad-output/ai-factory/reports/burndown.md'], dirs: [] }, '_bmad-output/ai-factory', new Set()).length, 0, 'KI-E89: mount-internal dirt (driver bookkeeping) is ALWAYS excluded regardless of claim status');
+  eq(unclaimedMainDrift({ paths: ['_bmad-output/ai-factory'], dirs: [] }, '_bmad-output/ai-factory', new Set()).length, 0, 'KI-E89: exact-equal mount path (no trailing slash) is excluded, not just prefix matches');
+  eq(unclaimedMainDrift({ paths: [], dirs: [] }, '_bmad-output/ai-factory', new Set()).length, 0, 'KI-E89: nothing dirty -> nothing unclaimed');
+  eq(unclaimedMainDrift(null, '_bmad-output/ai-factory', null).length, 0, 'KI-E89: null dirty/claimedPaths never throws, resolves to empty');
+  // Fix (multi-lens review, 2026-08-25, ported): the `dirs` branch used to ignore claimedPaths
+  // entirely (only `underMount` gated it) — a directory an item legitimately declared in its own
+  // files[] (e.g. a new untracked test-project subfolder, which git reports at the DIRECTORY level
+  // per its own shallowest-untracked-boundary convention — see the live-repo proof below) was
+  // permanently reported as unclaimed, contradicting this function's own header comment.
+  eq(unclaimedMainDrift({ paths: [], dirs: ['Svc/NewFeature/'] }, '_bmad-output/ai-factory', new Set(['Svc/NewFeature/File.cs'])).length, 0, 'KI-E89 fix: a dirty untracked DIRECTORY is excluded when a claimed FILE lives inside it — the dirs branch now consults claimedPaths, mirroring filesOverlapDirty\'s reversed-direction check');
+  eq(unclaimedMainDrift({ paths: [], dirs: ['Svc/NewFeature/'] }, '_bmad-output/ai-factory', new Set(['Svc/Unrelated/Other.cs'])).join(','), 'Svc/NewFeature/', 'KI-E89 fix: a claimed path that does NOT live under the dirty dir still leaves that dir correctly reported as unclaimed (the fix does not over-exclude)');
+  // live-repo proof: a mount dir with its own dirty bookkeeping, an outside-mount CLAIMED modified
+  // file, and an outside-mount UNCLAIMED new dir
+  const rootF = mkF(jF(tdF(), 'unclaimedmain-'));
+  exF('git', ['-C', rootF, 'init', '-q']);
+  mdF(jF(rootF, '_bmad-output', 'ai-factory', 'state'), { recursive: true });
+  wfF(jF(rootF, '_bmad-output', 'ai-factory', 'state', 'ledger.json'), '{}');
+  mdF(jF(rootF, 'Svc', 'Tests'), { recursive: true }); // the outer test-project dir already exists and is tracked
+  wfF(jF(rootF, 'Svc', 'Tests', 'Existing.cs'), 'pre-existing tracked test file');
+  wfF(jF(rootF, 'Svc', 'tracked.cs'), 'original');
+  exF('git', ['-C', rootF, 'add', '.']);
+  exF('git', ['-C', rootF, '-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-q', '-m', 'x', '--no-gpg-sign', '--no-verify']);
+  wfF(jF(rootF, '_bmad-output', 'ai-factory', 'state', 'ledger.json'), '{"cycle":72}'); // driver's own legit churn
+  wfF(jF(rootF, 'Svc', 'tracked.cs'), 'CLAIMED CHANGE'); // an item's own approved delivery
+  mdF(jF(rootF, 'Svc', 'Tests', 'Helpers'), { recursive: true }); // the only genuinely NEW, untracked leaf
+  wfF(jF(rootF, 'Svc', 'Tests', 'Helpers', 'Skip.cs'), 'leaked'); // nobody claimed this
+  const { dirtyMainPaths: dmpF } = await import('./mainguard.mjs');
+  const dirtyLiveF = dmpF(rootF);
+  const unclaimedLiveF = unclaimedMainDrift(dirtyLiveF, '_bmad-output/ai-factory', new Set(['Svc/tracked.cs']));
+  eq(unclaimedLiveF.join(','), 'Svc/Tests/Helpers/', 'KI-E89 live repro: the claimed tracked-file edit and the mount\'s own bookkeeping churn both stay silent; only the never-claimed leaked directory surfaces');
+  rmF(rootF, { recursive: true, force: true });
+  // Fix (multi-lens review, 2026-08-25, ported): dirtyMainPaths stripped only the OUTER quotes git
+  // wraps around a path containing a quote/backslash/non-ASCII byte, leaving the C-style \NNN octal
+  // escapes literally in the string — verified live against real git output before writing the fix.
+  // KI-E102: `"` and `\` are RESERVED characters in a Win32 filename — `weird"quote.cs` throws
+  // ENOENT at writeFileSync, and `back\slash.cs` would silently become a `back/` subdirectory
+  // instead of a one-file name. Both were written UNCONDITIONALLY, so on Windows this fixture threw
+  // UNCAUGHT and aborted the entire selftest at ~line 987 of 2953: every later assertion (roughly
+  // two thirds of the suite, including the KI-E87 plan-commitment block right below) never ran, and
+  // `node _workflow/lib/_selftest.mjs` — the command CLAUDE.md mandates be green after EVERY change
+  // — could not pass at all on the platform KI-E59 already calls "the very platform the gate was
+  // born on". The UTF-8 case is a legal filename everywhere and stays unconditional; the two
+  // POSIX-only cases are platform-gated and ANNOUNCE their skip, so silence never reads as "passed"
+  // (the KI-E41/E42 announce-never-skip-silently posture, and the same try/catch-SKIP convention the
+  // git-unavailable fixtures above already use). POSIX coverage is byte-for-byte unchanged — CI runs
+  // ubuntu-latest, so the decode assertions this fixture exists for still gate every push.
+  const rootQ = mkF(jF(tdF(), 'quotepath-'));
+  exF('git', ['-C', rootQ, 'init', '-q']);
+  const posixOnlyNames = process.platform !== 'win32';
+  wfF(jF(rootQ, 'café.cs'), 'utf8 filename');
+  if (posixOnlyNames) {
+    wfF(jF(rootQ, 'weird"quote.cs'), 'embedded quote');
+    wfF(jF(rootQ, 'back\\slash.cs'), 'embedded backslash');
+  }
+  const dirtyQ = dmpF(rootQ);
+  ok(dirtyQ.paths.includes('café.cs'), 'KI-E89 fix: a non-ASCII (UTF-8) filename decodes back to its real form, not the raw \\NNN octal escapes git emits');
+  if (posixOnlyNames) {
+    ok(dirtyQ.paths.includes('weird"quote.cs'), 'KI-E89 fix: an embedded double-quote decodes correctly');
+    ok(dirtyQ.paths.includes('back\\slash.cs'), 'KI-E89 fix: an embedded backslash decodes correctly (not doubled, not dropped)');
+  } else {
+    console.log('  SKIP KI-E89 quote/backslash filename decode (2 asserts — win32 reserves " and \\ in filenames; the café.cs UTF-8 decode case above still ran)');
+  }
+  rmF(rootQ, { recursive: true, force: true });
+  // driver wiring pins
+  const dsrc89 = readFileSync(new URL('../driver.mjs', import.meta.url), 'utf8');
+  ok(dsrc89.includes("import { snapshotMainFiles, driftAgainstSnapshot, dirtyMainPaths, filesOverlapDirty, splitDriftByStatus, repairDirtyDrift, unclaimedMainDrift } from './lib/mainguard.mjs';"), 'KI-E89: driver.mjs imports unclaimedMainDrift alongside its KI-E14/E61 siblings');
+  const cmcBody = dsrc89.slice(dsrc89.indexOf('function cmdMainCheck'), dsrc89.indexOf('function cmdMainCheck') + 9000);
+  ok(cmcBody.includes('const claimedPaths = new Set();') && cmcBody.includes('for (const f of Object.keys(snapFiles)) claimedPaths.add(f);'), 'KI-E89: claimedPaths is accumulated from every claimed item\'s snapshot files — the true ceiling of what the unclaimed sweep can see');
+  ok(cmcBody.includes('unclaimedMainDrift(dirtyMainPaths(REPO_ROOT), MOUNT_REL, claimedPaths)'), 'KI-E89: cmdMainCheck wires the real REPO_ROOT/MOUNT_REL/claimedPaths into the pure helper — reuses dirtyMainPaths (KI-E14), does not hand-roll a fresh git call');
+  ok(cmcBody.includes('MAIN-DRIFT unclaimed (KI-E89)'), 'KI-E89: the new warning is labeled distinctly from KI-E50/E82\'s per-item warning so a reader/grep can tell which mechanism found it');
+  // Fix (multi-lens review, 2026-08-25, ported): claimedPaths used to be built ONLY from the
+  // requested `ids` — correct under --all (ids WAS already every claimed item) but wrong on a
+  // targeted, narrow call (the common case: every item's own mid-band Verify stage runs
+  // `main-check <id>` for exactly one id, never --all), where any OTHER already-claimed item's
+  // legitimate change sitting in the repo-wide dirtyMainPaths(REPO_ROOT) scan got misreported as
+  // unclaimed. Fix: allClaimedIds is computed UNCONDITIONALLY (moved out of the
+  // `if (!ids.length || flags?.all)` branch — it now happens BEFORE that branch, which just reuses
+  // it for `ids` instead of re-scanning), and the claimedPaths-seeding loop iterates
+  // allClaimedIds, not `ids`.
+  const allClaimedIdx = cmcBody.indexOf('let allClaimedIds = [];');
+  const idsWideningIdx = cmcBody.indexOf('if (!ids.length || flags?.all)');
+  const claimedSeedLoopIdx = cmcBody.indexOf('for (const id of allClaimedIds) {');
+  const perIdLoopIdx = cmcBody.indexOf('for (const id of ids) {');
+  ok(allClaimedIdx >= 0 && idsWideningIdx >= 0 && allClaimedIdx < idsWideningIdx, 'KI-E89 fix: allClaimedIds is computed BEFORE (unconditionally, not inside) the --all/bare widening branch');
+  ok(claimedSeedLoopIdx >= 0 && perIdLoopIdx > claimedSeedLoopIdx, 'KI-E89 fix: the claimedPaths-seeding loop iterates allClaimedIds (the FULL inventory) and runs BEFORE the separate per-id drift-recheck loop, which still correctly iterates the narrower, targeted `ids`');
+  ok(!cmcBody.slice(claimedSeedLoopIdx, perIdLoopIdx).includes('driftAgainstSnapshot'), 'KI-E89 fix: the claimedPaths-seeding pass over allClaimedIds does ONLY path collection, never a drift re-hash (that stays the per-id loop\'s job, scoped to the requested ids)');
+}
+
+// KI-E88 (2026-08-24, ported from a host-mount session, adapted to this repo's cluster-based
+// suggest — the origin session's mixed-batch-fallback target does not exist here) — band-mix
+// surfacing: a FULL-band item runs the full 5-gate opus panel + planner; LIGHT skips 3 of those 5
+// gates and the planner entirely — roughly 4x the gate-panel size. Item COUNT alone gives zero
+// signal for what a batch actually costs.
+{
+  const { bandFor, BAND_FULL_THEMES } = await import('./band.mjs');
+  eq(bandFor({ band: 'LIGHT', theme: 'money-correctness' }).toString(), 'LIGHT', 'KI-E88: an explicit item.band=LIGHT wins even over a FULL-themed item');
+  eq(bandFor({ band: 'FULL', theme: 'doc-drift' }).toString(), 'FULL', 'KI-E88: an explicit item.band=FULL wins even over a LIGHT-themed item');
+  eq(bandFor({ band: 'garbage', theme: 'doc-drift' }).toString(), 'LIGHT', 'KI-E88: a non-LIGHT/FULL item.band value falls through to theme-based classification');
+  for (const t of BAND_FULL_THEMES) eq(bandFor({ theme: t }).toString(), 'FULL', 'KI-E88: BAND_FULL_THEMES member "' + t + '" always classifies FULL');
+  eq(bandFor({ theme: 'doc-drift' }).toString(), 'LIGHT', 'KI-E88: doc-drift theme classifies LIGHT');
+  eq(bandFor({ fixType: 'mechanical' }).toString(), 'LIGHT', 'KI-E88: mechanical fixType classifies LIGHT');
+  eq(bandFor({ theme: 'something-else', fixType: 'code' }).toString(), 'LIGHT', 'KI-E88: the unconditional default (anything not FULL-themed) is LIGHT');
+  // Fix (multi-lens review, 2026-08-25, ported): no case above combines a BAND_FULL_THEMES theme
+  // WITH fixType:'mechanical' in one call — bandFor's own P5 safety comment names exactly this
+  // interaction ("a mechanical authz/HMAC/tenant-filter edit is still a security change whose
+  // load-bearing reviewer must NOT be dropped"), but nothing pinned it: a future edit swapping the
+  // order of the two `if`s would silently downgrade a security-themed mechanical item from FULL to
+  // LIGHT with zero test failures.
+  for (const t of BAND_FULL_THEMES) eq(bandFor({ theme: t, fixType: 'mechanical' }).toString(), 'FULL', 'KI-E88 fix: BAND_FULL_THEMES theme "' + t + '" COMBINED with fixType:\'mechanical\' still derives FULL — theme dominates fixType (P5), never the reverse');
+  // factory.js <-> band.mjs byte-parity: both the function body and the themes array
+  const bandSrc = readFileSync(new URL('./band.mjs', import.meta.url), 'utf8');
+  const fsrc88 = readFileSync(new URL('../factory.js', import.meta.url), 'utf8');
+  const bodyOf = (s, name) => { const m = s.match(new RegExp('function ' + name + '[\\s\\S]*?\\n\\}')); return m ? m[0] : null; };
+  ok(bodyOf(bandSrc, 'bandFor') !== null, 'KI-E88: band.mjs carries bandFor');
+  eq(bodyOf(bandSrc, 'bandFor'), bodyOf(fsrc88, 'bandFor'), 'KI-E88: band.mjs\'s bandFor is byte-identical to factory.js\'s canonical definition');
+  const themesOf = (s) => { const m = s.match(/const BAND_FULL_THEMES = (\[[^\]]*\])/); return m ? m[1] : null; };
+  // Fix (multi-lens review, 2026-08-25, ported): this extraction had no null-guard, unlike the
+  // sibling bodyOf check above — if BOTH files' array-literal formatting changed identically at
+  // once, the regex would return null for both and eq(null, null) would silently pass through a
+  // genuine content divergence.
+  ok(themesOf(fsrc88) !== null, 'KI-E88 fix: factory.js\'s BAND_FULL_THEMES extraction actually matched something (a null here would let the eq() below silently pass on two unrelated failures)');
+  eq(themesOf(bandSrc), themesOf(fsrc88), 'KI-E88: BAND_FULL_THEMES array is byte-identical between band.mjs and factory.js');
+  // driver wiring pins — adapted target: this repo's cluster-based cmdSuggest, not a mixed-batch fallback
+  const dsrc88 = readFileSync(new URL('../driver.mjs', import.meta.url), 'utf8');
+  ok(dsrc88.includes("import { bandFor } from './lib/band.mjs';"), 'KI-E88: driver.mjs imports bandFor');
+  const suggestBody = dsrc88.slice(dsrc88.indexOf('function cmdSuggest'), dsrc88.indexOf('function cmdSuggest') + 4000);
+  ok(suggestBody.includes('band mix (KI-E88'), 'KI-E88: cmdSuggest prints the whole-pool band-mix line');
+  ok(suggestBody.includes('band mix of the') && suggestBody.includes('batchLight'), 'KI-E88: cmdSuggest prints a per-cluster band-mix tally on each cluster header');
+}
+
+// KI-E87 (2026-08-24, ported from a host-mount session) — PlanCommitmentScan: the deterministic
+// hasPlanCommitmentLanguage pre-filter (skip the haiku probe entirely when the plan makes no
+// checkable MUST-style promise), plus the factory.js inline-copy parity pin and pipeline-wiring pins.
+{
+  const { hasPlanCommitmentLanguage } = await import('./plan-commitment.mjs');
+  ok(hasPlanCommitmentLanguage('The fix MUST include the brownfield note in the runbook.'), 'KI-E87: all-caps MUST is detected');
+  ok(hasPlanCommitmentLanguage('The diff must include a migration for the new column.'), 'KI-E87: lowercase "must include" is detected');
+  ok(hasPlanCommitmentLanguage('This change must also update the data-flow doc.'), 'KI-E87: "must also" is detected');
+  ok(hasPlanCommitmentLanguage('The handler is required to validate the tenant claim first.'), 'KI-E87: "is required to" is detected');
+  ok(hasPlanCommitmentLanguage('Must-cover checklist (all four): (1) both immutable fields named.'), 'KI-E87: hyphenated title-case "Must-cover" is detected ([\\s-]+ separator, not whitespace-only)');
+  ok(!hasPlanCommitmentLanguage('This approach should be straightforward and low-risk.'), 'KI-E87: soft "should" language is NOT a commitment');
+  ok(!hasPlanCommitmentLanguage('The fix touches Program.cs and adds a null check.'), 'KI-E87: plain descriptive prose with no commitment language is NOT flagged');
+  ok(!hasPlanCommitmentLanguage(''), 'KI-E87: empty text -> false');
+  ok(!hasPlanCommitmentLanguage(null), 'KI-E87: null text -> false, never throws');
+  ok(!hasPlanCommitmentLanguage(undefined), 'KI-E87: undefined text -> false, never throws');
+  ok(!hasPlanCommitmentLanguage('Ship widgets in the mustard package.'), 'KI-E87: "must" as a substring of an unrelated word never false-fires — no separator at all between "must" and the following letters');
+  ok(!hasPlanCommitmentLanguage('A mustache is not a commitment.'), 'KI-E87: "mustache" never false-fires — no separator at all between "must" and the following letters');
+  // Fix (multi-lens review, 2026-08-25, ported): the "must + verb" pattern used to be a CLOSED
+  // 14-word verb allowlist. Independently verified: 13 of 14 realistic plan-commitment sentences
+  // using OTHER ordinary verbs were silently missed — every one of these represents a real gap the
+  // narrow allowlist left open.
+  ok(hasPlanCommitmentLanguage('The fix must verify the tenant claim before returning data.'), 'KI-E87 fix: "must verify" (verb not on the old 14-word allowlist) is now detected');
+  ok(hasPlanCommitmentLanguage('The handler must implement retry with backoff.'), 'KI-E87 fix: "must implement" is now detected');
+  ok(hasPlanCommitmentLanguage('The consumer must reject duplicate deliveries.'), 'KI-E87 fix: "must reject" is now detected');
+  ok(hasPlanCommitmentLanguage('The endpoint must enforce the CustomerOnly policy.'), 'KI-E87 fix: "must enforce" is now detected');
+  ok(hasPlanCommitmentLanguage('The diff must set the Status field to Approved.'), 'KI-E87 fix: "must set" is now detected');
+  ok(hasPlanCommitmentLanguage('Custom must-have widgets ship in the package.'), 'KI-E87 fix: "must-have" (hyphenated noun-modifier, not a verb-list member) now matches too — the widened net catches the whole "must + word" shape, not just the two-incident allowlist');
+  // factory.js inline-copy byte-parity
+  const fsrcPC = readFileSync(new URL('../factory.js', import.meta.url), 'utf8');
+  const asrcPC = readFileSync(new URL('./plan-commitment.mjs', import.meta.url), 'utf8');
+  const bodyOfPC = (s) => { const m = s.match(/function hasPlanCommitmentLanguage[\s\S]*?\n\}/); return m ? m[0] : null; };
+  ok(bodyOfPC(fsrcPC) !== null, 'KI-E87: factory.js carries an inlined hasPlanCommitmentLanguage');
+  eq(bodyOfPC(fsrcPC), bodyOfPC(asrcPC.replace('export function hasPlanCommitmentLanguage', 'function hasPlanCommitmentLanguage')), 'KI-E87: factory.js inline copy is byte-identical to lib/plan-commitment.mjs');
+  // full pipeline wiring pins
+  ok(fsrcPC.includes("const PLAN_COMMITMENT_SCHEMA = { type: 'object'") && fsrcPC.includes("required: ['honored']"), 'KI-E87: PLAN_COMMITMENT_SCHEMA is defined in factory.js');
+  ok(fsrcPC.includes('let plan = null') && fsrcPC.includes('if (R.planner) {'), 'KI-E87: plan is hoisted to function scope (was block-scoped) so the later probe can read it');
+  ok(fsrcPC.includes('if (!verificationOnly && plan) {') && fsrcPC.includes('const proseGated = hasPlanCommitmentLanguage(commitmentText)'), 'KI-E87: the scan is gated on verificationOnly + plan existing AND the deterministic commitment-language pre-filter (KI-E101 moved the prefilter into a named `proseGated` binding; it is still consulted, never dropped)');
+  ok(fsrcPC.includes("res.gates['probe:plan-commitment-scan']"), 'KI-E87: the probe writes a distinctly-named gate key');
+  ok(fsrcPC.slice(0, 2000).includes('plan-commitment scan'), 'KI-E87: factory.js\'s own meta.description names the plan-commitment scan stage, matching what the code actually runs');
+  const planCommitBlock = fsrcPC.slice(fsrcPC.indexOf('4c-bis. PLAN-COMMITMENT SCAN'), fsrcPC.indexOf('4d-pre. COMMENT SCAN'));
+  eq((planCommitBlock.match(/finish\('FAILED'/g) || []).length, 1, 'KI-E87: fail-open — exactly one finish(\'FAILED\', ...) call site in the whole plan-commitment block');
+  // Fix (multi-lens review, 2026-08-25, ported) — KI-E10 gap this repo specifically lacked: the
+  // PLAN-COMMITMENT AMEND prompt explicitly offers the fixer a note-only response, but the re-probe
+  // used to fire ONLY on `amend.applied` — a fixer taking that option got failed anyway on the
+  // stale pre-amend verdict, never re-evaluated.
+  ok(!planCommitBlock.includes('if (amend && amend.applied) {'), 'KI-E87 fix: the re-probe gate is no longer applied-only (the exact pre-fix condition text is gone)');
+  ok(planCommitBlock.includes('if (amend && (amend.applied || (amend.note && String(amend.note).trim()))) {'), 'KI-E87 fix: the re-probe now also fires on a genuine note-only response (no code change, non-empty note)');
+  ok(planCommitBlock.includes("judge whether this explanation genuinely justifies every ' + axis + ' as already-honored"), 'KI-E87 fix: the re-probe prompt explicitly instructs the probe to critically judge a note-only explanation, not rubber-stamp it (KI-E101 renders the noun through `axis` so both modes carry the instruction)');
+  // Same fix, sibling acceptance-scan block (the pre-existing KI-E18 bug this repo also had,
+  // inherited when KI-E87 mirrored its pattern) — verified fixed here too, not just KI-E87's copy.
+  const acceptBlockStandalone = fsrcPC.slice(fsrcPC.indexOf('ACCEPTANCE-GAP AMEND'), fsrcPC.indexOf('4c-bis. PLAN-COMMITMENT SCAN'));
+  ok(!acceptBlockStandalone.includes('if (amend && amend.applied) {'), 'KI-E18 fix (ported): the acceptance-scan re-probe gate is no longer applied-only');
+  ok(acceptBlockStandalone.includes('if (amend && (amend.applied || (amend.note && String(amend.note).trim()))) {'), 'KI-E18 fix (ported): the acceptance-scan re-probe now also fires on a genuine note-only response');
+}
+
+// KI-E103 (2026-09-02) — RUNTIME-parity gate for the opencode/Copilot binding. Until now the ONLY
+// mechanical cross-check between factory.js and the port was SCHEMA parity, whose own documented
+// workaround (export the schema, omit it from the SCHEMAS registry, add a `NOT yet ported` comment)
+// let three stages ship unported while green. Anything with no schema surface — a guard, a phase
+// re-order, a routing CONSTANT — was invisible: KI-E97's REALINFRA_SIGNAL narrowing landed in canon
+// only and drifted for days with both suites passing. This block is the forcing gate.
+{
+  const { extractFactoryRoles, extractPortRoles, namedConstantSource, parityGaps } = await import('./port-parity.mjs');
+  // --- pure-function coverage first (the helpers must be trustworthy before the gate leans on them)
+  eq([...extractFactoryRoles("await call('planner', X) ... call( 'red-proof-probe' , Y)")].sort(), ['planner', 'red-proof-probe'], 'KI-E103: extractFactoryRoles finds role literals incl. whitespace-padded call sites');
+  eq([...extractFactoryRoles('call(x.role, R, S)')], [], 'KI-E103: a dynamically-constructed role is deliberately NOT extracted (both sides build gates/review-flows the same dynamic way from shared tables, so there is no literal to drift)');
+  eq([...extractPortRoles("{ role: 'fixer' } { role: 'gate-' + g } { role: 'gate-po' }")].sort(), ['fixer', 'gate-po'], 'KI-E103: extractPortRoles filters the bare `gate-` template fragment but keeps the real gate-po role');
+  eq(namedConstantSource('export const A = /x/;', 'A'), '/x/', 'KI-E103: namedConstantSource normalises the `export` prefix and trailing semicolon (style, not semantics)');
+  eq(namedConstantSource("const A = ['x']", 'A'), "['x']", 'KI-E103: a semicolon-less canonical-style declaration reads identically');
+  eq(namedConstantSource('const B = 1', 'A'), null, 'KI-E103: an absent constant returns null, never a partial read');
+  {
+    const g = parityGaps(new Set(['a', 'b', 'c', 'd']), new Set(['a']), { mechanical: { b: 'why' }, unported: { c: 'why' } });
+    eq(g.undeclared, ['d'], 'KI-E103: a canonical stage that is neither dispatched nor declared is reported — the silent-fork class this gate exists for');
+    eq(g.staleDeclared, [], 'KI-E103: nothing stale in the healthy case');
+    const g2 = parityGaps(new Set(['a']), new Set(['a']), { mechanical: { a: 'why' }, unported: { gone: 'why' } });
+    eq(g2.staleDeclared, ['a'], 'KI-E103: declaring a stage the port actually DISPATCHES is reported — the manifest cannot claim a gap that no longer exists');
+    eq(g2.deadDeclared, ['gone'], 'KI-E103: declaring a stage factory.js no longer has is reported — dead manifest entries cannot accumulate');
+    eq(parityGaps(new Set(['a']), new Set(), { mechanical: { a: 'x' }, unported: { a: 'y' } }).doubleDeclared, ['a'], 'KI-E103: a stage declared BOTH mechanical and unported is contradictory and reported');
+  }
+  // --- the live gate against the real files
+  const facSrc103 = readFileSync(new URL('../factory.js', import.meta.url), 'utf8');
+  const rtSrc103 = readFileSync(new URL('../opencode/runtime.mjs', import.meta.url), 'utf8');
+  const routeSrc103 = readFileSync(new URL('../opencode/routing.mjs', import.meta.url), 'utf8');
+  const { STAGE_PARITY, SHARED_CONSTANTS } = await import('../opencode/stage-parity.mjs');
+  const facRoles103 = extractFactoryRoles(facSrc103);
+  const gaps103 = parityGaps(facRoles103, extractPortRoles(rtSrc103), STAGE_PARITY);
+  ok(facRoles103.size >= 15, 'KI-E103: the extractor actually finds factory.js\'s agent stages (guard against a silent regex break making this whole gate vacuous) — found ' + facRoles103.size);
+  eq(gaps103.undeclared, [], 'KI-E103 PARITY GATE: every factory.js agent stage is either dispatched by the port, or declared MECHANICAL/UNPORTED in _workflow/opencode/stage-parity.mjs. Undeclared stage(s) found — implement it in runtime.mjs planNext/applyPhaseResults, or add it to that manifest with a reason');
+  eq(gaps103.staleDeclared, [], 'KI-E103 PARITY GATE: no manifest entry claims a gap for a stage the port now dispatches (delete the stale entry)');
+  eq(gaps103.deadDeclared, [], 'KI-E103 PARITY GATE: no manifest entry names a stage factory.js no longer has (delete the dead entry)');
+  eq(gaps103.doubleDeclared, [], 'KI-E103 PARITY GATE: no stage is declared both MECHANICAL and UNPORTED');
+  // every declared entry carries a REAL reason — an empty/placeholder string would satisfy the key
+  // check above while disclosing nothing, which is the failure mode this whole file guards against
+  for (const [bucket, entries] of Object.entries(STAGE_PARITY)) {
+    for (const [role, why] of Object.entries(entries)) {
+      ok(typeof why === 'string' && why.trim().length >= 40, 'KI-E103: stage-parity ' + bucket + '.' + role + ' states a substantive reason, not a placeholder');
+    }
+  }
+  // the three genuinely-absent stages are named explicitly, so closing one is a visible manifest edit
+  // KI-E112: the UNPORTED set is now EMPTY — every canonical agent stage is either dispatched by the
+  // port or implemented mechanically. This assertion is deliberately an equality against `[]` rather
+  // than a "<= N" bound: re-opening a gap must be a visible, arguable edit to this line, not a
+  // quietly-growing list. If a future stage genuinely cannot be ported, add it to UNPORTED with a
+  // reason AND change this assertion in the same commit.
+  eq(Object.keys(STAGE_PARITY.unported), [], 'KI-E112: NO canonical stage is unported — the four KI-E103 disclosed gaps (red-proof KI-E83, plan-commitment/plan-step KI-E87+E101, ledger-anchor KI-E91, rootcause KI-E104) are all closed');
+  ok(Object.keys(STAGE_PARITY.mechanical).length >= 5, 'KI-E112: the mechanical set carries the stages implemented deterministically instead of via an agent (runner, marker, comment, red-proof, rootcause)');
+  // --- shared-constant byte parity (the KI-E97 drift class)
+  for (const name of SHARED_CONSTANTS) {
+    const a = namedConstantSource(facSrc103, name);
+    const b = namedConstantSource(routeSrc103, name);
+    ok(a !== null, 'KI-E103: factory.js declares ' + name + ' on a single line (comparable)');
+    ok(b !== null, 'KI-E103: opencode/routing.mjs declares ' + name + ' on a single line (comparable)');
+    eq(b, a, 'KI-E103 CONSTANT PARITY: opencode/routing.mjs ' + name + ' is byte-identical to factory.js — this is the exact check that would have caught the KI-E97 REALINFRA_SIGNAL drift the day it happened');
+  }
+  // regression pin on the specific KI-E97 shapes: the port must now agree with canon on all of them
+  {
+    const sig = (await import('../opencode/routing.mjs')).REALINFRA_SIGNAL;
+    const fresh = () => new RegExp(sig.source, sig.flags);
+    ok(!fresh().test('~10 concurrent 100mb downloads cause oom'), 'KI-E103/KI-E97: the port no longer false-fires on a volume/OOM concern (live incident 1)');
+    ok(!fresh().test('do not group concurrently with item x'), 'KI-E103/KI-E97: no false fire on file-lock batch-scheduling prose (live incident 2)');
+    ok(!fresh().test('file-lock will serialize against any concurrent work'), 'KI-E103/KI-E97: no false fire on scheduling prose (live incident 3)');
+    ok(!fresh().test('semaphoreslim cap (e.g. max 10 concurrent).'), 'KI-E103/KI-E97: no false fire on the dangling-adjective throttle-cap shape (live incident 4)');
+    ok(fresh().test('enforce the unique-constraint on tenantid'), 'KI-E103/KI-E97: the hyphenated unique-constraint shape now DOES match (the port previously false-negatived it, losing the real-infra floor)');
+    ok(fresh().test('handle dbupdateconcurrencyexception on save'), 'KI-E103/KI-E97: concurrencyexception matches (alternative absent from the stale copy)');
+    ok(fresh().test('genuine race condition in settlement'), 'KI-E103/KI-E97: a real concurrency defect still matches — the narrowing did not cost a true positive');
+  }
+}
+
+// KI-E112 (2026-09-02) — the LAST disclosed port gaps, closed. Every canonical agent stage is now
+// dispatched or implemented mechanically; UNPORTED is empty (asserted in the KI-E103 block above).
+{
+  const rt112 = readFileSync(new URL('../opencode/runtime.mjs', import.meta.url), 'utf8');
+  const cp112 = readFileSync(new URL('../opencode/compose.mjs', import.meta.url), 'utf8');
+  const bt112 = readFileSync(new URL('../opencode/buildtest.mjs', import.meta.url), 'utf8');
+  // (a) the three verify-side mechanical guards
+  ok(rt112.includes('RED-proof marker (KI-E83)') && rt112.includes('parseRedRaw(decodeTranscript('), 'KI-E112: the port re-reads verify-red-raw.txt from DISK (KI-E83) rather than trusting the test-author self-report until fold time');
+  ok(rt112.includes('progress.verificationOnly ? !exitIsZero : exitIsZero'), 'KI-E112: ... including KI-L55\'s INVERTED verificationOnly contract (a pinning test must PASS)');
+  ok(rt112.includes('debrisFiles(changed112, itemFiles112)'), 'KI-E112: the debris check (KI-D1) is ported — debrisFiles was previously not even imported');
+  ok(rt112.includes("progress.res.gates['mech:rootcause-touch']") && rt112.includes('nonTestChanged(changed112)'), 'KI-E112: the pre-band P9 root-cause touch check (KI-E104) is ported using the SAME lib/verify.mjs derivation the fold applies');
+  ok(rt112.includes("gates['mech:rootcause-touch'] = 'SKIPPED'"), 'KI-E112: ... and announces SKIPPED on an unreadable worktree rather than reading as clean');
+  // (b) plan-commitment / plan-step trio
+  ok(rt112.includes("phase === 'plancommit'") && rt112.includes("phase === 'plancommit_amend'") && rt112.includes("phase === 'plancommit_reprobe'"), 'KI-E112: the plan-commitment trio (probe / ONE bounded amend / one re-probe) is dispatched, mirroring the acceptance trio');
+  ok(rt112.includes('normalizePlanSteps(pl.steps, 8)') && rt112.includes('hasPlanCommitmentLanguage(commitmentText)'), 'KI-E112: both KI-E101 STEP mode and KI-E87 PROSE mode are wired — the port previously ACCEPTED plan.steps and never read it');
+  ok(rt112.includes('progress.plan = plan;'), 'KI-E112: the plan is RETAINED on progress so the scan has something to check (the canon equivalent of KI-E87 hoisting `plan` to function scope) — without this the whole stage silently no-ops');
+  ok(rt112.includes("gates['probe:plan-commitment-scan']"), 'KI-E112: both modes share canon\'s EXISTING gate key — a second key would orphan the telemetry/recover/feedback consumers');
+  ok(rt112.includes("(progress._planStepMode ? 'STEP' : 'PROSE') + ' mode]'"), 'KI-E112: the mode is stamped into the headline, as in canon');
+  // (c) ledger-anchor
+  ok(rt112.includes('function ledgerAnchorNext') && rt112.includes("runBuildTest(progress.ctx.factoryRoot, 'ledger-anchor'"), 'KI-E112: the ledger-anchor mechanical STEP-1 (KI-E91) runs the engine-owned lint');
+  ok(rt112.includes('STANDARDS-DIVERGENCE-LEDGER\\.md$'.replace('\\\\', '\\')) || /STANDARDS-DIVERGENCE-LEDGER/.test(rt112), 'KI-E112: ... gated exactly as canon gates it — only when the item declares such a ledger path, so it is a free no-op for hosts without one');
+  ok(rt112.includes("phase === 'ledger_anchor_classify'"), 'KI-E112: ... with the STEP-2 classify phase mirroring leftover_classify');
+  // (d) the phase chain actually REACHES the new stages (a stage nothing routes to is dead code)
+  ok(rt112.includes("progress.phase = 'plancommit'"), 'KI-E112: the acceptance phase advances INTO plancommit — the new stage is reachable, not orphaned');
+  ok(rt112.includes('ledgerAnchorNext(progress, itemsDirFor(progress.ctx, progress.id))'), 'KI-E112: leftover_classify advances INTO the ledger-anchor check');
+  // (e) the dead-code / dropped-field cleanups
+  ok(!/import \{[^}]*\btouchedRootCause\b[^}]*\} from '\.\/buildtest\.mjs'/.test(rt112), 'KI-E112: the dead touchedRootCause import is gone (it was imported and never called)');
+  ok(!/import \{[^}]*\bappendRaw\b[^}]*\} from '\.\/buildtest\.mjs'/.test(rt112), 'KI-E112: the dead appendRaw import is gone');
+  ok(rt112.includes('progress.item.verifyNote = caveats112.join'), 'KI-E112: the KI-E74B verify-note channel is now POPULATED — compose.mjs had rendered it since KI-E74B with nothing ever setting it (a dead render)');
+  ok(cp112.replace(/^\s*\/\/\s?/gm, '').replace(/\s+/g, ' ').includes('no longer a dead render'), 'KI-E112: ... and compose.mjs\'s disclosure comment is corrected rather than left claiming a gap that is closed (comment markers stripped then whitespace-flattened — the phrase straddles a comment line wrap)');
+  ok(rt112.includes('if (integ.branch) progress.res.branch = integ.branch;'), 'KI-E112: the integrator\'s branch reaches the folded result — the hand-off the human is meant to commit (KI-E1)');
+  ok(rt112.includes('function configuredGateSet()') && !rt112.includes('gateRolesFor(progress.item, progress.band, null)'), 'KI-E112: the host\'s configured gateSet is READ — both call sites passed null, silently ignoring a host that customised it');
+  ok(bt112.includes('flakeSuspects'), 'KI-E112: buildtest re-exports flakeSuspects so the port can record the KI-E108 caveat');
+}
+
+// KI-E111 (2026-09-02) — writeJsonAtomic survives a transient Windows rename failure. This is the
+// engine's ONLY durable-write primitive (ledger, reports, run-args, and the opencode checkpoint), so
+// a dropped write here strands real state — live-observed as an intermittent EPERM on the port's
+// opencode-progress.json rename, disclosed in KI-E102.
+{
+  const { writeJsonAtomic, readJson } = await import('./ledger.mjs');
+  const wdir = mkdtempSync(join(tmpdir(), 'atomicw-'));
+  const target = join(wdir, 'sub', 'state.json');
+  // happy path — still creates parent dirs and round-trips
+  writeJsonAtomic(target, { a: 1 });
+  eq(readJson(target), { a: 1 }, 'KI-E111: writeJsonAtomic still writes + creates parent dirs (no behaviour change on the success path)');
+  // overwrite of an EXISTING target is the case that fails on Windows under a sharing violation
+  writeJsonAtomic(target, { a: 2, b: 'x' });
+  eq(readJson(target), { a: 2, b: 'x' }, 'KI-E111: overwriting an existing target succeeds (the rename-over-existing path the retry protects)');
+  // no temp debris survives a successful write — a stray <path>.tmp.<pid> is exactly what KI-E42's
+  // relaunch scanner flags as non-canonical, so it would poison the next resume
+  const { readdirSync: rd111, rmSync: rm111 } = await import('node:fs');
+  eq(rd111(join(wdir, 'sub')).filter((f) => f.includes('.tmp.')), [], 'KI-E111: no .tmp.<pid> debris remains after a successful write');
+  // a REAL error still propagates rather than being retried into a silent delay
+  let threw111 = false;
+  try { writeJsonAtomic(join(wdir, 'sub', 'state.json', 'cannot', 'nest', 'under', 'a', 'file.json'), { x: 1 }); } catch { threw111 = true; }
+  ok(threw111, 'KI-E111: a genuine, non-transient failure still THROWS — the retry must never swallow a real error');
+  const lsrc111 = readFileSync(new URL('./ledger.mjs', import.meta.url), 'utf8');
+  ok(lsrc111.includes("if (process.platform !== 'win32') break;"), 'KI-E111: POSIX takes the pre-existing single-attempt path byte-for-byte — the retry is a win32-only addition, never a behaviour change on the platform CI runs');
+  ok(lsrc111.includes("['EPERM', 'EACCES', 'EBUSY'].includes(e && e.code)"), 'KI-E111: only the three transient sharing-violation codes are retried; any other error breaks out immediately');
+  ok(lsrc111.includes('rmSync(tmp, { force: true })'), 'KI-E111: a FAILED write cleans up its temp so it cannot become KI-E42 debris for the next resume');
+  ok(/Atomics\.wait/.test(lsrc111), 'KI-E111: the backoff is a real synchronous sleep (zero-dep Atomics.wait), not a busy-wait burning CPU inside a retry loop');
+  rm111(wdir, { recursive: true, force: true });
+}
+
+// KI-E110 (2026-09-02) — projected batch cost, in the same unit KI-E107 measures actuals in.
+{
+  const { projectedCalls, projectBatch, renderProjection } = await import('./band-cost.mjs');
+  const nonMech = { id: 'A', fixType: 'non-trivial' };
+  const mech = { id: 'B', fixType: 'mechanical' };
+  ok(projectedCalls(nonMech, 'FULL') > projectedCalls(nonMech, 'LIGHT'), 'KI-E110: FULL projects more calls than LIGHT');
+  eq(projectedCalls(nonMech, 'FULL') - projectedCalls(nonMech, 'LIGHT'), 7, 'KI-E110: the FULL premium is the 3 extra role gates + 4 extra review/refute/lens calls the band actually dispatches — derived from the pipeline, not invented');
+  eq(projectedCalls(nonMech, 'LIGHT') - projectedCalls(mech, 'LIGHT'), 1, 'KI-E110: a mechanical item skips exactly the planner call (factory.js: crit = fixType !== "mechanical")');
+  eq(projectedCalls(nonMech, 'nonsense'), projectedCalls(nonMech, 'LIGHT'), 'KI-E110: an unknown band falls back to LIGHT rather than throwing or inventing a tier');
+  {
+    const p = projectBatch([nonMech, nonMech, mech], (wi) => (wi.fixType === 'mechanical' ? 'LIGHT' : 'FULL'));
+    eq(p.byBand.FULL.items, 2, 'KI-E110: the roll-up buckets by band');
+    eq(p.byBand.LIGHT.items, 1, 'KI-E110: ... both ways');
+    eq(p.total, p.byBand.FULL.calls + p.byBand.LIGHT.calls, 'KI-E110: the total is the sum of the buckets (no double-count)');
+  }
+  eq(projectBatch([], () => 'FULL').total, 0, 'KI-E110: an empty batch projects zero');
+  eq(projectBatch(null, () => 'FULL').total, 0, 'KI-E110: a null batch never throws');
+  eq(renderProjection({ total: 0, byBand: {} }), '', 'KI-E110: nothing to project renders nothing — no "~0 calls" noise line');
+  {
+    const line = renderProjection(projectBatch([nonMech, mech], (wi) => (wi.fixType === 'mechanical' ? 'LIGHT' : 'FULL')));
+    ok(line.includes('agent calls'), 'KI-E110: the line names the unit explicitly');
+    ok(line.includes('a floor'), 'KI-E110: ... and states it is a FLOOR — retries/amends/adjudication add more, so the estimate under-promises (the safe direction for a planning aid)');
+    ok(line.includes('KI-E107'), 'KI-E110: ... and points at the report that measures the same unit, so the projection can actually be calibrated rather than becoming folklore');
+  }
+  const dsrc110 = readFileSync(new URL('../driver.mjs', import.meta.url), 'utf8');
+  ok(dsrc110.includes("import { projectBatch, renderProjection } from './lib/band-cost.mjs'"), 'KI-E110: driver imports the projection');
+  ok(dsrc110.includes('renderProjection(projectBatch(ready, bandFor))'), 'KI-E110: suggest projects the READY pool using the SAME bandFor the scheduler uses — projection and scheduling cannot disagree about a band');
+  ok(dsrc110.indexOf('band mix (KI-E88') < dsrc110.indexOf('renderProjection(projectBatch'), 'KI-E110: the size line follows the KI-E88 shape line (mix, then magnitude)');
+}
+
+// KI-E107 / KI-E108 / KI-E109 (2026-09-02) — cost-yield reporting, flake suspicion, and main-drift
+// prevention as a host policy.
+{
+  // --- KI-E107: agent-call spend by outcome (the yield number)
+  const { renderCallsByOutcome, aggregateEvents } = await import('./telemetry.mjs');
+  const r107 = renderCallsByOutcome({ CLOSED: { calls: 300, items: 15 }, FAILED: { calls: 100, items: 4 } });
+  ok(r107.includes('75.0%') && r107.includes('(300/400)'), 'KI-E107: the yield ratio is calls-on-CLOSED over total calls');
+  ok(r107.includes('FAILED spend: 25.0%'), 'KI-E107: FAILED spend is reported as the waste figure');
+  ok(/\| CLOSED \| 15 \| 300 \| 75\.0% \| 20\.0 \|/.test(r107), 'KI-E107: per-outcome row carries items, calls, share AND calls/item — the last column is what exposes a FAILED item costing more than a CLOSED one');
+  ok(!/\| ESCALATED \|/.test(r107), 'KI-E107: an outcome with no calls gets no table ROW (the word still appears in the footnote explaining why ESCALATED spend is not counted as waste — assert on the row, not the prose)');
+  {
+    const withEsc = renderCallsByOutcome({ CLOSED: { calls: 50, items: 5 }, ESCALATED: { calls: 50, items: 5 } });
+    ok(withEsc.includes('FAILED spend: 0.0%'), 'KI-E107: ESCALATED spend is deliberately NOT counted as waste — it reached a human with the analysis intact, which is the system working');
+  }
+  eq(renderCallsByOutcome({}), '_none — needs item_folded events carrying a cost map (KI-E23)._', 'KI-E107: empty input renders a self-explaining placeholder, never a fake 0%');
+  eq(renderCallsByOutcome(null), '_none — needs item_folded events carrying a cost map (KI-E23)._', 'KI-E107: null never throws');
+  eq(renderCallsByOutcome({ CLOSED: { calls: 0, items: 3 } }), '_none — needs item_folded events carrying a cost map (KI-E23)._', 'KI-E107: zero total calls cannot divide — placeholder, never NaN%');
+  {
+    const agg = aggregateEvents([
+      { event: 'item_folded', item: 'A', cycle: 1, attrs: { toState: 'CLOSED', cost: { 'claude-opus-4-8': 8, 'claude-haiku-4-5': 4 } } },
+      { event: 'item_folded', item: 'B', cycle: 1, attrs: { toState: 'FAILED', cost: { 'claude-opus-4-8': 10 } } },
+    ]);
+    eq(agg.callsByOutcome.CLOSED, { calls: 12, items: 1 }, 'KI-E107: aggregation sums calls ACROSS models per item and buckets by the item outcome');
+    eq(agg.callsByOutcome.FAILED, { calls: 10, items: 1 }, 'KI-E107: ... and keeps outcomes separate');
+    eq(agg.models['claude-opus-4-8'], 18, 'KI-E107: the pre-existing by-model tally is unchanged (purely additive)');
+  }
+  // --- KI-E108: flake suspicion
+  const { flakeSuspects } = await import('./verify.mjs');
+  const T = (pairs) => pairs.map(([c, e]) => `FACTORY::TEST::FILTER::START Svc.sln :: ${c}\nFACTORY::TEST::FILTER::RESULT exit=${e}`).join('\n');
+  eq(flakeSuspects(T([['FooTests', 1], ['FooTests', 0]])), ['FooTests'], 'KI-E108: a class that both FAILED and PASSED in one transcript is a flake suspect');
+  eq(flakeSuspects(T([['FooTests', 0], ['BarTests', 1]])), [], 'KI-E108: two DIFFERENT classes with different outcomes is not a flake — that is the ordinary KI-E70 multi-class shape');
+  eq(flakeSuspects(T([['FooTests', 1], ['FooTests', 1]])), [], 'KI-E108: a consistently failing class is a real failure, not a flake');
+  eq(flakeSuspects(T([['FooTests', 0], ['FooTests', 0]])), [], 'KI-E108: a consistently passing class is not a flake');
+  eq(flakeSuspects(T([['B', 1], ['B', 0], ['A', 1], ['A', 0]])), ['A', 'B'], 'KI-E108: multiple suspects are returned sorted (stable output)');
+  eq(flakeSuspects(''), [], 'KI-E108: empty text -> []');
+  eq(flakeSuspects(null), [], 'KI-E108: null never throws');
+  eq(flakeSuspects('FACTORY::TEST::FILTER::START Svc.sln :: OnlyStart'), [], 'KI-E108: an unpaired START (truncated transcript) is ignored, never half-counted');
+  {
+    // the ADVISORY bound: the verdict must be unchanged by a flake pattern (last-wins, cycle-8 retry shape)
+    const { parseVerifyRaw, verdictFromParse } = await import('./verify.mjs');
+    const retryShape = T([['FooTests', 1], ['FooTests', 0]]) + '\nFACTORY::BUILD::RESULT exit=0 errors=0';
+    ok(verdictFromParse(parseVerifyRaw(retryShape), []).pass, 'KI-E108: a fail-then-pass retry still PASSES — the flake signal is advisory and must never change the last-wins verdict the engine deliberately supports');
+    ok(flakeSuspects(retryShape).length === 1, 'KI-E108: ... while still being NAMED, so a human can tell a retry from an unstable test');
+  }
+  const dsrc108 = readFileSync(new URL('../driver.mjs', import.meta.url), 'utf8');
+  ok(dsrc108.includes('flakeSuspects') && dsrc108.includes('KI-E108 ${id}: FLAKE SUSPECT'), 'KI-E108: the fold reports suspects');
+  ok(/catch \{ \/\* advisory only/.test(dsrc108), 'KI-E108: the scan is wrapped — a flake scan must never affect a fold');
+  // --- KI-E109: main-drift prevention as a policy
+  const { loadPolicies } = await import('./policy.mjs');
+  ok('failLaneOnMainDrift' in loadPolicies('/nonexistent-path-for-defaults'), 'KI-E109: the policy exists in the shared loadPolicies seam (same KI-E57/E58 mechanism, not a bespoke flag)');
+  eq(loadPolicies('/nonexistent-path-for-defaults').failLaneOnMainDrift, false, 'KI-E109: OFF in the shipped engine — default behaviour is byte-for-byte the historical warn-only posture');
+  const fsrc109 = readFileSync(new URL('../factory.js', import.meta.url), 'utf8');
+  ok(fsrc109.includes('A.policies && A.policies.failLaneOnMainDrift'), 'KI-E109: factory.js gates the fail on the policy, never unconditionally');
+  ok(/MAIN-DRIFT/.test(fsrc109) && fsrc109.includes('failing the lane NOW instead of spending the gate band'), 'KI-E109: the lane fails on the ⚠ MAIN-DRIFT marker the KI-E50 verifyHint already has the runner paste into its note — reusing an existing signal, adding no new detection');
+  ok(fsrc109.indexOf('failLaneOnMainDrift') < fsrc109.indexOf('// 5. REVIEW band'), 'KI-E109: it fails BEFORE the gate band — the entire point is not paying for a run that already wrote outside its worktree');
+  const cfg109 = JSON.parse(readFileSync(new URL('../../config/factory.config.json', import.meta.url), 'utf8'));
+  eq(cfg109.policies.failLaneOnMainDrift, false, 'KI-E109: shipped config default is OFF');
+}
+
+// KI-E106 (2026-09-02) — ITEM READINESS: the deterministic input-contract gate at group time.
+{
+  const { itemReadiness, unreadyItems } = await import('./readiness.mjs');
+  const good = { id: 'A', acceptance: 'The ItemsController clamps pageSize to 100 and returns 400 above it.', regressionTest: 'A request with pageSize=500 must return 400; today it returns 200.', files: ['Svc/src/ItemsController.cs'] };
+  ok(itemReadiness(good).ready, 'KI-E106: a well-formed item is ready');
+  eq(itemReadiness(good).problems, [], 'KI-E106: ... with no problems reported');
+  // acceptance
+  eq(itemReadiness({ ...good, acceptance: '' }).problems.map((p) => p.code), ['acceptance-missing'], 'KI-E106: an empty acceptance is caught');
+  eq(itemReadiness({ ...good, acceptance: 'TBD' }).problems.map((p) => p.code), ['acceptance-missing'], 'KI-E106: a placeholder acceptance ("TBD") is ABSENT, not stated — it must not pass on length alone');
+  eq(itemReadiness({ ...good, acceptance: 'fix it' }).problems.map((p) => p.code), ['acceptance-uncheckable'], 'KI-E106: acceptance too short to yield ANY clause the KI-E18 splitter would probe is caught as a DISTINCT problem from absent');
+  // the "uncheckable" rule must agree with the real splitter, not a second definition
+  {
+    const { splitAcceptanceClauses } = await import('./acceptance.mjs');
+    const short = 'fix it';
+    eq(splitAcceptanceClauses(short, 8).length, 0, 'KI-E106: the SAME splitter the KI-E18 probe runs yields zero clauses for that text — the gate and the probe cannot disagree about what "checkable" means');
+  }
+  // regressionTest
+  eq(itemReadiness({ ...good, regressionTest: '' }).problems.map((p) => p.code), ['regression-test-missing'], 'KI-E106: a missing regressionTest is caught');
+  eq(itemReadiness({ ...good, regressionTest: 'n/a' }).problems.map((p) => p.code), ['regression-test-missing'], 'KI-E106: "n/a" is a placeholder, not a red->green contract');
+  eq(itemReadiness({ ...good, regressionTest: 'a test' }).problems.map((p) => p.code), ['regression-test-missing'], 'KI-E106: a too-short description is not a stated contract');
+  // files
+  eq(itemReadiness({ ...good, files: [] }).problems.map((p) => p.code), ['files-empty'], 'KI-E106: an empty files[] is caught (it silently disables the KI-E14 lock AND short-circuits the fold\'s P9 to PASS)');
+  eq(itemReadiness({ ...good, files: undefined }).problems.map((p) => p.code), ['files-empty'], 'KI-E106: a missing files[] is caught the same way');
+  // multiple problems are all reported, in stable order (so the operator fixes them in one pass)
+  eq(itemReadiness({ id: 'B' }).problems.map((p) => p.code), ['acceptance-missing', 'regression-test-missing', 'files-empty'], 'KI-E106: every problem is reported at once, in a stable order — never one-at-a-time whack-a-mole');
+  // never throws on junk
+  ok(!itemReadiness(null).ready && itemReadiness(null).problems.length === 3, 'KI-E106: a null item never throws and reports every problem');
+  ok(!itemReadiness({}).ready, 'KI-E106: an empty object is not ready');
+  // batch helper + the blocked-tier exemption
+  eq(unreadyItems([good, { id: 'C' }]).map((r) => r.id), ['C'], 'KI-E106: unreadyItems returns only the failing items');
+  eq(unreadyItems([{ id: 'D', autonomyTier: 'blocked' }]), [], 'KI-E106: a `blocked` item is SKIPPED — it awaits an owner ruling and is not scheduled anyway, so reporting it would be noise the operator cannot act on');
+  eq(unreadyItems([]), [], 'KI-E106: an empty batch is trivially ready');
+  eq(unreadyItems(null), [], 'KI-E106: a null batch never throws');
+  // driver wiring
+  const dsrc106 = readFileSync(new URL('../driver.mjs', import.meta.url), 'utf8');
+  ok(dsrc106.includes("import { unreadyItems } from './lib/readiness.mjs'"), 'KI-E106: driver imports the gate');
+  ok(dsrc106.includes('const unready106 = unreadyItems(picked)'), 'KI-E106: the gate runs against the PICKED batch');
+  ok(dsrc106.includes("if (!flags['force-unready'])") && dsrc106.includes('process.exit(1)'), 'KI-E106: the gate BLOCKS by default (unlike the KI-E29/KI-E90 scheduling warns) — an unready item is defective in itself, and no batch composition rescues it');
+  ok(dsrc106.includes('--force-unready'), 'KI-E106: ... with an explicit operator override, printed in the refusal message');
+  ok(dsrc106.indexOf('const unready106') > dsrc106.indexOf('const picked'), 'KI-E106: the gate runs after the pick (it grades the batch that would actually be scheduled)');
+}
+
+// KI-E105 (2026-09-02) — stall detection: the missing SHORTENING half of KI-L41's retry economics.
+{
+  const { isNotConverging, applyStallDetection, isStalled, gateFindingsSummary } = await import('./convergence.mjs');
+  const S = (findings, blockingGates = 1, maxRank = 1) => ({ findings, blockingGates, maxRank });
+  // the predicate — strict complement of PROGRESS, not of isStrictlyNarrower
+  ok(isNotConverging(S(5), S(5)), 'KI-E105: an identical finding count two rounds running is a stall');
+  ok(isNotConverging(S(7), S(5)), 'KI-E105: a GROWING finding count is a stall');
+  ok(!isNotConverging(S(3), S(5)), 'KI-E105: fewer findings is progress, never a stall');
+  ok(!isNotConverging(S(3, 1, 0), S(5, 1, 2)), 'KI-E105: findings shrank but max severity got WORSE — earns no bonus (not strictly narrower) yet is NOT a stall either; real progress was made, so the two directions are deliberately not complements');
+  ok(!isNotConverging(S(5), null), 'KI-E105: no prior round -> never a stall (nothing to compare)');
+  ok(!isNotConverging(S(5, 0), S(5)), 'KI-E105: a round with no blocking gates is not comparable — same guard isStrictlyNarrower uses');
+  // the accounting: streak accumulates, progress resets, bound is respected
+  {
+    const cfg = { maxStallRounds: 2 };
+    const led = { items: { A: { state: 'FAILED' } } };
+    const res = (findings) => [{ id: 'A', toState: 'FAILED', gateDetails: { 'gate:qa': { verdict: 'CHANGES_REQUIRED', findings: new Array(findings).fill({ severity: 'HIGH' }) } } }];
+    const out = applyStallDetection(led, cfg, res(5), { A: S(5) });
+    eq(led.items.A.stallRounds, 1, 'KI-E105: a FIRST flat round increments the streak to 1');
+    eq(out.length, 0, 'KI-E105: ... but is NOT reported — one flat round is noise, the bound is 2 consecutive. A single bad round must never park work that would still have closed');
+    ok(!isStalled(cfg, led.items.A), 'KI-E105: ... and the row is not yet stall-parked');
+  }
+  {
+    const cfg = { maxStallRounds: 2 };
+    const led = { items: { A: { state: 'FAILED', stallRounds: 1 } } };
+    const res = [{ id: 'A', toState: 'FAILED', gateDetails: { 'gate:qa': { verdict: 'CHANGES_REQUIRED', findings: [{ severity: 'HIGH' }, { severity: 'HIGH' }] } } }];
+    const out = applyStallDetection(led, cfg, res, { A: S(2) });
+    eq(led.items.A.stallRounds, 2, 'KI-E105: a second consecutive flat round reaches the bound');
+    eq(out.length, 1, 'KI-E105: ... and is reported to the driver for logging');
+    ok(isStalled(cfg, led.items.A), 'KI-E105: isStalled agrees with the accounting — one definition drives both');
+  }
+  {
+    const cfg = { maxStallRounds: 2 };
+    const led = { items: { A: { state: 'FAILED', stallRounds: 1 } } };
+    const res = [{ id: 'A', toState: 'FAILED', gateDetails: { 'gate:qa': { verdict: 'CHANGES_REQUIRED', findings: [{ severity: 'HIGH' }] } } }];
+    applyStallDetection(led, cfg, res, { A: S(4) });
+    eq(led.items.A.stallRounds, 0, 'KI-E105: ANY reduction in findings RESETS the streak — one bad round is noise, only a consecutive pattern parks');
+  }
+  {
+    const led = { items: { A: { state: 'FAILED', stallRounds: 5 } } };
+    eq(applyStallDetection(led, { maxStallRounds: 0 }, [], {}).length, 0, 'KI-E105: maxStallRounds 0 disables the mechanism (host opt-out)');
+    ok(!isStalled({ maxStallRounds: 0 }, led.items.A), 'KI-E105: ... and isStalled honours the same opt-out even on an already-high counter');
+  }
+  {
+    // a pre-gate failure carries no gateDetails -> not a judgeable trajectory, counter untouched
+    const cfg = { maxStallRounds: 2 };
+    const led = { items: { A: { state: 'FAILED', stallRounds: 1 } } };
+    applyStallDetection(led, cfg, [{ id: 'A', toState: 'FAILED' }], { A: S(3) });
+    eq(led.items.A.stallRounds, 1, 'KI-E105: a pre-gate failure (test/verify/fold stage — no gateDetails) neither increments nor resets: nothing was adjudicated, so there is no trajectory to judge');
+    eq(gateFindingsSummary({ toState: 'FAILED' }), null, 'KI-E105: gateFindingsSummary returns null for that shape (the guard this relies on)');
+  }
+  // driver wiring
+  const dsrc105 = readFileSync(new URL('../driver.mjs', import.meta.url), 'utf8');
+  ok(dsrc105.includes('applyStallDetection, isStalled') || (dsrc105.includes('applyStallDetection') && dsrc105.includes('isStalled')), 'KI-E105: driver imports both stall helpers from the single convergence module');
+  ok(dsrc105.indexOf('const priorConvergence = {}') < dsrc105.indexOf('applyConvergenceBonus(ledger, cfg, arr)'), 'KI-E105: the prior-round summary is captured BEFORE the bonus pass overwrites row.convergence — otherwise the stall pass compares a round against itself');
+  ok(dsrc105.includes('applyStallDetection(ledger, cfg, arr, priorConvergence)'), 'KI-E105: the stall pass receives that snapshot');
+  ok(dsrc105.includes('const stalled = isStalled(cfg, row)') && dsrc105.includes('row.attempts > bound || stalled'), 'KI-E105: escalateExhausted parks on EITHER stop condition — one decision point, so scheduling and parking cannot disagree');
+  ok(/NO-PROGRESS on \$\{row\.stallRounds\}/.test(dsrc105), 'KI-E105: the parked row records WHY it was parked (stall, not budget exhaustion) in its transition note');
+  const cfg105 = JSON.parse(readFileSync(new URL('../../config/factory.config.json', import.meta.url), 'utf8'));
+  eq(cfg105.maxStallRounds, 2, 'KI-E105: the shipped default is 2 consecutive no-progress rounds');
+}
+
+// KI-E104 (2026-09-02) — PRE-BAND P9: the shared isTest predicate, the non-test diff derivation, the
+// deterministic lint CLI contract, and the factory.js probe wiring. P9 used to run ONLY at fold, so a
+// tests-only diff cost a FULL gate band before rejection; this is the same hoist KI-E83 did for P1.
+{
+  const { isTestPath, nonTestChanged, touchedRootCause } = await import('./verify.mjs');
+  // the predicate, both shapes it recognises
+  ok(isTestPath('Svc/Tests/FooTests.cs'), 'KI-E104: a *Tests.cs filename is a test path');
+  ok(isTestPath('Svc/Foo.Test.cs'), 'KI-E104: the singular *Test.cs form counts too');
+  ok(isTestPath('Svc/Svc.Tests/Helper.cs'), 'KI-E104: any file under a .Tests/ project dir is a test path');
+  ok(!isTestPath('Svc/src/OrderService.cs'), 'KI-E104: ordinary source is not a test path');
+  ok(!isTestPath('k8s/base/deploy.yaml'), 'KI-E104: config is not a test path (P9 accepts config-only fixes — the KI-L24 class)');
+  ok(!isTestPath('Svc/src/Contests.cs'), 'KI-E104: a source file whose name merely ENDS in those letters is NOT a test path — `Contests.cs` used to match (/i + `[^/]*Tests?\\.cs$`), which would make P9 read a fix touching only it as "tests-only" and FAIL a correct fix');
+  ok(!isTestPath('Svc/src/Manifests.cs'), 'KI-E104: same false-positive class — Manifests.cs is source');
+  ok(isTestPath('Svc/Tests.cs'), 'KI-E104: a file named exactly Tests.cs is still a test path (the narrowing did not over-correct)');
+  ok(isTestPath('Svc/svc.tests/helper.cs'), 'KI-E104: the DIRECTORY arm stays case-insensitive — a lowercase test-project dir still classifies, which is the backstop for repos not using PascalCase filenames');
+  // the derivation
+  eq(nonTestChanged(['a/FooTests.cs', 'a/src/Foo.cs', 'b/Bar.Tests/X.cs', 'k8s/x.yaml']), ['a/src/Foo.cs', 'k8s/x.yaml'], 'KI-E104: nonTestChanged returns exactly the non-test files, preserving order');
+  eq(nonTestChanged([]), [], 'KI-E104: empty diff -> empty');
+  eq(nonTestChanged(null), [], 'KI-E104: a null diff never throws');
+  // REGRESSION GUARD on the refactor: touchedRootCause is now DEFINED in terms of nonTestChanged;
+  // its externally-observable behaviour (which the fold's P9 depends on) must be unchanged.
+  ok(touchedRootCause(['a/src/Foo.cs'], ['a/src/Foo.cs']), 'KI-E104: touchedRootCause still true when a non-test file changed');
+  ok(!touchedRootCause(['a/FooTests.cs'], ['a/src/Foo.cs']), 'KI-E104: touchedRootCause still FALSE for a tests-only diff (the P9 signal itself)');
+  ok(touchedRootCause(['a/FooTests.cs'], []), 'KI-E104: an empty rootCauseFiles set still short-circuits true (config/doc item — nothing to assert)');
+  ok(touchedRootCause(['a/FooTests.cs'], null), 'KI-E104: a null rootCauseFiles set still short-circuits true');
+  // the lint CLI's own contract + INVERTED exit polarity vs its leftovers/comments siblings
+  const rcli = readFileSync(new URL('../rootcause-lint.mjs', import.meta.url), 'utf8');
+  ok(rcli.includes('FACTORY::ROOTCAUSE::') && rcli.includes('FACTORY::ROOTCAUSE-FILE::'), 'KI-E104: the lint emits the count marker and the per-file markers');
+  ok(rcli.includes('FACTORY::ROOTCAUSE-SKIP'), 'KI-E104: an unreadable worktree emits a DISTINCT skip marker — "could not look" must never read as "looked and found nothing"');
+  ok(rcli.includes('process.exit(nonTest.length ? 0 : 1)'), 'KI-E104: exit polarity is INVERTED vs leftovers/comments (zero non-test files is the FAILURE here)');
+  ok(rcli.includes("import { nonTestChanged } from './lib/verify.mjs'") && rcli.includes("import { changedFiles } from './lib/worktree.mjs'"), 'KI-E104: the lint IMPORTS the same predicate + the same git reader the fold uses — no second derivation to drift');
+  // factory.js wiring
+  const fsrc104 = readFileSync(new URL('../factory.js', import.meta.url), 'utf8');
+  ok(fsrc104.includes("const ROOTCAUSE_SCHEMA = { type: 'object'") && fsrc104.includes("required: ['nonTestCount']"), 'KI-E104: ROOTCAUSE_SCHEMA is defined with the non-colliding nonTestCount field');
+  ok(!/ROOTCAUSE_SCHEMA[^\n]*required: \['count'\]/.test(fsrc104), 'KI-E104: the schema does NOT use a bare `count` — COMMENT_SCHEMA already owns that name with the OPPOSITE polarity (zero=good), and shape-sniffing consumers collide on it');
+  const rcBlock = fsrc104.slice(fsrc104.indexOf('4a4. ROOT-CAUSE TOUCH PROBE'), fsrc104.indexOf('Editorial (Band C)'));
+  ok(rcBlock.length > 200, 'KI-E104: the probe block exists between the RED-proof probe and the editorial pass');
+  ok(rcBlock.includes("if (codeChange && !verificationOnly && (res.rootCauseFiles || []).length) {"), 'KI-E104: gated exactly as the fold gates P9 — code items, never verificationOnly (KI-L55), only when a non-test touch-set was predicted');
+  eq((rcBlock.match(/finish\('FAILED'/g) || []).length, 1, 'KI-E104: exactly one finish(\'FAILED\') call site in the probe block');
+  ok(rcBlock.includes("res.gates['probe:rootcause-touch'] = 'SKIPPED'"), 'KI-E104: a probe that could not run ANNOUNCES itself on the gates map — silence never reads as clean (KI-E20/KI-E41 posture)');
+  ok(fsrc104.indexOf('4a2. RED-PROOF') < fsrc104.indexOf('4a4. ROOT-CAUSE TOUCH PROBE') && fsrc104.indexOf('4a4. ROOT-CAUSE TOUCH PROBE') < fsrc104.indexOf('// 5. REVIEW band'), 'KI-E104: the probe runs after the RED-proof probe and strictly BEFORE the review/gate band (the whole point of the hoist)');
+}
+
+// KI-E101 (2026-09-02) — STEP mode for the plan-scan: normalizePlanSteps (the structured sibling of
+// KI-E87's coarse prose prefilter), its factory.js inline-copy parity, the PLAN_SCHEMA `steps` field
+// (optional — backward compatibility is the whole point), the two-mode factory.js wiring, and the
+// planner brief that actually produces the field.
+{
+  const { normalizePlanSteps } = await import('./plan-commitment.mjs');
+  // shape / fail-open
+  eq(normalizePlanSteps(undefined), [], 'KI-E101: undefined steps -> [] (a plan without the new field degrades to PROSE mode, never throws)');
+  eq(normalizePlanSteps(null), [], 'KI-E101: null steps -> []');
+  eq(normalizePlanSteps('not an array'), [], 'KI-E101: a non-array steps value -> [], never throws');
+  eq(normalizePlanSteps([]), [], 'KI-E101: empty array -> []');
+  eq(normalizePlanSteps([{ step: 'an object, not a string' }, 42, null]), [], 'KI-E101: non-string entries are skipped, never thrown on');
+  // normalization
+  eq(normalizePlanSteps(['  Thread the token through   SubmitAsync  ']), ['Thread the token through SubmitAsync'], 'KI-E101: whitespace is collapsed and trimmed');
+  eq(normalizePlanSteps(['1. Thread the token through SubmitAsync']), ['Thread the token through SubmitAsync'], 'KI-E101: a hand-written "1. " ordinal is stripped so the probe numbering does not double up');
+  eq(normalizePlanSteps(['2) Thread the token through SubmitAsync']), ['Thread the token through SubmitAsync'], 'KI-E101: a "2) " ordinal is stripped');
+  eq(normalizePlanSteps(['(3) Thread the token through SubmitAsync']), ['Thread the token through SubmitAsync'], 'KI-E101: a "(3) " ordinal is stripped');
+  eq(normalizePlanSteps(['- Thread the token through SubmitAsync']), ['Thread the token through SubmitAsync'], 'KI-E101: a "- " bullet is stripped');
+  eq(normalizePlanSteps(['* Thread the token through SubmitAsync']), ['Thread the token through SubmitAsync'], 'KI-E101: a "* " bullet is stripped');
+  eq(normalizePlanSteps(['Add a guard clause to Foo', 'add a guard clause to FOO']), ['Add a guard clause to Foo'], 'KI-E101: dedupe is case-insensitive — a repeated step never inflates the gap count or re-spends probe budget');
+  // length floor: 12, deliberately BELOW splitAcceptanceClauses' 20 (dropping an authored step is a
+  // silent miss — the exact class this entry closes — so the floor errs low and only kills stubs).
+  eq(normalizePlanSteps(['TODO']), [], 'KI-E101: a sub-12-char stub entry is dropped as not a real step');
+  eq(normalizePlanSteps(['Wire the DI seam']), ['Wire the DI seam'], 'KI-E101: a genuine SHORT step (16 chars) survives — splitAcceptanceClauses\' 20-char floor would have silently dropped it');
+  eq(normalizePlanSteps(['Add the null guard']), ['Add the null guard'], 'KI-E101: an 18-char genuine step survives the floor (regression guard on the 12-vs-20 decision)');
+  // cap + tail merge (mirrors splitAcceptanceClauses: nothing is silently sliced away)
+  {
+    const ten = [];
+    for (let i = 1; i <= 10; i++) ten.push('Step number ' + i + ' does a real thing');
+    const capped = normalizePlanSteps(ten, 4);
+    eq(capped.length, 4, 'KI-E101: output honours the cap');
+    ok(capped[3].includes('Step number 4') && capped[3].includes('Step number 10'), 'KI-E101: the over-cap tail MERGES into the last entry — every authored step still reaches the probe, none is silently unchecked');
+    eq(normalizePlanSteps(ten).length, 8, 'KI-E101: the default cap is 8, matching splitAcceptanceClauses');
+  }
+  // factory.js inline-copy byte-parity (the KI-E2 split: the Workflow runtime cannot import)
+  const fsrc101 = readFileSync(new URL('../factory.js', import.meta.url), 'utf8');
+  const asrc101 = readFileSync(new URL('./plan-commitment.mjs', import.meta.url), 'utf8');
+  const bodyOf101 = (s) => { const m = s.match(/function normalizePlanSteps[\s\S]*?\n\}/); return m ? m[0] : null; };
+  ok(bodyOf101(fsrc101) !== null, 'KI-E101: factory.js carries an inlined normalizePlanSteps');
+  eq(bodyOf101(fsrc101), bodyOf101(asrc101.replace('export function normalizePlanSteps', 'function normalizePlanSteps')), 'KI-E101: factory.js inline copy is byte-identical to lib/plan-commitment.mjs');
+  // PLAN_SCHEMA — the field exists on BOTH copies and is OPTIONAL on both (backward compatibility:
+  // a planner that omits it, and a KI-E69 reused prior-attempt plan, must validate exactly as before)
+  const osrc101 = readFileSync(new URL('../opencode/schemas.mjs', import.meta.url), 'utf8');
+  ok(fsrc101.includes("steps: { type: 'array', items: { type: 'string' } }"), 'KI-E101: factory.js PLAN_SCHEMA declares steps as a string array');
+  ok(osrc101.includes("steps: { type: 'array', items: { type: 'string' } }"), 'KI-E101: opencode/schemas.mjs PLAN_SCHEMA mirrors the steps field (the schema-parity gate requires deep-equality)');
+  {
+    const planReq = (src) => { const i = src.indexOf('PLAN_SCHEMA = '); const j = src.indexOf('required:', i); return src.slice(j, src.indexOf(']', j) + 1); };
+    ok(!planReq(fsrc101).includes('steps'), 'KI-E101: steps is NOT in factory.js PLAN_SCHEMA.required — a planner omitting it still validates (backward compatible)');
+    ok(!planReq(osrc101).includes('steps'), 'KI-E101: steps is NOT in the opencode PLAN_SCHEMA.required either');
+  }
+  // two-mode wiring in the 4c-bis block
+  const pcBlock101 = fsrc101.slice(fsrc101.indexOf('4c-bis. PLAN-COMMITMENT SCAN'), fsrc101.indexOf('4d-pre. COMMENT SCAN'));
+  ok(pcBlock101.includes('const planSteps = normalizePlanSteps(plan.steps, 8)'), 'KI-E101: the block derives its steps deterministically from plan.steps');
+  ok(pcBlock101.includes('const stepMode = planSteps.length >= 2'), 'KI-E101: STEP mode needs >= 2 checkable steps (a 1-step plan is not a decomposition — falls back to PROSE)');
+  ok(pcBlock101.includes('if (stepMode || proseGated) {'), 'KI-E101: STEP mode runs regardless of prose phrasing; PROSE mode still requires the KI-E87 prefilter — neither path was dropped');
+  ok(pcBlock101.includes("const axis = stepMode ? 'plan step' : 'plan commitment'"), 'KI-E101: one `axis` noun renders both modes through the shared tail');
+  ok(pcBlock101.includes('PLAN-STEP SCAN (KI-E101') && pcBlock101.includes('PLAN-COMMITMENT SCAN (KI-E87'), 'KI-E101: both probe prompts are present — the KI-E87 prose prompt is preserved verbatim as the fallback');
+  ok(pcBlock101.includes('PLAN-STEP AMEND (KI-E101') && pcBlock101.includes('PLAN-COMMITMENT AMEND (KI-E87'), 'KI-E101: both amend prompts are present');
+  eq((pcBlock101.match(/finish\('FAILED'/g) || []).length, 1, 'KI-E101: the two modes still share ONE finish(\'FAILED\') call site — the KI-E87 fail-open invariant is not duplicated per mode');
+  eq((pcBlock101.match(/call\('plan-commitment-probe'/g) || []).length, 2, 'KI-E101: still exactly one probe + one bounded re-probe across both modes (no extra call was introduced)');
+  eq((pcBlock101.match(/call\('fixer'/g) || []).length, 1, 'KI-E101 scope bound: exactly ONE fixer call in the block — steps decompose CHECKING, never EXECUTION (a per-step fixer would defeat fixer.md\'s whole-diff SIBLING-PATTERN/DEAD-CODE/ADJACENT-CLAIM/CANCELLATIONTOKEN self-checks, KI-E94/E95/E96, which guard the #1 rejection class KI-E51)');
+  ok(pcBlock101.includes("res.gates['probe:plan-commitment-scan']") && !pcBlock101.includes("res.gates['probe:plan-step-scan']"), 'KI-E101: both modes share the EXISTING gate key — a second key would silently orphan telemetry/recover/feedback consumers keyed off it');
+  ok(pcBlock101.includes("+ ' [' + (stepMode ? 'STEP' : 'PROSE') + ' mode]'"), 'KI-E101: the headline stamps which mode fired, so gateDetails/feedback.md is self-describing');
+  ok(fsrc101.slice(0, 2500).includes('STEP mode probes the planner'), 'KI-E101: factory.js\'s own meta.description names STEP mode, matching what the code actually runs');
+  // the brief that produces the field. Prose assertions match against a whitespace-FLATTENED copy:
+  // planner.md is hand-wrapped markdown, so a phrase can straddle a line break (it already did once
+  // here) — pinning the semantic phrase rather than the current wrapping keeps a harmless reflow
+  // from reading as a regression.
+  const plannerMd101 = readFileSync(join(import.meta.dirname, '..', '..', 'agents', 'planner.md'), 'utf8');
+  const plannerFlat101 = plannerMd101.replace(/\s+/g, ' ');
+  ok(plannerFlat101.includes('Decompose the approach into `steps` (KI-E101)'), 'KI-E101: planner.md carries the step-authoring instruction');
+  ok(/2[–-]8/.test(plannerFlat101), 'KI-E101: planner.md states the 2-8 step bound the code actually enforces (>=2 for STEP mode, cap 8)');
+  ok(plannerFlat101.includes('This list is machine-checked.'), 'KI-E101: planner.md warns the planner its steps are probed against the diff — an aspirational step is a self-inflicted failure');
+  ok(plannerFlat101.includes('put it in `ruleRisks`, never in `steps`'), 'KI-E101: planner.md routes deferred/out-of-scope work to ruleRisks, keeping steps to what this item must actually deliver');
+  ok(plannerFlat101.includes('RETURN: `rootCause`, `approach`, `steps`'), 'KI-E101: planner.md\'s return contract lists steps (the brief and the schema agree)');
 }
 
 // KI-E35 (review fix): splitDriftByStatus — behavioral, throwaway real-git repo: only COMMITTED drift
@@ -1086,6 +1879,26 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
   ok(!D.claimResolves('Api/Controllers/Support/', entries), 'doclint: phantom dir claim does NOT resolve (the ITEM-HI-11 witness)');
   eq(D.findMissingClaims(['under `Api/Controllers/Support/` and `Api/Controllers/Admin/`'], entries), ['Api/Controllers/Support/'], 'doclint: findMissingClaims surfaces only the phantom, deduped');
   eq(D.findMissingClaims([], entries), [], 'doclint: no added lines -> no findings');
+}
+
+// Ported from a host-mount session (2026-08-29) — findMissingClaims flagged a line HONESTLY stating a
+// path does NOT exist yet as if it were a fabricated-existence claim, the opposite of what the linter
+// exists to catch. Origin evidence: a doc-drift fix's own added line — "**No K8s manifest yet**:
+// `k8s/base/services/a-service.yaml` is Wave 5 (deploy gates the full sprint)." — a true statement
+// about the current tree, flagged anyway because the linter only checked "does this path resolve",
+// never whether the surrounding prose asserts existence or absence.
+{
+  const D99 = await import('./doclint.mjs');
+  const notYetLine = '6. **No K8s manifest yet**: `k8s/base/services/a-service.yaml` is Wave 5 (deploy gates the full sprint).';
+  const entries99 = new Set(['scripts/services.json', 'scripts/', 'scripts']); // deliberately does NOT contain the k8s manifest — it genuinely doesn't exist yet
+  eq(D99.findMissingClaims([notYetLine], entries99), [], 'KI-E99: origin-incident line — honestly-absent path is not flagged as fabricated');
+  // Line-granularity check: a "not yet" line does not blind the linter to a genuine phantom claim on
+  // a SEPARATE line in the same call — NOT_YET_EXISTS_RE only skips the line it actually matches.
+  eq(D99.findMissingClaims([notYetLine, 'wired up in `Api/Controllers/Support/`'], entries99), ['Api/Controllers/Support/'],
+    'KI-E99: a genuine phantom-path claim on a DIFFERENT line still catches, even in the same call as a not-yet-exists line');
+  // Other real phrasings the same regex is designed to cover (not yet built/created/implemented, is Wave N).
+  eq(D99.findMissingClaims(['The retry queue does not exist yet in this service.'], entries99), [], 'KI-E99: "does not exist yet" phrasing is recognized');
+  eq(D99.findMissingClaims(['`Infra/dr-failover.yaml` is not yet built; tracked for Wave 3.'], entries99), [], 'KI-E99: "not yet built" phrasing is recognized');
 }
 
 // Exporter pure core (telemetry/exporter/lib/aggregate.mjs — spine AD-5/AD-12/AD-13 + review
@@ -1374,8 +2187,20 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
 // KI-D12: build-test.sh leftovers subcommand -> CLI; CLI emits the marker from the SAME lib the probe reads.
 {
   const bts = readFileSync(new URL('../../verify/build-test.sh', import.meta.url), 'utf8');
-  ok(bts.includes('leftovers|comments)') && bts.includes('leftover-lint.mjs'), 'KI-D12: build-test.sh leftovers subcommand wired to the CLI (engine-owned dispatch BEFORE the local-override seam — PR#9)');
-  ok(bts.indexOf('leftovers|comments)') < bts.indexOf('build-test.local.sh"') , 'PR#9: the diff-lint dispatch precedes the build-test.local.sh override exec (a stale host override can never swallow the lints)');
+  // KI-E104: pin MEMBERSHIP in the engine-owned lint case, not the exact alternation literal. The
+  // literal form broke on every lint added to it (KI-E91's ledger-anchor, then KI-E104's rootcause) —
+  // a pin that fails for a purely additive, correct change trains readers to edit pins reflexively,
+  // which is how a real regression eventually gets waved through.
+  ok(/^\s*[a-z|-]*\bleftovers\b[a-z|-]*\)/m.test(bts) && bts.includes('leftover-lint.mjs'), 'KI-D12: build-test.sh leftovers subcommand wired to the CLI (engine-owned dispatch BEFORE the local-override seam — PR#9)');
+  // KI-E104: this ordering assertion had been silently VACUOUS since KI-E91 extended the case pattern
+  // — `indexOf('leftovers|comments)')` returned -1, and `-1 < indexOf(...)` is trivially true, so it
+  // passed for the wrong reason and would no longer have caught a host override placed before the
+  // lints. Re-anchored on the real dispatch line, with an explicit guard that both anchors EXIST.
+  {
+    const iLintCase = bts.search(/^\s*[a-z|-]*\bleftovers\b[a-z|-]*\)/m);
+    const iOverride = bts.indexOf('build-test.local.sh"');
+    ok(iLintCase >= 0 && iOverride >= 0 && iLintCase < iOverride, 'PR#9: the diff-lint dispatch precedes the build-test.local.sh override exec (a stale host override can never swallow the lints) — both anchors must exist, so a renamed anchor fails loudly instead of passing on -1');
+  }
   const lcli = readFileSync(new URL('../leftover-lint.mjs', import.meta.url), 'utf8');
   ok(lcli.includes('FACTORY::LEFTOVER::') && lcli.includes('findLeftovers'), 'KI-D12: leftover CLI emits the machine marker from the SAME leftover-scan lib the probe + fold read');
 }
@@ -1455,7 +2280,7 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
 // KI-E59: build-test.sh comments subcommand -> CLI; CLI emits the marker from the SAME lib the probe reads.
 {
   const bts = readFileSync(new URL('../../verify/build-test.sh', import.meta.url), 'utf8');
-  ok(bts.includes('comments)') && bts.includes('comment-lint.mjs'), 'KI-E59: build-test.sh comments subcommand wired to the CLI');
+  ok(/^\s*[a-z|-]*\bcomments\b[a-z|-]*\)/m.test(bts) && bts.includes('comment-lint.mjs'), 'KI-E59: build-test.sh comments subcommand wired to the CLI (membership-pinned, KI-E104)');
   const ccli = readFileSync(new URL('../comment-lint.mjs', import.meta.url), 'utf8');
   ok(ccli.includes('FACTORY::COMMENT::') && ccli.includes('findComments'), 'KI-E59: comment CLI emits the machine marker from the SAME comment-scan lib the probe + fold read');
 }
@@ -1549,14 +2374,14 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
 // PR#9 review — the host-policy seam itself: lib/policy.mjs loader + the driver/factory wiring.
 {
   const pd = mkdtempSync(join(tmpdir(), 'pol-'));
-  eq(loadPolicies(pd), { noNewComments: false, noSchemaChanges: false }, 'policy: no config at all -> both OFF (shipped-engine default)');
+  eq(loadPolicies(pd), { noNewComments: false, noSchemaChanges: false, failLaneOnMainDrift: false }, 'policy: no config at all -> all OFF (shipped-engine default; KI-E109 added failLaneOnMainDrift)');
   mkdirSync(join(pd, 'config'), { recursive: true });
   fsWrite(join(pd, 'config', 'factory.config.json'), JSON.stringify({ policies: { noNewComments: false, noSchemaChanges: false } }));
   fsWrite(join(pd, 'config', 'factory.config.local.json'), JSON.stringify({ policies: { noNewComments: true } }));
-  eq(loadPolicies(pd), { noNewComments: true, noSchemaChanges: false }, 'policy: gitignored local overlay flips a policy per host (KI-E17 seam)');
+  eq(loadPolicies(pd), { noNewComments: true, noSchemaChanges: false, failLaneOnMainDrift: false }, 'policy: gitignored local overlay flips a policy per host (KI-E17 seam)');
   fsWrite(join(pd, 'config', 'factory.config.local.json'), '{ broken json');
-  eq(loadPolicies(pd), { noNewComments: false, noSchemaChanges: false }, 'policy: an unreadable overlay never throws — falls back to the committed config');
-  eq(renderPolicies({ noNewComments: true }), 'noNewComments=on noSchemaChanges=off', 'policy: renderPolicies one-liner for the driver status prints');
+  eq(loadPolicies(pd), { noNewComments: false, noSchemaChanges: false, failLaneOnMainDrift: false }, 'policy: an unreadable overlay never throws — falls back to the committed config');
+  eq(renderPolicies({ noNewComments: true }), 'noNewComments=on noSchemaChanges=off failLaneOnMainDrift=off', 'policy: renderPolicies one-liner for the driver status prints');
   // Committed config ships BOTH policies OFF — a public engine must not default to one owner's rules.
   const shipped = JSON.parse(readFileSync(join(import.meta.dirname, '..', '..', 'config', 'factory.config.json'), 'utf8'));
   eq(!!(shipped.policies && shipped.policies.noNewComments), false, 'policy: shipped config has noNewComments OFF');
@@ -1714,6 +2539,13 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
   eq(closedDepsWithLiveWorktree([{ id: 'B', dependsOn: ['A'] }], { A: { state: 'CLOSED', worktree: null } }, () => true).length, 0, 'KI-E29 (review fix): gc nulls row.worktree -> no warn (dep committed + collected)');
   eq(closedDepsWithLiveWorktree([{ id: 'B', dependsOn: ['A'] }], { A: { state: 'CLOSED', worktree: 'state/worktrees/sweep-3' } }, (w) => w.includes('sweep')), [{ id: 'B', dep: 'A', worktree: 'state/worktrees/sweep-3' }], 'KI-E29 (review fix): a SWEEP-closed dep is covered — the row path, not an assumed <id> dir');
   ok(dsrc20.includes('closedDepsWithLiveWorktree(picked, ledger.items'), 'KI-E29 (review fix): cmdGroup wires the pure warn core');
+  const { sameTargetPairs } = await import('./ledger.mjs');
+  eq(sameTargetPairs([{ id: 'A', target: 'Svc1' }, { id: 'B', target: 'Svc1' }]), [{ target: 'Svc1', ids: ['A', 'B'] }], 'KI-E90: two picked items on the same target -> one pair, ids in pick order');
+  eq(sameTargetPairs([{ id: 'A', target: 'Svc1' }, { id: 'B', target: 'Svc2' }]).length, 0, 'KI-E90: disjoint targets -> no pair');
+  eq(sameTargetPairs([{ id: 'A', target: 'Svc1' }, { id: 'B' }, { id: 'C', target: 'Svc1' }]), [{ target: 'Svc1', ids: ['A', 'C'] }], 'KI-E90: an item with no target is ignored, not grouped under undefined');
+  eq(sameTargetPairs([]), [], 'KI-E90: empty batch -> no pairs');
+  eq(sameTargetPairs(null), [], 'KI-E90: null picked -> no throw, empty result');
+  ok(dsrc20.includes('sameTargetPairs(picked)') && dsrc20.includes('KI-E90 WARN'), 'KI-E90: cmdGroup wires the pure same-target warn core');
   ok(dsrc20.includes('unwrapResultEnvelope(readJson(foldPath)') && dsrc20.includes('payload carried ZERO results'), 'KI-E31 (review fix): cmdFold wires the unwrap AND stops loudly on a zero-result payload (no success affect)');
   ok(readFileSync(join(import.meta.dirname, '..', 'factory.js'), 'utf8').includes('means EXACTLY a product-scope.md red-line'), 'KI-E30: the shared gate prompt carries the scopeViolation clarification');
   ok(/return `## \$\{id\} — \$\{r\.state\}\\n\\n- \$\{lastNote\(r\)\}/.test(dsrc20), 'KI-E53: escalations per-item line renders lastNote(r) (the real last-transition reason) — not the never-populated static r.note field');
@@ -1926,7 +2758,18 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
   const nonExecShim = join(dir, 'fake-build-test-noexec.local.sh');
   fsWrite(nonExecShim, '#!/usr/bin/env bash\nexit 0\n');
   chmodSync(nonExecShim, 0o644);
-  ok(!shimAvailable(nonExecShim), 'KI-E72: shimAvailable is false for a present but non-executable file (mode bit checked, not just existence)');
+  // KI-E111: the mode-bit half is POSIX-only. On Windows NTFS has no execute attribute — Node
+  // synthesises `mode` from the read-only flag, so EVERY file reads as non-executable and the old
+  // unconditional check made shimAvailable() always false there (the KI-E72 false-negative, one
+  // platform over). The win32 contract is "an existing file is usable", because Git Bash runs a .sh
+  // regardless of NTFS attributes; assert the REAL contract per platform rather than skipping.
+  if (process.platform === 'win32') {
+    ok(shimAvailable(nonExecShim), 'KI-E111: on win32 a present shim is available regardless of mode bits (NTFS has no exec bit; Git Bash runs the .sh anyway) — the pre-fix code returned false for every file, reporting "dotnet: ABSENT" on a host whose shim works');
+  } else {
+    ok(!shimAvailable(nonExecShim), 'KI-E72: shimAvailable is false for a present but non-executable file (mode bit checked, not just existence)');
+  }
+  ok(!shimAvailable(join(dir, 'no-such-shim.local.sh')), 'KI-E111: a nonexistent shim is unavailable on EVERY platform (the win32 relaxation must not degrade into "always true")');
+  ok(!shimAvailable(dir), 'KI-E111: a DIRECTORY is never a usable shim on any platform (isFile guard — win32 existence alone would otherwise accept it)');
   ok(!shimAvailable(join(dir, 'does-not-exist.sh')), 'KI-E72: shimAvailable is false for a nonexistent path');
   ok(!shimAvailable(''), 'KI-E72: shimAvailable degrades to false, never throws, on an empty path');
   ok(dotnetAvailable(execShim), 'KI-E72: dotnetAvailable(shimPath) is true when an injected shim resolves, independent of raw dotnet on THIS process PATH');
@@ -2090,12 +2933,31 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
   const rel = readFileSync(join(ROOT, 'setup', 'release.sh'), 'utf8');
   ok(/_selftest\.mjs/.test(rel) && /git tag -a/.test(rel) && rel.includes('> VERSION'), 'KI-E52: release cut is selftest-gated, bumps VERSION, tags vX.Y.Z');
   const gi = readFileSync(join(ROOT, '.gitignore'), 'utf8');
+  // KI-E113 — `.claude/` is per-host session state and/or generated install output, never engine
+  // content, and was missed by the original KI-E26 sweep. Three independent reasons it must stay
+  // out, each pinned below by intent rather than by the current directory contents (which change):
+  ok(/^\.claude\/$/m.test(gi), 'KI-E113: .claude/ is gitignored — it holds per-host settings.local.json (KI-E33/E52 write OTLP endpoints there), REGISTERED git worktrees (a checkout of this repo inside itself), and setup/init.mjs\'s generated copy of claude-assets/');
+  ok(!/^claude-assets/m.test(gi), 'KI-E113: claude-assets/ — the engine\'s SHIPPED Claude assets and the source init.mjs installs FROM — is NOT ignored; only the generated destination is');
   ok(/^telemetry\/\.env$/m.test(gi), 'KI-E52: per-host telemetry/.env is gitignored (E2E-caught — upgrades must see a clean tree)');
   // Deep-review hardening pins (2026-07-27) — behaviors are exercised end to end by setup/_e2e.sh.
   const { execFileSync: exf52 } = await import('node:child_process');
-  let parse52 = true;
-  try { for (const s of ['install.sh', 'release.sh', '_e2e.sh']) exf52('bash', ['-n', join(ROOT, 'setup', s)]); } catch { parse52 = false; }
-  ok(parse52, 'KI-E52: install.sh / release.sh / _e2e.sh all parse (bash -n)');
+  // KI-E111: probe bash SEPARATELY first. The old form wrapped the three `bash -n` calls in one
+  // try/catch and reported any throw as "the shipped install scripts do not parse" — conflating a
+  // real syntax error with a host that simply has no usable bash, and printing a scary false failure
+  // about shipped release tooling. On Windows `bash` typically resolves to the WSL launcher stub,
+  // which does NOT throw ENOENT: it runs and exits non-zero ("execvpe(/bin/bash) failed"), so even an
+  // errno check would not have separated the two. A trivial `bash -c "exit 0"` does. Announced SKIP,
+  // matching the git-unavailable fixtures in this file — silence never reads as a pass.
+  let bashUsable52 = true;
+  try { exf52('bash', ['-c', 'exit 0'], { stdio: 'ignore' }); } catch { bashUsable52 = false; }
+  if (bashUsable52) {
+    let parse52 = true;
+    let parseErr52 = '';
+    try { for (const s of ['install.sh', 'release.sh', '_e2e.sh']) exf52('bash', ['-n', join(ROOT, 'setup', s)], { stdio: 'pipe' }); } catch (e) { parse52 = false; parseErr52 = String((e && e.stderr) || (e && e.message) || ''); }
+    ok(parse52, 'KI-E52: install.sh / release.sh / _e2e.sh all parse (bash -n)' + (parse52 ? '' : ' — ' + parseErr52.slice(0, 300)));
+  } else {
+    console.log('  SKIP KI-E52 bash -n syntax check (1 assert — no usable bash on this host; on Windows `bash` resolves to the WSL stub and exits non-zero rather than ENOENT). CI runs ubuntu-latest, so the shipped scripts are still syntax-gated on every push.');
+  }
   ok(existsSync(join(ROOT, 'setup', '_e2e.sh')), 'KI-E52: the hermetic E2E harness ships in-tree — the "E2E-tested" claim is re-runnable');
   ok(/REFUSING to touch/.test(inst), 'KI-E52: an existing-but-unparseable settings.local.json is refused, never clobbered (review fix)');
   ok(inst.includes('cannot reach $REPO') && inst.includes("grep -E '^v[0-9]+\\.[0-9]+\\.[0-9]+$'"), 'KI-E52: latest-release resolve dies loudly on an unreachable remote and only strict vX.Y.Z tags win (review fix)');
@@ -2231,6 +3093,31 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
   ok(/f\.endsWith\('\.md'\) && f !== 'verify\.json'\) continue/.test(drvText74c), 'KI-E74C: the scan includes verify.json alongside .md files (the proven real source of the admission)');
 }
 
+// Ported from a host-mount session (2026-08-29) — neither KI-E67's nor KI-E74C's marker match
+// understood negation: a phrase preceded by "No"/"Not"/"Zero"/"None" asserts the OPPOSITE of what the
+// bare marker text implies, but neither detector's match logic ever looked at what preceded the
+// match. Origin evidence: an item's own verify.json wrote "No findings from the prior round remain
+// unaddressed." — a genuine, correct completion claim on a CLOSED result — and
+// detectUnresolvedCaveatOnClose's `findings…remain unaddressed` marker fired anyway, reading a
+// correct claim as an admission of failure. The negation guard must NOT suppress the real ITEM-H1
+// admission this detector exists to catch (see the KI-E74C block above) — its outer "does NOT mean X"
+// negates a different clause than the inner "findings…remain unaddressed" marker, so the two must be
+// told apart, not both suppressed by a blanket negation scan.
+{
+  const N98 = await import('./narrative-check.mjs');
+  const itemH2Note = 'GREEN now. No findings from the prior round remain unaddressed. FIX-MANIFEST CROSS-CHECK: git status shows 3 tracked changes.';
+  const itemH1Note = "Build+targeted-test green here does NOT mean round 2's findings are resolved — they are not, and are unaddressed in this worktree as of this pass";
+  eq(N98.detectUnresolvedCaveatOnClose('CLOSED', { 'verify.json': itemH2Note }), [], 'KI-E98: a negated admission ("No findings … remain unaddressed") is NOT flagged — it is a correct completion claim');
+  eq(N98.detectUnresolvedCaveatOnClose('CLOSED', { 'verify.json': itemH1Note }), [{ file: 'verify.json', marker: "does NOT mean round 2's findings are resolved — they are not, and are unaddressed" }], 'KI-E98: the ITEM-H1 admission still fires — its outer negation targets a different clause than the inner "findings…remain unaddressed" marker, so blanket suppression must not eat it too');
+  // Direct unit coverage of the negation primitive itself, independent of which detector calls it.
+  ok(/const NEGATION_BEFORE_RE = \/\\b\(no\|not\|zero\|none\|never\|nothing\)\\s\*\$\/i;/.test(readFileSync(join(import.meta.dirname, 'narrative-check.mjs'), 'utf8')),
+    'KI-E98: narrative-check.mjs defines the shared negation-lookbehind window used by both detectors');
+  // KI-E67's forward detector: pre-emptive hardening, no live incident, but same mechanism — a
+  // negated strong-completion marker on a FAILED/ESCALATED item must not misfire either.
+  eq(N98.detectNarrativeVerdictContradiction('FAILED', { 'x.md': 'Status is not yet complete; 3 findings remain open.' }), [], 'KI-E67/KI-E98: a negated completion marker ("not … complete") does not false-positive on a FAILED item');
+  ok(N98.detectNarrativeVerdictContradiction('FAILED', { 'x.md': 'Status: fully complete' }).length === 1, 'KI-E67/KI-E98: the un-negated genuine marker still fires (regression guard against the E98 fix over-suppressing E67)');
+}
+
 // KI-E68 (2026-08-03): cmdGroup's concurrency default was a bare hardcoded 2, disconnected from
 // config/factory.config.json's documented concurrency.{throttled,normal,max,default} tiers (never
 // read by any code path). No pure-function harness exists for cmdGroup itself (it is a CLI command
@@ -2270,16 +3157,29 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
   eq(P.priorAttemptStages(pa1), ['test'], 'KI-E69: priorAttemptStages reports exactly the reused stages');
 
   // plan.md + test.json + fix.json all present and fresh -> all three reused; plan is the safe
-  // {recommendScopeStop:false, recommendEscalate:false} stand-in, never a parse of the prose file.
+  // {recommendScopeStop:false, recommendEscalate:false} stand-in for the two structured flags
+  // (never a PARSE of the prose file — no attempt to extract structured fields from markdown), PLUS
+  // (fix, multi-lens review 2026-08-25, ported) the raw plan.md text carried verbatim as `approach`
+  // so the KI-E87 PLAN-COMMITMENT SCAN has real text to check on a relaunch, instead of silently
+  // never firing (see lib/prior-attempt.mjs's fix comment).
   const d2 = join(pdir, 'd2'); mkdirSync(d2, { recursive: true });
   fsWrite(join(d2, 'plan.md'), '# Plan\nproceed.');
   fsWrite(join(d2, 'test.json'), JSON.stringify({ red: false, verificationOnly: true }));
   fsWrite(join(d2, 'fix.json'), JSON.stringify({ applied: true, scopeStop: false, summary: 'did it' }));
   const pa2 = P.loadPriorAttempt(d2, beforeWrite);
-  eq(pa2.plan, { recommendScopeStop: false, recommendEscalate: false }, 'KI-E69: plan reuses the safe stand-in (never a plan.md prose parse) once test.json is ALSO present');
+  eq(pa2.plan, { recommendScopeStop: false, recommendEscalate: false, approach: '# Plan\nproceed.' }, 'KI-E69/E87: plan reuses the safe scope/escalate stand-in PLUS the verbatim plan.md text as approach (not a structured-field parse) once test.json is ALSO present');
   eq(pa2.test.verificationOnly, true, 'KI-E69: test.json reused verbatim');
   eq(pa2.fix.applied, true, 'KI-E69: fix.json reused verbatim');
   eq(P.priorAttemptStages(pa2), ['plan', 'test', 'fix'], 'KI-E69: all three stages report reused');
+  // KI-E87 fix regression proof: a plan.md carrying real commitment language IS now visible to
+  // hasPlanCommitmentLanguage through the reused stand-in — this is the exact gap that was silently
+  // open before (the pre-fix stand-in had no text fields at all).
+  const { hasPlanCommitmentLanguage: hpclE69 } = await import('./plan-commitment.mjs');
+  const dCommit = join(pdir, 'd-commit'); mkdirSync(dCommit, { recursive: true });
+  fsWrite(join(dCommit, 'plan.md'), '# Plan\nThe fix MUST include the brownfield note.');
+  fsWrite(join(dCommit, 'test.json'), JSON.stringify({ red: true, testFiles: ['a.cs'] }));
+  const paCommit = P.loadPriorAttempt(dCommit, beforeWrite);
+  ok(hpclE69(paCommit.plan.approach), 'KI-E87 fix: a relaunched item\'s reused plan stand-in carries real plan.md commitment language the pre-fix stub would have silently hidden from hasPlanCommitmentLanguage');
 
   // Stale artifacts (mtime BEFORE the current claim) are a prior cycle's leftovers, never reused —
   // a claim timestamp set strictly AFTER these already-written files simulates exactly that (this
@@ -2537,6 +3437,77 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
     'KI-O5: install.mjs delegates every host-side install to init.mjs — one implementation of the three controller seams, not two that can drift');
   ok(/telemetry/i.test(inst5) && inst5.includes('install.sh telemetry-up'),
     'KI-O5: the telemetry gap is DISCLOSED and points at the bash path, rather than silently omitted (KI-E40 posture: a missing capability must announce itself)');
+}
+
+// KI-E91 (2026-08-28, ported from a host-mount session) — LedgerAnchor pure-function coverage +
+// pipeline wiring pins. This repo has no schema-parity forcing test and no registration-drift
+// precedent (KI-E77 was never ported here), so the opencode side ships as a disclosed gap
+// (LEDGER_ANCHOR_SCHEMA exported for documentation, not routed) — see schemas.mjs's own comment.
+{
+  const { extractAddedAnchors, findAnchorBody, findDuplicateAnchors, extractTagClaims, fileHasStandardsEvolutionTag, findLedgerAnchorCandidates } = await import('./ledger-anchor.mjs');
+  eq(extractAddedAnchors('+### cps-in-suite-host\n+some prose\n').map((a) => a.anchor), ['cps-in-suite-host'], 'KI-E91: extractAddedAnchors finds a top-level (###) added heading');
+  eq(extractAddedAnchors('+#### cps-stub\n').map((a) => a.level), [4], 'KI-E91: a #### heading is level 4 (a per-service stub, never compared against a top-level entry)');
+  eq(extractAddedAnchors('-### removed-one\n unchanged line\n').length, 0, 'KI-E91: only + (added) lines count — a removed or unchanged heading is not "added or edited"');
+  eq(extractAddedAnchors('+++ b/some/STANDARDS-DIVERGENCE-LEDGER.md\n+### real-anchor\n').map((a) => a.anchor), ['real-anchor'], 'KI-E91: the diff\'s own "+++ b/file" header line is never mistaken for a heading');
+  const LEDGER_A = '# Ledger A\n\n### cps-ef-persistence-row-poco\n\n- **Created:** 2026-06-03\n- **Standard:** rule-a\n\n---\n';
+  const LEDGER_B = '# Ledger B\n\n### cps-ef-persistence-row-poco\n\n- **Created:** 2026-06-05\n- **Standard:** rule-b\n\n---\n';
+  eq(findAnchorBody(LEDGER_A, 'cps-ef-persistence-row-poco', 3).includes('2026-06-03'), true, 'KI-E91: findAnchorBody extracts the full body from the heading to the next heading/EOF');
+  eq(findAnchorBody(LEDGER_A, 'no-such-anchor', 3), null, 'KI-E91: an absent anchor returns null, not an empty string or throw');
+  eq(findAnchorBody(LEDGER_A, 'cps-ef-persistence-row-poco', 4), null, 'KI-E91: a level mismatch (### vs ####) is treated as absent — the sanctioned stub-vs-top-level pattern is never a candidate');
+  const dupCPS = findDuplicateAnchors('A.md', extractAddedAnchors('+### cps-ef-persistence-row-poco\n'), { 'A.md': LEDGER_A, 'B.md': LEDGER_B }, ['A.md', 'B.md']);
+  eq(dupCPS, [{ anchor: 'cps-ef-persistence-row-poco', level: 3, fileA: 'A.md', fileB: 'B.md' }], 'KI-E91: live-incident-shaped repro — the same anchor added as a top-level entry in one ledger, already present at the same level in the sibling, IS a duplicate candidate');
+  eq(findDuplicateAnchors('A.md', extractAddedAnchors('+### cps-ef-persistence-row-poco\n'), { 'A.md': LEDGER_A }, ['A.md']), [], 'KI-E91: a SINGLE configured ledger path always yields zero duplicate candidates (this repo\'s current reality — correct degrade, not a bug)');
+  const stubBody = '#### cps-per-service-stub\n\nSee `### cps-ef-persistence-row-poco` above.\n';
+  eq(findDuplicateAnchors('A.md', [{ anchor: 'cps-ef-persistence-row-poco', level: 4 }], { 'A.md': stubBody, 'B.md': LEDGER_B }, ['A.md', 'B.md']), [], 'KI-E91: a #### stub in one file vs a ### top-level entry in the sibling (different levels) is the SANCTIONED pattern, never a duplicate candidate');
+  const legacySitesBody = '### some-entry\n\n- **Legacy sites:** `saas/Foo/Bar.cs:12` and `saas/Foo/Baz.cs`\n- **Status:** all call-site references carry the `standards-evolution:` tag\n';
+  eq(extractTagClaims(legacySitesBody).sort(), ['saas/Foo/Bar.cs', 'saas/Foo/Baz.cs'], 'KI-E91: extractTagClaims pulls path tokens from a Legacy sites bullet, stripping a trailing :line');
+  eq(extractTagClaims('### x\n\nNo claim here, just prose about `some/file.cs` in passing.\n'), [], 'KI-E91: a bare backtick-quoted path with no Legacy-sites context and no "carries the tag" claim phrase is NOT extracted (avoids over-triggering on incidental file mentions)');
+  eq(extractTagClaims(''), [], 'KI-E91: empty body -> no claims, no throw');
+  eq(fileHasStandardsEvolutionTag('/// EF Core (ADR-CPS-11 / ledger cps-x). Append-only.'), false, 'KI-E91: a narrative XML-doc mention is NOT the canonical tag (this IS the live CPS-H-15 defect: prose citing an anchor is not the same as the standards-evolution: tag)');
+  eq(fileHasStandardsEvolutionTag('// standards-evolution: legacy of code-style.md — see LEDGER.md#x'), true, 'KI-E91: the real canonical tag string is detected');
+  eq(fileHasStandardsEvolutionTag(null), false, 'KI-E91: a missing/unreadable file (null text) reads as tag-absent, never throws');
+  const orch = findLedgerAnchorCandidates('A.md', '+### cps-ef-persistence-row-poco\n', { 'A.md': LEDGER_A, 'B.md': LEDGER_B }, ['A.md', 'B.md']);
+  eq(orch.dup.length, 1, 'KI-E91: findLedgerAnchorCandidates orchestrates dup-finding end to end');
+  eq(orch.tagClaims, [], 'KI-E91: the synthetic LEDGER_A fixture makes no tag claim in this entry, so tagClaims is empty — not a false positive');
+
+  const fsrc91 = readFileSync(join(import.meta.dirname, '..', 'factory.js'), 'utf8');
+  ok(fsrc91.includes('const LEDGER_ANCHOR_SCHEMA') && fsrc91.includes("call('ledger-anchor-probe'"), 'KI-E91: factory declares LEDGER_ANCHOR_SCHEMA + runs the haiku ledger-anchor-probe');
+  ok(fsrc91.includes("' ledger-anchor ' + wtPath"), 'KI-E91: the probe invokes build-test.sh ledger-anchor on the worktree');
+  ok(fsrc91.includes('typeof la.clean'), 'KI-E91: only an EXPLICIT boolean verdict acts (a malformed/unavailable probe never sinks an item)');
+  ok(fsrc91.indexOf("call('leftover-probe'") < fsrc91.indexOf("call('ledger-anchor-probe'"), 'KI-E91: the ledger-anchor probe call runs AFTER the leftover-probe call');
+  ok(fsrc91.indexOf("call('ledger-anchor-probe'") < fsrc91.indexOf('// 5. REVIEW band'), 'KI-E91: the ledger-anchor probe runs strictly BEFORE the review/gate band');
+  ok(fsrc91.includes('const ledgerTouch = (item.files || []).some'), 'KI-E91: ledgerTouch is computed from declared item.files, gating the probe off for non-ledger-touching items at zero cost');
+
+  const btsrc91 = readFileSync(join(import.meta.dirname, '..', '..', 'verify', 'build-test.sh'), 'utf8');
+  ok(btsrc91.includes('ledger-anchor-lint.mjs'), 'KI-E91: build-test.sh wires the ledger-anchor subcommand to the CLI');
+  ok(/^\s*[a-z|-]*\bledger-anchor\b[a-z|-]*\)/m.test(btsrc91), 'KI-E91: ledger-anchor joins the engine-owned lint case (runs before the host-override seam, same as leftovers/comments; membership-pinned, KI-E104)');
+
+  // KI-E112: this used to assert the OPPOSITE — that schemas.mjs still carried a 'NOT yet ported'
+  // disclosure for this stage. That was a disclosure gate (enforce the gap is admitted), correct
+  // while the gap existed. The gap is now closed, so the honest assertion is that the stage is
+  // actually DISPATCHED; leaving the old pin would have required keeping a false comment alive to
+  // satisfy it. The KI-E103 parity gate is the durable check — this one just pins the wiring.
+  const schsrc91 = readFileSync(join(import.meta.dirname, '..', 'opencode', 'schemas.mjs'), 'utf8');
+  const rtsrc91 = readFileSync(join(import.meta.dirname, '..', 'opencode', 'runtime.mjs'), 'utf8');
+  ok(schsrc91.includes('export const LEDGER_ANCHOR_SCHEMA') && !schsrc91.includes('NOT yet ported'), 'KI-E91/KI-E112: opencode schemas.mjs exports LEDGER_ANCHOR_SCHEMA and no longer carries a stale not-yet-ported disclosure');
+  ok(rtsrc91.includes("phase === 'ledger_anchor_classify'") && rtsrc91.includes("'ledger-anchor'"), 'KI-E91/KI-E112: the opencode runtime actually DISPATCHES the ledger-anchor stage (mechanical lint + classify), so the schema is live input rather than documentation');
+}
+
+// KI-E93/94/95/96 (2026-08-28, ported from a host-mount session) — five defect classes that
+// shipped past every gate/probe currently in the pipeline get a PREVENTION self-check in the
+// authoring briefs, not just another detection layer. Pin the new guidance text so it can't
+// silently regress out of the briefs.
+{
+  const fixerMd93 = readFileSync(join(import.meta.dirname, '..', '..', 'agents', 'fixer.md'), 'utf8');
+  const testAuthorMd93 = readFileSync(join(import.meta.dirname, '..', '..', 'agents', 'test-author.md'), 'utf8');
+  ok(testAuthorMd93.includes('MULTI-TARGET COVERAGE SELF-CHECK (KI-E93)'), 'KI-E93: test-author brief carries the multi-target coverage self-check');
+  ok(fixerMd93.includes('SIBLING-PATTERN SWEEP (KI-E94)'), 'KI-E94: fixer brief carries the sibling-pattern sweep');
+  ok(fixerMd93.includes('DEAD-CODE SELF-CHECK (KI-E94)'), 'KI-E94: fixer brief carries the dead-code self-check');
+  ok(fixerMd93.includes('NO-INVENTION SELF-CHECK (KI-E95)'), 'KI-E95: fixer brief carries the no-invention self-check');
+  ok(fixerMd93.includes('ADJACENT-CLAIM RE-CHECK (KI-E95)'), 'KI-E95: fixer brief carries the adjacent-claim re-check');
+  ok(fixerMd93.includes('CANCELLATIONTOKEN CHAIN SELF-CHECK (KI-E96)'), 'KI-E96: fixer brief carries the CancellationToken chain self-check');
+  ok(fixerMd93.indexOf('9. **RE-FIX') < fixerMd93.indexOf('10. **SIBLING-PATTERN SWEEP'), 'KI-E94: sibling-pattern sweep is numbered AFTER the existing RE-FIX step, not spliced ahead of it');
+  ok(fixerMd93.indexOf('10. **SIBLING-PATTERN SWEEP') < fixerMd93.indexOf('11. **CANCELLATIONTOKEN'), 'KI-E96: CancellationToken self-check follows the sibling-pattern sweep in list order');
 }
 
 console.log(`\nself-test: ${pass} passed, ${fail} failed`);

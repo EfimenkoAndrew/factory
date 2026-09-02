@@ -57,6 +57,21 @@ opus-high, xhigh for the gnarliest (critical money/security/concurrency).
    claims — a wrong count in your own additions is the #1 recent rejection class
    ("fix-introduced defects", cycle 47 3/4: an epic-count claim the tree grep-disproved; a
    false cross-reference clause contradicting the adjacent row). Verify, don't recall.
+   **NO-INVENTION SELF-CHECK (KI-E95):** every factual claim you write or edit in prose — a
+   config key name, a default value, a described behavior, a class/method/file name — MUST be
+   traceable to an actual grep/read of the real source in THIS worktree, not recalled from a
+   plausible-sounding convention or a similar service. If you cannot find where the described
+   behavior actually lives, do not describe what you assume it does — say so in `note` and either
+   escalate or narrow the claim to what you actually verified. Live incident (ported from a
+   host-mount session): a fixer invented a config key name, its default (backwards), and its
+   refund semantics (nonexistent) — asserted confidently in five places, shipped with a fully
+   green test run because nothing in the diff tested the DOCUMENTATION's own accuracy.
+   **ADJACENT-CLAIM RE-CHECK (KI-E95):** when your fix corrects one claim in a document, re-read
+   the WHOLE surrounding section — not just the line you're editing — for other claims about the
+   SAME subject that may now also be wrong; fixing one sentence while an adjacent one stays stale
+   is not complete. If you cite an exact line number or exact text from a file, re-verify that
+   citation against the file's CURRENT content immediately before finishing — not from your
+   earlier read, which an intervening edit (yours or a sibling's) may have invalidated.
    **NO-COMMENTS POLICY (KI-E55/KI-E57, HOST-POLICY-GATED): when this prompt carries a `HOST
    POLICY — NO NEW COMMENTS` block, do NOT add ANY comment to any file your diff touches — not
    one, no exceptions.** That means zero new `//` lines, zero `/* */` blocks, and zero new XML-doc
@@ -82,6 +97,25 @@ opus-high, xhigh for the gnarliest (critical money/security/concurrency).
    CHANGES_REQUIRED verdict and address EVERY finding — the prior fix was PARTIAL/wrong, so COMPLETE or
    correct it (do not just re-submit it). A re-fix that repeats the same omission fails again and burns the
    bounded retry budget (cycle-6 lesson: ITEM-FIND-H10 did only the PDB half and skipped the deploy-k8s.sh half).
+10. **SIBLING-PATTERN SWEEP (KI-E94).** When your fix touches one instance of a repeated pattern —
+    one arm of a `switch`/`case`, one overload among several, one of several near-identical
+    methods/controllers/consumers — grep the file (and sibling files in the same class/directory)
+    for every OTHER instance of that same pattern before you finish, and fix each one that carries
+    the identical defect. Live incident (ported from a host-mount session): a fixer fixed one arm
+    of a remediation switch while the very next arm — the same defect class, a write nothing reads
+    — shipped untouched.
+    **DEAD-CODE SELF-CHECK (KI-E94).** Before finishing, trace every write/increment/cache-set your
+    fix ADDS or relies on: is it actually READ by something downstream? Name the specific reader in
+    your own reasoning. A write nothing reads, a counter nothing checks, or a cache key nothing
+    looks up is not a fix — it is the same defect with a green test bolted on top.
+11. **CANCELLATIONTOKEN CHAIN SELF-CHECK (KI-E96).** `code-style.md`'s CancellationToken rule
+    ("ALWAYS pass CancellationToken through the entire async call chain") compiles cleanly when
+    violated, which is exactly why it keeps shipping broken: when your fix adds or touches a method
+    that accepts a `CancellationToken`, grep the method body for every downstream call ending in
+    `Async(...)` and verify the token is threaded to EVERY one, not just the first/obvious call.
+    Live incident (ported from a host-mount session): a fixer accepted a `CancellationToken` but
+    never forwarded it at multiple call sites — and the SAME gap, at the SAME call sites, survived
+    unfixed from one review round into the next.
 
 ### Constraints
 - All edits inside the WORKTREE. NEVER run git commit/add/checkout/restore/stash/reset/clean.

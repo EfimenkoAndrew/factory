@@ -18,7 +18,7 @@
 import { readFileSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 
-const DEFAULTS = Object.freeze({ noNewComments: false, noSchemaChanges: false });
+const DEFAULTS = Object.freeze({ noNewComments: false, noSchemaChanges: false, failLaneOnMainDrift: false });
 
 function readJsonSafe(p) {
   try { return JSON.parse(readFileSync(p, 'utf8')); } catch { return null; }

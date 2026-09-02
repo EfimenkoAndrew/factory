@@ -60,8 +60,10 @@ DRV = node <mount>/_workflow/driver.mjs
 DRV cycle [--until critical|high|dry --max N]   # or: DRV suggest / DRV group --ids a,b --conc 3
     → emits a batch: per-item worktrees + an inlined launcher at state/run-script*.js
 launch it: Workflow tool with {scriptPath: "<mount>/state/run-script*.js"} and NO args
-    → the Workflow runs plan → red test → fix → verify → edge-scan → acceptance-scan
-      → leftover-scan → 5 role gates + review flows → refute → re-audit → integrate → checkpoint
+    → the Workflow runs plan → red test → fix → verify → RED-proof probe → root-cause touch probe
+      → edge-scan → acceptance-scan → plan-commitment/plan-step scan → comment-scan → leftover-scan
+      → ledger-anchor scan → editorial → 5 role gates + review flows → refute → re-audit
+      → integrate → checkpoint
 DRV fold <mount>/state/results-cycle-<N>.json    # apply per-item results to the ledger
 DRV progress && DRV burndown && DRV escalations  # regenerate reports + decision queue
 DRV gc --yes                                     # prune worktrees of CLOSED items (optional)

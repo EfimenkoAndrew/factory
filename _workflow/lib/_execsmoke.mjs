@@ -23,7 +23,12 @@ export function defaultAgentStub(opts, blockedGate) {
   const label = (opts && opts.label) || '';
   if (p.written) return { written: true };
   if (p.covered !== undefined) return { covered: true, gaps: [] }; // KI-E18 AcceptanceScan probe (happy path)
+  if (p.honored !== undefined) return { honored: true, gaps: [] }; // KI-E87/E101 PlanCommitment/PlanStep probe (happy path)
   if (p.count !== undefined) return { count: 0, hits: [] }; // KI-E59 CommentScan probe (happy path — zero new comments)
+  // KI-E104 RootCauseTouch probe (happy path — the fix touched a real non-test file). Placed with its
+  // siblings; the schema's field is `nonTestCount` rather than `count` precisely so this dispatch
+  // cannot collide with the line above, where ZERO is the GOOD value and here it is the failure.
+  if (p.nonTestCount !== undefined) return { nonTestCount: 1, files: ['X/src/Some.cs'], skipped: false };
   if (p.red) return { red: true, testFiles: ['X/src/X.Tests/SomeTests.cs'], runCmd: 'stub', evidence: 'stub', note: 'stub' };
   if (p.applied) return { applied: true, filesChanged: ['X/src/Some.cs'], summary: 'stub', scopeStop: false, divergence: null, note: 'stub' };
   if (p.build) return { build: 'pass', targetedTest: 'pass', suite: { passed: 2, failed: 0, skipped: 0 }, realInfraExercised: false, debris: [], evidence: 'FACTORY::BUILD::RESULT exit=0 (stub)', note: 'stub' };
@@ -37,7 +42,10 @@ export function defaultAgentStub(opts, blockedGate) {
   if (p.refuted) return { refuted: false, headline: 'stub not refuted' };
   if (p.converged) return { converged: true, findingGone: true, newFindings: [], headline: 'stub converged' };
   if (p.globalGreen) return { globalGreen: true, branch: '', changedFiles: [], regressionDelta: 0, handoff: 'stub', note: 'stub' };
-  if (p.rootCause) return { rootCause: 'stub', approach: 'stub', files: [], testStrategy: 'stub', blastRadius: 'stub', ruleRisks: 'stub', recommendEscalate: false, recommendScopeStop: false };
+  // KI-E101: `steps` makes the planner stub exercise the plan-scan's STEP branch (>= 2 entries clearing
+  // normalizePlanSteps' 12-char floor). Without it the stub's 'stub' approach carries no commitment
+  // language, so hasPlanCommitmentLanguage gates the whole stage off and the branch never executes.
+  if (p.rootCause) return { rootCause: 'stub', approach: 'stub', steps: ['Add the guard clause to the handler', 'Thread the token through the repository call', 'Update the data-flow doc for the endpoint'], files: [], testStrategy: 'stub', blastRadius: 'stub', ruleRisks: 'stub', recommendEscalate: false, recommendScopeStop: false };
   if (req.includes('decision')) return { decision: 'stub', options: [], recommendation: 'stub', headline: 'stub' };
   if (p.pattern) return { pattern: 'stub', applicationNotes: 'stub', conformanceCheck: 'stub', headline: 'stub' };
   return { note: 'stub' };

@@ -86,6 +86,73 @@ export function applyConvergenceBonus(ledger, cfg, results) {
   return granted;
 }
 
+// KI-E105 (2026-09-02) — the MISSING HALF of KI-L41. Everything above is asymmetric: it only ever
+// EXTENDS the retry budget (a narrowing trajectory earns a bonus round). Nothing ever SHORTENS it.
+// An item whose blocking-finding set is flat or GROWING round over round still consumed its full
+// `maxItemRetries` allowance — and a band is the single most expensive unit of work the factory has
+// (a FULL band is ~5 opus gates + review.code + review.adversarial + refuter + multi-lens re-audit;
+// KI-E88 measures the gate panel alone at ~4x LIGHT). Spending band three on a trajectory that has
+// twice failed to make ANY numerical progress is close to pure waste, and it delays the human review
+// the item evidently needs.
+//
+// The comparison data already existed and was simply unused: `applyConvergenceBonus` persists
+// `row.convergence` on EVERY fold (line ~84), not just on the rounds it grants a bonus for. This
+// reads the same field the bonus path writes, so the two directions can never disagree about what
+// "the prior round" was.
+//
+// Deliberately CONSERVATIVE, in three ways, because a false stall parks work that would have closed:
+//   - It is the strict complement of progress, not the complement of `isStrictlyNarrower`. A round
+//     that reduces findings but whose max severity got WORSE is NOT narrowing (no bonus) yet is also
+//     NOT stalled — real progress was made and the severity shift may be a re-classification. Only
+//     `cur.findings >= prev.findings` — no numerical progress at all — counts as a stall.
+//   - It requires BOTH rounds to carry comparable gate data (`blockingGates`), exactly as
+//     `isStrictlyNarrower` does. A pre-gate failure (test/verify/fold stage) never counts toward a
+//     stall: nothing was adjudicated, so there is no trajectory to judge.
+//   - It needs `maxStallRounds` CONSECUTIVE stalled rounds (config; default 2), and any round with
+//     real progress resets the counter to zero. One bad round is noise; two in a row is a pattern.
+export function isNotConverging(cur, prev) {
+  if (!cur || !prev) return false;
+  if (!cur.blockingGates || !prev.blockingGates) return false;
+  return cur.findings >= prev.findings;
+}
+
+// Fold-time stall accounting. Mirrors applyConvergenceBonus's shape (mutates rows, returns what it
+// changed for the driver to log) and is called immediately after it so both read the SAME
+// `row.convergence` value from the prior fold before it is overwritten.
+//
+// Ordering note: applyConvergenceBonus overwrites `row.convergence` with the CURRENT summary at the
+// end of its loop, so this function cannot run after it and still see the prior round. It therefore
+// takes the prior summary explicitly, captured by the driver BEFORE the bonus pass.
+export function applyStallDetection(ledger, cfg, results, priorByItem) {
+  const maxStall = typeof cfg?.maxStallRounds === 'number' ? cfg.maxStallRounds : 2;
+  if (maxStall <= 0) return []; // 0 disables the mechanism entirely (host opt-out)
+  const stalled = [];
+  for (const r of results || []) {
+    if (!r || r.toState !== 'FAILED') continue;
+    const row = ledger.items[r.id];
+    if (!row) continue;
+    const cur = gateFindingsSummary(r);
+    if (!cur) continue; // pre-gate failure — not a judgeable trajectory, counter untouched
+    const prev = (priorByItem && priorByItem[r.id]) || null;
+    if (isNotConverging(cur, prev)) {
+      row.stallRounds = (row.stallRounds || 0) + 1;
+      if (row.stallRounds >= maxStall) stalled.push({ id: r.id, stallRounds: row.stallRounds, from: prev, to: cur });
+    } else {
+      row.stallRounds = 0; // any real progress clears the streak
+    }
+  }
+  return stalled;
+}
+
+// A row is stall-parked when its consecutive-no-progress streak has reached the bound. Read by the
+// driver's exhaustion sweep so a stalled item is escalated to the human queue on the SAME pass that
+// parks retry-exhausted ones — one place decides "stop scheduling this", never two.
+export function isStalled(cfg, row) {
+  const maxStall = typeof cfg?.maxStallRounds === 'number' ? cfg.maxStallRounds : 2;
+  if (maxStall <= 0) return false;
+  return ((row && row.stallRounds) || 0) >= maxStall;
+}
+
 // Effective retry bound for a row: the flat config bound plus any convergence bonus this row earned.
 // Single definition consumed by BOTH gatekeepers (computeReady scheduling + escalateExhausted
 // parking) so they can never disagree about whether an item is retryable.

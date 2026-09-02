@@ -24,24 +24,27 @@ import { resolveRepoRoot, swapMountPrefix, toPosix, STOCK_MOUNT } from './lib/ro
 import {
   emptyLedger, loadLedger, syncFromGraph, transition, foldResults,
   countByState, writeJsonAtomic, readJson, unwrapResultEnvelope, ACTIVE, OFFRAMPS, FORWARD,
-  parkedAtMs, allCommittedAfter, closedDepsWithLiveWorktree, lastHistoryNote,
+  parkedAtMs, allCommittedAfter, closedDepsWithLiveWorktree, sameTargetPairs, lastHistoryNote,
   reconcileToStateAndTransitions, deriveUnfoldedCycle,
 } from './lib/ledger.mjs';
 import { loadGraph, computeReady, waitingOnDeps, byId } from './lib/graph.mjs';
+import { unreadyItems } from './lib/readiness.mjs';
+import { bandFor } from './lib/band.mjs';
+import { projectBatch, renderProjection } from './lib/band-cost.mjs';
 import { loadRouting, resolve as routeResolve, concurrencyFor } from './lib/router.mjs';
-import { addWorktree, removeWorktree, listWorktrees, changedFiles, pruneWorktrees, isFactoryWorktreePath, parseComposeLs, strayComposeProjects } from './lib/worktree.mjs';
+import { addWorktree, removeWorktree, pruneStaleBranch, listWorktrees, changedFiles, pruneWorktrees, isFactoryWorktreePath, parseComposeLs, strayComposeProjects } from './lib/worktree.mjs';
 import { acquireLock, releaseLock } from './lib/lock.mjs';
-import { parseVerifyRaw, verdictFromParse, debrisFiles, parseRedRaw, hasRealInfraMarker, touchedRootCause, effectiveBaseline, decodeTranscript } from './lib/verify.mjs';
+import { parseVerifyRaw, verdictFromParse, debrisFiles, parseRedRaw, hasRealInfraMarker, touchedRootCause, effectiveBaseline, decodeTranscript, flakeSuspects } from './lib/verify.mjs';
 import { preflight, dockerAvailable } from './lib/preflight.mjs';
 import { classifyFilesEntry, buildBasenameIndex, acceptanceSurfaceGaps } from './lib/graphaudit.mjs';
 import { renderFeedback } from './lib/feedback.mjs';
 import { dissentersFrom, roleForGateKey, recoveryFoldSkeleton, priorCycleOf, missingStageFrom } from './lib/recover.mjs'; // KI-E20 — the direct-recovery scaffold; KI-E81 — missing-stage auto-detection
-import { applyConvergenceBonus, effectiveRetryBound } from './lib/convergence.mjs';
+import { applyConvergenceBonus, effectiveRetryBound, applyStallDetection, isStalled } from './lib/convergence.mjs';
 import { clusterBySimilarity, sharedLabel, perCliqueBatchPatterns, bestClosedPrecedent, sig as simSig, similarSigs } from './lib/similarity.mjs';
 import { loadController, isStale as controllerStale, claimController, verifyController, releaseController, DEFAULT_TTL_MINUTES } from './lib/controller.mjs';
 import { buildFactoryRouting } from './lib/routing-drift.mjs';
 import { githubIssueToItem, markdownChecklistToItems, ingestReport, enforceIngestTier, countCheckedBoxes } from './lib/ingest.mjs'; // KI-E27 — multi-source issue ingestion
-import { snapshotMainFiles, driftAgainstSnapshot, dirtyMainPaths, filesOverlapDirty, splitDriftByStatus, repairDirtyDrift } from './lib/mainguard.mjs';
+import { snapshotMainFiles, driftAgainstSnapshot, dirtyMainPaths, filesOverlapDirty, splitDriftByStatus, repairDirtyDrift, unclaimedMainDrift } from './lib/mainguard.mjs';
 import { buildDocMap, readRoleBriefs, readRepoProfiles } from './lib/promptpack.mjs';
 import { loadPolicies, renderPolicies, POLICY_TEXT } from './lib/policy.mjs'; // PR#9 review — host-policy gating (no-comments / no-schema-changes are per-host, never universal)
 // KI-E7 — telemetry is OBSERVATIONAL ONLY (ai-factory-observability spine AD-1..3/AD-11): emit()
@@ -555,6 +558,16 @@ function deterministicVerifyOverride(cfg, ledger, wi, r) {
     else if (codeChange) console.log(`  KI-E20 ${id}: worktree GONE (${wtRel}) — debris/P9 diff checks SKIPPED (transcripts remain the only evidence)`);
   }
   if (debris.length) return fail('worktree debris: ' + debris.join(', '));
+  // KI-E108 — FLAKE SUSPICION (advisory, never a verdict). A test class that appears with BOTH a
+  // passing and a failing filter result in the same transcript behaved non-deterministically on this
+  // host. This deliberately does NOT change the verdict: fail-then-pass is also the legitimate
+  // cycle-8 retry shape, which `lastMatch` resolves as last-wins by design. It NAMES the class so a
+  // human can tell "retried after a fix" from "this test is unstable" — the distinction KI-E65's
+  // flaky-test-folded-CLOSED incident had no signal for.
+  try {
+    const flaky = [...new Set([...flakeSuspects(vText || ''), ...flakeSuspects(intText || '')])];
+    if (flaky.length) console.log(`  KI-E108 ${id}: FLAKE SUSPECT — test class(es) both PASSED and FAILED in this run: ${flaky.join(', ')}. Advisory only (a fix-then-retry shows the same pattern); if it was not a retry, this test is unstable and will re-band the item.`);
+  } catch { /* advisory only — a flake scan must never affect a fold */ }
   // P9 — the fix must change real (non-test) code; a diff that touched ONLY tests greened the test, not the bug.
   // KI-L55: skipped for verificationOnly — NO fixer ran by design (stale finding / pure coverage), so a
   // tests-only diff is the CORRECT shape there, not a greened-test-unfixed-bug signal.
@@ -580,8 +593,14 @@ function escalateExhausted(ledger, cfg) {
   const out = [];
   for (const [id, row] of Object.entries(ledger.items)) {
     const bound = effectiveRetryBound(cfg.maxItemRetries, row);
-    if (row.state === 'FAILED' && row.attempts > bound &&
-        transition(ledger, id, 'ESCALATED', `auto-escalated: exhausted ${row.attempts} fix attempt(s) (bound ${bound}${row.retryBonus ? ` incl. +${row.retryBonus} convergence bonus` : ''}); needs a human`)) {
+    // KI-E105 — two independent stop conditions, ONE parking decision, so scheduling and parking can
+    // never disagree: the retry budget is spent, OR the trajectory has stalled (consecutive rounds
+    // with no reduction in blocking findings — spending the remaining band is near-certain waste).
+    const stalled = isStalled(cfg, row);
+    if (row.state === 'FAILED' && (row.attempts > bound || stalled) &&
+        transition(ledger, id, 'ESCALATED', stalled
+          ? `auto-escalated: NO-PROGRESS on ${row.stallRounds} consecutive round(s) (blocking findings did not shrink) after ${row.attempts} attempt(s); another band is near-certain waste — needs a human`
+          : `auto-escalated: exhausted ${row.attempts} fix attempt(s) (bound ${bound}${row.retryBonus ? ` incl. +${row.retryBonus} convergence bonus` : ''}); needs a human`)) {
       out.push(id);
       temit({ source: 'driver', event: 'transition', item: id, cycle: ledger.cycle, outcome: 'ESCALATED' }); // KI-E7 finding #12
     }
@@ -845,7 +864,17 @@ function cmdFold(file, flags) {
   // set is strictly narrower than the prior round's (fewer findings, max severity not worse — both
   // from the structured gateDetails, never agent self-assessment) earns ONE bonus attempt past
   // maxItemRetries instead of parking. Deterministic; bounded by maxBonusRounds.
+  // KI-E105 — capture each row's PRIOR convergence summary first: applyConvergenceBonus overwrites
+  // row.convergence with the current round's summary as it goes, so the stall pass that follows it
+  // could not otherwise see what the previous round looked like. One snapshot, two consumers.
+  const priorConvergence = {};
+  for (const r of arr) { const row = ledger.items[r && r.id]; if (row && row.convergence) priorConvergence[r.id] = row.convergence; }
   const bonuses = applyConvergenceBonus(ledger, cfg, arr);
+  // KI-E105 — the opposite direction: two consecutive rounds with NO reduction in blocking findings
+  // means the trajectory is not converging, so the remaining band(s) are near-certain waste. Park it
+  // for a human instead (escalateExhausted below applies the transition).
+  const stalls = applyStallDetection(ledger, cfg, arr, priorConvergence);
+  for (const s of stalls) console.log(`  KI-E105 ${s.id}: NO-PROGRESS streak ${s.stallRounds} (findings ${s.from ? s.from.findings : '?'} -> ${s.to.findings}) — parking for a human instead of spending another band`);
   const escalated = escalateExhausted(ledger, cfg);
   writeJsonAtomic(abs(cfg.paths.ledger), ledger);
   recordCostSnapshot(cfg, ledger); // per-cycle cost snapshot for the trend (observability, not a gate)
@@ -1307,6 +1336,17 @@ function cmdSuggest(flags) {
   const lines = [];
   const say = (s) => { lines.push(s); console.log(s); };
   say(`suggest: ${ready.length} schedulable item(s) -> ${clusters.length} similarity cluster(s) of size >= ${min}`);
+  // KI-E88 (2026-08-24, ported from a host-mount session, adapted to this repo's cluster-based
+  // suggest — the origin session's mixed-batch-fallback target this feature was built for does not
+  // exist here): band-mix surfacing — a FULL-band item runs ~4x the gate panel of LIGHT, so item
+  // COUNT alone gives zero signal for what a batch actually costs. Whole-pool line here; a per-
+  // cluster tally is appended to each cluster's own header below.
+  const wholeLight = ready.filter((wi) => bandFor(wi) === 'LIGHT').length;
+  say(`  band mix (KI-E88, cost signal — FULL runs ~4x the gate panel of LIGHT): ${wholeLight} LIGHT / ${ready.length - wholeLight} FULL across the whole pool`);
+  // KI-E110 — put a NUMBER on that "~4x". The band mix gives the shape; this gives the size, in the
+  // same unit (agent calls) the KI-E107 yield report measures actuals in, so a projection can be
+  // checked against reality instead of becoming folklore.
+  say(`  ${renderProjection(projectBatch(ready, bandFor))}`);
   let n = 0;
   for (const c of clusters) {
     n++;
@@ -1329,7 +1369,8 @@ function cmdSuggest(flags) {
     };
     let { batch, rest: collided } = pick(true);
     if (batch.length < min) ({ batch, rest: collided } = pick(false));
-    say(`\n#${n} [${c[0].theme || '?'}] ${sharedLabel(c)} — ${c.length} item(s) across ${[...new Set(c.map((w) => w.target))].length} target(s)`);
+    const batchLight = batch.filter((wi) => bandFor(wi) === 'LIGHT').length; // KI-E88 (ported)
+    say(`\n#${n} [${c[0].theme || '?'}] ${sharedLabel(c)} — ${c.length} item(s) across ${[...new Set(c.map((w) => w.target))].length} target(s)${batch.length ? ` (band mix of the ${batch.length}-item pick: ${batchLight} LIGHT / ${batch.length - batchLight} FULL)` : ''}`);
     for (const wi of batch) say(`  ${wi.id} (${wi.severity}/${wi.fixType}) @ ${wi.target}`);
     if (collided.length) say(`  next-wave (file-collision, >max, or outside the clique — stay READY): ${collided.join(', ')}`);
     // KI-E21 (improvement-analysis P3): a LARGE homogeneous cluster is a SWEEP, not pair lanes —
@@ -1488,6 +1529,38 @@ function cmdGroup(flags) {
   });
   if (deferred.length) console.log('group: deferred (same-file collision within batch — stay READY for a later batch):', deferred.join(', '));
   if (!picked.length) { console.log('group: no schedulable items for the filter'); return; }
+  // KI-E90 (2026-08-28, ported from the host-mount session) — advisory same-target pairing warning:
+  // two items in one batch sharing the same `target` service can collide even when their declared
+  // files[] are disjoint, because a fixer is allowed to touch files OUTSIDE its declared lock-set
+  // when "strictly required" (fix.json's own documented escape hatch). Live incident on the sibling
+  // host-mount session (cycle 73, both CryptoPaymentService): two same-target items had ZERO
+  // declared files[] overlap, both cleared the file-lock check above, yet one item's fixer
+  // discovered mid-run it also needed a file the other item held, and FAILED on a pure
+  // batch-scheduling collision neither item's own content caused. WARN, don't exclude (KI-E29
+  // posture): nothing is clobbered by pairing them, and same-target items are often fine together —
+  // but the odds of a hidden-dependency lock collision are highest within one target, so flag it for
+  // the operator to judge (split the batch, or accept the risk knowingly).
+  const sameTarget90 = sameTargetPairs(picked);
+  if (sameTarget90.length) console.log('  KI-E90 WARN: batch pairs multiple items on the same target — a fixer may touch files OUTSIDE its declared lock-set and collide with a same-target sibling even with zero declared files[] overlap: ' + sameTarget90.map((p) => p.target + ': ' + p.ids.join('+')).join('; '));
+  // KI-E106 — ITEM READINESS: the deterministic INPUT-contract gate. Unlike the KI-E29/KI-E90 warns
+  // above (scheduling risks that may or may not bite), an unready item is defective in ITSELF: no
+  // batch composition rescues an acceptance criterion the downstream probes cannot check. Every
+  // stage from the acceptance-scan to gate-po to the re-auditor grades the diff against `acceptance`,
+  // so scheduling an item without a checkable one buys a full band of expensive argument and a
+  // near-certain FAIL. Blocking, because the cost of proceeding is a whole band and the cost of
+  // stopping is one edit to the graph — but with an explicit `--force-unready` for the operator who
+  // knows better (the item's contract may live somewhere this mechanical check cannot see).
+  const unready106 = unreadyItems(picked);
+  if (unready106.length) {
+    console.log('\n  KI-E106 ITEM READINESS: ' + unready106.length + ' of ' + picked.length + ' picked item(s) FAIL the input-contract gate:');
+    for (const u of unready106) for (const p of u.problems) console.log(`    ${u.id} [${p.code}] ${p.detail}`);
+    if (!flags['force-unready']) {
+      console.log('\n  REFUSING to group. Fix the item(s) in the findings-graph (it is hand-editable — schema/work-item.schema.json),');
+      console.log('  then re-run. To schedule anyway (you judge the contract adequate): driver.mjs group --force-unready\n');
+      process.exit(1);
+    }
+    console.log('  --force-unready: proceeding anyway on operator judgment (the band will grade the diff against this contract as-is).\n');
+  }
   // KI-E22 (improvement-analysis P4) — advisory acceptance-surface check on the picked batch: warn
   // when an item's acceptance names a real repo file its files[] (the lock set) does not carry —
   // the fixer would be lock-forbidden from meeting acceptance (the ITEM-M7 controller-clause
@@ -1741,7 +1814,20 @@ function cmdWorktree(sub, rest) {
     console.log(JSON.stringify(wt));
     return;
   }
-  if (sub === 'worktree-remove') { removeWorktree(rest[0], true); console.log('removed', rest[0]); return; }
+  if (sub === 'worktree-remove') {
+    const target = abs(rest[0]);
+    // Resolve the branch attached to this worktree BEFORE removing it (listWorktrees reads live
+    // git state; once the worktree is gone there is nothing left to look up).
+    let branch = null;
+    try { branch = (listWorktrees().find((w) => abs(w.worktree || '') === target) || {}).branch || null; } catch { /* best effort */ }
+    removeWorktree(rest[0], true);
+    console.log('removed', rest[0]);
+    if (branch) {
+      const r = pruneStaleBranch(branch, REPO_ROOT);
+      console.log(r.deleted ? `  branch ${r.branch} deleted (fresh checkout guaranteed next time)` : `  branch left standing: ${r.reason}`);
+    }
+    return;
+  }
 }
 
 // KI-L27 — audit (and with --fix, repair) stale files[] paths in the findings graph. A stale path
@@ -1842,7 +1928,15 @@ function cmdGc(flags) {
     let removed = 0;
     for (const [id, r] of closed) {
       const wtAbs = presolve(REPO_ROOT, r.worktree);
-      try { if (existsSync(wtAbs)) removeWorktree(wtAbs, true); r.worktree = null; r.branch = null; removed++; }
+      try {
+        if (existsSync(wtAbs)) removeWorktree(wtAbs, true);
+        // The same stale-branch gap as the CLI worktree-remove subcommand — close it identically.
+        if (r.branch) {
+          const pr = pruneStaleBranch(r.branch, REPO_ROOT);
+          if (!pr.deleted) console.log(`  ! ${id}: ${pr.reason}`);
+        }
+        r.worktree = null; r.branch = null; removed++;
+      }
       catch (e) { console.log(`  ! could not remove ${id}: ${String((e && e.message) || e)}`); }
     }
     try { pruneWorktrees(); } catch { /* best effort */ }
@@ -2550,27 +2644,64 @@ function cmdMainCheck(rest, flags) {
   // `main-snapshot.json` (i.e. every item the factory has EVER claimed, regardless of which
   // cycle) and checks all of them in one pass — still fully read-only/warn-only, same
   // contract as the targeted form.
+  // Fix (multi-lens review, 2026-08-25, ported from the origin host-mount session): this
+  // full-inventory scan now ALWAYS runs (previously only under --all/bare) because claimedPaths
+  // (below) MUST reflect every item the factory has ever claimed, independent of which specific
+  // id(s) THIS invocation was asked to re-hash. The pre-fix code built claimedPaths only from the
+  // requested `ids` — correct under --all (ids WAS already the full set) but wrong on the far more
+  // common single-id call every item's own mid-band Verify stage makes (never --all): any OTHER
+  // item's legitimately snapshot-backed but not-yet-committed change sitting in main at that moment
+  // was misreported as unclaimed/leaked contamination, because its snapshot was never loaded for a
+  // call that only asked about a different id — even though unclaimedMainDrift's own
+  // dirtyMainPaths(REPO_ROOT) input has always scanned the WHOLE main tree, not just files touched
+  // by the requested id(s).
+  let allClaimedIds = [];
+  try {
+    const itemsRoot = abs(cfg.paths.items);
+    allClaimedIds = readdirSync(itemsRoot, { withFileTypes: true })
+      .filter((d) => d.isDirectory() && existsSync(join(itemsRoot, d.name, 'main-snapshot.json')))
+      .map((d) => d.name).sort();
+  } catch { allClaimedIds = []; }
   if (!ids.length || flags?.all) {
-    try {
-      const itemsRoot = abs(cfg.paths.items);
-      ids = readdirSync(itemsRoot, { withFileTypes: true })
-        .filter((d) => d.isDirectory() && existsSync(join(itemsRoot, d.name, 'main-snapshot.json')))
-        .map((d) => d.name).sort();
-    } catch { ids = []; }
+    // `--all`/bare reuses the SAME full inventory as the id list to re-hash, not a second scan.
+    ids = allClaimedIds;
     if (!ids.length) { console.log('main-check --all: no item carries a main-snapshot.json yet (nothing has been claimed under KI-L65) — nothing to check'); return; }
     console.log(`main-check --all: sweeping ${ids.length} item(s) with a recorded claim-time snapshot (every id the factory has ever claimed, any cycle) —`);
   }
   if (!ids.length) { console.log('usage: driver main-check <itemId> [...] | driver main-check --all — re-hash each item\'s claim-time main-snapshot against the MAIN tree (read-only, warn-only)'); return; }
+  // KI-E89 (ported): every path any item has EVER claimed (its snapshot's files[] keys), regardless
+  // of drift status — this is the exact ceiling of what the unclaimed-path sweep below is even
+  // CAPABLE of seeing. Seeded from allClaimedIds (every claimed item, full stop), NOT from the
+  // per-id loop below (which only re-hashes the ids THIS invocation targeted) — see the fix note
+  // above allClaimedIds for why that distinction matters.
+  const claimedPaths = new Set();
+  for (const id of allClaimedIds) {
+    try {
+      const snapFiles = (readJson(abs(join(cfg.paths.items, id, 'main-snapshot.json'))) || {}).files || {};
+      for (const f of Object.keys(snapFiles)) claimedPaths.add(f);
+    } catch { /* a corrupt snapshot just contributes nothing to claimedPaths here — the per-id loop below still reports it via its own catch if this id is also being re-hashed */ }
+  }
   for (const id of ids) {
     const snapPath = abs(join(cfg.paths.items, id, 'main-snapshot.json'));
     if (!existsSync(snapPath)) { console.log(`MAIN-CHECK ${id}: no main-snapshot.json (unclaimed or pre-KI-L65 claim) — nothing to compare`); continue; }
     try {
-      const drifted = driftAgainstSnapshot(REPO_ROOT, (readJson(snapPath) || {}).files || {});
+      const snapFiles = (readJson(snapPath) || {}).files || {};
+      const drifted = driftAgainstSnapshot(REPO_ROOT, snapFiles);
       if (!drifted.length) { console.log(`MAIN-CHECK ${id}: clean — no main-tree drift on the snapshot set`); continue; }
       const { committed, dirty } = splitDriftByStatus(REPO_ROOT, drifted);
       if (dirty.length) console.log(`⚠ MAIN-DRIFT ${id} (KI-E50/KI-L65): main-tree file(s) changed mid-run — an agent likely wrote outside its worktree. Do NOT edit or repair main yourself; report this line verbatim:\n` + dirty.map((d) => `    ${d.file} (${d.was} -> ${d.now})`).join('\n'));
       if (committed.length) console.log(`ℹ MAIN-CHECK ${id}: committed drift (human delivery, KI-E35) — verify intent, no repair needed:\n` + committed.map((d) => `    ${d.file}`).join('\n'));
     } catch (e) { console.log(`MAIN-CHECK ${id}: check failed (${e && e.message}) — treat as unknown, not clean`); }
+  }
+  // KI-E89 (2026-08-24, ported from a host-mount session): the snapshot-based loop above can only
+  // ever check a path that was PART OF SOME ITEM'S claim-time files[] — a brand-new leaked path
+  // that no item ever declared has no snapshot to diff against and is structurally invisible to it,
+  // even under this function's own KI-E82 --all widening. See lib/mainguard.mjs's
+  // unclaimedMainDrift header for the full reasoning; this call site just wires
+  // REPO_ROOT/MOUNT_REL/claimedPaths.
+  const unclaimed = unclaimedMainDrift(dirtyMainPaths(REPO_ROOT), MOUNT_REL, claimedPaths);
+  if (unclaimed.length) {
+    console.log(`⚠ MAIN-DRIFT unclaimed (KI-E89): main-tree path(s) dirty outside the factory mount with NO item snapshot to check against — could be leaked factory-worktree contamination (no item has ever claimed this path) OR your own unrelated work-in-progress; main-check cannot tell which, so it surfaces it rather than silently missing the contamination case. Eyeball each:\n` + unclaimed.map((p) => `    ${p}`).join('\n'));
   }
 }
 

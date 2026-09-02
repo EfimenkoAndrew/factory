@@ -30,8 +30,10 @@ import { fileURLToPath } from 'node:url';
 import { validateNamed } from './schemas.mjs';
 import { flowsFor, routesFor, bandFor, reauditLenses, needsRealInfra as computeNeedsRealInfra, gateRolesFor } from './routing.mjs';
 import { compose, itemsDir as itemsDirFor } from './compose.mjs';
-import { runBuildTest, writeRaw, appendRaw, parseVerifyRaw, verdictFromParse, parseRedRaw, hasRealInfraMarker, touchedRootCause, effectiveBaseline, decodeTranscript, dockerAvailable } from './buildtest.mjs';
+import { runBuildTest, writeRaw, parseVerifyRaw, verdictFromParse, parseRedRaw, hasRealInfraMarker, debrisFiles, nonTestChanged, flakeSuspects, effectiveBaseline, decodeTranscript, dockerAvailable } from './buildtest.mjs';
+import { changedFiles } from '../lib/worktree.mjs';
 import { splitAcceptanceClauses } from '../lib/acceptance.mjs';
+import { normalizePlanSteps, hasPlanCommitmentLanguage } from '../lib/plan-commitment.mjs';
 // Host-policy gate (PR#9 review): the no-new-comments mechanical check runs ONLY when the HOST enables
 // policies.noNewComments (config/factory.config[.local].json) — same single loader factory.js's probe
 // gating (factory.js `if (codeChange && A && A.policies && A.policies.noNewComments)`) and driver
@@ -269,6 +271,39 @@ function planNext(progress) {
   if (phase === 'acceptance_reprobe') {
     return agentStep(progress, 'acceptance_reprobe', [{ role: 'acceptance-probe', phaseLabel: 'EdgeScan', schema: 'ACCEPT_SCHEMA', extra: 'RE-PROBE the amended diff against the SAME clauses: ' + JSON.stringify(splitAcceptanceClauses(progress.item.acceptance, 8)) }]);
   }
+  // KI-E112 — PLAN-COMMITMENT / PLAN-STEP SCAN (KI-E87 + KI-E101), previously UNPORTED. Same two
+  // modes and the same bounded amend + one re-probe as canon, sharing one gate key. STEP mode reads
+  // the planner's own `steps[]` (which this port already ACCEPTED and validated but never acted on —
+  // schemas.mjs said so explicitly); PROSE mode falls back to the deterministic commitment-language
+  // prefilter. `progress.plan` is null for a mechanical item (planner skipped), gating this off free.
+  if (phase === 'plancommit') {
+    const pl = progress.plan;
+    if (progress.verificationOnly || !pl) { progress.phase = 'leftover'; saveProgress(progress.id, progress); return planNext(progress); }
+    const steps = normalizePlanSteps(pl.steps, 8);
+    const commitmentText = (pl.approach || '') + '\n' + (pl.blastRadius || '');
+    const stepMode = steps.length >= 2;
+    if (!stepMode && !hasPlanCommitmentLanguage(commitmentText)) { progress.phase = 'leftover'; saveProgress(progress.id, progress); return planNext(progress); }
+    progress._planStepMode = stepMode;
+    const body = stepMode
+      ? 'PLAN-STEP SCAN (KI-E101). This item\'s OWN plan decomposed the work into the numbered steps below. Read ' + itemsDirFor(ctx, progress.id) + '/review-pack.md, then for EACH step decide whether the diff carries CONCRETE evidence it was carried out. Judge COVERAGE of the plan\'s own steps, not general quality. honored=true ONLY if EVERY step is evidenced; otherwise honored=false with each un-evidenced step in gaps (quote the step in `commitment`, why in `why`). Do NOT edit anything.\nPLAN STEPS:\n' + steps.map((s, i) => '  ' + (i + 1) + '. ' + s).join('\n')
+      : 'PLAN-COMMITMENT SCAN (KI-E87). This item\'s OWN plan stated the commitment language below. Read ' + itemsDirFor(ctx, progress.id) + '/review-pack.md, then for each "MUST"/"required to" commitment decide whether the diff carries CONCRETE evidence it was honored. honored=true ONLY if EVERY commitment is evidenced; otherwise honored=false with each unhonored commitment in gaps. Do NOT edit anything.\nPLAN TEXT:\n' + commitmentText;
+    progress._planPrompt = body;
+    saveProgress(progress.id, progress);
+    return agentStep(progress, 'plancommit', [{ role: 'plan-commitment-probe', phaseLabel: 'EdgeScan', schema: 'PLAN_COMMITMENT_SCHEMA', extra: body }]);
+  }
+  if (phase === 'plancommit_amend') {
+    const axis = progress._planStepMode ? 'plan step' : 'plan commitment';
+    return agentStep(progress, 'plancommit_amend', [{ role: 'fixer', phaseLabel: 'EdgeScan', schema: 'FIX_SCHEMA', extra: 'PLAN-COMMITMENT AMEND: a pre-band probe found ' + axis + '(s) your OWN plan made with NO evidence in your diff. Address EVERY gap below with the minimal correct change (or state in note precisely why that ' + axis + ' is already satisfied or no longer applicable), then re-run the targeted build+test and REGENERATE the review pack. GAPS: ' + JSON.stringify((progress._planGaps || []).slice(0, 8)) }]);
+  }
+  if (phase === 'plancommit_reprobe') {
+    return agentStep(progress, 'plancommit_reprobe', [{ role: 'plan-commitment-probe', phaseLabel: 'EdgeScan', schema: 'PLAN_COMMITMENT_SCHEMA', extra: (progress._planPrompt || '') + '\nRE-SCAN: an amend just addressed the prior gaps — judge the AMENDED diff fresh; prior gaps are hypotheses to re-verify, never conclusions to copy forward.' }]);
+  }
+  // KI-E112 — LEDGER-ANCHOR classify (KI-E91), previously UNPORTED. The mechanical half runs in
+  // `mech leftover` (build-test.sh ledger-anchor, engine-owned); this is the STEP-2 classify, exactly
+  // mirroring the leftover_classify shape.
+  if (phase === 'ledger_anchor_classify') {
+    return agentStep(progress, 'ledger_anchor_classify', [{ role: 'ledger-anchor-probe', phaseLabel: 'EdgeScan', schema: 'LEDGER_ANCHOR_SCHEMA', extra: 'Judge each candidate for MATERIAL disagreement (a duplicate anchor whose entries genuinely contradict, or a claimed `standards-evolution:` call-site tag the file does not carry). clean=false only for a real defect. CANDIDATES: ' + JSON.stringify(progress._ledgerAnchorHits || []) }]);
+  }
   if (phase === 'leftover') {
     if (!progress.res.codeChange) { progress.phase = 'editorial'; saveProgress(progress.id, progress); return planNext(progress); }
     return { mechanical: 'leftover', note: 'run: node runtime.mjs mech ' + progress.id + ' leftover' };
@@ -287,7 +322,7 @@ function planNext(progress) {
     return agentStep(progress, 'editorial', flows.map((f) => ({ role: routingRoleFor(f), phaseLabel: 'Verify', schema: 'GATE_SCHEMA', extra: editorialExtra, routeKey: f.routeKey })));
   }
   if (phase === 'gates') {
-    const gateRoles = gateRolesFor(progress.item, progress.band, null).filter((g) => g !== 'po');
+    const gateRoles = gateRolesFor(progress.item, progress.band, configuredGateSet()).filter((g) => g !== 'po');
     const methodFlows = flowsFor(progress.item).filter((f) => f.band === 'method' && f.blocking && !(progress.edgeFinal && f.routeKey === 'review.edgecase'));
     // Parity: factory.js's gate band extras — tech gates carry (staleGuard + voGuard) || null; method
     // review flows carry the methodology line + both guards.
@@ -455,6 +490,23 @@ function detail(role, r) {
   return { verdict: r.verdict, headline: r.headline, findings: (r.findings || []).slice(0, 12), acceptanceMet: r.acceptanceMet, redGreenConfirmed: r.redGreenConfirmed };
 }
 
+// KI-E103 — byte-parity with factory.js's acceptance-scan gateDetails shape (factory.js: the
+// `res.gateDetails['probe:acceptance-scan'] = {verdict, headline, findings}` literal). This port used
+// to store the probe's RAW `{covered, gaps}` return instead, which is not the shape ANY consumer
+// reads: `lib/feedback.mjs` renders `d.verdict` (-> the reFix digest printed
+// "## probe:acceptance-scan - undefined") and iterates `d.findings` (-> every un-evidenced clause was
+// silently DROPPED from feedback.md, the KI-L31 authoritative channel a reFix reads FIRST). So the
+// port detected acceptance gaps correctly and then threw the actionable detail away.
+function acceptanceDetail(ac) {
+  const covered = ac.covered !== false;
+  const gaps = ac.gaps || [];
+  return {
+    verdict: covered ? 'APPROVED' : 'CHANGES_REQUIRED',
+    headline: covered ? 'every acceptance clause evidenced in the diff' : (gaps.length + ' acceptance clause(s) with NO evidence in the diff'),
+    findings: gaps.slice(0, 12).map((g) => ({ severity: 'HIGH', title: 'un-evidenced acceptance clause: ' + String(g.clause || '').slice(0, 140), fix: String(g.why || '') })),
+  };
+}
+
 // Phase-specific side effects once ALL pending roles for the current phase are in. Mirrors the
 // relevant slice of factory.js's runItem for each phase, then sets progress.phase to the next step.
 function applyPhaseResults(progress) {
@@ -467,7 +519,17 @@ function applyPhaseResults(progress) {
     writeArtifact(progress, 'plan', 'plan.md', '# Plan\n\n' + JSON.stringify(plan, null, 2));
     if (plan.recommendScopeStop) return frameAndBlock(progress, 'planner recommended scope-stop: ' + plan.rootCause);
     if (plan.recommendEscalate) progress._escalate = true;
-    if (Array.isArray(plan.files)) progress.res.rootCauseFiles = plan.files;
+    // KI-E112: retain the plan so the pre-band plan-commitment/plan-step scan can read its own
+    // approach/blastRadius/steps against the FINAL diff — the same reason factory.js hoists `plan`
+    // to function scope (KI-E87). Without this the scan has nothing to check and silently no-ops.
+    progress.plan = plan;
+    // KI-E103: this used to `progress.res.rootCauseFiles = plan.files` — a divergence from factory.js
+    // (which NEVER reassigns it) that also contradicted this file's own cmdInit comment. rootCauseFiles
+    // is computed once at claim time from the item's DECLARED files[] (see cmdInit) because the fold's
+    // P9 check asserts the fixer actually touched a declared root-cause file; letting the planner's
+    // self-reported `files` overwrite it means the port graded the diff against the planner's own
+    // opinion of scope rather than the work item's, which is exactly the self-certification P9 exists
+    // to prevent. plan.files stays informational (it is written into plan.md above).
     progress.phase = 'test';
     return;
   }
@@ -525,13 +587,18 @@ function applyPhaseResults(progress) {
   }
   if (phaseKey === 'acceptance') {
     const ac = recv['acceptance-probe'];
-    progress.res.gateDetails['probe:acceptance-scan'] = { covered: ac.covered, gaps: ac.gaps || [] };
+    // KI-E103: record the gate on BOTH outcomes. factory.js writes res.gates unconditionally
+    // (factory.js: `res.gates['probe:acceptance-scan'] = ac.covered ? 'APPROVED' : 'CHANGES_REQUIRED'`);
+    // this port only wrote it on the reprobe path, so a first-pass covered:true recorded NO gate at
+    // all — the probe ran, passed, and left no evidence it had ever run in the folded result.
+    progress.res.gates['probe:acceptance-scan'] = ac.covered === false ? 'CHANGES_REQUIRED' : 'APPROVED';
+    progress.res.gateDetails['probe:acceptance-scan'] = acceptanceDetail(ac);
     if (ac.covered === false) {
       progress._acceptGaps = ac.gaps || [];
       progress.phase = 'acceptance_amend';
       return;
     }
-    progress.phase = 'leftover';
+    progress.phase = 'plancommit';
     return;
   }
   if (phaseKey === 'acceptance_amend') {
@@ -543,14 +610,69 @@ function applyPhaseResults(progress) {
   }
   if (phaseKey === 'acceptance_reprobe') {
     const re = recv['acceptance-probe'];
-    progress.res.gateDetails['probe:acceptance-scan'] = { covered: re.covered, gaps: re.gaps || [] };
+    progress.res.gates['probe:acceptance-scan'] = re.covered === false ? 'CHANGES_REQUIRED' : 'APPROVED';
+    progress.res.gateDetails['probe:acceptance-scan'] = acceptanceDetail(re);
     if (typeof re.covered === 'boolean' && re.covered === false) {
       const gapNote = (re.gaps || []).map((g) => g.clause).join('; ');
       finish(progress, 'FAILED', 'acceptance-scan: acceptance clause(s) with NO evidence in the diff after one bounded amend — ' + gapNote);
       return;
     }
-    progress.res.gates['probe:acceptance-scan'] = 'APPROVED';
+    progress.phase = 'plancommit';
+    return;
+  }
+  // KI-E112 — plan-commitment / plan-step trio (KI-E87 + KI-E101), mirroring the acceptance trio
+  // above: one probe, ONE bounded amend, one re-probe whose verdict is final. Both modes share the
+  // `probe:plan-commitment-scan` gate key (canon does too — a second key would orphan the
+  // telemetry/recover/feedback consumers already reading it), with the mode stamped in the headline.
+  const planAxis = () => (progress._planStepMode ? 'plan step' : 'plan commitment');
+  const planDetail = (pc) => {
+    const honored = pc.honored !== false;
+    const gaps = pc.gaps || [];
+    return {
+      verdict: honored ? 'APPROVED' : 'CHANGES_REQUIRED',
+      headline: (honored ? 'every ' + planAxis() + ' evidenced in the diff' : gaps.length + ' ' + planAxis() + '(s) with NO evidence in the diff') + ' [' + (progress._planStepMode ? 'STEP' : 'PROSE') + ' mode]',
+      findings: gaps.slice(0, 12).map((g) => ({ severity: 'HIGH', title: 'unhonored ' + planAxis() + ': ' + String(g.commitment || '').slice(0, 140), fix: String(g.why || '') })),
+    };
+  };
+  if (phaseKey === 'plancommit') {
+    const pc = recv['plan-commitment-probe'];
+    progress.res.gates['probe:plan-commitment-scan'] = pc.honored === false ? 'CHANGES_REQUIRED' : 'APPROVED';
+    progress.res.gateDetails['probe:plan-commitment-scan'] = planDetail(pc);
+    if (pc.honored === false && (pc.gaps || []).length) { progress._planGaps = pc.gaps; progress.phase = 'plancommit_amend'; return; }
     progress.phase = 'leftover';
+    return;
+  }
+  if (phaseKey === 'plancommit_amend') {
+    const amend = recv['fixer'];
+    writeArtifact(progress, 'plancommit-amend', 'plancommit-amend.json', amend);
+    if (amend.scopeStop) return frameAndBlock(progress, 'fixer scope-stop during plan-commitment amend: ' + amend.summary);
+    progress.phase = 'plancommit_reprobe';
+    return;
+  }
+  if (phaseKey === 'plancommit_reprobe') {
+    const re = recv['plan-commitment-probe'];
+    progress.res.gates['probe:plan-commitment-scan'] = re.honored === false ? 'CHANGES_REQUIRED' : 'APPROVED';
+    progress.res.gateDetails['probe:plan-commitment-scan'] = planDetail(re);
+    if (re.honored === false) {
+      const gapNote = (re.gaps || []).slice(0, 6).map((g) => String(g.commitment || '').slice(0, 90)).join(' | ');
+      finish(progress, 'FAILED', 'plan-commitment-scan (' + (progress._planStepMode ? 'KI-E101 STEP mode' : 'KI-E87 PROSE mode') + '): the plan\'s own ' + planAxis() + '(s) have NO evidence in the diff after one bounded amend — ' + (gapNote || 'see gateDetails') + '. Pre-band fail; the fix must cover every ' + planAxis() + ' the plan itself laid out.');
+      return;
+    }
+    progress.phase = 'leftover';
+    return;
+  }
+  // KI-E112 — ledger-anchor classify (KI-E91). Mechanical candidates come from `mech leftover`.
+  if (phaseKey === 'ledger_anchor_classify') {
+    const la = recv['ledger-anchor-probe'];
+    writeArtifact(progress, 'probe:ledger-anchor', 'ledger-anchor-classify.json', la);
+    if (la.clean === false) {
+      progress.res.gates['probe:ledger-anchor'] = 'CHANGES_REQUIRED';
+      const f = (la.findings || []).slice(0, 5).map((x) => `${x.anchor} (${x.file}): ${x.why}`);
+      finish(progress, 'FAILED', 'ledger-anchor scan (KI-E91): ' + f.join(' | '));
+      return;
+    }
+    progress.res.gates['probe:ledger-anchor'] = 'APPROVED';
+    progress.phase = 'editorial';
     return;
   }
   if (phaseKey === 'leftover_classify') {
@@ -562,7 +684,8 @@ function applyPhaseResults(progress) {
       return;
     }
     progress.res.gates['probe:leftover-scan'] = 'APPROVED';
-    progress.phase = 'editorial';
+    // KI-E112: the ledger-anchor scan (KI-E91) runs AFTER the leftover scan, mirroring canon's order.
+    progress.phase = ledgerAnchorNext(progress, itemsDirFor(progress.ctx, progress.id));
     return;
   }
   if (phaseKey === 'editorial') {
@@ -587,7 +710,13 @@ function applyPhaseResults(progress) {
       const scopeViolationIgnored = r.scopeViolation === true && r.verdict === 'APPROVED';
       if (r.scopeViolation === true && r.verdict !== 'APPROVED') { return frameAndBlock(progress, `${role} scopeViolation: ${r.headline}`); }
       progress.res.gates[key] = r.verdict;
-      progress.res.gateDetails[key] = { ...detail(role, r), ...(scopeViolationIgnored ? { scopeViolationIgnored: true } : {}) };
+      // KI-E103: a P8 re-gate must NOT destroy the original dissent's structured detail. factory.js
+      // records the re-gate under a DISTINCT `<key>:re-gate` entry and leaves the original standing;
+      // `lib/recover.mjs` filters `:re-gate` rows precisely because it expects BOTH to exist (the
+      // original is what `dissentersFrom` reads to scaffold a delta re-gate prompt). This port
+      // overwrote the original key on the second pass, so after an OVERRULED adjudication the reason
+      // the gate ever dissented was gone from the folded result.
+      progress.res.gateDetails[phaseKey === 'gates_regate' ? key + ':re-gate' : key] = { ...detail(role, r), ...(scopeViolationIgnored ? { scopeViolationIgnored: true } : {}) };
       // Keep the ORIGINAL call extra so a P8 re-gate re-runs the dissenting reviewer with the same
       // brief factory.js re-composes (its `b.extra` rides into the re-gate call).
       const srcCall = (progress.pendingSet.calls || []).find((c) => c.key === role);
@@ -625,6 +754,11 @@ function applyPhaseResults(progress) {
     const adj = recv['adjudicator'];
     writeArtifact(progress, 'adjudication', 'adjudication.md', '# Adjudication\n\n' + JSON.stringify(adj, null, 2));
     progress.res.gates['adjudicator'] = adj.verdict;
+    // KI-E103: factory.js also records the adjudicator's structured detail. Without it the
+    // adjudicator's headline + reasons — the ONLY narrative explaining why a disputed CRITICAL/HIGH
+    // was overruled or upheld — never reached feedback.md (`lib/feedback.mjs` renders both
+    // `d.headline` and `d.reasons`), so a reFix read "adjudicator: UPHELD" with no stated grounds.
+    progress.res.gateDetails['adjudicator'] = { verdict: adj.verdict, headline: adj.headline, reasons: Array.isArray(adj.reasons) ? adj.reasons : [] };
     if (adj.verdict !== 'OVERRULED') { finish(progress, 'FAILED', 'review(s) not APPROVED + adjudicator ' + adj.verdict + ': ' + progress._failedForRegate.map((f) => f.key).join(', ')); return; }
     // P8: re-run the dissenting gate(s) once against the unchanged diff. Parity: factory.js composes
     // `(b.extra || 'Re-gate this worktree diff.') + ' RE-GATE: ...'` — original brief + the mandate.
@@ -652,6 +786,12 @@ function applyPhaseResults(progress) {
       }
     }
     if (refuted) { finish(progress, 'FAILED', 'refuted: ' + (recv['refuter'] && recv['refuter'].headline)); return; }
+    // KI-E103: REFUTE_OK is pushed HERE — the moment the refuter passes — matching factory.js, which
+    // pushes it before the lens-convergence check. This port used to push it only alongside REAUDITED
+    // after ALL lenses converged, so a refuter-passed/lens-failed item ended its transitions at GATED.
+    // `lib/recover.mjs missingStageFrom()` keys the "only the re-auditor is missing" recovery scaffold
+    // on `last === 'REFUTE_OK'`, so that shape could never be auto-scaffolded from a port result.
+    progress.res.transitions.push('REFUTE_OK');
     const reauditEntries = progress.pendingSet.calls.filter((c) => c.role === 're-auditor');
     // recv is keyed by the unique call `key` (see agentStep) — each lens's key is `re-auditor:<lens>`,
     // never bare `re-auditor`, so lookups below never collide across lenses.
@@ -664,8 +804,14 @@ function applyPhaseResults(progress) {
       writeArtifact(progress, 'reaudit:' + c.lens, 'reaudit-' + c.lens + '.md', '# Re-audit (' + c.lens + ')\n\n' + JSON.stringify(r, null, 2));
       if (!r.converged) { allConverged = false; lensNotes.push(c.lens + ': not converged — ' + r.headline); }
     }
+    // KI-E103: the per-lens roll-up gate factory.js records as `res.gates['reaudit'] = 'code=ok
+    // edge-case=no …'`. Absent here entirely, which broke two independent consumers: `lib/recover.mjs
+    // missingStageFrom()` reads the recorded string to derive WHICH lens set a recovery must re-run
+    // (it parses e.g. "code=NULL" rather than re-deriving reauditLenses), and KI-E40's telemetry
+    // verdict classifier counts the all-`key=ok` family as an ok verdict — a missing key read as 0%.
+    progress.res.gates['reaudit'] = reauditEntries.map((c) => c.lens + '=' + (recv['re-auditor:' + c.lens] ? (recv['re-auditor:' + c.lens].converged ? 'ok' : 'no') : 'NULL')).join(' ');
     if (!allConverged) { finish(progress, 'FAILED', 're-audit lens(es) did not converge: ' + lensNotes.join('; ')); return; }
-    progress.res.transitions.push('REFUTE_OK', 'REAUDITED');
+    progress.res.transitions.push('REAUDITED');
     progress.phase = 'escalatecheck'; // factory.js ~958: the escalate-tier park happens ONLY after refute + re-audit pass
     return;
   }
@@ -677,6 +823,11 @@ function applyPhaseResults(progress) {
       return;
     }
     progress.res.transitions.push('INTEGRATED', 'CLOSED');
+    // KI-E112: canon propagates the integrator's reported branch onto the result (factory.js:
+    // `if (integ.branch) res.branch = integ.branch`); this port dropped it, so the folded row lost
+    // the branch the human is meant to review and commit — the one hand-off the factory exists to
+    // produce (KI-E1: the human authors every commit).
+    if (integ.branch) progress.res.branch = integ.branch;
     progress.res.toState = 'CLOSED';
     progress.res.note = 'red\u2192green; ' + Object.keys(progress.res.gates).length + ' gates APPROVED; refute OK; re-audit converged; global green';
     progress.res.integrateRaw = progress.res.codeChange;
@@ -702,8 +853,21 @@ function reverseRoleKey(role) {
 // `if (gateRoles.includes('po')) { ... }` — the PO gate runs ONLY when the band's gateRoles include
 // 'po' (LIGHT = developer+qa only, so LIGHT items skip PO entirely); either way 'GATED' lands on the
 // transitions (factory.js pushes it after the po block unconditionally).
+// KI-E112 — the host's configured gateSet, read once. `gateRolesFor(item, band, cfgGateSet)` has
+// always accepted this third argument, but both call sites passed `null`, so a host that customised
+// `config/factory.config.json`'s `gateSet` was silently ignored by this port while canon honoured it
+// (factory.js: `item.gateSet?.length ? item.gateSet : (CFG.gateSet || [...])`). Harmless while the
+// config happens to equal the hardcoded default — which is exactly what made it a latent trap rather
+// than a visible bug. Best-effort: an unreadable/absent config yields null, i.e. the prior behaviour.
+function configuredGateSet() {
+  try {
+    const cfg = readJson(join(FACTORY_ROOT, 'config', 'factory.config.json'));
+    return Array.isArray(cfg && cfg.gateSet) && cfg.gateSet.length ? cfg.gateSet : null;
+  } catch { return null; }
+}
+
 function nextAfterGateBand(progress) {
-  const gateRoles = gateRolesFor(progress.item, progress.band, null);
+  const gateRoles = gateRolesFor(progress.item, progress.band, configuredGateSet());
   if (gateRoles.includes('po')) { progress.phase = 'po'; return; }
   progress.res.transitions.push('GATED');
   progress.phase = 'refute_reaudit';
@@ -918,7 +1082,7 @@ function cmdMech(id, step, rest, flags) {
     }
     if (n === 0) {
       progress.res.gates['probe:leftover-scan'] = 'APPROVED';
-      progress.phase = 'editorial';
+      progress.phase = ledgerAnchorNext(progress, dir);
       saveProgress(id, progress);
       log('leftover-scan: 0 candidates -> APPROVED, advancing. next:');
       return cmdNext(id);
@@ -1013,6 +1177,26 @@ function cmdFinalize(id) {
   log('next: node ' + FACTORY_ROOT + '/_workflow/driver.mjs fold ' + 'state/results-cycle-' + cycle + '-' + id + '.json' + ' --controller <token>');
 }
 
+// KI-E112 — LEDGER-ANCHOR (KI-E91) STEP-1: run the engine-owned deterministic lint and decide the
+// next phase. Gated exactly as canon gates it — only when the item's declared files[] name a
+// *STANDARDS-DIVERGENCE-LEDGER.md path — so it is a free no-op for every host that keeps no such
+// ledger. Best-effort by the same posture as its siblings: a lint that cannot run announces itself
+// and advances rather than blocking a fix that may be perfectly correct.
+function ledgerAnchorNext(progress, dir) {
+  const touches = ((progress.item && progress.item.files) || []).some((f) => /STANDARDS-DIVERGENCE-LEDGER\.md$/i.test(String(f)));
+  if (!touches) return 'editorial';
+  let out = '';
+  try { out = runBuildTest(progress.ctx.factoryRoot, 'ledger-anchor', [progress.ctx.worktreePath]).output || ''; } catch (e) { out = ''; }
+  if (!out) { log('⚠ ledger-anchor (KI-E91): lint produced no output — check SKIPPED (announced, never silently clean).'); return 'editorial'; }
+  try { writeRaw(join(dir, 'ledger-anchor-raw.txt'), out); } catch { /* artifact only */ }
+  const n = lastMarkerCount(out, 'LEDGER-ANCHOR');
+  if (n === null) { log('⚠ ledger-anchor (KI-E91): no FACTORY::LEDGER-ANCHOR::<n> marker — check SKIPPED (announced).'); return 'editorial'; }
+  if (n === 0) { progress.res.gates['probe:ledger-anchor'] = 'APPROVED'; log('ledger-anchor: 0 candidates -> APPROVED.'); return 'editorial'; }
+  progress._ledgerAnchorHits = [...out.matchAll(/FACTORY::LEDGER-ANCHOR-HIT::([^\n]+)/g)].map((m) => m[1]);
+  log(`ledger-anchor: ${n} candidate(s) -> needs classification.`);
+  return 'ledger_anchor_classify';
+}
+
 function afterVerify(progress, combined) {
   const parsed = parseVerifyRaw(combined);
   // Same KI-E43 effective baseline the driver fold applies to the verify transcript (vVerdict) —
@@ -1033,6 +1217,87 @@ function afterVerify(progress, combined) {
       return cmdNext(progress.id);
     }
     log('FACTORY::REALINFRA:: marker present — real-infra proof OK.');
+  }
+  // KI-E112 — three canonical guards ported here, all DETERMINISTIC (no agent), closing gaps this
+  // port had disclosed in stage-parity.mjs. Positioned exactly where factory.js puts them: after the
+  // GREEN/BUILT/TESTED transitions and strictly BEFORE the edge-scan and the gate band, so a failure
+  // costs one mech step instead of a full band.
+  const wtP112 = progress.ctx.worktreePath;
+  const itemFiles112 = (progress.item && progress.item.files) || [];
+  let changed112 = null;
+  try { changed112 = changedFiles(wtP112); } catch { changed112 = null; }
+
+  // (a) RED-PROOF (KI-E83). factory.js re-greps verify-red-raw.txt on DISK because a test-author's
+  // self-reported `test.red` can diverge from what its own artifact shows — ITEM-H24/ITEM-H26 each
+  // burned a FULL band with 9 and 8 gates APPROVED before the fold caught FACTORY::RED::0. This port
+  // trusted the self-report until fold time. `parseRedRaw` was already imported here and unused.
+  // Contract is INVERTED for verificationOnly (KI-L55): the pinning/coverage test must PASS (exit 0).
+  {
+    const redPath = join(itemsDirFor(progress.ctx, progress.id), 'verify-red-raw.txt');
+    const redParse = existsSync(redPath) ? parseRedRaw(decodeTranscript(readFileSync(redPath))) : null;
+    if (redParse && typeof redParse.exit === 'number') {
+      const exitIsZero = redParse.exit === 0;
+      const probeFail = progress.verificationOnly ? !exitIsZero : exitIsZero;
+      if (probeFail) {
+        finish(progress, 'FAILED', 'RED-proof marker (KI-E83): verify-red-raw.txt shows exit=' + redParse.exit + ' — ' + (progress.verificationOnly ? 'the pinning/coverage test did NOT pass on the current tree (verificationOnly requires exit=0)' : 'the regression test PASSED on old code (vacuous test — passes on both old and new code)') + '. Failing BEFORE the gate band; the fold-time P1 remains the close authority.');
+        saveProgress(progress.id, progress);
+        log('FAILED (red-proof). next:');
+        return cmdNext(progress.id);
+      }
+      log('RED-proof marker OK (exit=' + redParse.exit + ').');
+    } else {
+      // Fail-open, ANNOUNCED — same posture as factory.js's null-probe path and KI-E20/KI-E41.
+      log('⚠ RED-proof marker (KI-E83): no readable FACTORY::RED:: marker in verify-red-raw.txt — check SKIPPED (the fold-time P1 remains the authority).');
+    }
+  }
+
+  // (b) DEBRIS (KI-D1). factory.js fails on obvious factory-artifact/scratch files in the diff; this
+  // port never imported debrisFiles at all, so a teed artifact or scratch file reached the band.
+  if (changed112) {
+    const debris112 = debrisFiles(changed112, itemFiles112);
+    if (debris112.length) {
+      finish(progress, 'FAILED', 'worktree debris (scratch/temp/artifact files): ' + debris112.join(', '));
+      saveProgress(progress.id, progress);
+      log('FAILED (debris). next:');
+      return cmdNext(progress.id);
+    }
+  }
+
+  // (c) ROOT-CAUSE TOUCH (KI-E104, the pre-band half of the fold's P9). Same predicate + same gating
+  // as canon: code items only, never verificationOnly (KI-L55 — no fixer ran by design there), and
+  // only when the item predicted a non-test touch-set. Uses the SAME lib/verify.mjs derivation the
+  // fold applies, so the two cannot disagree.
+  if (progress.res.codeChange && !progress.verificationOnly && (progress.res.rootCauseFiles || []).length) {
+    if (!changed112) {
+      progress.res.gates['mech:rootcause-touch'] = 'SKIPPED';
+      log('⚠ rootcause-touch (KI-E104): worktree unreadable — check SKIPPED (announced, never silently clean).');
+    } else if (!nonTestChanged(changed112).length) {
+      progress.res.gates['mech:rootcause-touch'] = 'CHANGES_REQUIRED';
+      progress.res.gateDetails['mech:rootcause-touch'] = { verdict: 'CHANGES_REQUIRED', headline: 'the diff changes NO non-test file — the test was greened, the root cause was not fixed', findings: [{ severity: 'HIGH', title: 'tests-only diff on a code item that declared a non-test touch-set', fix: 'change the real source/config file that carries the defect; the regression test alone is not a fix' }] };
+      finish(progress, 'FAILED', 'rootcause-touch (KI-E104): the fix changed NO non-test source file (diff touched only tests) — the test was greened but the root cause was not fixed. Pre-band fail; the fold-time P9 remains the close authority.');
+      saveProgress(progress.id, progress);
+      log('FAILED (rootcause-touch). next:');
+      return cmdNext(progress.id);
+    } else {
+      progress.res.gates['mech:rootcause-touch'] = 'APPROVED';
+    }
+  }
+  // KI-E112 — WIRE the KI-E74B verify-note channel, which compose.mjs has rendered since KI-E74B but
+  // which nothing ever populated (a dead render, self-disclosed there). Canon fills it from the
+  // runner AGENT's honest self-caveat; this port has no runner agent, so the honest analogue is the
+  // set of caveats the DETERMINISTIC pass itself produced — a check that could not run, or a test
+  // class that behaved non-deterministically. Those are exactly what a reviewer must not approve
+  // past unverified, and unlike an agent's prose they cannot be self-serving.
+  const caveats112 = [];
+  if (progress.res.gates['mech:rootcause-touch'] === 'SKIPPED') caveats112.push('the root-cause touch check could not run (worktree unreadable) — the tests-only-diff class is UNVERIFIED here.');
+  if (!existsSync(join(itemsDirFor(progress.ctx, progress.id), 'verify-red-raw.txt'))) caveats112.push('no verify-red-raw.txt on disk — the RED proof (that the regression test fails on OLD code) is UNVERIFIED here; the fold re-checks it.');
+  try {
+    const flaky112 = flakeSuspects(combined);
+    if (flaky112.length) caveats112.push('FLAKE SUSPECT — test class(es) both PASSED and FAILED in this run: ' + flaky112.join(', ') + '. If that was not a fix-then-retry, the test is unstable and its green is not trustworthy.');
+  } catch { /* advisory only */ }
+  if (caveats112.length) {
+    progress.item.verifyNote = caveats112.join(' ');
+    log('⚠ verify caveats recorded for the review band: ' + progress.item.verifyNote);
   }
   saveProgress(progress.id, progress);
   progress.phase = 'edgescan';

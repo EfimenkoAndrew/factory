@@ -1,6 +1,6 @@
 export const meta = {
   name: 'impl-factory',
-  description: 'AI Implementation Factory control plane. Receives a batch of READY work items (audit findings / stories) + agent templates + per-item model routing via args (emitted by driver.mjs select), then drives each item through the implement-and-auto-evaluate lifecycle: (plan) -> test-author(red) -> fixer -> verify(build+test) -> RED-proof marker probe (disk-authoritative FACTORY::RED:: re-check, pre-band, KI-E83) -> early edge-scan (pre-band edge-case hunt + one bounded amend, every code item) -> acceptance-scan (pre-band clause-coverage probe + one bounded amend, KI-E18) -> cheap haiku leftover-scan (pre-band deferral/tech-debt lint, KI-D12) -> the review stage (5 role gates + applicable BMAD review-named flows: code/adversarial/testreview + editorial) as separate adversarial subagents -> refuter -> scoped re-audit -> integrate. Worktree-isolated, model-routed, low-concurrency under throttle. Each agent writes its artifact to disk; the factory returns compact per-item results (a transition path) the driver folds into the ledger (single writer, resumable). NEVER runs mutating git — fixes stay on a factory/<id> branch in a worktree for the human to commit.',
+  description: 'AI Implementation Factory control plane. Receives a batch of READY work items (audit findings / stories) + agent templates + per-item model routing via args (emitted by driver.mjs select), then drives each item through the implement-and-auto-evaluate lifecycle: (plan) -> test-author(red) -> fixer -> verify(build+test) -> RED-proof marker probe (disk-authoritative FACTORY::RED:: re-check, pre-band, KI-E83) -> early edge-scan (pre-band edge-case hunt + one bounded amend, every code item) -> acceptance-scan (pre-band clause-coverage probe + one bounded amend, KI-E18) -> plan-commitment scan (pre-band plan-vs-diff self-consistency probe + one bounded amend, KI-E87; STEP mode probes the planner\'s own steps[] one-by-one when present, PROSE mode falls back to the commitment-language prefilter, KI-E101) -> cheap haiku leftover-scan (pre-band deferral/tech-debt lint, KI-D12) -> comment-scan (host-policy-gated zero-new-comments lint, KI-E59) -> ledger-anchor scan (duplicate/contradictory standards-ledger anchors, KI-E91) -> root-cause touch probe (pre-band P9: the diff must change a non-test file, KI-E104) -> the review stage (5 role gates + applicable BMAD review-named flows: code/adversarial/testreview + editorial) as separate adversarial subagents -> refuter -> scoped re-audit -> integrate. Worktree-isolated, model-routed, low-concurrency under throttle. Each agent writes its artifact to disk; the factory returns compact per-item results (a transition path) the driver folds into the ledger (single writer, resumable). NEVER runs mutating git — fixes stay on a factory/<id> branch in a worktree for the human to commit.',
   phases: [
     { title: 'Plan' }, { title: 'Test' }, { title: 'Fix' }, { title: 'Verify' },
     { title: 'EdgeScan' }, // KI-E12: the edge-case hunter runs EARLY (pre-band) for every code item; findings feed one bounded amend
@@ -57,9 +57,44 @@ function splitAcceptanceClauses(text, cap) {
   return clauses.slice(0, cap - 1).concat(clauses.slice(cap - 1).join('; '))
 }
 
+// ---- inlined pure helper (byte-equivalent to _workflow/lib/plan-commitment.mjs — the runtime cannot
+//      import; change both copies together, the selftest pins their parity) ----
+function hasPlanCommitmentLanguage(text) {
+  if (!text || typeof text !== 'string') return false
+  if (/\bMUST\b/.test(text)) return true
+  if (/\bmust[\s-]+\w+/i.test(text)) return true
+  if (/\bis\s+required\s+to\b|\brequired\s+to\s+\w+/i.test(text)) return true
+  return false
+}
+
+// ---- inlined pure helper (byte-equivalent to _workflow/lib/plan-commitment.mjs normalizePlanSteps —
+//      KI-E101; the runtime cannot import; change both copies together, the selftest pins parity) ----
+function normalizePlanSteps(steps, cap) {
+  if (cap === undefined) cap = 8
+  if (!Array.isArray(steps)) return []
+  const seen = new Set()
+  const out = []
+  for (let i = 0; i < steps.length; i++) {
+    if (typeof steps[i] !== 'string') continue
+    const s = steps[i].replace(/\s+/g, ' ').trim().replace(/^(?:[-*\u2022]|\(?\d{1,2}[.)])\s+/, '').trim()
+    if (s.length < 12) continue
+    const key = s.toLowerCase()
+    if (seen.has(key)) continue
+    seen.add(key)
+    out.push(s)
+  }
+  if (out.length <= cap) return out
+  return out.slice(0, cap - 1).concat(out.slice(cap - 1).join('; '))
+}
+
 // ---- schemas (compact structured returns; the full artifact is written to disk) ----
 const FINDING = { type: 'object', additionalProperties: false, required: ['severity', 'title'], properties: { severity: { type: 'string' }, title: { type: 'string' }, file: { type: 'string' }, fix: { type: 'string' } } }
-const PLAN_SCHEMA = { type: 'object', additionalProperties: false, required: ['rootCause', 'approach', 'recommendScopeStop', 'recommendEscalate'], properties: { rootCause: { type: 'string' }, approach: { type: 'string' }, files: { type: 'array', items: { type: 'string' } }, testStrategy: { type: 'string' }, blastRadius: { type: 'string' }, ruleRisks: { type: 'string' }, recommendEscalate: { type: 'boolean' }, recommendScopeStop: { type: 'boolean' } } }
+// KI-E101: `steps` is the OPTIONAL structured decomposition of `approach` — 2-8 individually
+// checkable units of work that the pre-band plan-scan probes one-by-one against the final diff
+// (STEP mode). It is deliberately NOT in `required`: a planner that omits it, and a KI-E69 reused
+// prior-attempt plan authored before this field existed, both fall through to the original KI-E87
+// PROSE mode unchanged — the silent-no-op posture buildDocMap/solutionFor/precedent already use.
+const PLAN_SCHEMA = { type: 'object', additionalProperties: false, required: ['rootCause', 'approach', 'recommendScopeStop', 'recommendEscalate'], properties: { rootCause: { type: 'string' }, approach: { type: 'string' }, steps: { type: 'array', items: { type: 'string' } }, files: { type: 'array', items: { type: 'string' } }, testStrategy: { type: 'string' }, blastRadius: { type: 'string' }, ruleRisks: { type: 'string' }, recommendEscalate: { type: 'boolean' }, recommendScopeStop: { type: 'boolean' } } }
 // KI-L37: verificationOnly (reFix only) — the test-author attests every prior finding is already
 // addressed in the CURRENT tree (or explicitly out of scope) and no NEW red is possible; the item
 // skips the fixer and proceeds to verify + gates on the standing prior-round red proof.
@@ -99,11 +134,23 @@ const LEFTOVER_SCHEMA = { type: 'object', additionalProperties: false, required:
 // owner directive (2026-07-30) has zero legitimate exceptions: any new or reworded comment is a hard
 // violation. `count>0` fails the item PRE-BAND (cheap, before the opus gates).
 const COMMENT_SCHEMA = { type: 'object', additionalProperties: false, required: ['count'], properties: { count: { type: 'number' }, hits: { type: 'array', items: { type: 'string' } } } }
+// KI-E91 — duplicate/contradictory standards-evolution ledger anchors + false standards-evolution: tag claims.
+const LEDGER_ANCHOR_SCHEMA = { type: 'object', additionalProperties: false, required: ['clean'], properties: { clean: { type: 'boolean' }, findings: { type: 'array', items: { type: 'object', additionalProperties: false, required: ['anchor', 'file', 'why'], properties: { anchor: { type: 'string' }, file: { type: 'string' }, why: { type: 'string' } } } } } }
 // KI-E18 — AcceptanceScan probe: pre-band acceptance-clause coverage (the KI-D12 pattern applied to
 // the #1 recent FAIL cause: 4/4 last band FAILs were acceptance-clause gaps the opus band found at
 // full price). A haiku probe answers per deterministic clause "does the diff carry evidence?";
 // gaps feed ONE bounded fixer amend; a malformed/unavailable probe never sinks the item.
 const ACCEPT_SCHEMA = { type: 'object', additionalProperties: false, required: ['covered'], properties: { covered: { type: 'boolean' }, gaps: { type: 'array', items: { type: 'object', additionalProperties: false, required: ['clause', 'why'], properties: { clause: { type: 'string' }, why: { type: 'string' } } } } } }
+const PLAN_COMMITMENT_SCHEMA = { type: 'object', additionalProperties: false, required: ['honored'], properties: { honored: { type: 'boolean' }, gaps: { type: 'array', items: { type: 'object', additionalProperties: false, required: ['commitment', 'why'], properties: { commitment: { type: 'string' }, why: { type: 'string' } } } } } }
+// KI-E104 — root-cause touch probe: reports `verify/build-test.sh rootcause`'s markers verbatim (the
+// pre-band half of the fold's P9). No classify step — like KI-E59's comment probe, the linter has
+// already made the judgment; the agent is a relay. `skipped` distinguishes "the check could not run"
+// from "the check ran and found nothing", so a SKIP can never be read as a pass. The count field is
+// deliberately named `nonTestCount`, NOT `count`: COMMENT_SCHEMA/LEFTOVER already use a `count`/
+// `clean` field whose ZERO means GOOD, whereas zero here means FAILURE — an identically-named field
+// with inverted polarity is a genuine footgun for any consumer keying off shape (the exec-smoke
+// harness sniffs exactly that way and did in fact mis-stub this probe into failing every lane).
+const ROOTCAUSE_SCHEMA = { type: 'object', additionalProperties: false, required: ['nonTestCount'], properties: { nonTestCount: { type: 'number' }, files: { type: 'array', items: { type: 'string' } }, skipped: { type: 'boolean' } } }
 // Sweep-designer: the canonical fix pattern for a whole root-cause cluster (designed once, applied N times).
 const SWEEP_DESIGN_SCHEMA = { type: 'object', additionalProperties: false, required: ['pattern', 'headline'], properties: { pattern: { type: 'string' }, applicationNotes: { type: 'string' }, conformanceCheck: { type: 'string' }, headline: { type: 'string' } } }
 
@@ -121,8 +168,10 @@ const SKILL_ROLE = {
 //      read files AND this session caps args size, so per-item run-args OMIT the verbose `routes`;
 //      factory.js derives them here from fixType. item.routes, when present, still wins (Phase 2/3 compat). ----
 const RT = {
-  fixerMech: { model: 'claude-sonnet-5', effort: 'medium' }, fixerCrit: { model: 'claude-opus-4-8', effort: 'high' },
-  testMech: { model: 'claude-sonnet-5', effort: 'medium' }, testCrit: { model: 'claude-opus-4-8', effort: 'high' },
+  // KI-E92 (2026-08-28): re-routed to claude-sonnet-4-6 — see config/model-routing.json
+  // fixer.mechanical._note for the full rationale.
+  fixerMech: { model: 'claude-sonnet-4-6', effort: 'medium' }, fixerCrit: { model: 'claude-opus-4-8', effort: 'high' },
+  testMech: { model: 'claude-sonnet-4-6', effort: 'medium' }, testCrit: { model: 'claude-opus-4-8', effort: 'high' },
   // KI-L64: runner pinned haiku→sonnet — haiku's 200k ceiling dies terminal ("Prompt is too long")
   // on big-solution verify runs (ITEM-H7 + ITEM-H5 cycle 35 burned ALL runner retries; ITEM-H-14
   // survived on retry luck). Same KI-L56 context-ceiling class + KI-L58 pin precedent.
@@ -211,7 +260,40 @@ const BAND_FULL_THEMES = ['security-multitenancy', 'money-correctness', 'idempot
 // hardcoded-zeros aggregate fix whose correctness is fully in-memory-expressible.) The normalizer's per-item
 // `item.realInfra` stays the PRIMARY signal; this keyword floor is the safety net for a MIS-TRIAGED item whose
 // own text betrays a real-infra need the normalizer missed (the ITEM-M1/M20 case P2 was created for).
-const REALINFRA_SIGNAL = /concurren|race condition|\brace\b|lost update|toctou|isolation level|serializable|deadlock|advisory lock|unique (constraint|index)|23505|fromsql|raw sql|rowversion|optimistic concurren|pessimistic|\bfor update\b|interleav|double-?spend|idempoten.*(dup|race|concurrent)/
+// Ported from a host-mount session (2026-08-29) — the bare `concurren` catch-all had accumulated two
+// classes of bug on the origin session's own graph, both fixed there and carried here verbatim (the
+// regex is a general text-classification heuristic, not tied to any specific host's item content):
+// (1) The two more-specific alternatives requiring a literal SPACE ("optimistic concurren",
+// "unique (constraint|index)") never matched real prose's hyphenated form ("optimistic-concurrency",
+// "unique-constraint"), silently falling through to depend on the unrelated bare-`concurren` fallback
+// instead. Normalized both to `[\s-]+`. Deliberately did NOT hyphen-normalize "advisory lock" the same
+// way: origin evidence showed it newly matched several runbook/observability items that merely
+// DOCUMENT "advisory-lock" as a monitored concept rather than describing a live defect; the one
+// origin-confirmed-genuine case using the hyphenated form matched independently via its own bare
+// "concurrent" text regardless, so the space-only form lost nothing. Also added an explicit
+// `concurrencyexception` alternative (catches `DbUpdateConcurrencyException`/`ConcurrencyConflictException`
+// by name) so EF-concurrency-conflict items whose graph entry under-declares realInfra:false no longer
+// depend on the narrowed catch-all either.
+// (2) The bare `concurren` catch-all matched the plain-English word regardless of context,
+// force-escalating items whose text used "concurrent" as a load/scheduling descriptor, not a
+// database-transaction-concurrency claim. Origin evidence (5 confirmed false positives, all
+// realInfra:false in the graph, all correctly written by the test-author as in-memory tests per this
+// file's own already-correct DEFECT-SHAPE judgment above, then overruled by this regex): a "~10
+// concurrent 100MB downloads" load descriptor; two "do NOT group concurrently with X" batch-scheduling
+// instructions TO THE FACTORY itself, not defect content; a "serialize against any concurrent … work"
+// file-lock scheduling note; and an item with TWO separate false-trigger occurrences in its own text —
+// "or that they are concurrent" (verifying HTTP-call parallelization for a perf/N+1 fix, not a DB
+// race) AND, missed by the first-pass fix since `.test()` only needs one survivor, a bare throttle-cap
+// aside "…SemaphoreSlim cap (e.g. max 10 concurrent)." with no following noun at all. Fixed by
+// excluding these confirmed non-DB shapes at the `concurren` alternative itself (a word-boundary lock
+// prevents the greedy `\w*` from backtracking around the exclusions, and a close-paren exclusion
+// `(?!\))` catches the dangling-adjective throttle-cap shape) rather than requiring a positive DB-word
+// match, which would risk missing a genuine case phrased differently than any case seen so far.
+// Verified this does NOT regress any of 11 origin-confirmed-genuine cases, 4 of which depend ENTIRELY
+// on this regex since their own graph entry declares realInfra:false — including 2 that only worked
+// via the bare-concurren fallback because the more specific alternatives needed the space-vs-hyphen
+// fix in (1) above.
+const REALINFRA_SIGNAL = /race condition|\brace\b|lost update|toctou|isolation level|serializable|deadlock|advisory lock|unique[\s-]+(constraint|index)|23505|fromsql|raw sql|rowversion|optimistic[\s-]+concurren|pessimistic|\bfor update\b|interleav|double-?spend|idempoten.*(dup|race|concurrent)|concurrencyexception|(?<!\bare\s)(?<!\bis\s)concurren\w*\b(?!\))(?!\s+\d)(?!(ly)?\s+(with|to|against)\b)(?!\s+(\w+\s+)?(downloads?|requests?|clients?|users?|sessions?|connections?|tabs?|calls?|work)\b)/
 const SONNET = { model: 'claude-sonnet-5', effort: 'medium' }
 function bandFor(item) {
   if (item.band === 'LIGHT' || item.band === 'FULL') return item.band
@@ -441,6 +523,11 @@ async function runItem(item) {
   const R = item.routes || routesFor(item)
   const band = bandFor(item) // LIGHT | FULL — decided up front (drives the verify mode AND the gate band)
   const filesHaveCs = (item.files || []).some(function (f) { return /\.cs$/.test(f) })
+  // KI-E91 gating signal (ported from a host-mount session) — declared files[] naming a
+  // STANDARDS-DIVERGENCE-LEDGER.md path is sufficient to trigger the probe below: its own STEP 1
+  // does a live `git diff --name-only` against the worktree, so it independently discovers a
+  // ledger file touched but never declared.
+  const ledgerTouch = (item.files || []).some(function (f) { return /STANDARDS-DIVERGENCE-LEDGER\.md$/.test(f) })
   // P2 real-infra FLOOR — `realInfraLikely` is known early (it drives the test-author: write a Testcontainers
   // test when the normalizer flagged it OR the defect text betrays a real-DB-dependent shape). The binding
   // `needsRealInfra` (= realInfraLikely ∧ codeChange) is finalised at the verify stage.
@@ -525,10 +612,15 @@ async function runItem(item) {
 
   // 1. plan (non-trivial / escalate only)
   phase('Plan')
+  // KI-E87 (ported): hoisted to function scope (was block-scoped to this `if`) so the PLAN-COMMITMENT
+  // SCAN pre-band probe (below, after acceptance-scan) can read the planner's own stated approach/
+  // blastRadius against the FINAL diff. `null` for a mechanical item (R.planner falsy — the planner
+  // is skipped entirely), which naturally gates the new probe off for that whole class at zero cost.
+  let plan = null
   if (R.planner) {
     // KI-E69: reuse a prior (killed) attempt's plan when its two control-flow fields are provably
     // safe to stand in for (lib/prior-attempt.mjs) — skips the planner call entirely on a relaunch.
-    const plan = (item.priorAttempt && item.priorAttempt.plan) || await call('planner', R.planner, PLAN_SCHEMA, null, 'Plan')
+    plan = (item.priorAttempt && item.priorAttempt.plan) || await call('planner', R.planner, PLAN_SCHEMA, null, 'Plan')
     res.artifacts.plan = 'state/items/' + id + '/plan.md'
     if (plan && plan.recommendScopeStop) return await frameAndBlock('planner scope-stop — ' + (plan.ruleRisks || plan.approach || ''))
     if (plan && plan.recommendEscalate) item._escalate = true
@@ -668,6 +760,18 @@ async function runItem(item) {
   }
   const realDebris = (Array.isArray(verify.debris) ? verify.debris : []).filter(isObviousDebris)
   if (realDebris.length) return finish('FAILED', 'worktree debris (scratch/temp/artifact files): ' + realDebris.join(', '))
+  // KI-E109 (HOST-POLICY-GATED) — main-tree contamination PREVENTION. KI-L65/E41/E45/E50/E35/E82/E89
+  // are seven detection passes and zero prevention, because KI-E50 explicitly parked the choice with
+  // the host owner ("sandboxing main read-only vs failing the lane fast remains a host-owner policy
+  // decision the engine deliberately does not make"). This makes that decision available instead of
+  // permanently unmade: the KI-E50 verifyHint already has the runner paste any `⚠ MAIN-DRIFT` line
+  // VERBATIM into its own note, so when the policy is ON that marker fails the lane HERE — before the
+  // gate band — rather than after it, and long before the fold's KI-L65 check. OFF by default, which
+  // is byte-for-byte the historical warn-only behaviour. Detection is unchanged either way; this only
+  // decides what the factory DOES with a signal it already has.
+  if (A.policies && A.policies.failLaneOnMainDrift && /⚠\s*MAIN-DRIFT/.test(String(verify.note || ''))) {
+    return finish('FAILED', 'main-tree contamination (KI-E109, host policy failLaneOnMainDrift=ON): the mid-band main-check reported drift and the runner recorded it — ' + String(verify.note || '').slice(0, 400) + ' — failing the lane NOW instead of spending the gate band on a run that has already written outside its worktree. Repair main (operator judgment, never the factory) before re-running.')
+  }
   if (Array.isArray(verify.newFailures)) {
     if (verify.newFailures.length) return finish('FAILED', 'fix introduced ' + verify.newFailures.length + ' new test failure(s): ' + verify.newFailures.join(', '))
   } else {
@@ -741,6 +845,38 @@ async function runItem(item) {
     }
     // redProbe null (infra failure / agent unavailable) -> proceed; the fold-time deterministic
     // P1 check is the backstop either way, same fail-open posture as every sibling pre-band probe.
+  }
+
+  // 4a4. ROOT-CAUSE TOUCH PROBE (KI-E104) — the PRE-BAND half of the fold's deterministic P9
+  //     ("a diff that touched ONLY tests greened the test, it did not fix the bug"). P9 ran ONLY at
+  //     fold, i.e. AFTER the whole gate band was spent — the identical economics KI-E83 fixed for
+  //     its sibling P1, and cheaper to hoist than P1 was: no marker, no transcript, no agent
+  //     judgment, just the worktree's own `git status` through the SAME lib/verify.mjs predicate the
+  //     fold applies. Gated exactly as the fold gates P9: code items only, never verificationOnly
+  //     (KI-L55 — no fixer ran by design there, so a tests-only diff is the CORRECT shape), and only
+  //     when the item actually predicted a non-test touch-set. Fail-open on a null/malformed/SKIP
+  //     probe — the fold's P9 stays the close authority either way.
+  if (codeChange && !verificationOnly && (res.rootCauseFiles || []).length) {
+    const rcProbe = await call('rootcause-probe', { model: 'claude-haiku-4-5', effort: 'low' }, ROOTCAUSE_SCHEMA,
+      'ROOT-CAUSE TOUCH PROBE (KI-E104). Run EXACTLY this ONE command via Bash: `' + BT + ' rootcause ' + wtPath + '` and report its output VERBATIM — no interpretation, no edits, no other command. Return nonTestCount = the integer in the `FACTORY::ROOTCAUSE::<count>` line, files = every `FACTORY::ROOTCAUSE-FILE::<path>` path (may be empty), and skipped = true ONLY if the output contains `FACTORY::ROOTCAUSE-SKIP`.', 'EdgeScan')
+    if (rcProbe && rcProbe.skipped !== true && typeof rcProbe.nonTestCount === 'number' && rcProbe.nonTestCount === 0) {
+      res.gates['probe:rootcause-touch'] = 'CHANGES_REQUIRED'
+      res.gateDetails = res.gateDetails || {}
+      res.gateDetails['probe:rootcause-touch'] = {
+        verdict: 'CHANGES_REQUIRED',
+        headline: 'the diff changes NO non-test file — the test was greened, the root cause was not fixed',
+        findings: [{ severity: 'HIGH', title: 'tests-only diff on a code item that declared a non-test touch-set', fix: 'change the real source/config file that carries the defect; the regression test alone is not a fix' }],
+      }
+      return finish('FAILED', 'rootcause-touch probe (KI-E104): the fix changed NO non-test source file (diff touched only tests) — the test was greened but the root cause was not fixed. Pre-band fail (cheap — no gate band was spent); the fold-time P9 remains the close authority.')
+    }
+    // A SKIP (unreadable worktree / git unavailable), a null probe, or a malformed count all proceed
+    // — announced on the gates map so "the check did not run" is a VISIBLE state, never silence
+    // reading as clean (the KI-E20/KI-E41 announce-don't-skip-silently posture).
+    if (!rcProbe || rcProbe.skipped === true || typeof rcProbe.nonTestCount !== 'number') {
+      res.gates['probe:rootcause-touch'] = 'SKIPPED'
+    } else {
+      res.gates['probe:rootcause-touch'] = 'APPROVED'
+    }
   }
 
   // Editorial (Band C) — advisory, doc items only; applies doc fixes in the worktree, NEVER blocks.
@@ -828,8 +964,18 @@ async function runItem(item) {
         // ONE bounded amend (mirrors the edge-scan amend), then ONE re-probe; the re-probe's verdict is final.
         const amend = await call('fixer', R.fixer, FIX_SCHEMA, 'ACCEPTANCE-GAP AMEND (KI-E18): a pre-band probe found acceptance clause(s) with NO evidence in your diff — the gate band would FAIL the item at full price for exactly this (the #1 recent FAIL cause). Address EVERY gap below with the minimal correct change (or state in note precisely why a clause is already satisfied or out of this item\'s scope). Then re-verify the touched surface (code: `' + BT + ' build <touched .csproj> 2>&1 | tee -a ' + RAW + '` + `' + BT + ' filter <test .csproj> "<TestClassName>" 2>&1 | tee -a ' + RAW + '`; doc/config: the spec\'s grep) and REGENERATE the review pack: `' + PACKCMD + '`. GAPS: ' + JSON.stringify(ac.gaps.slice(0, 8)) + claimsHint, 'EdgeScan')
         if (amend && amend.scopeStop) return await frameAndBlock('fixer scope-stop during acceptance amend — ' + (amend.summary || ''))
-        if (amend && amend.applied) {
-          const re = await call('acceptance-probe', { model: 'claude-haiku-4-5', effort: 'low' }, ACCEPT_SCHEMA, acceptPrompt + '\nRE-SCAN: an amend just addressed the prior gaps — judge the AMENDED diff fresh; prior gaps are hypotheses to re-verify, never conclusions to copy forward.', 'EdgeScan')
+        // Fix (multi-lens review, 2026-08-25): the prompt above explicitly OFFERS the fixer a
+        // note-only response ("or state in note precisely why a clause is already satisfied or out
+        // of this item's scope") but the re-probe used to fire ONLY on `amend.applied` — a fixer
+        // taking that offered option (applied:false, a real note) got the item failed anyway on the
+        // STALE pre-amend verdict, never re-evaluated. Fix: also re-probe on a genuine note-only
+        // response (non-empty `note`, no code change), feeding the probe that explanation explicitly
+        // and instructing it to judge the explanation critically rather than rubber-stamp it — a
+        // malformed/empty amend (neither applied nor a real note) still correctly skips the re-probe
+        // and falls through to the stale verdict.
+        if (amend && (amend.applied || (amend.note && String(amend.note).trim()))) {
+          const noteHint = amend.applied ? '' : ('\nFIXER\'S EXPLANATION (no code change was applied — the diff is UNCHANGED from the first scan; judge whether this explanation genuinely justifies every gap as already-satisfied or legitimately out of scope, do NOT rubber-stamp a bare assertion with no evidence): ' + amend.note)
+          const re = await call('acceptance-probe', { model: 'claude-haiku-4-5', effort: 'low' }, ACCEPT_SCHEMA, acceptPrompt + '\nRE-SCAN: an amend just addressed the prior gaps — judge the AMENDED diff fresh; prior gaps are hypotheses to re-verify, never conclusions to copy forward.' + noteHint, 'EdgeScan')
           if (re && typeof re.covered === 'boolean') ac = re
         }
       }
@@ -844,6 +990,95 @@ async function runItem(item) {
         if (!ac.covered) {
           const gapNote = (ac.gaps || []).slice(0, 6).map(function (g) { return String(g.clause || '').slice(0, 90) }).join(' | ')
           return finish('FAILED', 'acceptance-scan (KI-E18): acceptance clause(s) with NO evidence in the diff after one bounded amend — ' + (gapNote || 'see gateDetails') + '. Pre-band fail (cheap — no gate band was spent); the fix must address EVERY acceptance clause.')
+        }
+      }
+    }
+  }
+
+  // 4c-bis. PLAN-COMMITMENT SCAN (KI-E87, ported from a host-mount session; KI-E101 adds STEP mode) —
+  //     a cheap haiku pass that cross-checks the diff against the PLANNER's OWN stated intent, a
+  //     different axis from the acceptance-scan above (which checks the diff against the ITEM's
+  //     external acceptance criteria). TWO modes feeding ONE probe/amend/re-probe/gate tail:
+  //       STEP  (KI-E101, preferred) — the planner returned an explicit `steps[]`, so the work is
+  //             already decomposed into individually checkable units and the probe judges coverage
+  //             step-by-step: exactly the shape splitAcceptanceClauses gives the KI-E18
+  //             AcceptanceScan on the acceptance axis, and with no dependence on the planner's
+  //             phrasing (a plan written as plain narrative was structurally invisible to PROSE mode).
+  //       PROSE (KI-E87, fallback)  — no usable steps[]; gate on the deterministic
+  //             hasPlanCommitmentLanguage prefilter over approach/blastRadius so the common case (a
+  //             plan with no checkable "MUST"-style promise) never spends a call.
+  //     `plan` is null for a mechanical item (planner skipped) — naturally gates this off too.
+  //     Positioned AFTER the acceptance-scan (probes the FINAL diff, post any acceptance-scan amend)
+  //     and BEFORE the comment-scan, mirroring the bounded-amend-then-reprobe shape of
+  //     acceptance-scan exactly. Fail-open: a null/malformed probe never sinks the item.
+  //     KI-E101 SCOPE BOUND (load-bearing, not incidental): steps decompose CHECKING, never
+  //     EXECUTION. The fixer still implements the whole item in ONE call with ONE whole-diff view,
+  //     because fixer.md's SIBLING-PATTERN SWEEP / DEAD-CODE SELF-CHECK (KI-E94), ADJACENT-CLAIM
+  //     RE-CHECK (KI-E95) and CANCELLATIONTOKEN CHAIN SELF-CHECK (KI-E96) are all whole-item,
+  //     cross-file consistency checks a worker holding only its own slice structurally cannot run —
+  //     and those guard "fix-introduced defects" (KI-E51), the #1 rejection class. Splitting the
+  //     implementation would trade a bounded model-cost saving for a regression in exactly the
+  //     failure mode this pipeline is most expensive at catching.
+  if (!verificationOnly && plan) {
+    const commitmentText = (plan.approach || '') + '\n' + (plan.blastRadius || '')
+    const planSteps = normalizePlanSteps(plan.steps, 8)
+    const stepMode = planSteps.length >= 2
+    const proseGated = hasPlanCommitmentLanguage(commitmentText)
+    if (stepMode || proseGated) {
+      phase('EdgeScan')
+      // Cross-repo note (review-caught, 2026-08-25): this prompt's wording was independently
+      // authored here rather than ported byte-for-byte from the origin host-mount session's copy —
+      // unlike the deterministic logic around it (hasPlanCommitmentLanguage, PLAN_COMMITMENT_SCHEMA,
+      // the `let plan = null` hoisting, the fail-open structure), which ARE byte-identical between
+      // the two repos and selftest-pinned as such. This is an ACCEPTED, now-documented adaptation:
+      // LLM-facing prompt text has no byte-parity convention anywhere else in this file (every
+      // pre-band probe's prompt is phrased independently at its own call site), so forcing this one
+      // prompt to match a sibling repo's exact wording would be inconsistent with how every other
+      // prompt in this file is treated — the SEMANTIC contract (same schema, same gate condition,
+      // same amend/re-probe safety valve) is what selftest pins, not the prose.
+      // KI-E101: `axis` is the ONE noun both modes render through, so the gate key, headline,
+      // findings, amend prompt and failure note all stay self-describing without a second tail.
+      const axis = stepMode ? 'plan step' : 'plan commitment'
+      const stepList = planSteps.map(function (s, i) { return '  ' + (i + 1) + '. ' + s }).join('\n')
+      const planPrompt = stepMode
+        ? 'PLAN-STEP SCAN (KI-E101 — pre-band plan-vs-diff step-coverage probe). Before implementing, this item\'s OWN plan decomposed the work into the numbered steps below. STEP 1: Read ' + itemsDir(id) + '/review-pack.md (the machine snapshot of this change). STEP 2: for EACH numbered step, decide whether the CHANGE (the diff / new files) carries CONCRETE evidence that step was actually carried out — a specific hunk, file, or test. Judge COVERAGE of the plan\'s own steps, not general quality (the review band judges that); a step the diff quietly skipped is precisely what this probe exists to catch. Return honored=true ONLY if EVERY step is evidenced; otherwise honored=false with each un-evidenced step in gaps (quote the step text in `commitment`, why no evidence in `why`). Do NOT edit anything.\nPLAN STEPS:\n' + stepList
+        : 'PLAN-COMMITMENT SCAN (KI-E87 — pre-band plan-vs-diff self-consistency probe). Before implementing, this item\'s OWN plan stated the commitment language below (its approach/blast-radius fields). STEP 1: Read ' + itemsDir(id) + '/review-pack.md (the machine snapshot of this change). STEP 2: for each "MUST"/"must include/add/…"/"required to" commitment in the text below, decide whether the CHANGE (the diff / new files) contains CONCRETE evidence the commitment was honored. Judge whether the plan\'s own promise was kept — not general quality (the review band judges that). Return honored=true ONLY if EVERY commitment is evidenced; otherwise honored=false with each unhonored commitment in gaps (quote the commitment + why no evidence). Do NOT edit anything.\nPLAN TEXT:\n' + commitmentText
+      let pc = await call('plan-commitment-probe', { model: 'claude-haiku-4-5', effort: 'low' }, PLAN_COMMITMENT_SCHEMA, planPrompt, 'EdgeScan')
+      if (pc && pc.honored === false && Array.isArray(pc.gaps) && pc.gaps.length) {
+        const amendHead = stepMode
+          ? 'PLAN-STEP AMEND (KI-E101): a pre-band probe found step(s) your OWN plan laid out with NO evidence in your diff — the re-audit would FAIL the item at full band price for exactly this.'
+          : 'PLAN-COMMITMENT AMEND (KI-E87): a pre-band probe found commitment(s) your OWN plan made with NO evidence in your diff — the re-audit would FAIL the item at full band price for exactly this.'
+        const amend = await call('fixer', R.fixer, FIX_SCHEMA, amendHead + ' Address EVERY gap below with the minimal correct change (or state in note precisely why that ' + axis + ' is already satisfied or no longer applicable). Then re-verify the touched surface (code: `' + BT + ' build <touched .csproj> 2>&1 | tee -a ' + RAW + '` + `' + BT + ' filter <test .csproj> "<TestClassName>" 2>&1 | tee -a ' + RAW + '`; doc/config: the spec\'s grep) and REGENERATE the review pack: `' + PACKCMD + '`. GAPS: ' + JSON.stringify(pc.gaps.slice(0, 8)) + claimsHint, 'EdgeScan')
+        if (amend && amend.scopeStop) return await frameAndBlock('fixer scope-stop during plan-commitment amend — ' + (amend.summary || ''))
+        // Fix (multi-lens review, 2026-08-25): the prompt above explicitly OFFERS the fixer a
+        // note-only response ("or state in note precisely why the commitment is already satisfied
+        // or no longer applicable") but the re-probe used to fire ONLY on `amend.applied` — a fixer
+        // taking that offered option got the item failed anyway on the STALE pre-amend verdict,
+        // never re-evaluated. Fix mirrors the acceptance-scan sibling above: also re-probe on a
+        // genuine note-only response (non-empty `note`, no code change), feeding the probe that
+        // explanation explicitly and instructing it to judge it critically rather than rubber-stamp
+        // it — a malformed/empty amend still correctly skips the re-probe.
+        if (amend && (amend.applied || (amend.note && String(amend.note).trim()))) {
+          const noteHint = amend.applied ? '' : ('\nFIXER\'S EXPLANATION (no code change was applied — the diff is UNCHANGED from the first scan; judge whether this explanation genuinely justifies every ' + axis + ' as already-honored or legitimately superseded, do NOT rubber-stamp a bare assertion with no evidence): ' + amend.note)
+          const re = await call('plan-commitment-probe', { model: 'claude-haiku-4-5', effort: 'low' }, PLAN_COMMITMENT_SCHEMA, planPrompt + '\nRE-SCAN: an amend just addressed the prior gaps — judge the AMENDED diff fresh; prior gaps are hypotheses to re-verify, never conclusions to copy forward.' + noteHint, 'EdgeScan')
+          if (re && typeof re.honored === 'boolean') pc = re
+        }
+      }
+      if (pc && typeof pc.honored === 'boolean') {
+        res.gates['probe:plan-commitment-scan'] = pc.honored ? 'APPROVED' : 'CHANGES_REQUIRED'
+        res.gateDetails = res.gateDetails || {}
+        res.gateDetails['probe:plan-commitment-scan'] = {
+          verdict: pc.honored ? 'APPROVED' : 'CHANGES_REQUIRED',
+          // KI-E101: the mode is stamped into the headline so a reader of feedback.md/gateDetails can
+          // tell WHICH axis fired without re-deriving it from the plan — STEP and PROSE mode share
+          // this one gate key deliberately (telemetry, recover.mjs and the feedback digest all key
+          // off `probe:plan-commitment-scan`, and splitting the key would silently orphan them).
+          headline: (pc.honored ? 'every ' + axis + ' evidenced in the diff' : ((pc.gaps || []).length + ' ' + axis + '(s) with NO evidence in the diff')) + ' [' + (stepMode ? 'STEP' : 'PROSE') + ' mode]',
+          findings: (pc.gaps || []).slice(0, 12).map(function (g) { return { severity: 'HIGH', title: 'unhonored ' + axis + ': ' + String(g.commitment || '').slice(0, 140), fix: String(g.why || '') } }),
+        }
+        if (!pc.honored) {
+          const gapNote = (pc.gaps || []).slice(0, 6).map(function (g) { return String(g.commitment || '').slice(0, 90) }).join(' | ')
+          return finish('FAILED', 'plan-commitment-scan (' + (stepMode ? 'KI-E101 STEP mode' : 'KI-E87 PROSE mode') + '): the plan\'s own ' + axis + '(s) have NO evidence in the diff after one bounded amend — ' + (gapNote || 'see gateDetails') + '. Pre-band fail (cheap — no gate band was spent); the fix must cover every ' + axis + ' the plan itself laid out.')
         }
       }
     }
@@ -910,6 +1145,39 @@ async function runItem(item) {
       if (!lo.clean) {
         const punts = (lo.punts || []).slice(0, 8).map(function (p) { return (p.file || '?') + ': ' + (p.why || p.line || '') }).join(' | ')
         return finish('FAILED', 'leftover-scan (KI-D12): fixer-introduced deferral(s)/tech-debt not ledgered — ' + (punts || 'see leftover-raw.txt') + '. execution-policy.md §4: no leftovers.')
+      }
+    }
+  }
+
+  // LEDGER-ANCHOR CONSISTENCY SCAN (KI-E91, ported from a host-mount session, cycle-73
+  //     post-mortem) — a cheap haiku pass that mechanizes standards-evolution.md §3.4's own
+  //     documented "ripple check" (grep for the tag, confirm the ledger anchor exists, confirm the
+  //     entry isn't self-contradictory) instead of leaving it to a human/reviewer's memory. Origin
+  //     evidence: a doc-drift item authored the SAME anchor slug as a top-level entry in TWO
+  //     sibling ledger files with materially different Created dates / Standard citations /
+  //     Legacy-sites content for what is presented as the SAME divergence, and separately asserted
+  //     a standards-evolution: call-site tag was present in five files that grep proved did NOT
+  //     carry it — both caught only after a full expensive adversarial review + adjudication. Gated
+  //     on ledgerTouch — declared item.files naming a STANDARDS-DIVERGENCE-LEDGER.md path
+  //     (sufficient: the mechanical lint's own live worktree diff/grep independently discovers a
+  //     ledger file touched but never declared). This repo has a single configured ledger path
+  //     (see ledger-anchor-lint.mjs's LEDGER_PATHS), so the duplicate-anchor half of the mechanical
+  //     lint always returns zero candidates here — the false-tag-claim half stays fully active.
+  //     Deterministic candidate-finding lives in build-test.sh ledger-anchor (mirrors
+  //     leftover-scan's STEP-1-mechanical/STEP-2-classify split); fail-open, same posture as
+  //     leftover-scan: only acts on an explicit boolean; a malformed/unavailable probe never sinks
+  //     an item on its own.
+  if (ledgerTouch) {
+    phase('EdgeScan')
+    const LARAW = itemsDir(id) + '/ledger-anchor-raw.txt'
+    const la = await call('ledger-anchor-probe', { model: 'claude-haiku-4-5', effort: 'low' }, LEDGER_ANCHOR_SCHEMA,
+      'LEDGER-ANCHOR CONSISTENCY SCAN (KI-E91). STEP 1 — run EXACTLY this via Bash and TEE the output: `' + BT + ' ledger-anchor ' + wtPath + ' 2>&1 | tee ' + LARAW + '`. It prints `FACTORY::LEDGER-ANCHOR-DUP-HIT::<anchor>::<level>::<fileA>::<fileB>` for a NEW/edited anchor that also exists at the same heading level in a sibling ledger, `FACTORY::LEDGER-ANCHOR-TAG-HIT::<anchor>::<claimedFile>::<tagFound>` for a file an entry claims carries a standards-evolution: tag (tagFound already grep-verified) per candidate + a final `FACTORY::LEDGER-ANCHOR::<count>`. STEP 2 — for EACH DUP hit, read both entries bodies in the worktree (`' + wtPath + '/<fileA>` and `' + wtPath + '/<fileB>`, the heading `#{level} <anchor>` to the next heading) and compare their `Created:`/`Standard:`/`Legacy sites:` lines: a pair whose content materially disagrees (different dates, different cited rule, different site list) about what is presented as the SAME divergence is a finding (contradictory-duplicate); an identical or clearly-intentional cross-post (e.g. one entry explicitly says "see the other ledger") is NOT a finding. For EACH TAG hit, tagFound=false means the entry claims claimedFile carries the tag but it does not (a finding, false-tag-claim) UNLESS the claim was misextracted (re-read the entry body to confirm it genuinely asserts THIS file carries the tag before flagging). Return clean=true ONLY if ZERO genuine findings (or the marker shows 0 candidates). Do NOT edit anything.', 'EdgeScan')
+    res.artifacts['probe:ledger-anchor-scan'] = 'state/items/' + id + '/ledger-anchor-raw.txt'
+    if (la && typeof la.clean === 'boolean') {
+      res.gates['probe:ledger-anchor-scan'] = la.clean ? 'APPROVED' : 'CHANGES_REQUIRED'
+      if (!la.clean) {
+        const hits = (la.findings || []).slice(0, 8).map(function (f) { return (f.anchor || '?') + ' [' + (f.file || '?') + ']: ' + (f.why || '') }).join(' | ')
+        return finish('FAILED', 'ledger-anchor-scan (KI-E91): contradictory-duplicate or false-tag-claim ledger entry — ' + (hits || 'see ledger-anchor-raw.txt') + '. standards-evolution.md §3.4: a single authoritative entry per anchor, and prose claims must match grep-verifiable reality.')
       }
     }
   }

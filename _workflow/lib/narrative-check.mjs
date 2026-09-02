@@ -26,6 +26,23 @@ const STRONG_COMPLETION_MARKERS = [
   /status.{0,10}:\s*.{0,20}complete/i,
 ];
 
+// Ported from a host-mount session (2026-08-29) — neither direction of this detector understood
+// negation: a phrase preceded by "No"/"Not"/"Zero"/"None"/"Never"/"Nothing" asserts the OPPOSITE of
+// what the bare marker text implies, but the original match logic never looked at what came before
+// it. Origin evidence, on the REVERSE detector (detectUnresolvedCaveatOnClose, below): an item's own
+// verify.json wrote "No findings from the prior round remain unaddressed" — a genuine, correct
+// completion claim — and the bare marker `findings...remain unaddressed` fired anyway, reading it as
+// an admission of failure. Hardened symmetrically on THIS (forward) detector too, pre-emptively —
+// same underlying weakness, same fix, even without a separately-confirmed live incident on this side.
+// Care was taken NOT to over-suppress: the real ITEM-H1 admission below (detectUnresolvedCaveatOnClose
+// exists to catch it) still fires — its outer "does NOT mean X" negates a different clause than the
+// inner "findings…remain unaddressed" marker actually matched on, so a naive blanket negation scan
+// could have silently broken the very detector this negation guard is added on top of.
+const NEGATION_BEFORE_RE = /\b(no|not|zero|none|never|nothing)\s*$/i;
+function isNegated(text, matchIndex, window = 25) {
+  return NEGATION_BEFORE_RE.test(text.slice(Math.max(0, matchIndex - window), matchIndex));
+}
+
 // Pure core (selftest-covered): given the fold toState and a map of {filename: text}, return the
 // files whose text contains a strong completion marker, when toState signals a real failure.
 export function detectNarrativeVerdictContradiction(toState, textsByFile) {
@@ -35,7 +52,7 @@ export function detectNarrativeVerdictContradiction(toState, textsByFile) {
     const t = String(text || '');
     for (const re of STRONG_COMPLETION_MARKERS) {
       const m = t.match(re);
-      if (m) { hits.push({ file, marker: m[0] }); break; } // one hit per file is enough to flag it
+      if (m && !isNegated(t, m.index)) { hits.push({ file, marker: m[0] }); break; } // one hit per file is enough to flag it
     }
   }
   return hits;
@@ -73,7 +90,7 @@ export function detectUnresolvedCaveatOnClose(toState, textsByFile) {
     const t = String(text || '');
     for (const re of NON_RESOLUTION_MARKERS) {
       const m = t.match(re);
-      if (m) { hits.push({ file, marker: m[0] }); break; } // one hit per file is enough to flag it
+      if (m && !isNegated(t, m.index)) { hits.push({ file, marker: m[0] }); break; } // one hit per file is enough to flag it
     }
   }
   return hits;

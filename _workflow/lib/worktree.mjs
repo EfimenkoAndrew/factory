@@ -105,6 +105,49 @@ export function removeWorktree(path, force) {
   git(args);
 }
 
+// Ported from a host-mount session (2026-08-29) — `removeWorktree` above drops the worktree
+// directory + git's worktree-admin entry, but leaves the `factory/<id>` branch ref standing at its
+// stale creation commit. Origin evidence: refreshing worktrees that had drifted far behind HEAD
+// required a MANUAL `git branch -D factory/<id>` after `worktree-remove` before a subsequent
+// `addWorktree` call actually started fresh — because addWorktree's OWN fallback path above (`git
+// worktree add -b` failing "already exists" -> falls back to plain `git worktree add <path>
+// <existing-branch>`) silently attaches the new worktree to the OLD branch tip instead of cutting a
+// new one from current HEAD. That is the exact staleness trap this function closes: call it right
+// after `removeWorktree` and the branch this worktree used is gone too, so the next `addWorktree` for
+// the same id takes the `-b` (fresh-from-HEAD) path instead of the silent-stale fallback.
+//
+// Deletion is gated on the same check the operator ran by hand: per this file's header invariant (the
+// factory NEVER commits — PLAN.md 6), a `factory/<id>` branch has, by construction, zero commits
+// beyond whatever base it was cut from; all real fix content lives only as UNSTAGED changes in the
+// worktree's working tree, which `removeWorktree` has already discarded by the time this runs — so a
+// branch with no unique commits carries no value once its worktree is gone. `git merge-base
+// --is-ancestor <branch> HEAD` (exit 0 = branch tip already reachable from HEAD = nothing exclusive to
+// lose) verifies that BEFORE deleting. If the branch is NOT an ancestor of HEAD — an unexpected commit
+// landed on it, which the hard rule forbids but this function must not blindly trust — it is left
+// standing and the reason is returned so the caller can warn a human, rather than either silently
+// discarding history or silently leaving the staleness trap live.
+export function pruneStaleBranch(branch, repoRoot) {
+  if (!branch) return { deleted: false, reason: 'no-branch-given' };
+  const root = repoRoot || '.';
+  const name = branch.replace(/^refs\/heads\//, '');
+  try {
+    git(['-C', root, 'rev-parse', '--verify', '--quiet', `refs/heads/${name}`]);
+  } catch (_) {
+    return { deleted: false, reason: `${name} does not exist (already removed?)` };
+  }
+  try {
+    git(['-C', root, 'merge-base', '--is-ancestor', name, 'HEAD']);
+  } catch (_) {
+    return { deleted: false, reason: `${name} has commits not reachable from HEAD — left standing for manual review` };
+  }
+  try {
+    git(['-C', root, 'branch', '-D', name]);
+    return { deleted: true, branch: name };
+  } catch (e) {
+    return { deleted: false, reason: String((e && e.message) || e) };
+  }
+}
+
 export function listWorktrees() {
   const out = git(['worktree', 'list', '--porcelain']);
   const blocks = out.split('\n\n').filter(Boolean);

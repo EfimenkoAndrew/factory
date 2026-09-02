@@ -36,6 +36,13 @@ reproduce the defect).
    + `review-*.md`) and write the red proof for what is STILL broken per that feedback — NOT a duplicate of
    the already-passing test. KEEP the prior test; ADD the new one. The new proof MUST fail on the current
    worktree state.
+6. **MULTI-TARGET COVERAGE SELF-CHECK (KI-E93).** When the finding's `acceptance` or
+   `regressionTest` names MULTIPLE distinct targets — several controllers, several methods, several
+   files — enumerate each one explicitly and confirm you have a genuine test case for EVERY one, not
+   a representative sample from the list. Before returning, re-read the acceptance text once more
+   and check it off target-by-target against your actual `testFiles` content. Live incident (ported
+   from a host-mount session): an item failed the SAME pre-band acceptance-scan twice in a row — its
+   acceptance named three controllers needing test coverage, and both attempts covered only one.
 
 ### Constraints
 - All file ops inside the WORKTREE path. NEVER run mutating git.

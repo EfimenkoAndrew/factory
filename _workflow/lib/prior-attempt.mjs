@@ -21,11 +21,23 @@
 // principle that gates re-adjudicate the worktree on every relaunch (SKILL.md § Recovery); this
 // module never touches that.
 //
-// plan.md is prose, not JSON — there is no durable record of the planner's own
-// recommendScopeStop/recommendEscalate structured fields. But if test.json ALSO exists (proving
-// the run proceeded past planning — either flag would have short-circuited runItem() before ever
-// reaching test-author), reusing plan as {recommendScopeStop:false, recommendEscalate:false} is
-// provably correct, not a guess: those are the only two fields runItem() reads from `plan`.
+// plan.md is prose, not JSON — there is no durable record of the planner's own structured fields.
+// But if test.json ALSO exists (proving the run proceeded past planning — either flag would have
+// short-circuited runItem() before ever reaching test-author), reusing recommendScopeStop/
+// recommendEscalate as {false, false} is provably correct, not a guess: a relaunch only reaches
+// this reuse path when neither flag fired the first time.
+//
+// Fix (multi-lens review, 2026-08-25, ported from the origin host-mount session): runItem() ALSO
+// reads plan.approach/plan.blastRadius (the PLAN-COMMITMENT SCAN's input text) — a fact this module
+// predates. The stub used to omit both fields entirely, so hasPlanCommitmentLanguage('' + '\n' + '')
+// was always false and the scan silently, permanently never fired for ANY relaunched item, no
+// matter what the real on-disk plan.md actually promised (the exact EGS-2-2 failure shape this
+// feature exists to catch — just reachable through the relaunch path instead of the first-attempt
+// path). Fix: `approach` below carries the raw plan.md TEXT (prose, not the planner's original
+// structured field split) — hasPlanCommitmentLanguage's regex-based pre-filter doesn't care which
+// field the text sits in, only that it can see the commitment language at all, so the whole
+// document is a strictly better input than the two narrower fields a fresh planner call would have
+// split it into.
 import { existsSync, readFileSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 
@@ -59,7 +71,12 @@ export function loadPriorAttempt(itemDir, sinceMs) {
     // plan reuse requires BOTH plan.md on disk AND test.json successfully reused (the proof that
     // the planner did not scope-stop/escalate) — never inferred from test.json alone without the
     // file itself also being present, so a missing plan.md still forces a fresh (cheap) plan call.
-    if (out.test && freshFile(itemDir, 'plan.md', sinceMs)) out.plan = { recommendScopeStop: false, recommendEscalate: false };
+    const planPath = freshFile(itemDir, 'plan.md', sinceMs);
+    if (out.test && planPath) {
+      let planText = '';
+      try { planText = readFileSync(planPath, 'utf8'); } catch { /* best-effort — empty text still gates the plan-commitment probe off safely (fail-open) */ }
+      out.plan = { recommendScopeStop: false, recommendEscalate: false, approach: planText };
+    }
   } catch { /* best-effort — a read failure just means no reuse, never a crash */ }
   return out;
 }

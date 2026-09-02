@@ -35,3 +35,18 @@ reports/*
 !reports/.gitkeep
 queue/*
 !queue/.gitkeep
+# Claude Code session state (KI-E113) — per-host and/or generated, never engine content. Missed by
+# the original KI-E26 sweep because `.claude/` is the one path that IS legitimately tracked in a
+# HOST repo (its `.claude/rules/*.md` are the acceptance rules the factory enforces — that tracked
+# copy is exactly what worktree.mjs's KI-L67 sparse-checkout strips out of each worktree). In THIS
+# engine repo it is never engine content, for three separate reasons:
+#   - `.claude/settings.local.json` is per-host session config; KI-E33/KI-E52 write the OTLP env
+#     block (endpoints) into precisely this file.
+#   - `.claude/worktrees/<branch>/` are REGISTERED git worktrees (`git worktree list`) — a full
+#     checkout of this repo. Committing one is actively broken, not just noisy, and the Claude Code
+#     worktree feature recreates them, so ignoring the contents once would not hold.
+#   - `setup/init.mjs` INSTALLS the controller skill into `.claude/skills/`, so running init against
+#     this repo (dogfooding) generates a copy of the tracked `claude-assets/` source. Committing the
+#     copy would let it drift from the original it was generated from.
+# The engine's own shipped Claude assets live in `claude-assets/` and ARE committed.
+.claude/
