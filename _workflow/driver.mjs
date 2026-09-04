@@ -522,7 +522,29 @@ function deterministicVerifyOverride(cfg, ledger, wi, r) {
   // (FACTORY::RED::0) — machine proof the acceptance already holds. A missing transcript still fails.
   if (codeChange) {
     const red = parseRedRaw(readIf('verify-red-raw.txt'));
-    if (r.verificationOnly === true) {
+    // KI-E132: r.verificationOnly is a copy captured when this checkpoint was produced — it goes STALE
+    // when an item is re-claimed for a later re-verification round whose fresh test.json/verify-red-raw.txt
+    // overwrite the very files this check reads, without ever updating the embedded r object (itself often
+    // reconstructed from an EARLIER, now-superseded checkpoint — live: PAYMENTS-M4/MARKETING-M3/RISK-M3,
+    // cycle 82, each a fully-13-gates-APPROVED item re-claimed for a redundant "is this still fixed?" pass
+    // whose legitimate exit=0 confirmation then read as "vacuous test" against the stale embedded flag).
+    // Re-derive from the on-disk test.json — the SAME freshness tier as verify-red-raw.txt below — and
+    // prefer it on disagreement: it is the test-author's own live attestation for THIS transcript, not a
+    // possibly-older copy. Falls back to r.verificationOnly when test.json is absent/unparseable (pre-KI-E132
+    // results, or a hand-authored recovery fold with no test.json on disk).
+    let effectiveVO = r.verificationOnly === true;
+    try {
+      const tjRaw = readIf('test.json');
+      const tj = tjRaw ? JSON.parse(tjRaw) : null;
+      if (tj) {
+        const diskVO = !!(tj.verificationOnly === true && !tj.red);
+        if (diskVO !== effectiveVO) {
+          console.log(`  KI-E132 ${r.id}: verificationOnly mismatch — embedded result said ${effectiveVO}, on-disk test.json says ${diskVO} (test.json wins: it is the live test-author attestation, not a possibly-stale checkpoint copy)`);
+          effectiveVO = diskVO;
+        }
+      }
+    } catch { /* unparseable test.json — trust the embedded flag, same as pre-KI-E132 behavior */ }
+    if (effectiveVO) {
       if (!red.hasData) return fail('verificationOnly item has no verify-red-raw.txt transcript (FACTORY::RED:: marker) — cannot machine-prove the acceptance already holds on the current tree');
       if (red.red) {
         // KI-E61 — the flag was an in-run MISCLASSIFICATION, but the transcript satisfies the
@@ -533,12 +555,13 @@ function deterministicVerifyOverride(cfg, ledger, wi, r) {
         // the KI-L37 reFix heuristic stamps verificationOnly even when the test-author went on
         // to produce a real red). Clearing the flag also re-arms the P9 root-cause check below.
         console.log(`  KI-E61 ${r.id}: verificationOnly flag contradicted by a GENUINE red (exit=${red.exit}) + machine green — auto-corrected to the normal red-green contract (result closes on the STRONGER evidence)`);
-        r.verificationOnly = false;
+        effectiveVO = false;
       }
     } else {
       if (!red.hasData) return fail('no RED proof (verify-red-raw.txt absent / no FACTORY::RED:: marker) — cannot prove the regression test fails on old code (vacuous-test risk)');
       if (!red.red) return fail('RED proof shows the test PASSED on old code (exit=' + red.exit + ') — vacuous test (passes on both old and new code)');
     }
+    r.verificationOnly = effectiveVO; // keep it consistent for the P9/filesChanged checks below and every downstream consumer of this result object
   }
 
   // P2 — real-infra: a needsRealInfra item must carry a real container marker (not an EF in-memory green).

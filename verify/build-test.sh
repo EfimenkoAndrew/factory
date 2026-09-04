@@ -26,6 +26,45 @@ set -uo pipefail
 # future) without touching each one.
 export MSBUILDDISABLENODEREUSE=1
 
+# KI-E134 (2026-09-04) — PREVENTION, not just detection. Every main-tree contamination incident this
+# session traced back to the SAME root cause: `dotnet build $target` (and friends) resolved a
+# worktree-rooted argument against the WRONG cwd — usually because the caller forgot to `cd` into its
+# assigned worktree first. This is unusually dangerous here specifically because every factory
+# worktree AND the main tree are full checkouts of the SAME repo: `dotnet build AdminIdentityService/
+# ...` run from the wrong directory frequently does NOT error (no MSB1009) — it silently SUCCEEDS
+# against the OTHER tree's copy of that same relative path, giving the caller no signal anything is
+# wrong, and (for red/filter, whose exit code and teed transcript become fold evidence) can make the
+# wrong tree's state look like proof about the right one. Refuse instead of silently substituting the
+# wrong tree: the argument must resolve to somewhere under a `state/worktrees/<id>/` directory, or
+# this script exits loud before touching anything.
+#
+# Scoped DELIBERATELY to build/red/filter/suite — the four subcommands that invoke `dotnet` and so
+# carry the "silently succeeds against the wrong tree" danger above. The read-only lints (claims/pack,
+# and any future git-diff-based lint added alongside them) do not share that failure mode —
+# `git -C <path> ...` / a node script over the path either operates correctly or fails cleanly if the
+# path isn't a real worktree, and (confirmed live on the origin host this fix was ported from) a
+# synthetic/placeholder worktree path is a legitimate, useful thing for a caller to pass there when
+# exercising wiring logic
+# rather than real content. Guarding them too would reject exactly that legitimate use for no safety
+# benefit, so they are intentionally left unguarded. This does not replace the fold-time/main-check
+# detection nets (KI-L65/E41/E45/E50/E61/E82/E89) — a direct Edit/Write/Bash-heredoc write that never
+# goes through this script is a separate vector those still cover — it closes the specific,
+# well-evidenced class that flows through the four dotnet-invoking subcommands.
+_guard_worktree_path() {
+  raw="$1"; label="$2"
+  case "$raw" in
+    /*) abs="$raw" ;;
+    *) abs="$(pwd)/$raw" ;;
+  esac
+  case "$abs" in
+    */state/worktrees/*) ;;
+    *)
+      echo "FACTORY::WORKTREE-GUARD::REFUSED $label '$raw' resolves to '$abs' (cwd=$(pwd)) — that path is NOT inside any state/worktrees/<id>/ directory. You are very likely operating against the MAIN tree instead of your assigned worktree (both are full checkouts of the same repo, so this often does not fail the way you'd expect it to). cd into your worktree first, or pass an absolute .../state/worktrees/<id>/... path." >&2
+      exit 65
+      ;;
+  esac
+}
+
 # Engine-owned diff lints run BEFORE the host-override seam below: leftovers/comments are
 # stack-agnostic (pure git-diff + node — no dotnet), so a host's build-test.local.sh never needs to
 # implement them, and a pre-existing override that predates a lint subcommand must not swallow it
@@ -75,6 +114,7 @@ cmd="${1:-}"; target="${2:-}"; filter="${3:-}"
 
 case "$cmd" in
   build)
+    _guard_worktree_path "$target" "target"
     echo "FACTORY::BUILD::START $target"
     out=$(dotnet build "$target" --nologo -clp:ErrorsOnly 2>&1)
     code=$?
@@ -85,6 +125,7 @@ case "$cmd" in
     exit $code
     ;;
   red)
+    _guard_worktree_path "$target" "target"
     # Run the NEW regression test against the CURRENT (unfixed) worktree. A non-zero exit (compile-or-assert
     # failure) is the REQUIRED red proof — it shows the test genuinely fails on old code (non-vacuous).
     echo "FACTORY::RED::START $target :: $filter"
@@ -96,6 +137,7 @@ case "$cmd" in
     exit $code
     ;;
   filter)
+    _guard_worktree_path "$target" "target"
     # NOTE (KI-L22, 2026-06-28): run the TARGETED test at DETAILED console-logger verbosity. At dotnet
     # test's default verbosity the VSTest host SUPPRESSES test stdout, so a regression test's
     # `FACTORY::REALINFRA::<kind>` marker (and the testcontainers/ryuk container lifecycle logs) never
@@ -114,6 +156,7 @@ case "$cmd" in
     exit $code
     ;;
   suite)
+    _guard_worktree_path "$target" "target"
     echo "FACTORY::TEST::SUITE::START $target"
     out=$(dotnet test "$target" --nologo 2>&1)
     code=$?

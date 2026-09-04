@@ -22,6 +22,10 @@ export const FINDING = { type: 'object', additionalProperties: false, required: 
 // the port "accepts and validates but never acts on". Optional by design: a planner that omits it,
 // and a plan authored before the field existed, both validate exactly as before.
 export const PLAN_SCHEMA = { type: 'object', additionalProperties: false, required: ['rootCause', 'approach', 'recommendScopeStop', 'recommendEscalate'], properties: { rootCause: { type: 'string' }, approach: { type: 'string' }, steps: { type: 'array', items: { type: 'string' } }, files: { type: 'array', items: { type: 'string' } }, testStrategy: { type: 'string' }, blastRadius: { type: 'string' }, ruleRisks: { type: 'string' }, recommendEscalate: { type: 'boolean' }, recommendScopeStop: { type: 'boolean' } } };
+// KI-E134 — the narrow follow-up ask fired when a plan's own approach/blastRadius carries commitment
+// language ("MUST"/"required to") but `steps` came back missing/under-decomposed: a SINGLE cheap
+// bounded call (never a second full plan). Byte-identical to factory.js's copy (schema-parity gate).
+export const PLAN_STEPS_NUDGE_SCHEMA = { type: 'object', additionalProperties: false, required: ['steps', 'note'], properties: { steps: { type: 'array', items: { type: 'string' } }, note: { type: 'string' } } };
 
 export const TEST_SCHEMA = { type: 'object', additionalProperties: false, required: ['red', 'note'], properties: { red: { type: 'boolean' }, verificationOnly: { type: 'boolean' }, testFiles: { type: 'array', items: { type: 'string' } }, runCmd: { type: 'string' }, baselineFailures: { type: 'array', items: { type: 'string' } }, evidence: { type: 'string' }, note: { type: 'string' } } };
 
@@ -87,7 +91,7 @@ export const CHECKPOINT_SCHEMA = { type: 'object', additionalProperties: false, 
 
 // Registry keyed by the same schema-name string the runtime.mjs CLI accepts on `submit --schema <name>`.
 export const SCHEMAS = {
-  PLAN_SCHEMA, TEST_SCHEMA, FIX_SCHEMA, VERIFY_SCHEMA, GATE_SCHEMA, REFUTE_SCHEMA, REAUDIT_SCHEMA,
+  PLAN_SCHEMA, PLAN_STEPS_NUDGE_SCHEMA, TEST_SCHEMA, FIX_SCHEMA, VERIFY_SCHEMA, GATE_SCHEMA, REFUTE_SCHEMA, REAUDIT_SCHEMA,
   INTEG_SCHEMA, ADJUDICATE_SCHEMA, DECISION_SCHEMA, ACCEPT_SCHEMA, LEFTOVER_SCHEMA, PROBE_SCHEMA,
   SWEEP_DESIGN_SCHEMA, CHECKPOINT_SCHEMA,
 };

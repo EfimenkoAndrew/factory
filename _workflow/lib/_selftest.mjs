@@ -3510,5 +3510,131 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
   ok(fixerMd93.indexOf('10. **SIBLING-PATTERN SWEEP') < fixerMd93.indexOf('11. **CANCELLATIONTOKEN'), 'KI-E96: CancellationToken self-check follows the sibling-pattern sweep in list order');
 }
 
+// KI-E132 (ported from a host-mount session, 2026-09-04) — fold's P1 verificationOnly branch read
+// r.verificationOnly, a copy embedded in the checkpoint/result object at whatever point it was
+// captured. It goes STALE when an item is re-claimed for a later, redundant re-verification round:
+// that round's fresh test.json/verify-red-raw.txt overwrite the very files P1 reads, but nothing
+// ever updates the embedded r.verificationOnly it also reads — so a fully-gate-APPROVED item's
+// legitimate "still passes, exit=0" re-confirmation gets folded as if it were a normal lane's
+// vacuous test. Live on the origin host: three fully-approved closes folded to FAILED by this bug
+// alone. Fix: re-derive from the on-disk test.json (same freshness tier as verify-red-raw.txt, read
+// via the same readIf) and prefer it on disagreement. driver.mjs has no exports (a CLI script, not
+// a module) — this pins the corrected SHAPE at the source level, the same convention every other
+// driver.mjs-internal behavior in this suite already uses.
+{
+  const dsrc132 = readFileSync(new URL('../driver.mjs', import.meta.url), 'utf8');
+  const p1Start = dsrc132.indexOf('// P1 — RED proof:');
+  ok(p1Start > 0, 'KI-E132: the P1 RED-proof block is still findable by its own comment anchor');
+  const p1Block = dsrc132.slice(p1Start, p1Start + 4200);
+  ok(p1Block.includes("readIf('test.json')"), 'KI-E132: P1 re-reads test.json fresh from disk, the same freshness tier as verify-red-raw.txt');
+  ok(/const diskVO = !!\(tj\.verificationOnly === true && !tj\.red\)/.test(p1Block), 'KI-E132: the on-disk verificationOnly is recomputed with the SAME formula factory.js uses in the first place (test.verificationOnly===true && !test.red), not trusted as a bare flag');
+  ok(/if \(diskVO !== effectiveVO\)/.test(p1Block), 'KI-E132: a mismatch between the embedded flag and the on-disk file is DETECTED and logged, not silently overwritten');
+  ok(p1Block.includes('effectiveVO = diskVO;'), 'KI-E132: and the on-disk value WINS the disagreement — it is the live test-author attestation, the embedded copy is not');
+  ok(!/if \(r\.verificationOnly === true\)/.test(p1Block), 'KI-E132: the branch condition no longer reads the possibly-stale r.verificationOnly directly');
+  ok(p1Block.includes('if (effectiveVO) {'), 'KI-E132: the branch now decides on the re-derived value');
+  ok(p1Block.includes('r.verificationOnly = effectiveVO;'), 'KI-E132: the embedded flag is written back so the LATER P9/filesChanged checks (which also read r.verificationOnly) see the corrected value too');
+  ok(p1Block.includes('try {') && p1Block.includes('catch { /* unparseable test.json'), 'KI-E132: an unparseable/absent test.json falls back to the embedded flag rather than throwing or defaulting to false');
+}
+
+// KI-E134 (ported from a host-mount session, 2026-09-04) — PREVENTION guard: every build-test.sh
+// subcommand that takes a worktree-rooted path and invokes dotnet now refuses to run unless that
+// path resolves under state/worktrees/<id>/. Real behavioral tests (actual script invocation, real
+// exit codes / stderr), not source-text pins — this is the mechanism directly motivated by the
+// origin session's repeated main-tree contamination incidents.
+{
+  const { mkdtempSync: mkH, mkdirSync: mdH, rmSync: rmH } = await import('node:fs');
+  const { tmpdir: tdH } = await import('node:os');
+  const { join: jH } = await import('node:path');
+  const { execFileSync: exH } = await import('node:child_process');
+  const btPathH = join(import.meta.dirname, '..', '..', 'verify', 'build-test.sh');
+  const runBt = (args, cwd) => {
+    try { const out = exH('bash', [btPathH, ...args], { cwd, stdio: ['ignore', 'pipe', 'pipe'], encoding: 'utf8' }); return { code: 0, stdout: out, stderr: '' }; }
+    catch (e) { return { code: e.status, stdout: String(e.stdout || ''), stderr: String(e.stderr || '') }; }
+  };
+
+  // A cwd OUTSIDE any state/worktrees/ tree — the four dotnet-invoking subcommands must refuse
+  // before touching anything.
+  const outsideH = mkH(jH(tdH(), 'bt134-outside-'));
+  for (const args of [['build', 'SomeProject.sln'], ['red', 'SomeProject.sln', 'SomeFilter'], ['filter', 'SomeProject.sln', 'SomeFilter'], ['suite', 'SomeProject.sln']]) {
+    const r = runBt(args, outsideH);
+    eq(r.code, 65, `KI-E134: '${args[0]}' from OUTSIDE any worktree refuses with exit 65, not a silent wrong-tree operation`);
+    ok(r.stderr.includes('FACTORY::WORKTREE-GUARD::REFUSED'), `KI-E134: '${args[0]}'s refusal is announced on stderr with the guard marker`);
+  }
+  // `claims` (a read-only git/node lint, not a dotnet invocation) is DELIBERATELY not guarded — a
+  // placeholder/non-worktree path is a legitimate way to exercise its wiring, and it fails (or
+  // degrades) for its own reason, never the guard's. Confirm the narrower scope is pinned, not just
+  // documented.
+  const rClaims = runBt(['claims', 'SomeNonexistentWorktree'], outsideH);
+  ok(!rClaims.stderr.includes('WORKTREE-GUARD'), 'KI-E134: `claims` (a read-only lint, no dotnet invocation) is NOT guarded — it fails for its own reason, never the guard\'s');
+
+  // A cwd INSIDE a (fake) state/worktrees/<id>/ tree — the guard passes; whatever happens next is a
+  // REAL dotnet failure (bogus project), never the guard's exit 65.
+  const insideParentH = jH(tdH(), 'bt134-fake-mount', 'state', 'worktrees');
+  mdH(insideParentH, { recursive: true });
+  const insideH = mkH(jH(insideParentH, 'FAKE-ITEM-'));
+  const rBuild = runBt(['build', 'NoSuchProject.sln'], insideH);
+  ok(rBuild.code !== 65 || !rBuild.stderr.includes('WORKTREE-GUARD'), 'KI-E134: from INSIDE a state/worktrees/<id>/ tree, the guard passes (a bogus project fails for its OWN reason, not the guard)');
+
+  // An explicit ABSOLUTE state/worktrees/... path is accepted even when cwd is OUTSIDE any worktree —
+  // this is the controller's own usage pattern (invoked from the factory root).
+  const rAbs = runBt(['build', jH(insideH, 'NoSuchProject.sln')], outsideH);
+  ok(rAbs.code !== 65 || !rAbs.stderr.includes('WORKTREE-GUARD'), 'KI-E134: an absolute state/worktrees/-rooted target passes the guard regardless of cwd — the controller\'s own invocation style stays supported');
+
+  rmH(outsideH, { recursive: true, force: true });
+  rmH(jH(tdH(), 'bt134-fake-mount'), { recursive: true, force: true });
+}
+
+// KI-E134 exec-smoke (ported from a host-mount session, 2026-09-04) — the plan-steps nudge must
+// ACTUALLY fire and feed into STEP mode, not just pin as source text (a TDZ/reference/shape crash
+// in a newly-added branch is invisible to `node --check` and to every source-text assertion). Live
+// motivation on the origin host: two items in one batch both died in PROSE mode with "no evidence
+// in the diff after one bounded amend" — a STEP-mode probe would have named the exact missing piece
+// instead of a vague prose match.
+{
+  const src134 = readFileSync(join(import.meta.dirname, '..', 'factory.js'), 'utf8');
+  let planCallCount134 = 0;
+  const { result: res134, calls: calls134 } = await execSmoke(src134, smokeBatch(), {
+    agentOverride: (prompt, opts) => {
+      if ((opts && opts.label) === 'SMOKE-CODE:planner') {
+        planCallCount134++;
+        if (planCallCount134 === 1) {
+          // the INITIAL call: commitment language present, but steps under the 2-entry floor.
+          return { rootCause: 'stub', approach: 'The fix MUST thread the CancellationToken through the repository call.', steps: [], files: [], testStrategy: 'stub', blastRadius: 'stub', ruleRisks: 'stub', recommendEscalate: false, recommendScopeStop: false };
+        }
+        // the NUDGE call: supply real decomposition.
+        return { steps: ['Thread the CancellationToken through OrderService.SubmitAsync', 'Thread it through the downstream repository call', 'Add a regression test asserting cancellation propagates'], note: 'decomposed on request' };
+      }
+      return undefined;
+    },
+  });
+  eq(planCallCount134, 2, 'KI-E134 exec-smoke: a plan with commitment language and no steps triggers exactly ONE nudge call (never a loop)');
+  const plannerCalls134 = calls134.filter((c) => c.label === 'SMOKE-CODE:planner');
+  eq(plannerCalls134.length, 2, 'KI-E134 exec-smoke: exactly two SMOKE-CODE:planner calls are recorded — the initial plan plus the one nudge follow-up');
+  const by134 = Object.fromEntries((res134.results || []).map((r) => [r.id, r]));
+  ok(by134['SMOKE-CODE'] && by134['SMOKE-CODE'].gateDetails && by134['SMOKE-CODE'].gateDetails['probe:plan-commitment-scan'] && by134['SMOKE-CODE'].gateDetails['probe:plan-commitment-scan'].headline.includes('[STEP mode]'),
+    'KI-E134 exec-smoke: the nudged steps feed into the SAME plan object the probe reads — STEP mode engages instead of falling through to the weaker PROSE mode');
+  ok(!(res134.results || []).some((r) => String(r.note || '').startsWith('runItem threw')), 'KI-E134 exec-smoke: no runItem crash (KI-L36 class) — the new branch is shape-safe under the Workflow AsyncFunction execution model');
+
+  // The common case (default stub already returns 2+ steps, no commitment language needed to trigger
+  // it either way) must NOT spend a second call — every pre-existing exec-smoke call-count assertion
+  // elsewhere in this suite already regression-covers this: if the nudge over-fired on an unrelated
+  // item/lane, those counts would shift and this suite would fail elsewhere.
+  ok(!/if \(plan && item\.priorAttempt\)/.test(src134), 'KI-E134: sanity — the nudge gate reads freshPlanCall, not a re-derived priorAttempt check (avoids two sources of truth for the same condition)');
+  ok(/const freshPlanCall = !\(item\.priorAttempt && item\.priorAttempt\.plan\)/.test(src134), 'KI-E134: a KI-E69 reused plan is excluded from the nudge — re-asking about a PRIOR call\'s authorship makes no sense, and reuse exists specifically to skip the planner call for cost');
+
+  // Ported to the opencode runtime too (the schema-parity gate — Fix #20 in opencode/_selftest.mjs —
+  // requires every factory.js *_SCHEMA to have a byte-identical schemas.mjs counterpart, COMMENT_SCHEMA
+  // being the one sanctioned exception for a genuine architectural reason that does not apply here).
+  // That runtime has no KI-E69 reuse concept at all (grepped: zero priorAttempt references), so every
+  // plan call there is inherently "fresh" — no equivalent guard needed on that side.
+  const rt134 = readFileSync(join(import.meta.dirname, '..', 'opencode', 'runtime.mjs'), 'utf8');
+  const sc134 = readFileSync(join(import.meta.dirname, '..', 'opencode', 'schemas.mjs'), 'utf8');
+  ok(sc134.includes('export const PLAN_STEPS_NUDGE_SCHEMA') && sc134.includes('PLAN_SCHEMA, PLAN_STEPS_NUDGE_SCHEMA,'), 'KI-E134: opencode/schemas.mjs exports PLAN_STEPS_NUDGE_SCHEMA and registers it in SCHEMAS');
+  ok(/if \(phase === 'plan-steps-nudge'\)/.test(rt134), 'KI-E134: opencode/runtime.mjs dispatches the nudge as its own phase (this runtime is an external-dispatch state machine, not a single async function — a new phase is the correct shape, not a nested await)');
+  ok(/if \(normalizePlanSteps\(plan\.steps\)\.length < 2 && hasPlanCommitmentLanguage/.test(rt134), 'KI-E134: opencode\'s plan-result handler checks the SAME condition as factory.js before routing to the nudge phase');
+  ok(/progress\.phase = 'plan-steps-nudge'/.test(rt134) && /if \(phaseKey === 'plan-steps-nudge'\)/.test(rt134), 'KI-E134: the nudge phase is both entered (on the plan side) and its result consumed (merged into progress.plan) — not a dead-end phase');
+  ok(rt134.indexOf("if (phaseKey === 'plan-steps-nudge')") > rt134.indexOf("if (phaseKey === 'plan')"), 'KI-E134: the nudge result-handler is wired AFTER the plan result-handler in source order, matching the phase transition direction');
+}
+
 console.log(`\nself-test: ${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

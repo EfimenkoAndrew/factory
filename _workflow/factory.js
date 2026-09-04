@@ -95,6 +95,12 @@ const FINDING = { type: 'object', additionalProperties: false, required: ['sever
 // prior-attempt plan authored before this field existed, both fall through to the original KI-E87
 // PROSE mode unchanged — the silent-no-op posture buildDocMap/solutionFor/precedent already use.
 const PLAN_SCHEMA = { type: 'object', additionalProperties: false, required: ['rootCause', 'approach', 'recommendScopeStop', 'recommendEscalate'], properties: { rootCause: { type: 'string' }, approach: { type: 'string' }, steps: { type: 'array', items: { type: 'string' } }, files: { type: 'array', items: { type: 'string' } }, testStrategy: { type: 'string' }, blastRadius: { type: 'string' }, ruleRisks: { type: 'string' }, recommendEscalate: { type: 'boolean' }, recommendScopeStop: { type: 'boolean' } } }
+// KI-E134 — the narrow follow-up ask fired when a fresh plan's own approach/blastRadius carries
+// commitment language ("MUST"/"required to") but `steps` came back missing/under-decomposed: a
+// SINGLE cheap bounded call (never a second full plan), same shape as the "one bounded amend"
+// pattern used everywhere else in this pipeline. `note` is required so a planner that maintains the
+// omission is genuinely atomic must say so explicitly, not just return an empty array silently.
+const PLAN_STEPS_NUDGE_SCHEMA = { type: 'object', additionalProperties: false, required: ['steps', 'note'], properties: { steps: { type: 'array', items: { type: 'string' } }, note: { type: 'string' } } }
 // KI-L37: verificationOnly (reFix only) — the test-author attests every prior finding is already
 // addressed in the CURRENT tree (or explicitly out of scope) and no NEW red is possible; the item
 // skips the fixer and proceeds to verify + gates on the standing prior-round red proof.
@@ -620,10 +626,33 @@ async function runItem(item) {
   if (R.planner) {
     // KI-E69: reuse a prior (killed) attempt's plan when its two control-flow fields are provably
     // safe to stand in for (lib/prior-attempt.mjs) — skips the planner call entirely on a relaunch.
+    const freshPlanCall = !(item.priorAttempt && item.priorAttempt.plan)
     plan = (item.priorAttempt && item.priorAttempt.plan) || await call('planner', R.planner, PLAN_SCHEMA, null, 'Plan')
     res.artifacts.plan = 'state/items/' + id + '/plan.md'
     if (plan && plan.recommendScopeStop) return await frameAndBlock('planner scope-stop — ' + (plan.ruleRisks || plan.approach || ''))
     if (plan && plan.recommendEscalate) item._escalate = true
+    // KI-E134 — PLAN-DRIFT PREVENTION at the source, not just detection downstream. A plan whose OWN
+    // approach/blastRadius text uses commitment language ("MUST"/"required to") is describing
+    // substantive, individually-checkable work — but if `steps` came back missing/under-decomposed,
+    // that work never gets machine-checked against the diff: PROSE mode's hasPlanCommitmentLanguage
+    // prefilter (below, pre-band) is a much coarser keyword heuristic than STEP mode's per-step
+    // evidence check, and PROSE mode's own bounded amend works from vague prose rather than a
+    // concrete target — live, this session: AUDIT-M11 and WEBSHARED-M3 both died in PROSE mode with
+    // "no evidence in the diff after one bounded amend", where a STEP-mode probe would have named the
+    // exact missing piece instead. Only for a FRESH call (never a KI-E69 reused plan — re-asking about
+    // someone else's prior-attempt authorship makes no sense, and reuse exists specifically to skip
+    // the planner call for cost) and only when the mismatch is real: skip the extra call entirely for
+    // the common case (no commitment language, or steps already present).
+    if (plan && freshPlanCall && normalizePlanSteps(plan.steps).length < 2
+        && hasPlanCommitmentLanguage((plan.approach || '') + ' ' + (plan.blastRadius || ''))) {
+      const nudge = await call('planner', R.planner, PLAN_STEPS_NUDGE_SCHEMA,
+        'Your own approach/blastRadius above uses commitment language ("MUST" / "required to") describing substantive, checkable work, but you did not decompose it into `steps` (brief point 6) — or decomposed fewer than 2. Re-read that point now. Return ONLY: `steps` — 2-8 ordered, individually checkable one-sentence steps covering the commitments your own approach/blastRadius text just made; leave it empty ONLY if the work is genuinely one atomic edit despite the commitment wording. `note` (required either way) — if steps is non-empty, one sentence is fine; if empty, EXPLICITLY justify why the commitment language does not actually decompose (do not just restate the approach).',
+        'Plan')
+      if (nudge && Array.isArray(nudge.steps) && normalizePlanSteps(nudge.steps).length >= 2) {
+        plan = Object.assign({}, plan, { steps: nudge.steps })
+        res.planStepsNudged = true
+      }
+    }
   }
 
   // 2. test-author -> RED
