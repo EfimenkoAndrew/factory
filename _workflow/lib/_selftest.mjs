@@ -3691,5 +3691,34 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
   ok(rt134.indexOf("if (phaseKey === 'plan-steps-nudge')") > rt134.indexOf("if (phaseKey === 'plan')"), 'KI-E134: the nudge result-handler is wired AFTER the plan result-handler in source order, matching the phase transition direction');
 }
 
+// KI-E146 (ported from a host-mount session) — the KI-E89 unclaimed-drift sweep now also runs at fold
+// time, not just when an operator remembers to invoke `main-check` by hand. Source-text pin (matching
+// the established rigor for this exact class of WARN-only, never-blocking fold-time detection aid —
+// cmdMainCheck's own KI-E89 wiring above is pinned the same way, not with a filesystem-fixture
+// integration test): confirms the new block exists inside cmdFold, wires the real REPO_ROOT/MOUNT_REL
+// through the same pure helper unclaimedMainDrift (no hand-rolled reimplementation), aggregates
+// claimedPaths from every item's OWN main-snapshot.json (not just the one item cmdMainCheck was asked
+// about), fails safe (never crashes a fold on a missing/corrupt items dir), and runs BEFORE
+// foldResults so a drifting fold's output is never truncated by an exception in the new code.
+{
+  const drv146 = readFileSync(join(import.meta.dirname, '..', 'driver.mjs'), 'utf8');
+  const cmdFoldStart146 = drv146.indexOf('function cmdFold(file, flags)');
+  ok(cmdFoldStart146 !== -1, 'KI-E146: cmdFold still exists under its expected signature');
+  const foldResultsCall146 = drv146.indexOf('const { applied, rejected, skipped } = foldResults(ledger, arr)', cmdFoldStart146);
+  ok(foldResultsCall146 !== -1 && foldResultsCall146 > cmdFoldStart146, 'KI-E146: sanity — foldResults call still exists after cmdFold\'s start');
+  const cfBody146 = drv146.slice(cmdFoldStart146, foldResultsCall146 + 100);
+  ok(cfBody146.includes('KI-E146'), 'KI-E146: the new block is labeled so a reader/grep can find why fold now scans for unclaimed drift');
+  const ki146Idx = cfBody146.indexOf('KI-E146');
+  const foldResultsIdxInBody = cfBody146.indexOf('const { applied, rejected, skipped } = foldResults(ledger, arr)');
+  ok(ki146Idx !== -1 && foldResultsIdxInBody !== -1 && ki146Idx < foldResultsIdxInBody, 'KI-E146: the unclaimed-drift sweep runs BEFORE foldResults is applied, not after');
+  ok(cfBody146.includes('unclaimedMainDrift(dirtyMainPaths(REPO_ROOT), MOUNT_REL, claimedPaths)'), 'KI-E146: reuses the real dirtyMainPaths(REPO_ROOT)/MOUNT_REL + the pure unclaimedMainDrift helper — same call shape as cmdMainCheck (KI-E89), no bespoke reimplementation');
+  ok(/for \(const d of readdirSync\(itemsRoot,\s*\{\s*withFileTypes:\s*true\s*\}\)\)/.test(cfBody146), 'KI-E146: claimedPaths is aggregated by scanning EVERY item dir, not just a single id — this is the genuinely new part vs cmdMainCheck (which is only ever asked about one id at a time)');
+  ok(/readJson\(join\(itemsRoot, d\.name, 'main-snapshot\.json'\)\)/.test(cfBody146), 'KI-E146: reads each item\'s OWN main-snapshot.json (the same claim-time snapshot KI-L65/KI-E50 already trust) rather than re-deriving claimed paths from the ledger or items[].files');
+  ok(/catch\s*\{\s*\/\*\s*no snapshot for this item/.test(cfBody146), 'KI-E146: a missing/unreadable snapshot for one item contributes nothing and does not abort the aggregation for the rest — matches cmdMainCheck\'s own per-item tolerance');
+  ok(/try\s*\{[\s\S]*unclaimedMainDrift\(dirtyMainPaths\(REPO_ROOT\), MOUNT_REL, claimedPaths\)[\s\S]*\}\s*catch\s*\{\s*\/\*\s*detection aid only/.test(cfBody146), 'KI-E146: the entire sweep is wrapped in try/catch — a fold must never fail (or worse, half-apply) because this new, purely-observational aid threw');
+  ok(cfBody146.includes('MAIN-DRIFT unclaimed (KI-E89/E146)'), 'KI-E146: the fold-time warning carries BOTH ids (distinct from cmdMainCheck\'s bare KI-E89 label) so a reader can tell which call site caught it');
+  ok(!cfBody146.includes('unlinkSync(') && !cfBody146.includes('rmSync(') && !/execSync\(['"]rm /.test(cfBody146), 'KI-E146: still never auto-repairs (KI-E89\'s own documented reason: cannot distinguish agent contamination from an operator\'s unrelated WIP) — detection only, no deletion path exists in this block');
+}
+
 console.log(`\nself-test: ${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

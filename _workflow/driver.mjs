@@ -882,6 +882,34 @@ function cmdFold(file, flags) {
       if (committedDrift.length) console.log(`  ℹ COMMITTED DELIVERY ${r.id} (KI-E35): item files changed in main via HUMAN commits during the run window (clean per git status) — likely the operator committed this item's output; verify intent, no repair needed:\n` + committedDrift.map((d) => `      ${d.file} (${d.was} -> ${d.now})`).join('\n'));
     } catch { /* detection aid only */ }
   }
+  // KI-E146 (ported from a host-mount session) — the KI-E89 unclaimed-drift sweep, run here for the
+  // first time. Every prior invocation site was `cmdMainCheck`, a command an operator has to remember
+  // to run manually; `fold` runs automatically every single cycle and, until now, never looked for
+  // this class at all — the per-item loop just above can only ever check a path some item's OWN
+  // snapshot declared, so a stray NEW file an agent creates ad-hoc (never in any files[]) is invisible
+  // to it by construction. Live cost of the gap on the origin host: a stray file left by one item sat
+  // unreported through that cycle's own fold, then poisoned an entire SEPARATE, unrelated batch's
+  // main-check sweep the NEXT cycle (KI-E144) — a whole cycle of silence in between during which
+  // nobody had reason to run `main-check` by hand. This closes the "just happened not to look" window
+  // by surfacing it at the ONE checkpoint that always runs, not the one that sometimes does.
+  // Deliberately still NEVER auto-repaired, same as `cmdMainCheck`'s own posture (KI-E89's header
+  // comment is explicit about why: an unclaimed path could be agent contamination OR an operator's
+  // own unrelated work-in-progress sitting in the same tree, and there is no snapshot to prove which
+  // — auto-deleting the wrong guess would destroy real, uncommitted human work). Read-only, WARN-only,
+  // same posture as every other detection aid in this function.
+  try {
+    const itemsRoot = abs(cfg.paths.items);
+    const claimedPaths = new Set();
+    for (const d of readdirSync(itemsRoot, { withFileTypes: true })) {
+      if (!d.isDirectory()) continue;
+      try {
+        const snapFiles = (readJson(join(itemsRoot, d.name, 'main-snapshot.json')) || {}).files || {};
+        for (const f of Object.keys(snapFiles)) claimedPaths.add(f);
+      } catch { /* no snapshot for this item, or unreadable — contributes nothing, matches cmdMainCheck */ }
+    }
+    const unclaimed = unclaimedMainDrift(dirtyMainPaths(REPO_ROOT), MOUNT_REL, claimedPaths);
+    if (unclaimed.length) console.log(`  ⚠ MAIN-DRIFT unclaimed (KI-E89/E146): main-tree path(s) dirty outside the factory mount with NO item snapshot to check against, found during fold — could be leaked factory-worktree contamination (no item has ever claimed this path) OR the operator's own unrelated work-in-progress; this fold cannot tell which, so it surfaces it rather than silently missing the contamination case AGAIN. Eyeball each (never auto-repaired — see KI-E89):\n` + unclaimed.map((p) => `      ${p}`).join('\n'));
+  } catch { /* detection aid only */ }
   const { applied, rejected, skipped } = foldResults(ledger, arr);
   // KI-L41 — convergence bonus BEFORE the exhaustion sweep: a FAILED round whose blocking-finding
   // set is strictly narrower than the prior round's (fewer findings, max severity not worse — both
