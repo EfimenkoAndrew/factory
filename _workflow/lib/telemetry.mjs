@@ -93,7 +93,16 @@ export function stageForArtifact(name) {
 // stray RESULT.md claiming "false positive — already fixed, no action taken" from dead run #1 was
 // read mid-run #2; two gates burned findings on the debris). Pure classification over FILE names —
 // the driver owns directory filtering and the actual move (`resume --quarantine`).
-export const CONTROL_ARTIFACTS = ['feedback.md', 'last-failure.md', 'main-snapshot.json', 'review-pack.md', 'baseline-raw.txt'];
+// KI-E137/KI-E140 (ported from a host-mount session): progress.json (incremental mid-pipeline
+// checkpoints) and launch-meta.json (recorded {taskId, runId} for the KI-E140 task-liveness reminder)
+// are control files a LIVE attempt still needs — caught live on the origin host: the very first
+// `resume` run after launch-meta.json existed flagged it as non-canonical debris, meaning the
+// documented `resume --quarantine` step would have swept away the ONE file the KI-E140 reminder
+// exists to surface, and a stale progress.json missing this entry would equally have silently broken
+// KI-E137's diagnostics and KI-E139's gate-band reuse the next time a real relaunch ran quarantine
+// first. progress.json's own omission here was a gap in this repo's own KI-E137 port, not caught
+// until KI-E140 (this same commit) needed launch-meta.json added alongside it — both close together.
+export const CONTROL_ARTIFACTS = ['feedback.md', 'last-failure.md', 'main-snapshot.json', 'review-pack.md', 'baseline-raw.txt', 'progress.json', 'launch-meta.json'];
 export function nonCanonicalArtifacts(names) {
   return (names || []).filter((n) => !stageForArtifact(n) && !CONTROL_ARTIFACTS.includes(n));
 }

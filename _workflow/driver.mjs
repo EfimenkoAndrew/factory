@@ -1033,6 +1033,35 @@ function cmdFold(file, flags) {
   if (rejected.length) console.log('  rejected:', JSON.stringify(rejected));
 }
 
+// KI-E140 (ported from a host-mount session) — record what launched, for the ONE thing the driver
+// structurally cannot check itself: whether a PRIOR attempt's Workflow task is actually dead before a
+// NEW one relaunches into the SAME worktree path. Only the controller session holds a
+// TaskOutput/TaskStop handle on its own launches — the driver is a separate Node process with no
+// visibility into the harness's task registry — so this command exists purely so the controller can
+// hand the driver something to remember and SURFACE later (cmdResume's KI-E140 reminder), instead of
+// relying on the controller's own memory across a session boundary. Best-effort, read-nothing,
+// writes-only: a bad flag combination logs and no-ops rather than throwing, since this command sits
+// on the hot path right after a real Workflow launch and must never be the reason a controller loses
+// track of what it just started.
+function cmdMarkLaunched(flags) {
+  const cfg = loadConfig();
+  const ids = (flags.ids || '').split(',').map((s) => s.trim()).filter(Boolean);
+  const taskId = flags.taskId || flags.task || '';
+  const runId = flags.runId || flags.run || '';
+  if (!ids.length || !taskId) { console.log('mark-launched: need --ids a,b,c --taskId <id> (--runId <id> optional) — no-op'); return; }
+  const meta = { taskId, runId: runId || undefined, launchedAt: now() };
+  let n = 0;
+  for (const id of ids) {
+    try {
+      const dir = abs(join(cfg.paths.items, id));
+      if (!existsSync(dir)) { console.log(`  mark-launched ${id} SKIPPED — no state/items/${id}/ dir (not a claimed item)`); continue; }
+      writeJsonAtomic(join(dir, 'launch-meta.json'), meta);
+      n++;
+    } catch (e) { console.log(`  mark-launched ${id} SKIPPED (${e && e.message})`); }
+  }
+  console.log(`mark-launched: recorded taskId=${taskId}${runId ? ` runId=${runId}` : ''} for ${n}/${ids.length} item(s) — cmdResume will surface this before a relaunch (KI-E140)`);
+}
+
 function cmdResume(flags) {
   const cfg = loadConfig();
   const graph = loadGraph(abs(cfg.paths.graph));
@@ -1108,6 +1137,23 @@ function cmdResume(flags) {
         }
         if (committed.length) console.log(`    ℹ MAIN-GUARD ${id} (KI-E41/KI-E35): item files changed in main via HUMAN commits since claim (clean per git status) — verify the relaunch is still meaningful against the new main:\n` + committed.map((d) => `        ${d.file}`).join('\n'));
       } catch (e) { console.log(`    MAIN-GUARD ${id} SKIPPED (${e && e.message}) — treat as UNCHECKED, not clean (KI-E41; never blocks the relaunch listing)`); }
+    }
+    // KI-E140 (ported from a host-mount session) — TASK-LIVENESS REMINDER. A relaunch issued before a
+    // JUST-killed attempt's task is confirmed torn down risks two live attempts racing the SAME
+    // worktree path. The driver cannot check this itself — only the controller session holds a
+    // TaskOutput/TaskStop handle — so this is a REMINDER, mechanically surfaced instead of left to
+    // memory: if the controller recorded {runId, taskId} to state/items/<id>/launch-meta.json right
+    // after ITS OWN prior launch, print it here so the relaunch line is never copied without a
+    // liveness check. Read-only; a missing file (nothing recorded, or an old session that predates
+    // this convention) is silent, never a warning — this is a best-effort aid for controller
+    // behaviour this file cannot enforce, not a detector with a false-negative to worry about.
+    for (const id of relaunchIds) {
+      try {
+        const metaPath = abs(join(cfg.paths.items, id, 'launch-meta.json'));
+        if (!existsSync(metaPath)) continue;
+        const meta = readJson(metaPath);
+        if (meta && meta.taskId) console.log(`    ⚠ TASK-LIVENESS (KI-E140) ${id}: a prior launch recorded taskId=${meta.taskId}${meta.runId ? ` runId=${meta.runId}` : ''}${meta.launchedAt ? ` (launched ${meta.launchedAt})` : ''} — verify it is NOT still running (TaskOutput ${meta.taskId} block:false) BEFORE relaunching into the same worktree.`);
+      } catch (e) { console.log(`    TASK-LIVENESS ${id} SKIPPED (${e && e.message}) — treat as UNCHECKED (KI-E140; never blocks the relaunch listing)`); }
     }
     // KI-E42 — killed-run artifact quarantine. A dead attempt's improvised artifacts (cycle 47: a stray
     // RESULT.md claiming "false positive — already fixed, no action taken") survive into the relaunch's
@@ -2910,6 +2956,7 @@ function dispatch(cmd, flags, rest) {
     case 'decisions-digest': return cmdDecisionsDigest(); // KI-E24 — ranked owner-decision digest (severity x age + one-line reply format)
     case 'realinfra-lint': return cmdRealinfraLint(); // KI-L42 — report realInfra=true items with no .cs (KI-L38 false-fail shape)
     case 'resume': return cmdResume(flags);
+    case 'mark-launched': return cmdMarkLaunched(flags); // KI-E140 — record {taskId, runId} for a just-launched Workflow, surfaced later by resume's task-liveness reminder
     case 'progress': return cmdReport('progress');
     case 'burndown': return cmdReport('burndown');
     case 'cost': return cmdReport('cost');
@@ -2930,7 +2977,7 @@ function dispatch(cmd, flags, rest) {
     case 'telemetry-report': return cmdTelemetryReport(flags); // KI-E7 / spine AD-9 — evaluation report from events.jsonl
     case 'main-check': return cmdMainCheck(rest, flags); // KI-E50 — mid-band main-drift check (read-only, warn-only); KI-E82 — --all sweep
     default:
-      console.log('commands: init | status | select | claim | reset | fold | reconstruct | recover | resume | progress | burndown | cost | escalations | decisions-digest | group | suggest | cycle | sweep | sweep-fold | gc | preflight | graph-audit | realinfra-lint | report-cycle | ingest | merge-graph | controller | telemetry-report | main-check | worktree-add|remove|list');
+      console.log('commands: init | status | select | claim | reset | fold | reconstruct | recover | resume | mark-launched | progress | burndown | cost | escalations | decisions-digest | group | suggest | cycle | sweep | sweep-fold | gc | preflight | graph-audit | realinfra-lint | report-cycle | ingest | merge-graph | controller | telemetry-report | main-check | worktree-add|remove|list');
   }
 }
 

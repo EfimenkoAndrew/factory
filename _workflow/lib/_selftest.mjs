@@ -2891,6 +2891,13 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
   // factory.js/agents/*.md — it genuinely IS agent improvisation and must stay flagged.
   eq(T42.nonCanonicalArtifacts(['leftover-raw.txt', 'leftover-final.txt', 'plan.md']), ['leftover-final.txt'], 'KI-E71: leftover-raw.txt is canonical (KI-D12 probe output); leftover-final.txt is genuine improvisation and still flags');
   eq(T42.stageForArtifact('leftover-raw.txt'), 'probe:leftover-scan', 'KI-E71: leftover-raw.txt maps to the probe:leftover-scan stage');
+  // KI-E137/KI-E140 (ported from a host-mount session — live there: the very first `resume` run after
+  // launch-meta.json existed flagged it as non-canonical debris — the documented `resume --quarantine`
+  // step would have swept away the ONE file the KI-E140 task-liveness reminder exists to surface, and
+  // (had a real relaunch run quarantine first) equally have broken KI-E137's diagnostics / KI-E139's
+  // gate-band reuse the next time progress.json was needed. Both are control files a LIVE attempt
+  // still needs.
+  eq(T42.nonCanonicalArtifacts(['progress.json', 'launch-meta.json', 'RESULT.md']), ['RESULT.md'], 'KI-E137/KI-E140: progress.json and launch-meta.json are canonical control files, never debris — only genuine improvisation still flags');
   const drvText42 = readFileSync(join(import.meta.dirname, '..', 'driver.mjs'), 'utf8');
   ok(/resume --quarantine/.test(drvText42) && /flags\.quarantine/.test(drvText42), 'KI-E42: resume detects debris always, moves only on --quarantine');
   ok(/MAIN-GUARD/.test(drvText42) && /KI-E41/.test(drvText42), 'KI-E41: resume diffs main-snapshot.json for relaunch candidates before printing the launch lines');
@@ -4010,6 +4017,31 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
   // exec-smoke test in this file) — is unaffected: already proven by the KI-E137 block above
   // (byStage137('post-gates').length === 6 with a plain smokeBatch() carrying no priorProgress
   // anywhere), cited here for cross-reference rather than re-proven.
+}
+
+// KI-E140 (ported from a host-mount session) — TASK-LIVENESS REMINDER. The driver cannot check
+// whether a prior Workflow task is actually dead before a relaunch reuses its worktree path (only the
+// controller session holds a TaskOutput/TaskStop handle) — this is a best-effort recording +
+// surfacing mechanism, not a detector, so its tests are source-text (matching this file's established
+// convention for driver.mjs: no test anywhere in this file spawns driver.mjs as a live subprocess or
+// imports it directly — it is a bare CLI script with no exports and a top-level main(), so
+// source-text verification is the established, safe way this file tests driver.mjs logic).
+{
+  const drv140 = readFileSync(join(import.meta.dirname, '..', 'driver.mjs'), 'utf8');
+  ok(drv140.includes("case 'mark-launched': return cmdMarkLaunched(flags);"), 'KI-E140: mark-launched is wired into the command dispatch table');
+  ok(drv140.includes('function cmdMarkLaunched(flags)'), 'KI-E140: cmdMarkLaunched is defined');
+  const mlBody = drv140.slice(drv140.indexOf('function cmdMarkLaunched'), drv140.indexOf('function cmdMarkLaunched') + 1800);
+  ok(mlBody.includes("if (!ids.length || !taskId)") && mlBody.includes('no-op'), 'KI-E140: missing --ids or --taskId is a safe no-op with a clear message, never a throw — this runs right after a real Workflow launch and must never be the reason a controller loses track of what it just started');
+  ok(mlBody.includes('if (!existsSync(dir))') && mlBody.includes('SKIPPED'), 'KI-E140: an id with no state/items/<id>/ dir (not actually a claimed item) is skipped per-id, never a hard failure for the rest of the batch');
+  ok(mlBody.includes("writeJsonAtomic(join(dir, 'launch-meta.json'), meta)"), 'KI-E140: writes via the SAME atomic-write helper every other state file in this codebase uses, not a raw writeFileSync');
+  ok(mlBody.includes('launchedAt: now()'), 'KI-E140: stamps a real timestamp (Node has no KI-E2 Date restriction — that only applies inside factory.js\'s Workflow-runtime execution) for diagnostic value alongside the taskId/runId');
+
+  // The reader half, inside cmdResume's relaunch-candidate loop (KI-E41's MAIN-GUARD sibling).
+  ok(drv140.includes('KI-E140') && drv140.includes("launch-meta.json"), 'KI-E140: cmdResume reads launch-meta.json back');
+  const tlBlock = drv140.slice(drv140.indexOf('TASK-LIVENESS REMINDER'), drv140.indexOf('KI-E42 — killed-run artifact quarantine'));
+  ok(tlBlock.includes('if (!existsSync(metaPath)) continue;'), 'KI-E140: a missing launch-meta.json (no prior session recorded one, or it predates this convention) is silent — never a warning, since this is a best-effort aid this file cannot enforce, not a detector with a false-negative to worry about');
+  ok(tlBlock.includes('verify it is NOT still running') && tlBlock.includes('block:false'), 'KI-E140: the printed reminder names the EXACT check to run (TaskOutput with block:false) — not just "be careful"');
+  ok(tlBlock.includes("} catch (e)") && tlBlock.includes('never blocks the relaunch listing'), 'KI-E140: a read failure degrades to UNCHECKED and never blocks the relaunch line, matching KI-E41\'s own MAIN-GUARD posture exactly');
 }
 
 console.log(`\nself-test: ${pass} passed, ${fail} failed`);
