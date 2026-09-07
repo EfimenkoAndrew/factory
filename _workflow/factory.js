@@ -1,6 +1,6 @@
 export const meta = {
   name: 'impl-factory',
-  description: 'AI Implementation Factory control plane. Receives a batch of READY work items (audit findings / stories) + agent templates + per-item model routing via args (emitted by driver.mjs select), then drives each item through the implement-and-auto-evaluate lifecycle: (plan) -> test-author(red) -> fixer -> verify(build+test) -> RED-proof marker probe (disk-authoritative FACTORY::RED:: re-check, pre-band, KI-E83) -> early edge-scan (pre-band edge-case hunt + one bounded amend, every code item) -> acceptance-scan (pre-band clause-coverage probe + one bounded amend, KI-E18) -> plan-commitment scan (pre-band plan-vs-diff self-consistency probe + one bounded amend, KI-E87; STEP mode probes the planner\'s own steps[] one-by-one when present, PROSE mode falls back to the commitment-language prefilter, KI-E101) -> cheap haiku leftover-scan (pre-band deferral/tech-debt lint, KI-D12) -> comment-scan (host-policy-gated zero-new-comments lint, KI-E59) -> ledger-anchor scan (duplicate/contradictory standards-ledger anchors, KI-E91) -> root-cause touch probe (pre-band P9: the diff must change a non-test file, KI-E104) -> the review stage (5 role gates + applicable BMAD review-named flows: code/adversarial/testreview + editorial) as separate adversarial subagents -> refuter -> scoped re-audit -> integrate. Worktree-isolated, model-routed, low-concurrency under throttle. Each agent writes its artifact to disk; the factory returns compact per-item results (a transition path) the driver folds into the ledger (single writer, resumable). NEVER runs mutating git — fixes stay on a factory/<id> branch in a worktree for the human to commit.',
+  description: 'AI Implementation Factory control plane. Receives a batch of READY work items (audit findings / stories) + agent templates + per-item model routing via args (emitted by driver.mjs select), then drives each item through the implement-and-auto-evaluate lifecycle: (plan) -> test-author(red) -> fixer -> verify(build+test) -> RED-proof marker probe (disk-authoritative FACTORY::RED:: re-check, pre-band, KI-E83) -> early edge-scan (pre-band edge-case hunt + one bounded amend, every code item) -> acceptance-scan (pre-band clause-coverage probe + one bounded amend, KI-E18) -> plan-commitment scan (pre-band plan-vs-diff self-consistency probe + one bounded amend, KI-E87; STEP mode probes the planner\'s own steps[] one-by-one when present, PROSE mode falls back to the commitment-language prefilter, KI-E101) -> cheap haiku leftover-scan (pre-band deferral/tech-debt lint, KI-D12) -> comment-scan (host-policy-gated zero-new-comments lint, KI-E59) -> ledger-anchor scan (duplicate/contradictory standards-ledger anchors, KI-E91) -> root-cause touch probe (pre-band P9: the diff must change a non-test file, KI-E104) -> the review stage (5 role gates + applicable BMAD review-named flows: code/adversarial/testreview + editorial) as separate adversarial subagents -> refuter -> scoped re-audit -> integrate. Worktree-isolated, model-routed, low-concurrency under throttle. Each agent writes its artifact to disk; 4 incremental progress checkpoints (post-verify/post-preband/post-gates/post-reaudit, KI-E137) survive a mid-pipeline kill so a resumed item does not lose already-paid-for stages; the factory returns compact per-item results (a transition path) the driver folds into the ledger (single writer, resumable). NEVER runs mutating git — fixes stay on a factory/<id> branch in a worktree for the human to commit.',
   phases: [
     { title: 'Plan' }, { title: 'Test' }, { title: 'Fix' }, { title: 'Verify' },
     { title: 'EdgeScan' }, // KI-E12: the edge-case hunter runs EARLY (pre-band) for every code item; findings feed one bounded amend
@@ -930,6 +930,7 @@ async function runItem(item) {
     ? test.baselineFailures
     : (Array.isArray(verify.baselineFailures) ? verify.baselineFailures : [])
   res.transitions.push('GREEN', 'BUILT', 'TESTED')
+  await checkpointProgress(res, 'post-verify') // KI-E137 — kill-resilience: fix+verify survive a kill during the 8-scan pre-band chain
 
   // TESTED-pre. RED-PROOF MARKER PROBE (KI-E83) — the KI-E10 realInfra-marker-probe pattern applied
   //     to the sibling FACTORY::RED:: marker. The self-reported `test.red` check a few lines above
@@ -1299,6 +1300,8 @@ async function runItem(item) {
     }
   }
 
+  await checkpointProgress(res, 'post-preband') // KI-E137 — kill-resilience: fix+verify+the whole pre-band scan chain survive a kill during the (expensive) opus gate band. Placed here rather than immediately before phase('Gates') in the origin diff's exact spot because this repo's pre-band scan chain ends one scan earlier (ledger-anchor-scan, KI-E91) — no root-cause-touch-probe (KI-E104's probe form) exists here yet to checkpoint after; this is still the correct "last thing before the gate band" position for THIS repo's actual pipeline.
+
   // 5. REVIEW band — role gates (Band A) + method review-flows (Band B), EACH a separate adversarial
   //    subagent (never nested in the doing agent). 4 technical role gates + applicable method flows run
   //    pooled; the PO role gate runs LAST (functional acceptance after the technical band).
@@ -1391,6 +1394,7 @@ async function runItem(item) {
     if (res.gates['gate:po'] !== 'APPROVED') return finish('FAILED', 'PO gate not APPROVED')
   }
   res.transitions.push('GATED')
+  await checkpointProgress(res, 'post-gates') // KI-E137 — kill-resilience: the whole (expensive) opus gate band survives a kill during refute+re-audit
 
   // 6+7. REFUTE + RE-AUDIT — two INDEPENDENT adversarial passes over the SAME verified+gated diff: the refuter
   //      ATTACKS the fix (the in-memory-illusion skeptic); the multi-lens re-audit CONFIRMS the original finding
@@ -1438,6 +1442,7 @@ async function runItem(item) {
     return finish('FAILED', parts.join('; '))
   }
   res.transitions.push('REAUDITED')
+  await checkpointProgress(res, 'post-reaudit') // KI-E137 — kill-resilience: gates + refute + re-audit survive a kill during integrate
 
   // 8. escalate-tier stops here for human sign-off (auth/money/crypto/cross-service)
   if (item.autonomyTier === 'escalate' || item._escalate) {
@@ -1605,6 +1610,36 @@ if (DRY || !items.length) {
 // call routes through the global `limit` (makeLimiter(CONC)), so total concurrent agents stay <= CONC
 // across all items + stages — an item never holds a slot while awaiting another, so there is no
 // nested-limiter deadlock. Isolated per-item worktrees => zero cross-item contamination (Phase-2 finding 4).
+// KI-E137 (ported from a host-mount session) — INCREMENTAL PROGRESS CHECKPOINTING. checkpointResult
+// (KI-L40) below persists only the TERMINAL outcome, so a kill anywhere between `fix` and `integrate`
+// (10-25+ agent calls: the whole pre-band scan chain, then the entire opus gate band, then
+// refute+re-audit) left a resumed item with NOTHING — discarding every already-paid-for stage no
+// matter how close to done it was. `checkpointProgress(res, stage, extra)`, a sibling of
+// checkpointResult (same KI-D8 provenance framing, same CHECKPOINT_SCHEMA write contract, a SEPARATE
+// state/items/<id>/progress.json file so the terminal-checkpoint contract reconstruct/fold depend on
+// is untouched), is called at 4 phase boundaries: post-verify (before the pre-band scan chain
+// begins), post-preband (after it, before the gate band), post-gates (after GATED, before
+// refute+re-audit), post-reaudit (after REAUDITED, before integrate). Deliberately does NOT (yet)
+// feed relaunch reuse — progress.json is advisory/forensic only in this change, same posture
+// lib/prior-attempt.mjs already documents for why `verify` onward stays unreused; teaching a relaunch
+// to actually SKIP a stage whose progress.json proves current against the live worktree is a
+// separate, larger change (KI-E139's content-hash-fenced gate-band reuse) that touches the "gates
+// re-adjudicate every relaunch" trust boundary and needs its own review.
+async function checkpointProgress(res, stage, extra) {
+  try {
+    const path = itemsDir(res.id) + '/progress.json'
+    // toState is meaningless mid-pipeline (finish() hasn't run yet) — stamp an explicit sentinel so
+    // nothing downstream can mistake this for a terminal verdict (res.toState defaults to 'FAILED'
+    // at construction, which would otherwise silently misread as a real failure on disk). `extra`
+    // (KI-E139) merges IN ADDITION — e.g. reviewPackHash, the fencing token gate-band reuse needs —
+    // without ever touching the real `res` object itself (this snapshot is a throwaway clone).
+    const snapshot = Object.assign({}, res, { toState: 'IN_PROGRESS', progressStage: stage }, extra || {})
+    const json = JSON.stringify(snapshot)
+    const ck = await tryAgent('You are a checkpoint writer performing kill-resilience PROGRESS persistence (KI-E137, sibling of KI-L40) — you are NOT authoring or judging a result. This is routine machine-state bookkeeping of an automated build pipeline about its OWN run, MID-FLIGHT: the JSON below is an INCOMPLETE snapshot (stage "' + stage + '" just reached, not a final verdict) of automated build/test/review state about CODE in a scratch worktree — it represents no human signature, no official record, and no communication to any person (KI-D8 provenance). Write the EXACT text between the CHECKPOINT-BEGIN and CHECKPOINT-END markers (exclusive) to the file ' + path + ' (absolute path; overwrite if it exists) using the Write tool — byte-for-byte, ONE line, no reformatting, no added/removed fields, no markdown fences.\nCHECKPOINT-BEGIN\n' + json + '\nCHECKPOINT-END\nThen VERIFY it parses: run `node -e "JSON.parse(require(\'fs\').readFileSync(\'' + path + '\',\'utf8\'));console.log(\'CHECKPOINT-OK\')"` via Bash and confirm the output is CHECKPOINT-OK. If the parse fails, rewrite the file and re-verify. Return written=true ONLY after seeing CHECKPOINT-OK.', { label: res.id + ':progress:' + stage, phase: 'Checkpoint', model: 'claude-haiku-4-5', effort: 'low', schema: CHECKPOINT_SCHEMA }, claimTokensSilently)
+    if (!ck || ck.written !== true) log('[progress-checkpoint] ' + res.id + ' (' + stage + ') NOT persisted — a reconstruct/resume after a kill past this point will not see it')
+  } catch (e) { log('[progress-checkpoint] ' + res.id + ' (' + stage + ') failed: ' + (e && e.message)) }
+}
+
 // KI-L40 — kill-resilience checkpoint: the batch's results previously existed ONLY in this workflow's
 // memory until the final return, so a session kill mid-run lost every COMPLETED item's lifecycle and
 // the whole band re-ran (cycle 25 was launched 3×, ~2 dead bands). The moment an item resolves, a

@@ -52,6 +52,7 @@ import { loadPolicies, renderPolicies, POLICY_TEXT } from './lib/policy.mjs'; //
 import { emit as temit, deriveStageTimeline, readEvents, aggregateEvents, renderTelemetryReport, telemetryFile, GAP_FENCE_MS, nonCanonicalArtifacts, isRecoveryResultId, isDirectRecoveryFold } from './lib/telemetry.mjs';
 import { parseTokenUsageVector, buildTokenUsageQuery, tokenUsageSummary } from './lib/token-usage.mjs'; // KI-E66 — cache-hit-rate bridge
 import { loadPriorAttempt, priorAttemptStages } from './lib/prior-attempt.mjs'; // KI-E69 — cross-session plan/test/fix reuse on relaunch
+import { readProgressCheckpoint, summarizeProgress } from './lib/progress-checkpoint.mjs'; // KI-E137 — incremental mid-pipeline checkpoint read/summarize (resume/reconstruct diagnostics)
 import { lintWorktreeDocClaims } from './lib/doclint.mjs'; // F2 — phantom doc-path detection aid at fold (WARN-only)
 import { findLeftovers } from './lib/leftover-scan.mjs'; // KI-D12 — deferral/tech-debt lexicon detection aid at fold (WARN-only)
 import { findComments } from './lib/comment-scan.mjs'; // KI-E59 — no-new-comments detection aid at fold (WARN-only)
@@ -1057,6 +1058,13 @@ function cmdResume(flags) {
     }
     const ck = hasCheckpoint(r.id);
     console.log(`  ${r.id}: ${r.state}${wtState}${r.runLabel ? ` [label=${r.runLabel}]` : ''}${ck ? ' [checkpointed #' + cyc + ' — reconstruct+fold will pick it up]' : ''}`);
+    // KI-E137 (ported from a host-mount session): no FINAL checkpoint, but a mid-pipeline
+    // progress.json may still show how far this attempt got before dying — surfaced here so "must
+    // re-run" is never mistaken for "nothing happened".
+    if (!ck) {
+      const pr = readProgressCheckpoint(abs(join(cfg.paths.items, r.id)), r.id, cyc);
+      if (pr) console.log(`    ${summarizeProgress(pr)}`);
+    }
     if (!ck && r.runScript && existsSync(presolve(REPO_ROOT, r.runScript))) {
       const k = r.runScript; if (!relaunch.has(k)) relaunch.set(k, []); relaunch.get(k).push(r.id);
     }
@@ -1209,7 +1217,16 @@ function cmdReconstruct(flags) {
   const out = abs(join(String(cfg.root || '_bmad-output/ai-factory'), 'state', `results-cycle-${cyc}.json`));
   if (!results.length) {
     console.log(`reconstruct: NO cycle-${cyc} checkpoints found under ${cfg.paths.items} — nothing to fold`);
-    if (missing.length) console.log(`  in-flight with no checkpoint (must re-run): ${missing.join(', ')}`);
+    if (missing.length) {
+      console.log(`  in-flight with no FINAL checkpoint (must re-run): ${missing.join(', ')}`);
+      // KI-E137 (ported from a host-mount session): a missing result.json no longer means "nothing
+      // recoverable" — print each item's latest mid-pipeline progress.json (if any) so the operator
+      // can see how far a dead attempt got.
+      for (const id of missing) {
+        const pr = readProgressCheckpoint(join(itemsRoot, id), id, cyc);
+        if (pr) console.log(`    ${id}: ${summarizeProgress(pr)}`);
+      }
+    }
     return;
   }
   // KI-E44 — usage passthrough: checkpoints carry NO usage (factory.js reports the run total only at
@@ -1229,7 +1246,14 @@ function cmdReconstruct(flags) {
   for (const r of results) console.log(`  ${r.id}: ${r.toState} — ${String(r.note || '').slice(0, 110)}`);
   if (already.length) console.log(`  already folded (skipped): ${already.join(', ')}`);
   if (stale.length) console.log(`  stale checkpoints from other cycles (ignored): ${stale.join(', ')}`);
-  if (missing.length) console.log(`  in-flight with NO checkpoint — re-run only these after \`resume --reset-stale\`: ${missing.join(', ')}`);
+  if (missing.length) {
+    console.log(`  in-flight with NO FINAL checkpoint — re-run only these after \`resume --reset-stale\`: ${missing.join(', ')}`);
+    // KI-E137 (ported from a host-mount session): same mid-pipeline visibility as the zero-results branch above.
+    for (const id of missing) {
+      const pr = readProgressCheckpoint(join(itemsRoot, id), id, cyc);
+      if (pr) console.log(`    ${id}: ${summarizeProgress(pr)}`);
+    }
+  }
   console.log(`  next: node _bmad-output/ai-factory/_workflow/driver.mjs fold ${join(String(cfg.root || '_bmad-output/ai-factory'), 'state', `results-cycle-${cyc}.json`)}`);
 }
 

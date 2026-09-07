@@ -3852,5 +3852,107 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
   ok((resultDefault150.results || []).every((r) => r.tokensUsed === undefined), 'KI-E150 exec-smoke: with the default (non-incrementing) budget stub every OTHER test in this suite already relies on, tokensUsed stays undefined — this feature is fully inert until a host actually wires a real budget');
 }
 
+// KI-E137 (ported from a host-mount session) — INCREMENTAL PROGRESS CHECKPOINTING. checkpointResult
+// (KI-L40) persists ONLY the terminal outcome, chained via .then() AFTER runItem() fully resolves —
+// so a Workflow killed anywhere between `fix` and `integrate` (10-25+ agent calls: the whole pre-band
+// scan chain, then the entire opus gate band, then refute+re-audit) left reconstruct with NOTHING,
+// discarding every already-paid-for stage no matter how close to done it was.
+// NOTE on scope: this port deliberately lands WITHOUT KI-E139 (content-hash-fenced gate-band reuse),
+// which the origin repo shipped in the SAME commit — the post-preband checkpoint call here is the
+// plain 2-arg form (`checkpointProgress(res, 'post-preband')`), not yet the 3-arg form carrying a
+// reviewPackHash, since there is no PACK_HASH_SCHEMA/prebandHash probe here yet to produce one. E139
+// is a separate, later port; the assertion below is adapted to match this repo's CURRENT 2-arg call
+// rather than assuming the 3-arg shape the origin's own test (written after E137+E139 together) pins.
+{
+  const fac137 = readFileSync(join(import.meta.dirname, '..', 'factory.js'), 'utf8');
+  ok(/async function checkpointProgress\(res, stage, extra\)/.test(fac137), 'KI-E137: checkpointProgress is defined as its own function, mirroring checkpointResult (KI-L40) — extra merges additional fields into the snapshot only, never onto res itself');
+  const cp137body = fac137.slice(fac137.indexOf('async function checkpointProgress'), fac137.indexOf('async function checkpointResult'));
+  ok(cp137body.includes("toState: 'IN_PROGRESS'"), 'KI-E137: a progress snapshot is explicitly stamped IN_PROGRESS — never left at res\'s default \'FAILED\' toState (set at construction), which would otherwise misread as a real failure on disk');
+  ok(cp137body.includes('schema: CHECKPOINT_SCHEMA'), 'KI-E137: reuses the SAME CHECKPOINT_SCHEMA as the terminal checkpoint — one write contract, not two');
+  ok(cp137body.includes("itemsDir(res.id) + '/progress.json'"), 'KI-E137: writes a SEPARATE file from result.json — never clobbers the terminal-checkpoint contract reconstruct/fold already depend on');
+  ok(cp137body.includes('KI-D8 provenance'), 'KI-E137: carries the SAME KI-D8 provenance framing as checkpointResult — this JSON is machine bookkeeping, never a human signature or official record');
+
+  // Structural order: each checkpoint call sits AFTER its milestone res.transitions.push(...) and
+  // BEFORE the next expensive phase begins — source-text position as a proxy for control-flow order.
+  const iCallPV = fac137.indexOf("checkpointProgress(res, 'post-verify')");
+  const iCallPP = fac137.indexOf("checkpointProgress(res, 'post-preband')"); // this repo: still 2-arg (no KI-E139 hash yet)
+  const iCallPG = fac137.indexOf("checkpointProgress(res, 'post-gates')");
+  const iCallPR = fac137.indexOf("checkpointProgress(res, 'post-reaudit')");
+  ok(iCallPV > 0 && iCallPP > iCallPV && iCallPG > iCallPP && iCallPR > iCallPG, 'KI-E137: the four checkpoint call sites appear in pipeline order in the source (post-verify < post-preband < post-gates < post-reaudit)');
+  ok(iCallPG > fac137.indexOf("res.transitions.push('GATED')"), 'KI-E137: post-gates checkpoints AFTER GATED');
+  ok(iCallPR > fac137.indexOf("res.transitions.push('REAUDITED')"), 'KI-E137: post-reaudit checkpoints AFTER REAUDITED');
+
+  // Behavioural: EXECUTE the pipeline over the canonical 6-item synthetic batch (no overrides — every
+  // gate/probe stub is happy-path) and prove each checkpoint actually FIRES once per lane that reaches
+  // it, not merely present in the source (KI-L43's whole reason to exist — a TDZ/scope error in a
+  // newly added branch parses clean).
+  const { calls: c137 } = await execSmoke(fac137, smokeBatch(), {});
+  const byStage137 = (stage) => c137.filter((c) => new RegExp(':progress:' + stage + '$').test(c.label));
+  eq(byStage137('post-verify').length, 6, 'KI-E137 exec-smoke: post-verify fires once per lane in the 6-item batch (every lane\'s stub verify is green)');
+  eq(byStage137('post-preband').length, 6, 'KI-E137 exec-smoke: post-preband fires once per lane — every lane clears the pre-band scan chain on the happy-path stub');
+  eq(byStage137('post-gates').length, 6, 'KI-E137 exec-smoke: post-gates fires once per lane — every lane\'s gate band is all-APPROVED on the happy-path stub, none diverted to BLOCKED/FAILED before GATED');
+  eq(byStage137('post-reaudit').length, 6, 'KI-E137 exec-smoke: post-reaudit fires once per lane — refute+re-audit converge for every lane on the happy-path stub');
+
+  // Per-item RUNTIME order (stronger than the source-text position check above): for one representative
+  // FULL-band lane, the checkpoint calls interleave with the real milestone calls in the order the
+  // pipeline actually EXECUTED them — not just the order they happen to appear in the file.
+  const lane137 = c137.filter((c) => c.label.startsWith('SMOKE-CODE:'));
+  const firstIdx137 = (re) => lane137.findIndex((c) => re.test(c.label));
+  const iPV = firstIdx137(/^SMOKE-CODE:progress:post-verify$/);
+  const iPP = firstIdx137(/^SMOKE-CODE:progress:post-preband$/);
+  const iGateArch = firstIdx137(/^SMOKE-CODE:gate-architect$/);
+  const iGatePo = firstIdx137(/^SMOKE-CODE:gate-po$/);
+  const iPG = firstIdx137(/^SMOKE-CODE:progress:post-gates$/);
+  const iReaud = firstIdx137(/^SMOKE-CODE:(refuter|re-auditor)$/);
+  const iPR = firstIdx137(/^SMOKE-CODE:progress:post-reaudit$/);
+  const iInteg = firstIdx137(/^SMOKE-CODE:integrator$/);
+  ok([iPV, iPP, iGateArch, iGatePo, iPG, iReaud, iPR, iInteg].every((i) => i >= 0), 'KI-E137 exec-smoke (SMOKE-CODE lane): every expected milestone call is present in the recorded call trace');
+  ok(iPV < iPP && iPP < iGateArch && iGateArch < iGatePo && iGatePo < iPG && iPG < iReaud && iReaud < iPR && iPR < iInteg, 'KI-E137 exec-smoke (SMOKE-CODE lane): the 4 checkpoints interleave with the real pipeline calls in true RUNTIME call order — post-verify < post-preband < gate band < po gate < post-gates < refute/re-audit < post-reaudit < integrator');
+}
+
+// KI-E137 (read side, ported from a host-mount session) — lib/progress-checkpoint.mjs: parse/
+// validate/summarize a mid-pipeline progress.json, shared by cmdResume + cmdReconstruct so a killed
+// run's reached stage is visible instead of a bare "no checkpoint — must re-run". Deliberately
+// read-only/advisory (does not feed loadPriorAttempt or any relaunch-reuse decision — that is
+// KI-E139, not yet ported here).
+{
+  const PC = await import('./progress-checkpoint.mjs');
+  const pdir137 = mkdtempSync(join(tmpdir(), 'factory-progresscheckpoint-'));
+
+  eq(PC.readProgressCheckpoint(join(pdir137, 'nope'), 'X', 1), null, 'KI-E137: a nonexistent item dir -> null, no throw');
+
+  const d1 = join(pdir137, 'd1'); mkdirSync(d1, { recursive: true });
+  fsWrite(join(d1, 'progress.json'), JSON.stringify({ id: 'X', resultId: 'X#3', progressStage: 'post-gates', gates: { 'gate:architect': 'APPROVED', 'gate:developer': 'APPROVED' } }));
+  const pr1 = PC.readProgressCheckpoint(d1, 'X', 3);
+  ok(pr1 && pr1.progressStage === 'post-gates', 'KI-E137: a fresh, matching progress.json is read back');
+  const sum1 = PC.summarizeProgress(pr1);
+  ok(/stage 'post-gates' reached/.test(sum1) && /gate:architect=APPROVED/.test(sum1) && /refute\+re-audit, integrate/.test(sum1) && /not yet reusable on relaunch/.test(sum1), 'KI-E137: summarizeProgress names the stage, tallies recorded gates, states what remains, and is explicit that this is NOT (yet) relaunch-reusable');
+
+  eq(PC.readProgressCheckpoint(d1, 'X', 4), null, 'KI-E137: a progress.json for a DIFFERENT cycle (id#3 when asked for cycle 4) is stale — never reported as the current frontier (mirrors result.json\'s resultId fold-idempotency check, KI-B4)');
+  eq(PC.readProgressCheckpoint(d1, 'Y', 3), null, 'KI-E137: an id mismatch between the caller and the file\'s own `id` field -> null, never trusted on directory-name alone');
+
+  const d2 = join(pdir137, 'd2'); mkdirSync(d2, { recursive: true });
+  fsWrite(join(d2, 'progress.json'), '{ not valid json');
+  eq(PC.readProgressCheckpoint(d2, 'X', 3), null, 'KI-E137: malformed progress.json -> null, never a throw');
+
+  const d3 = join(pdir137, 'd3'); mkdirSync(d3, { recursive: true });
+  fsWrite(join(d3, 'progress.json'), JSON.stringify({ id: 'X', resultId: 'X#3', progressStage: 'some-future-stage', gates: {} }));
+  eq(PC.readProgressCheckpoint(d3, 'X', 3), null, 'KI-E137: an unrecognized progressStage (corrupt/future-version field) -> null, never guessed at');
+
+  const d4 = join(pdir137, 'd4'); mkdirSync(d4, { recursive: true });
+  fsWrite(join(d4, 'progress.json'), JSON.stringify({ id: 'X', resultId: 'X#3', progressStage: 'post-verify', gates: {} }));
+  const sum4 = PC.summarizeProgress(PC.readProgressCheckpoint(d4, 'X', 3));
+  ok(/no gate\/scan verdicts recorded yet/.test(sum4) && /pre-band scan chain, the gate band, refute\+re-audit, integrate/.test(sum4), 'KI-E137: post-verify (the earliest checkpoint) correctly reports the LONGEST remaining scope, and an empty gate map never fabricates a tally');
+
+  eq(PC.summarizeProgress(null), null, 'KI-E137: summarizeProgress(null) -> null, never throws or fabricates a line');
+
+  // Wiring: both driver commands actually CALL the read/summarize pair on the no-final-checkpoint
+  // path (never printed alongside a real checkpointed result).
+  const drv137 = readFileSync(join(import.meta.dirname, '..', 'driver.mjs'), 'utf8');
+  ok(drv137.includes("import { readProgressCheckpoint, summarizeProgress } from './lib/progress-checkpoint.mjs';"), 'KI-E137: driver.mjs imports the read-side module');
+  ok(drv137.includes('readProgressCheckpoint(abs(join(cfg.paths.items, r.id)), r.id, cyc)'), 'KI-E137: cmdResume\'s per-item inflight line consults progress.json when there is no final checkpoint');
+  eq((drv137.match(/readProgressCheckpoint\(join\(itemsRoot, id\), id, cyc\)/g) || []).length, 2, 'KI-E137: cmdReconstruct consults progress.json in BOTH the zero-results and partial-results missing-item branches');
+}
+
 console.log(`\nself-test: ${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);
