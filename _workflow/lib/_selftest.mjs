@@ -1402,6 +1402,61 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
   eq(cfg109.policies.failLaneOnMainDrift, false, 'KI-E109: shipped config default is OFF');
 }
 
+// KI-E144/KI-E144B (ported from a host-mount session) — main-drift detection reads a STRUCTURED
+// boolean (`mainDriftOwnFiles`), never prose. Live there, cycle 93: a single genuine stray file from
+// ONE item's agent made `driver.mjs main-check`'s separate, always-appended, repo-wide "unclaimed"
+// sweep (KI-E89) non-empty; every OTHER concurrently-running item's runner dutifully pasted the WHOLE
+// main-check output (per its own brief) into its own note, and a regex over that text could not tell
+// "MY declared files drifted" from "an unrelated stray path exists somewhere else nobody has
+// claimed" — six items across five unrelated services all failed off ONE incident. The FIRST fix
+// anchored the regex to the item's own id — better, but the very next retry broke it a different way
+// (KI-E144B): a runner correctly found nothing wrong and wrote "No `⚠ MAIN-DRIFT <id> (` line...
+// printed" to PROVE it — and the anchored regex matched its own quoted negation anyway. The durable
+// fix drops prose-parsing entirely: `mainDriftOwnFiles` is a closed boolean the runner sets directly,
+// so no wording can misrepresent it.
+{
+  const src = readFileSync(new URL('../factory.js', import.meta.url), 'utf8');
+  const wt = (id) => ({ path: '/tmp/exec-smoke-wt/' + id, branch: 'factory/' + id });
+  const base = { target: 'X', layer: 'service', dependsOn: [], gateSet: [], autonomyTier: 'auto', source: 'smoke', solution: 'X/X.sln', peers: [] };
+  const batchFor = (id) => ({
+    cycle: 0, concurrency: 2, attempts: 1, repoRoot: '.', templatesDir: '_bmad-output/ai-factory/agents', config: {}, dryRun: false,
+    policies: { failLaneOnMainDrift: true },
+    items: [{ ...base, id, title: 'x', severity: 'HIGH', theme: 'money-correctness', fixType: 'non-trivial', files: ['X/src/Some.cs'], acceptance: 'x', regressionTest: 'test', realInfra: false, worktree: wt(id) }],
+  });
+  const runVerify = async (id, verifyExtra) => {
+    const { result } = await execSmoke(src, batchFor(id), {
+      agentOverride: (prompt, opts) => {
+        if ((opts && opts.label) === id + ':runner') return Object.assign({ build: 'pass', targetedTest: 'pass', suite: { passed: 2, failed: 0, skipped: 0 }, realInfraExercised: false, debris: [], evidence: 'stub', note: 'stub' }, verifyExtra);
+        return undefined;
+      },
+    });
+    return (result.results || []).find((r) => r.id === id);
+  };
+  // (a) an UNRELATED item's genuine drift + the repo-wide unclaimed sweep, described in prose,
+  //     mainDriftOwnFiles correctly false — the exact live cycle-93 (first retry) shape — must NOT fail.
+  const codeInnocent = await runVerify('SMOKE-INNOCENT', {
+    mainDriftOwnFiles: false,
+    note: '⚠ MAIN-DRIFT SMOKE-GUILTY (KI-E50/KI-L65): main-tree file(s) changed mid-run.\n⚠ MAIN-DRIFT unclaimed (KI-E89): a stray path exists, could be leaked contamination OR unrelated work-in-progress.',
+  });
+  ok(codeInnocent && codeInnocent.toState !== 'FAILED', 'KI-E144 innocent: mainDriftOwnFiles=false must NOT fail me, regardless of what unrelated drift text appears in my own note');
+  // (b) THIS item's own drift, mainDriftOwnFiles correctly true — must fail.
+  const codeGuilty = await runVerify('SMOKE-GUILTY', {
+    mainDriftOwnFiles: true,
+    note: '⚠ MAIN-DRIFT SMOKE-GUILTY (KI-E50/KI-L65): main-tree file(s) changed mid-run — X/src/Some.cs (present -> changed/present)',
+  });
+  eq(codeGuilty && codeGuilty.toState, 'FAILED', 'KI-E144 guilty: mainDriftOwnFiles=true fails the lane — the real detection is preserved');
+  ok(String(codeGuilty.note || '').includes('mainDriftOwnFiles=true'), 'KI-E144 guilty: the message cites the structured field, not a prose match');
+  // (c) KI-E144B's exact failure shape: the runner's PROSE contains a quoted negation of its own
+  //     item's drift marker (proving absence), but mainDriftOwnFiles is correctly false — must NOT
+  //     fail, unlike the live incident this reproduces.
+  const codeNegation = await runVerify('SMOKE-NEGATION', {
+    mainDriftOwnFiles: false,
+    note: 'MAIN-CHECK SMOKE-NEGATION: clean. No `⚠ MAIN-DRIFT SMOKE-NEGATION (` line and no `⚠ MAIN-DRIFT unclaimed (KI-E89)` line printed.',
+  });
+  ok(codeNegation && codeNegation.toState !== 'FAILED', 'KI-E144B: a runner correctly proving absence by quoting the marker format in negation must NOT fail — the boolean field is immune to whatever the prose says, unlike the live incident it reproduces');
+  ok(![codeInnocent, codeGuilty, codeNegation].some((r) => String((r && r.note) || '').startsWith('runItem threw')), 'KI-E144/144B: no runItem crash across all three scenarios');
+}
+
 // KI-E106 (2026-09-02) — ITEM READINESS: the deterministic input-contract gate at group time.
 {
   const { itemReadiness, unreadyItems } = await import('./readiness.mjs');
