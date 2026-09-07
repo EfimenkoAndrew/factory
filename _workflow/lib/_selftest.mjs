@@ -1385,7 +1385,7 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
   // host-mount session) just did: `pack-hash-probe` (the gate-band-reuse content-hash probe) has no
   // relaunch-reuse concept in this runtime to fast-forward from at all, so it is genuinely UNPORTED,
   // not a silent regression.
-  eq(Object.keys(STAGE_PARITY.unported).sort(), ['adjudicator:realinfra-override', 'pack-hash-probe', 'plan-feasibility-probe', 'plan-quality-probe'].sort(), 'KI-E112/KI-E139/KI-E142A/KI-E143C: the UNPORTED set contains EXACTLY the reviewed, dated entries — the four original KI-E103 disclosed gaps (red-proof KI-E83, plan-commitment/plan-step KI-E87+E101, ledger-anchor KI-E91, rootcause KI-E104) are still all closed; a name added here without ALSO updating this pinned list (in the same change) is precisely the silent-growth failure mode KI-E112 exists to catch');
+  eq(Object.keys(STAGE_PARITY.unported).sort(), ['adjudicator:realinfra-override', 'main-drift-probe', 'pack-hash-probe', 'plan-feasibility-probe', 'plan-quality-probe'].sort(), 'KI-E112/KI-E139/KI-E142A/KI-E143C/KI-E145: the UNPORTED set contains EXACTLY the reviewed, dated entries — the four original KI-E103 disclosed gaps (red-proof KI-E83, plan-commitment/plan-step KI-E87+E101, ledger-anchor KI-E91, rootcause KI-E104) are still all closed; a name added here without ALSO updating this pinned list (in the same change) is precisely the silent-growth failure mode KI-E112 exists to catch');
   ok(Object.keys(STAGE_PARITY.mechanical).length >= 5, 'KI-E112: the mechanical set carries the stages implemented deterministically instead of via an agent (runner, marker, comment, red-proof, rootcause)');
   // --- shared-constant byte parity (the KI-E97 drift class)
   for (const name of SHARED_CONSTANTS) {
@@ -1563,18 +1563,18 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
   eq(cfg109.policies.failLaneOnMainDrift, false, 'KI-E109: shipped config default is OFF');
 }
 
-// KI-E144/KI-E144B (ported from a host-mount session) — main-drift detection reads a STRUCTURED
-// boolean (`mainDriftOwnFiles`), never prose. Live there, cycle 93: a single genuine stray file from
-// ONE item's agent made `driver.mjs main-check`'s separate, always-appended, repo-wide "unclaimed"
-// sweep (KI-E89) non-empty; every OTHER concurrently-running item's runner dutifully pasted the WHOLE
-// main-check output (per its own brief) into its own note, and a regex over that text could not tell
-// "MY declared files drifted" from "an unrelated stray path exists somewhere else nobody has
-// claimed" — six items across five unrelated services all failed off ONE incident. The FIRST fix
-// anchored the regex to the item's own id — better, but the very next retry broke it a different way
-// (KI-E144B): a runner correctly found nothing wrong and wrote "No `⚠ MAIN-DRIFT <id> (` line...
-// printed" to PROVE it — and the anchored regex matched its own quoted negation anyway. The durable
-// fix drops prose-parsing entirely: `mainDriftOwnFiles` is a closed boolean the runner sets directly,
-// so no wording can misrepresent it.
+// KI-E144/E144B/E145 (ported from a host-mount session) — main-drift detection is now an
+// INDEPENDENT probe re-grepping disk-authoritative evidence, never the runner's own claim about it
+// (prose OR a self-reported boolean). History there: a naive substring match (KI-E144) let one
+// unrelated item's stray file fail an entire 6-item batch across five services (driver.mjs
+// main-check always appends a repo-wide "unclaimed" sweep after the per-id result, and the runner
+// pastes the whole output into its own note); an id-anchored regex fix (still KI-E144) was defeated
+// on the very next retry by a runner correctly quoting the marker format IN NEGATION to prove its
+// own absence (KI-E144B); a self-reported boolean field (still KI-E144B) removed the wording risk
+// but was still an unverified self-report. KI-E145 stops asking the runner to characterize the
+// evidence AT ALL — it only tees `main-check`'s output to disk, and a separate `main-drift-probe`
+// call greps that file directly, mirroring the established KI-E10/E83/E104 posture (never trust the
+// claim, re-derive the fact).
 {
   const src = readFileSync(new URL('../factory.js', import.meta.url), 'utf8');
   const wt = (id) => ({ path: '/tmp/exec-smoke-wt/' + id, branch: 'factory/' + id });
@@ -1584,38 +1584,36 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
     policies: { failLaneOnMainDrift: true },
     items: [{ ...base, id, title: 'x', severity: 'HIGH', theme: 'money-correctness', fixType: 'non-trivial', files: ['X/src/Some.cs'], acceptance: 'x', regressionTest: 'test', realInfra: false, worktree: wt(id) }],
   });
-  const runVerify = async (id, verifyExtra) => {
-    const { result } = await execSmoke(src, batchFor(id), {
+  const runWithProbe = async (id, probeResult, verifyNote) => {
+    const { result, calls } = await execSmoke(src, batchFor(id), {
       agentOverride: (prompt, opts) => {
-        if ((opts && opts.label) === id + ':runner') return Object.assign({ build: 'pass', targetedTest: 'pass', suite: { passed: 2, failed: 0, skipped: 0 }, realInfraExercised: false, debris: [], evidence: 'stub', note: 'stub' }, verifyExtra);
+        const label = (opts && opts.label) || '';
+        if (label === id + ':runner') return { build: 'pass', targetedTest: 'pass', suite: { passed: 2, failed: 0, skipped: 0 }, realInfraExercised: false, debris: [], evidence: 'stub', note: verifyNote || 'stub' };
+        if (label === id + ':main-drift-probe') return probeResult;
         return undefined;
       },
     });
-    return (result.results || []).find((r) => r.id === id);
+    return { r: (result.results || []).find((r) => r.id === id), calls };
   };
-  // (a) an UNRELATED item's genuine drift + the repo-wide unclaimed sweep, described in prose,
-  //     mainDriftOwnFiles correctly false — the exact live cycle-93 (first retry) shape — must NOT fail.
-  const codeInnocent = await runVerify('SMOKE-INNOCENT', {
-    mainDriftOwnFiles: false,
-    note: '⚠ MAIN-DRIFT SMOKE-GUILTY (KI-E50/KI-L65): main-tree file(s) changed mid-run.\n⚠ MAIN-DRIFT unclaimed (KI-E89): a stray path exists, could be leaked contamination OR unrelated work-in-progress.',
-  });
-  ok(codeInnocent && codeInnocent.toState !== 'FAILED', 'KI-E144 innocent: mainDriftOwnFiles=false must NOT fail me, regardless of what unrelated drift text appears in my own note');
-  // (b) THIS item's own drift, mainDriftOwnFiles correctly true — must fail.
-  const codeGuilty = await runVerify('SMOKE-GUILTY', {
-    mainDriftOwnFiles: true,
-    note: '⚠ MAIN-DRIFT SMOKE-GUILTY (KI-E50/KI-L65): main-tree file(s) changed mid-run — X/src/Some.cs (present -> changed/present)',
-  });
-  eq(codeGuilty && codeGuilty.toState, 'FAILED', 'KI-E144 guilty: mainDriftOwnFiles=true fails the lane — the real detection is preserved');
-  ok(String(codeGuilty.note || '').includes('mainDriftOwnFiles=true'), 'KI-E144 guilty: the message cites the structured field, not a prose match');
-  // (c) KI-E144B's exact failure shape: the runner's PROSE contains a quoted negation of its own
-  //     item's drift marker (proving absence), but mainDriftOwnFiles is correctly false — must NOT
-  //     fail, unlike the live incident this reproduces.
-  const codeNegation = await runVerify('SMOKE-NEGATION', {
-    mainDriftOwnFiles: false,
-    note: 'MAIN-CHECK SMOKE-NEGATION: clean. No `⚠ MAIN-DRIFT SMOKE-NEGATION (` line and no `⚠ MAIN-DRIFT unclaimed (KI-E89)` line printed.',
-  });
-  ok(codeNegation && codeNegation.toState !== 'FAILED', 'KI-E144B: a runner correctly proving absence by quoting the marker format in negation must NOT fail — the boolean field is immune to whatever the prose says, unlike the live incident it reproduces');
-  ok(![codeInnocent, codeGuilty, codeNegation].some((r) => String((r && r.note) || '').startsWith('runItem threw')), 'KI-E144/144B: no runItem crash across all three scenarios');
+  // (a) the probe correctly finds nothing (whether because there really is no drift, or because —
+  //     the exact live cycle-93 shape — the only thing main-check printed was an UNRELATED item's
+  //     drift plus the repo-wide unclaimed sweep) — must NOT fail, regardless of what the runner's
+  //     own note happens to say about it (the note is no longer read for this decision at all).
+  const { r: codeInnocent } = await runWithProbe('SMOKE-INNOCENT', { markerFound: false },
+    '⚠ MAIN-DRIFT SMOKE-GUILTY (KI-E50/KI-L65): main-tree file(s) changed mid-run.\n⚠ MAIN-DRIFT unclaimed (KI-E89): a stray path exists, could be leaked contamination OR unrelated work-in-progress.');
+  ok(codeInnocent && codeInnocent.toState !== 'FAILED', 'KI-E145 innocent: probe markerFound=false must NOT fail me, regardless of what unrelated drift text appears in my own note');
+  // (b) the probe correctly finds THIS item's own drift line — must fail, citing the probe's line.
+  const { r: codeGuilty } = await runWithProbe('SMOKE-GUILTY', { markerFound: true, line: '⚠ MAIN-DRIFT SMOKE-GUILTY (KI-E50/KI-L65): X/src/Some.cs (present -> changed/present)' });
+  eq(codeGuilty && codeGuilty.toState, 'FAILED', 'KI-E145 guilty: probe markerFound=true fails the lane — the real detection is preserved');
+  ok(String(codeGuilty.note || '').includes('an independent probe confirmed'), 'KI-E145 guilty: the message cites the independent probe, not the runner\'s own claim');
+  // (c) KI-E144B's exact defeated shape, reproduced directly: the runner's OWN note quotes the
+  //     marker format in negation to prove absence — but since note is never read for the verdict
+  //     anymore, this can no longer matter either way. Pair it with markerFound=true to prove the
+  //     PROBE's answer wins even when the runner's prose points the opposite direction.
+  const { r: codeNegation } = await runWithProbe('SMOKE-NEGATION', { markerFound: true, line: '⚠ MAIN-DRIFT SMOKE-NEGATION (KI-E50/KI-L65): X/src/Some.cs (present -> changed/present)' },
+    'MAIN-CHECK SMOKE-NEGATION: clean. No `⚠ MAIN-DRIFT SMOKE-NEGATION (` line and no `⚠ MAIN-DRIFT unclaimed (KI-E89)` line printed.');
+  eq(codeNegation && codeNegation.toState, 'FAILED', 'KI-E144B regression check: the runner\'s own prose disproving drift does NOT override a probe that independently found real drift — the probe is authoritative regardless of what the runner\'s note claims, closing the exact ambiguity that defeated the prior fix');
+  ok(![codeInnocent, codeGuilty, codeNegation].some((r) => String((r && r.note) || '').startsWith('runItem threw')), 'KI-E144/144B/E145: no runItem crash across all three scenarios');
 }
 
 // KI-E106 (2026-09-02) — ITEM READINESS: the deterministic input-contract gate at group time.
@@ -3113,7 +3111,7 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
   ok(/case 'main-check'/.test(drv46) && /KI-E50/.test(drv46), 'KI-E50: driver main-check command exists (read-only, warn-only)');
   ok(!/MUTATING = new Set\(\[[^\]]*main-check/.test(drv46), 'KI-E50: main-check is NOT in the mutating set (no lock, no lease)');
   const fac46 = readFileSync(join(import.meta.dirname, '..', 'factory.js'), 'utf8');
-  ok(/MAIN-DRIFT CHECK \(KI-E50\)/.test(fac46) && /main-check ' \+ id/.test(fac46), 'KI-E50: the runner verify hint carries the mid-band main-check command');
+  ok(/MAIN-DRIFT CHECK \(KI-E50/.test(fac46) && /main-check ' \+ id/.test(fac46), 'KI-E50: the runner verify hint carries the mid-band main-check command'); // KI-E145 (ported): the label grew a trailing "/KI-E145" — pin the stable prefix, not the exact closing paren
   const emit46 = readFileSync(join(import.meta.dirname, '..', 'telemetry-emit.mjs'), 'utf8');
   ok(/clampAgentEvent/.test(emit46) && /origEvent/.test(emit46), 'KI-E49: telemetry-emit clamps the vocabulary and preserves the original name');
   ok(readFileSync(join(import.meta.dirname, '..', '..', 'agents', 'fixer.md'), 'utf8').includes('COUNT-CLAIM SELF-CHECK (KI-E51)'), 'KI-E51: fixer card carries the count-claim self-check');

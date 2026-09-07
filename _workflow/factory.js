@@ -139,7 +139,7 @@ const STRARR = { type: 'array', items: { type: 'string' } }
 // Two cycle-20 runners put the TEST NAME in targetedTest ("ServicesJsonServiceBMappingTests
 // (all 5 ... pass)") while writing the correct verdict to verify.json on disk → both GREEN fixes
 // false-failed pre-gates. The schema pattern makes the tool-call layer reject-and-retry instead.
-const VERIFY_SCHEMA = { type: 'object', additionalProperties: false, required: ['build', 'targetedTest', 'suite'], properties: { build: { type: 'string', pattern: '^(pass|fail)' }, targetedTest: { type: 'string', pattern: '^(pass|fail)' }, suite: { type: 'object', additionalProperties: true }, realInfraExercised: {}, realInfraKind: { type: 'string' }, dockerAbsent: { type: 'boolean' }, failingTests: STRARR, newFailures: STRARR, baselineFailures: STRARR, debris: STRARR, evidence: { type: 'string' }, note: { type: 'string' }, mainDriftOwnFiles: { type: 'boolean' } } } // KI-E144B (ported): a STRUCTURED verdict for a signal this file used to regex-match out of free text, unreliably. `mainDriftOwnFiles` — did main-check print a real per-item drift line for MY OWN id, yes or no (a regex, even one anchored to the item's own id per KI-E144, cannot tell "the marker line WAS printed" from a careful runner's own NEGATION of it: "No `⚠ MAIN-DRIFT <id> (` line... printed" — the runner quoted the exact marker format to PROVE its absence, and the quote itself matched the anchored regex). The runner's own closed yes/no answer — never parsed from wording, so wording can never misrepresent it.
+const VERIFY_SCHEMA = { type: 'object', additionalProperties: false, required: ['build', 'targetedTest', 'suite'], properties: { build: { type: 'string', pattern: '^(pass|fail)' }, targetedTest: { type: 'string', pattern: '^(pass|fail)' }, suite: { type: 'object', additionalProperties: true }, realInfraExercised: {}, realInfraKind: { type: 'string' }, dockerAbsent: { type: 'boolean' }, failingTests: STRARR, newFailures: STRARR, baselineFailures: STRARR, debris: STRARR, evidence: { type: 'string' }, note: { type: 'string' } } } // KI-E145 (ported from a host-mount session): briefly carried mainDriftOwnFiles here (KI-E144B) as the runner's OWN closed boolean answer — an improvement on free-text regex-matching, but still a self-report. Now superseded: an INDEPENDENT probe (main-drift-probe, PROBE_SCHEMA below) re-derives the fact directly from the teed evidence file, matching this pipeline's own established posture (KI-E10/E83/E104) of never trusting an agent's claim about its own evidence. Removed from here rather than left as a dead field nothing reads.
 const GATE_SCHEMA = { type: 'object', additionalProperties: false, required: ['gate', 'verdict', 'headline'], properties: { gate: { type: 'string' }, verdict: { type: 'string', enum: ['APPROVED', 'CHANGES_REQUIRED'] }, findings: { type: 'array', items: FINDING }, scopeViolation: { type: 'boolean' }, acceptanceMet: { type: 'boolean' }, redGreenConfirmed: { type: 'boolean' }, headline: { type: 'string' } } }
 const REFUTE_SCHEMA = { type: 'object', additionalProperties: false, required: ['refuted', 'headline'], properties: { refuted: { type: 'boolean' }, severity: { type: 'string' }, attack: { type: 'string' }, reasons: { type: 'array', items: { type: 'string' } }, headline: { type: 'string' } } }
 const REAUDIT_SCHEMA = { type: 'object', additionalProperties: false, required: ['converged', 'findingGone', 'headline'], properties: { converged: { type: 'boolean' }, findingGone: { type: 'boolean' }, newFindings: { type: 'array', items: FINDING }, headline: { type: 'string' } } }
@@ -877,7 +877,14 @@ async function runItem(item) {
   // KI-E50 — mid-band main-drift check: fold/resume detection ran HOURS after the write (cycle 48:
   // 4/6 lanes wrote main mid-band). The runner runs the read-only driver check between verify and
   // the gate band so drift is visible to the gates + checkpoint the moment it exists. Warn-only.
-  const mainCheckHint = ' MAIN-DRIFT CHECK (KI-E50): run `node ' + FDIR + '/_workflow/driver.mjs main-check ' + id + '` (read-only, never blocks you). It prints up to TWO different things — treat them differently (KI-E144): a line starting `⚠ MAIN-DRIFT ' + id + ' (` means YOUR OWN declared files drifted in main. A SEPARATE line starting `⚠ MAIN-DRIFT unclaimed (KI-E89)` is a repo-wide sweep unrelated to your item — it can list a stray path some OTHER item\'s agent left behind; it is NOT your problem. Set `mainDriftOwnFiles` to a plain BOOLEAN: true ONLY if that first, ' + id + '-specific line actually printed — false in every other case (clean, or only the unclaimed line, or anything else). This is a closed yes/no field the fold reads directly — it is NOT parsed from your prose, so do not rely on wording to convey the answer (KI-E144B: a prior runner correctly determined its own check was clean and wrote "no such line printed" in its note to prove it, but literally quoting the marker format to negate it made a naive text scan misread the quote itself as a hit — the boolean field exists precisely so wording can never cause that again). Still copy whichever line(s) actually printed into your note VERBATIM for operator context, labeled clearly as your own vs. unrelated — but `mainDriftOwnFiles` alone decides whether the lane fails. Do NOT edit/repair the main tree yourself — the worktree stays your only edit surface; repair is operator judgment.'
+  // KI-E145 (ported from a host-mount session): this used to end with "set a boolean field to convey
+  // what you saw" — but that is STILL a self-report, just a shorter one, and this pipeline's own
+  // established pattern (KI-E10/E83/E104's marker-probes) never trusts an agent's claim about its own
+  // evidence — it dispatches an INDEPENDENT cheap probe to re-grep the SAME raw file. Applied here:
+  // the runner's only job is to TEE the check output to disk; a separate probe below decides the
+  // verdict from that file directly.
+  const MCRAW = itemsDir(id) + '/main-check-raw.txt'
+  const mainCheckHint = ' MAIN-DRIFT CHECK (KI-E50/KI-E145): run `node ' + FDIR + '/_workflow/driver.mjs main-check ' + id + ' 2>&1 | tee ' + MCRAW + '` (read-only, never blocks you) — an independent probe re-checks this file directly, so just tee it; do not interpret, summarize, or set any field about its result yourself. Do NOT edit/repair the main tree — the worktree stays your only edit surface; repair is operator judgment.'
   const verify = await call('runner', R.runner, VERIFY_SCHEMA, verifyHint + realInfraHint + mainCheckHint + (item.reFix ? ' RE-FIX: the PRIOR attempt\'s test file(s) are EXPECTED in this worktree alongside the new one — do NOT report them as debris; only flag genuine scratch/diagnostic/duplicate files.' : ''), 'Verify')
   res.artifacts.verify = 'state/items/' + id + '/verify.json'
   if (!verify) { res.infraSuspect = true; return finish('FAILED', 'runner agent UNAVAILABLE (null after retries — possible infra/credit failure, NOT a quality verdict)') } // KI-L53
@@ -921,25 +928,24 @@ async function runItem(item) {
   // gate band — rather than after it, and long before the fold's KI-L65 check. OFF by default, which
   // is byte-for-byte the historical warn-only behaviour. Detection is unchanged either way; this only
   // decides what the factory DOES with a signal it already has.
-  // KI-E144 (ported from a host-mount session; live there, cycle 93 — one batch, six items, five
-  // UNRELATED services, ALL failed identically): the ORIGINAL regex here matched ANY `⚠ MAIN-DRIFT`
-  // substring, but `driver.mjs main-check <id>` ALWAYS appends a SECOND, GLOBAL, unconditional sweep
-  // after the per-id result — `⚠ MAIN-DRIFT unclaimed (KI-E89): ...` — which fires on ANY stray path
-  // ANYWHERE in the repo, regardless of which id was asked about. The KI-E50 brief tells the runner
-  // to paste the WHOLE main-check output verbatim into its note, so ONE genuine stray file from ONE
-  // item's agent made the SAME "unclaimed" line appear in EVERY other concurrently-running item's own
-  // note too — four+ services with zero file overlap with the actual offender. A regex cannot tell
-  // "MY declared files drifted" from "an unrelated path exists somewhere else that nobody has
-  // claimed." One real incident became a batch-wide false failure. First fix attempt anchored the
-  // match to the item's own id (`⚠ MAIN-DRIFT <id> (`) — better, but STILL regex-over-prose, and the
-  // very next retry broke it a different way: KI-E144B — a runner correctly found its OWN check clean
-  // and wrote "No `⚠ MAIN-DRIFT <id> (` line... printed" to PROVE the absence — and the negation
-  // sentence's own quoted marker matched the anchored regex anyway, failing an item whose runner had
-  // explicitly, correctly said nothing was wrong. Durable fix: stop parsing prose for a verdict at
-  // all. `mainDriftOwnFiles` is a closed boolean the runner sets directly — no wording, no quoting,
-  // no negation-vs-assertion ambiguity for any regex to misread.
-  if (A.policies && A.policies.failLaneOnMainDrift && verify.mainDriftOwnFiles === true) {
-    return finish('FAILED', 'main-tree contamination (KI-E109, host policy failLaneOnMainDrift=ON): the runner reported mainDriftOwnFiles=true — main-check printed a real drift line for THIS item\'s OWN declared files — ' + String(verify.note || '').slice(0, 400) + ' — failing the lane NOW instead of spending the gate band on a run that has already written outside its worktree. Repair main (operator judgment, never the factory) before re-running.')
+  // KI-E144/KI-E144B (see the KNOWN-ISSUES.md entries above — one batch failed 6-for-6 off ONE
+  // unrelated stray file, then the id-anchored regex fix broke AGAIN on a runner's own negation of
+  // the marker it was quoting to disprove) both tried to get this right by reading a SELF-REPORT of
+  // what the runner saw — first free prose, then a boolean field. Both are still an agent's OWN claim
+  // about its own evidence, unverified. KI-E145 (ported from a host-mount session): this pipeline
+  // already has a standing answer for exactly that shape of risk — never trust the claim, dispatch an
+  // INDEPENDENT cheap probe to re-derive the fact from disk (the same posture KI-E10/E83/E104's
+  // marker-probes take for realInfra/RED-proof/root-cause). Applied here: the runner only tees
+  // `main-check`'s output to `MCRAW` above; this probe alone decides the verdict, by grepping that
+  // file directly for the item's OWN id-specific line — mirroring the realInfra marker-probe's exact
+  // `grep -m1` idiom (a "did it print anything" question a cheap model answers reliably, not a "count
+  // and don't double-echo on no-match" one).
+  if (A.policies && A.policies.failLaneOnMainDrift) {
+    const mcProbe = await call('main-drift-probe', { model: 'claude-haiku-4-5', effort: 'low' }, PROBE_SCHEMA,
+      'Run EXACTLY this ONE command via Bash: `grep -m1 "^⚠ MAIN-DRIFT ' + id + ' (" ' + MCRAW + '` — if it prints a line, return markerFound=true with that line. If it prints nothing (exit 1, no match) or the file does not exist (exit 2), return markerFound=false. Do NOTHING else: no edits, no other commands, no interpretation of what the line MEANS — just whether it is there.', 'Verify')
+    if (mcProbe && mcProbe.markerFound === true) {
+      return finish('FAILED', 'main-tree contamination (KI-E109/E145, host policy failLaneOnMainDrift=ON): an independent probe confirmed a real `⚠ MAIN-DRIFT ' + id + ' (` line in main-check-raw.txt — ' + String(mcProbe.line || '').slice(0, 300) + ' — failing the lane NOW instead of spending the gate band on a run that has already written outside its worktree. Repair main (operator judgment, never the factory) before re-running.')
+    }
   }
   if (Array.isArray(verify.newFailures)) {
     if (verify.newFailures.length) return finish('FAILED', 'fix introduced ' + verify.newFailures.length + ' new test failure(s): ' + verify.newFailures.join(', '))
