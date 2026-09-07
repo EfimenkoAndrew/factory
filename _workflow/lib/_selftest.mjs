@@ -847,6 +847,97 @@ try {
   eq(byE101['SMOKE-DOC'] && byE101['SMOKE-DOC'].toState, 'CLOSED', 'KI-E101 fail-path: a sibling lane whose own steps ARE evidenced still closes (per-item isolation holds)');
 }
 
+// KI-E142A (ported from a host-mount session) — PLAN-REVIEW fail path: a feasibility gap that
+// survives one revision hard-fails BEFORE test-author, fixer, or verify ever run — the cheapest
+// possible fail this stage exists to prove.
+{
+  const src = readFileSync(join(import.meta.dirname, '..', 'factory.js'), 'utf8');
+  const { result, calls } = await execSmoke(src, smokeBatch(), {
+    agentOverride: (prompt, opts) => {
+      const label = (opts && opts.label) || '';
+      if (label === 'SMOKE-CODE:plan-feasibility-probe') return { honored: false, gaps: [{ commitment: 'Services/IDoesNotExist.cs', why: 'no such file in the worktree, and the plan never says it is new' }] };
+      return undefined;
+    },
+  });
+  const byPRA = Object.fromEntries((result.results || []).map((r) => [r.id, r]));
+  const codePRA = byPRA['SMOKE-CODE'];
+  ok(!(result.results || []).some((r) => String(r.note || '').startsWith('runItem threw')), 'KI-E142A fail-path: no runItem crash on any lane');
+  eq(codePRA && codePRA.toState, 'FAILED', 'KI-E142A fail-path: a feasibility gap surviving one revision FAILS the item');
+  ok(String(codePRA.note || '').includes('plan-review (KI-E142A)'), 'KI-E142A fail-path: the note names the stage that rejected it');
+  ok(String(codePRA.note || '').includes('no test-author, no fixer, no verify ran'), 'KI-E142A fail-path: the note states the cost claim the whole stage exists for');
+  eq(codePRA.gates['probe:plan-review'], 'CHANGES_REQUIRED', 'KI-E142A fail-path: the gate key records CHANGES_REQUIRED');
+  ok(!calls.some((c) => c.label === 'SMOKE-CODE:test-author'), 'KI-E142A fail-path: test-author never ran — this is the entire economic argument for reviewing the plan before implementation starts');
+  ok(!calls.some((c) => c.label === 'SMOKE-CODE:fixer'), 'KI-E142A fail-path: the fixer never ran either — no implementation cost was paid for a plan whose premise was already broken');
+  eq(calls.filter((c) => c.label === 'SMOKE-CODE:plan-feasibility-probe').length, 2, 'KI-E142A fail-path: exactly TWO feasibility probe calls (initial + ONE re-probe after the bounded revision) — no loop');
+  eq(calls.filter((c) => c.label === 'SMOKE-CODE:planner').length, 2, 'KI-E142A fail-path: exactly TWO planner calls (the original plan + ONE bounded revision) — the revision is bounded, not repeated');
+}
+
+// KI-E142A — PLAN-REVIEW: a quality/edge-case gap alone NEVER hard-fails (only feasibility can) — it
+// drives the same bounded revision and rides along as telemetry, but the item proceeds to implement.
+{
+  const src = readFileSync(join(import.meta.dirname, '..', 'factory.js'), 'utf8');
+  const { result, calls } = await execSmoke(src, smokeBatch(), {
+    agentOverride: (prompt, opts) => {
+      const label = (opts && opts.label) || '';
+      if (label === 'SMOKE-CODE:plan-quality-probe') return { honored: false, gaps: [{ commitment: 'concurrent access to the shared counter', why: 'the plan never mentions a lock or CAS pattern' }] };
+      return undefined;
+    },
+  });
+  const codePRB = (result.results || []).find((r) => r.id === 'SMOKE-CODE');
+  ok(!(result.results || []).some((r) => String(r.note || '').startsWith('runItem threw')), 'KI-E142A quality-only: no runItem crash');
+  ok(codePRB && codePRB.toState !== 'FAILED', 'KI-E142A quality-only: a quality/edge-case gap alone never fails the item pre-band (only an unfixable feasibility gap can)');
+  eq(codePRB.gates['probe:plan-review'], 'APPROVED', 'KI-E142A quality-only: still APPROVED — the asymmetry is deliberate (see the KI-E142 KNOWN-ISSUES.md entry)');
+  eq(calls.filter((c) => c.label === 'SMOKE-CODE:planner').length, 2, 'KI-E142A quality-only: the gap still earns exactly one bounded planner revision');
+}
+
+// KI-E142B — plan-deviation adjudication: a DECLARED, explained gap that the adjudicator OVERRULES
+// proceeds instead of failing — the whole point of not treating every unhonored commitment as fatal.
+{
+  const src = readFileSync(join(import.meta.dirname, '..', 'factory.js'), 'utf8');
+  const gapStep = 'Update the data-flow doc for the endpoint';
+  const { result, calls } = await execSmoke(src, smokeBatch(), {
+    agentOverride: (prompt, opts) => {
+      const label = (opts && opts.label) || '';
+      if (label === 'SMOKE-CODE:plan-commitment-probe') return { honored: false, gaps: [{ commitment: gapStep, why: 'no hunk anywhere in the diff touches the data-flow doc' }] };
+      if (label === 'SMOKE-CODE:fixer' && /PLAN-STEP AMEND/.test(String(prompt || ''))) {
+        return { applied: false, filesChanged: [], summary: 'no change needed', scopeStop: false, divergence: null, deviations: [{ commitment: gapStep, reason: 'this endpoint has no data-flow doc entry today (grepped doc/data-flows/) — nothing to update' }], note: 'declared deviation' };
+      }
+      if (label === 'SMOKE-CODE:adjudicator') return { verdict: 'OVERRULED', reasons: ['the endpoint genuinely has no doc entry to update — the plan step does not apply'], headline: 'deviation legitimate' };
+      return undefined;
+    },
+  });
+  const codeOV = (result.results || []).find((r) => r.id === 'SMOKE-CODE');
+  ok(!(result.results || []).some((r) => String(r.note || '').startsWith('runItem threw')), 'KI-E142B overruled: no runItem crash');
+  ok(codeOV && codeOV.toState !== 'FAILED', 'KI-E142B overruled: an adjudicated-legitimate deviation does NOT fail the item — this is the entire point of not treating silence and a reasoned deviation the same way');
+  eq(codeOV.gates['adjudicator:plan-deviation'], 'OVERRULED', 'KI-E142B overruled: the deviation-specific adjudicator gate key records OVERRULED');
+  eq(codeOV.gates['probe:plan-commitment-scan'], 'APPROVED', 'KI-E142B overruled: the ORIGINAL gate key flips to APPROVED once the deviation is adjudicated legitimate');
+  ok(codeOV.gateDetails['probe:plan-commitment-scan'].headline.includes('KI-E142B'), 'KI-E142B overruled: the headline records that this APPROVED came via adjudicated deviation, not a clean scan');
+  eq(calls.filter((c) => c.label === 'SMOKE-CODE:adjudicator').length, 1, 'KI-E142B overruled: exactly one adjudicator call — a declared deviation earns ONE independent ruling, not a loop');
+}
+
+// KI-E142B — the fail-safe direction: a DECLARED deviation the adjudicator UPHOLDS still fails the
+// item, with a message distinguishing it from a silent gap.
+{
+  const src = readFileSync(join(import.meta.dirname, '..', 'factory.js'), 'utf8');
+  const gapStep = 'Update the data-flow doc for the endpoint';
+  const { result } = await execSmoke(src, smokeBatch(), {
+    agentOverride: (prompt, opts) => {
+      const label = (opts && opts.label) || '';
+      if (label === 'SMOKE-CODE:plan-commitment-probe') return { honored: false, gaps: [{ commitment: gapStep, why: 'no hunk anywhere in the diff touches the data-flow doc' }] };
+      if (label === 'SMOKE-CODE:fixer' && /PLAN-STEP AMEND/.test(String(prompt || ''))) {
+        return { applied: false, filesChanged: [], summary: 'skipped', scopeStop: false, divergence: null, deviations: [{ commitment: gapStep, reason: 'ran out of time, will do it later' }], note: 'declared deviation' };
+      }
+      if (label === 'SMOKE-CODE:adjudicator') return { verdict: 'UPHELD', reasons: ['"will do it later" is not a legitimate reason the commitment no longer applies — this is an incomplete fix wearing a deviation label'], headline: 'deviation not legitimate' };
+      return undefined;
+    },
+  });
+  const codeUP = (result.results || []).find((r) => r.id === 'SMOKE-CODE');
+  ok(!(result.results || []).some((r) => String(r.note || '').startsWith('runItem threw')), 'KI-E142B upheld: no runItem crash');
+  eq(codeUP && codeUP.toState, 'FAILED', 'KI-E142B upheld: an UPHELD ruling still fails the item — adjudication is a real check, not a rubber stamp for any declared deviation');
+  eq(codeUP.gates['adjudicator:plan-deviation'], 'UPHELD', 'KI-E142B upheld: the deviation-specific gate key records UPHELD');
+  ok(String(codeUP.note || '').includes('adjudicator UPHELD'), 'KI-E142B upheld: the note distinguishes this from a silent-gap fail — an operator can tell a deviation was CLAIMED and rejected, not simply never explained');
+}
+
 // KI-C2 (closed 2026-07-12): the budget-ACTIVE lane — a launch-turn token budget whose remaining()
 // is already inside the reserve must stop every item BEFORE its first agent call: id-less CLAIMED
 // no-op (attempt NOT burned), NOT checkpointed (reconstruct must ignore it; resume must list it as
@@ -1160,7 +1251,7 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
   ok(fsrcPC.includes("res.gates['probe:plan-commitment-scan']"), 'KI-E87: the probe writes a distinctly-named gate key');
   ok(fsrcPC.slice(0, 2000).includes('plan-commitment scan'), 'KI-E87: factory.js\'s own meta.description names the plan-commitment scan stage, matching what the code actually runs');
   const planCommitBlock = fsrcPC.slice(fsrcPC.indexOf('4c-bis. PLAN-COMMITMENT SCAN'), fsrcPC.indexOf('4d-pre. COMMENT SCAN'));
-  eq((planCommitBlock.match(/finish\('FAILED'/g) || []).length, 1, 'KI-E87: fail-open — exactly one finish(\'FAILED\', ...) call site in the whole plan-commitment block');
+  eq((planCommitBlock.match(/finish\('FAILED'/g) || []).length, 2, 'KI-E87/KI-E142B (ported): the whole plan-commitment block now has TWO finish(\'FAILED\', ...) call sites — the original fail-open, and the new KI-E142B declared-deviation fail-open when the adjudicator does not overrule');
   // Fix (multi-lens review, 2026-08-25, ported) — KI-E10 gap this repo specifically lacked: the
   // PLAN-COMMITMENT AMEND prompt explicitly offers the fixer a note-only response, but the re-probe
   // used to fire ONLY on `amend.applied` — a fixer taking that option got failed anyway on the
@@ -1226,7 +1317,7 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
   // host-mount session) just did: `pack-hash-probe` (the gate-band-reuse content-hash probe) has no
   // relaunch-reuse concept in this runtime to fast-forward from at all, so it is genuinely UNPORTED,
   // not a silent regression.
-  eq(Object.keys(STAGE_PARITY.unported), ['pack-hash-probe'], 'KI-E112/KI-E139: the UNPORTED set contains EXACTLY pack-hash-probe — the four original KI-E103 disclosed gaps (red-proof KI-E83, plan-commitment/plan-step KI-E87+E101, ledger-anchor KI-E91, rootcause KI-E104) are still all closed; pack-hash-probe is the one new, deliberately-disclosed gap KI-E139 introduces');
+  eq(Object.keys(STAGE_PARITY.unported).sort(), ['pack-hash-probe', 'plan-feasibility-probe', 'plan-quality-probe'].sort(), 'KI-E112/KI-E139/KI-E142A: the UNPORTED set contains EXACTLY the reviewed, dated entries — the four original KI-E103 disclosed gaps (red-proof KI-E83, plan-commitment/plan-step KI-E87+E101, ledger-anchor KI-E91, rootcause KI-E104) are still all closed; a name added here without ALSO updating this pinned list (in the same change) is precisely the silent-growth failure mode KI-E112 exists to catch');
   ok(Object.keys(STAGE_PARITY.mechanical).length >= 5, 'KI-E112: the mechanical set carries the stages implemented deterministically instead of via an agent (runner, marker, comment, red-proof, rootcause)');
   // --- shared-constant byte parity (the KI-E97 drift class)
   for (const name of SHARED_CONSTANTS) {
@@ -1663,7 +1754,7 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
   ok(pcBlock101.includes("const axis = stepMode ? 'plan step' : 'plan commitment'"), 'KI-E101: one `axis` noun renders both modes through the shared tail');
   ok(pcBlock101.includes('PLAN-STEP SCAN (KI-E101') && pcBlock101.includes('PLAN-COMMITMENT SCAN (KI-E87'), 'KI-E101: both probe prompts are present — the KI-E87 prose prompt is preserved verbatim as the fallback');
   ok(pcBlock101.includes('PLAN-STEP AMEND (KI-E101') && pcBlock101.includes('PLAN-COMMITMENT AMEND (KI-E87'), 'KI-E101: both amend prompts are present');
-  eq((pcBlock101.match(/finish\('FAILED'/g) || []).length, 1, 'KI-E101: the two modes still share ONE finish(\'FAILED\') call site — the KI-E87 fail-open invariant is not duplicated per mode');
+  eq((pcBlock101.match(/finish\('FAILED'/g) || []).length, 2, 'KI-E101/KI-E142B (ported): the two modes still share the SAME two finish(\'FAILED\') call sites — the KI-E87 fail-open invariant, and the new KI-E142B declared-deviation fail-open, are each not duplicated per mode');
   eq((pcBlock101.match(/call\('plan-commitment-probe'/g) || []).length, 2, 'KI-E101: still exactly one probe + one bounded re-probe across both modes (no extra call was introduced)');
   eq((pcBlock101.match(/call\('fixer'/g) || []).length, 1, 'KI-E101 scope bound: exactly ONE fixer call in the block — steps decompose CHECKING, never EXECUTION (a per-step fixer would defeat fixer.md\'s whole-diff SIBLING-PATTERN/DEAD-CODE/ADJACENT-CLAIM/CANCELLATIONTOKEN self-checks, KI-E94/E95/E96, which guard the #1 rejection class KI-E51)');
   ok(pcBlock101.includes("res.gates['probe:plan-commitment-scan']") && !pcBlock101.includes("res.gates['probe:plan-step-scan']"), 'KI-E101: both modes share the EXISTING gate key — a second key would silently orphan telemetry/recover/feedback consumers keyed off it');

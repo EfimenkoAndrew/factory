@@ -1,6 +1,6 @@
 export const meta = {
   name: 'impl-factory',
-  description: 'AI Implementation Factory control plane. Receives a batch of READY work items (audit findings / stories) + agent templates + per-item model routing via args (emitted by driver.mjs select), then drives each item through the implement-and-auto-evaluate lifecycle: (plan) -> test-author(red) -> fixer -> verify(build+test) -> RED-proof marker probe (disk-authoritative FACTORY::RED:: re-check, pre-band, KI-E83) -> early edge-scan (pre-band edge-case hunt + one bounded amend, every code item) -> acceptance-scan (pre-band clause-coverage probe + one bounded amend, KI-E18) -> plan-commitment scan (pre-band plan-vs-diff self-consistency probe + one bounded amend, KI-E87; STEP mode probes the planner\'s own steps[] one-by-one when present, PROSE mode falls back to the commitment-language prefilter, KI-E101) -> cheap haiku leftover-scan (pre-band deferral/tech-debt lint, KI-D12) -> comment-scan (host-policy-gated zero-new-comments lint, KI-E59) -> ledger-anchor scan (duplicate/contradictory standards-ledger anchors, KI-E91) -> root-cause touch probe (pre-band P9: the diff must change a non-test file, KI-E104) -> the review stage (5 role gates + applicable BMAD review-named flows: code/adversarial/testreview + editorial) as separate adversarial subagents -> refuter -> scoped re-audit -> integrate. Worktree-isolated, model-routed, low-concurrency under throttle. Each agent writes its artifact to disk; 4 incremental progress checkpoints (post-verify/post-preband/post-gates/post-reaudit, KI-E137) survive a mid-pipeline kill so a resumed item does not lose already-paid-for stages; the factory returns compact per-item results (a transition path) the driver folds into the ledger (single writer, resumable). NEVER runs mutating git — fixes stay on a factory/<id> branch in a worktree for the human to commit.',
+  description: 'AI Implementation Factory control plane. Receives a batch of READY work items (audit findings / stories) + agent templates + per-item model routing via args (emitted by driver.mjs select), then drives each item through the implement-and-auto-evaluate lifecycle: (plan) -> plan-review (pre-implementation multi-lens plan critique: mechanical feasibility + LLM quality/edge-case, one bounded revision, KI-E142A) -> test-author(red) -> fixer -> verify(build+test) -> RED-proof marker probe (disk-authoritative FACTORY::RED:: re-check, pre-band, KI-E83) -> early edge-scan (pre-band edge-case hunt + one bounded amend, every code item) -> acceptance-scan (pre-band clause-coverage probe + one bounded amend, KI-E18) -> plan-commitment scan (pre-band plan-vs-diff self-consistency probe + one bounded amend, KI-E87; STEP mode probes the planner\'s own steps[] one-by-one when present, PROSE mode falls back to the commitment-language prefilter, KI-E101; an unhonored commitment the fixer DECLARES as a deliberate deviation goes to independent adjudication rather than an automatic fail, KI-E142B) -> cheap haiku leftover-scan (pre-band deferral/tech-debt lint, KI-D12) -> comment-scan (host-policy-gated zero-new-comments lint, KI-E59) -> ledger-anchor scan (duplicate/contradictory standards-ledger anchors, KI-E91) -> root-cause touch probe (pre-band P9: the diff must change a non-test file, KI-E104) -> the review stage (5 role gates + applicable BMAD review-named flows: code/adversarial/testreview + editorial) as separate adversarial subagents -> refuter -> scoped re-audit -> integrate. Worktree-isolated, model-routed, low-concurrency under throttle. Each agent writes its artifact to disk; 4 incremental progress checkpoints (post-verify/post-preband/post-gates/post-reaudit, KI-E137) survive a mid-pipeline kill so a resumed item does not lose already-paid-for stages; the factory returns compact per-item results (a transition path) the driver folds into the ledger (single writer, resumable). NEVER runs mutating git — fixes stay on a factory/<id> branch in a worktree for the human to commit.',
   phases: [
     { title: 'Plan' }, { title: 'Test' }, { title: 'Fix' }, { title: 'Verify' },
     { title: 'EdgeScan' }, // KI-E12: the edge-case hunter runs EARLY (pre-band) for every code item; findings feed one bounded amend
@@ -133,7 +133,7 @@ const PLAN_STEPS_NUDGE_SCHEMA = { type: 'object', additionalProperties: false, r
 // addressed in the CURRENT tree (or explicitly out of scope) and no NEW red is possible; the item
 // skips the fixer and proceeds to verify + gates on the standing prior-round red proof.
 const TEST_SCHEMA = { type: 'object', additionalProperties: false, required: ['red', 'note'], properties: { red: { type: 'boolean' }, verificationOnly: { type: 'boolean' }, testFiles: { type: 'array', items: { type: 'string' } }, runCmd: { type: 'string' }, baselineFailures: { type: 'array', items: { type: 'string' } }, evidence: { type: 'string' }, note: { type: 'string' } } }
-const FIX_SCHEMA = { type: 'object', additionalProperties: false, required: ['applied', 'scopeStop', 'summary'], properties: { applied: { type: 'boolean' }, filesChanged: { type: 'array', items: { type: 'string' } }, summary: { type: 'string' }, scopeStop: { type: 'boolean' }, divergence: { type: ['string', 'null', 'object'] }, note: { type: 'string' } } } // KI-O2: widened string|null -> +object; agents/fixer.md's brief asks for "divergence (null or {rule, ledgerAnchor})", an object shape the schema never accepted (a real fixer response hit this live, 2026-07-28). Nothing downstream reads .divergence programmatically (grepped driver.mjs/lib/*.mjs/factory.js) -- purely informational for human fold review -- so the schema now matches what the brief actually asks for instead of silently rejecting a brief-conforming answer.
+const FIX_SCHEMA = { type: 'object', additionalProperties: false, required: ['applied', 'scopeStop', 'summary'], properties: { applied: { type: 'boolean' }, filesChanged: { type: 'array', items: { type: 'string' } }, summary: { type: 'string' }, scopeStop: { type: 'boolean' }, divergence: { type: ['string', 'null', 'object'] }, note: { type: 'string' }, deviations: { type: 'array', items: { type: 'object', additionalProperties: false, required: ['commitment', 'reason'], properties: { commitment: { type: 'string' }, reason: { type: 'string' } } } } } } // KI-O2: widened string|null -> +object; agents/fixer.md's brief asks for "divergence (null or {rule, ledgerAnchor})", an object shape the schema never accepted (a real fixer response hit this live, 2026-07-28). Nothing downstream reads .divergence programmatically (grepped driver.mjs/lib/*.mjs/factory.js) -- purely informational for human fold review -- so the schema now matches what the brief actually asks for instead of silently rejecting a brief-conforming answer. KI-E142B (ported from a host-mount session): `deviations` is a DIFFERENT concept from `divergence` -- divergence is about departing from the TARGET CODEBASE's own standards-evolution.md conventions; deviations is about knowingly not honoring one of THIS ITEM'S OWN plan.md commitments (a step turned out unnecessary/wrong/already-satisfied/superseded). plan-commitment-scan reads this to route an unhonored commitment to an independent adjudicator instead of an automatic fail -- see the plan-commitment-scan block below.
 const STRARR = { type: 'array', items: { type: 'string' } }
 // KI-L28: build/targetedTest are VERDICTS — the lifecycle gate tests /^pass/i on the RETURNED field.
 // Two cycle-20 runners put the TEST NAME in targetedTest ("ServicesJsonServiceBMappingTests
@@ -728,6 +728,54 @@ async function runItem(item) {
         res.planStepsNudged = true
       }
     }
+    // KI-E142A (ported from a host-mount session) — PLAN-REVIEW: the earliest possible point to fail
+    // cheap. Everything before this line costs one planner call; test-author/fixer/verify below cost a
+    // full red-test + implementation + build+test cycle. Two lenses: a MECHANICAL feasibility check (do
+    // the files/approach the plan names actually hold up against the real worktree?) and an LLM
+    // quality/edge-case reviewer (does the plan cover every acceptance criterion and the edge-case
+    // categories that plainly apply?). Only for a FRESH plan — same reasoning as the KI-E134 nudge just
+    // above: a KI-E69-reused plan is already backed by real, on-disk diff evidence, so "review it
+    // before implementation" is a non-question.
+    // A feasibility gap that survives ONE bounded revision is an OBJECTIVELY broken premise (a named
+    // file does not exist and was never declared new) — fail here, before test-author/fixer/verify ever
+    // run. A quality/edge-case gap is a JUDGMENT call with no diff yet to ground it in; it drives the
+    // SAME bounded revision but NEVER hard-fails on its own — failing pre-emptively on a reviewer's
+    // opinion, with nothing yet to verify it against, is exactly the false-positive risk this factory's
+    // own KI-E43/KI-E67 history exists to warn against. It only ever informs the revision + rides along
+    // as visible telemetry for whoever reviews the item later.
+    if (plan && freshPlanCall) {
+      phase('Plan')
+      const planSnap = function (p) { return JSON.stringify({ approach: p.approach, steps: p.steps, files: p.files, blastRadius: p.blastRadius }, null, 1) }
+      const feas = await call('plan-feasibility-probe', { model: 'claude-haiku-4-5', effort: 'low' }, PLAN_COMMITMENT_SCHEMA,
+        'PLAN-FEASIBILITY PROBE (KI-E142A). Before any implementation, sanity-check this plan against the REAL worktree (' + wtPath + '). For each file path named in `files` or clearly implied by `approach`/`steps`, run `test -f <path> && echo EXISTS || echo MISSING` (or `ls`) UNLESS the plan\'s own text says that file is being newly created. Also flag any step too vague to independently implement and verify (e.g. "improve error handling" with no concrete target). Return honored=true ONLY if every existing-file claim resolves and every step is concrete; otherwise honored=false with each problem in gaps ({commitment: quote the claim, why: what is wrong}). Do NOT edit anything.\nPLAN:\n' + planSnap(plan), 'Plan')
+      const cov = await call('plan-quality-probe', R.planner, PLAN_COMMITMENT_SCHEMA,
+        'PLAN-QUALITY REVIEW (KI-E142A — pre-implementation, before ANY code is written). Read this item\'s acceptance criteria and the plan below. Judge: does the plan address EVERY acceptance criterion? Does it account for the edge-case categories that plainly apply to this kind of change (null/empty input, concurrency, boundary values, auth/multi-tenancy, error paths) — or is it silent on ones that obviously matter here? Any internal contradiction, or a step that does not follow from the stated approach? Return honored=true ONLY if the plan is genuinely ready to implement from; otherwise honored=false with each gap in gaps ({commitment: the specific missing/contradictory thing, why: why it matters}) — a generic "consider edge cases" is not a usable finding; name the specific case. Do NOT edit anything.\nPLAN:\n' + planSnap(plan), 'Plan')
+      const feasGaps = (feas && feas.honored === false && Array.isArray(feas.gaps)) ? feas.gaps : []
+      const covGaps = (cov && cov.honored === false && Array.isArray(cov.gaps)) ? cov.gaps : []
+      res.gateDetails = res.gateDetails || {}
+      if (feasGaps.length || covGaps.length) {
+        const revise = await call('planner', R.planner, PLAN_SCHEMA,
+          'PLAN-REVIEW AMEND (KI-E142A): an independent pre-implementation review found gap(s) below BEFORE any test/fix work started — this is the cheapest possible point to fix a plan problem. Revise approach/steps/files/blastRadius to address EVERY gap (or, if a gap genuinely does not apply, leave that part unchanged and say why in ruleRisks). FEASIBILITY GAPS: ' + JSON.stringify(feasGaps.slice(0, 6)) + '. QUALITY/EDGE-CASE GAPS: ' + JSON.stringify(covGaps.slice(0, 6)), 'Plan')
+        if (revise && revise.recommendScopeStop) return await frameAndBlock('planner scope-stop during plan-review amend — ' + (revise.ruleRisks || revise.approach || ''))
+        if (revise) plan = revise
+        // Re-probe feasibility ONLY (objective + cheap) — a revised plan whose file claims are STILL
+        // broken means the premise itself cannot be salvaged by one more implementation attempt.
+        const reFeas = await call('plan-feasibility-probe', { model: 'claude-haiku-4-5', effort: 'low' }, PLAN_COMMITMENT_SCHEMA,
+          'RE-SCAN (KI-E142A): the plan was just revised in response to your prior gaps — judge the REVISED plan fresh against the REAL worktree; prior gaps are hypotheses to re-verify, never conclusions to copy forward.\nREVISED PLAN:\n' + planSnap(plan), 'Plan')
+        const stillBroken = (reFeas && reFeas.honored === false && Array.isArray(reFeas.gaps)) ? reFeas.gaps : []
+        const allGaps = feasGaps.concat(covGaps)
+        if (stillBroken.length) {
+          res.gates['probe:plan-review'] = 'CHANGES_REQUIRED'
+          res.gateDetails['probe:plan-review'] = { verdict: 'CHANGES_REQUIRED', headline: stillBroken.length + ' plan-feasibility gap(s) survive one revision [feasibility+quality lenses]', findings: allGaps.slice(0, 12).map(function (g) { return { severity: 'HIGH', title: String(g.commitment || '').slice(0, 140), fix: String(g.why || '') } }) }
+          return finish('FAILED', 'plan-review (KI-E142A): ' + stillBroken.length + ' plan-feasibility gap(s) survive one revision, BEFORE any test/fix cost was paid — ' + stillBroken.slice(0, 4).map(function (g) { return String(g.commitment || '').slice(0, 90) }).join(' | ') + '. Cheapest possible fail (no test-author, no fixer, no verify ran).')
+        }
+        res.gates['probe:plan-review'] = 'APPROVED'
+        res.gateDetails['probe:plan-review'] = { verdict: 'APPROVED', headline: 'plan revised once to address ' + feasGaps.length + ' feasibility + ' + covGaps.length + ' quality gap(s) [feasibility+quality lenses]', findings: allGaps.slice(0, 12).map(function (g) { return { severity: 'HIGH', title: String(g.commitment || '').slice(0, 140), fix: String(g.why || '') } }) }
+      } else {
+        res.gates['probe:plan-review'] = 'APPROVED'
+        res.gateDetails['probe:plan-review'] = { verdict: 'APPROVED', headline: 'plan reviewed clean on the first pass [feasibility+quality lenses]', findings: [] }
+      }
+    }
   }
 
   // 2. test-author -> RED
@@ -1166,11 +1214,12 @@ async function runItem(item) {
         ? 'PLAN-STEP SCAN (KI-E101 — pre-band plan-vs-diff step-coverage probe). Before implementing, this item\'s OWN plan decomposed the work into the numbered steps below. STEP 1: Read ' + itemsDir(id) + '/review-pack.md (the machine snapshot of this change). STEP 2: for EACH numbered step, decide whether the CHANGE (the diff / new files) carries CONCRETE evidence that step was actually carried out — a specific hunk, file, or test. Judge COVERAGE of the plan\'s own steps, not general quality (the review band judges that); a step the diff quietly skipped is precisely what this probe exists to catch. Return honored=true ONLY if EVERY step is evidenced; otherwise honored=false with each un-evidenced step in gaps (quote the step text in `commitment`, why no evidence in `why`). Do NOT edit anything.\nPLAN STEPS:\n' + stepList
         : 'PLAN-COMMITMENT SCAN (KI-E87 — pre-band plan-vs-diff self-consistency probe). Before implementing, this item\'s OWN plan stated the commitment language below (its approach/blast-radius fields). STEP 1: Read ' + itemsDir(id) + '/review-pack.md (the machine snapshot of this change). STEP 2: for each "MUST"/"must include/add/…"/"required to" commitment in the text below, decide whether the CHANGE (the diff / new files) contains CONCRETE evidence the commitment was honored. Judge whether the plan\'s own promise was kept — not general quality (the review band judges that). Return honored=true ONLY if EVERY commitment is evidenced; otherwise honored=false with each unhonored commitment in gaps (quote the commitment + why no evidence). Do NOT edit anything.\nPLAN TEXT:\n' + commitmentText
       let pc = await call('plan-commitment-probe', { model: 'claude-haiku-4-5', effort: 'low' }, PLAN_COMMITMENT_SCHEMA, planPrompt, 'EdgeScan')
+      let amend = null // KI-E142B (ported from a host-mount session): hoisted out of the gap-handling block below so the deviation-adjudication check further down (after the re-probe) can still read amend.deviations — a bounded-amend that never ran (no gaps found) leaves this null, which the deviation check already treats as "nothing declared".
       if (pc && pc.honored === false && Array.isArray(pc.gaps) && pc.gaps.length) {
         const amendHead = stepMode
           ? 'PLAN-STEP AMEND (KI-E101): a pre-band probe found step(s) your OWN plan laid out with NO evidence in your diff — the re-audit would FAIL the item at full band price for exactly this.'
           : 'PLAN-COMMITMENT AMEND (KI-E87): a pre-band probe found commitment(s) your OWN plan made with NO evidence in your diff — the re-audit would FAIL the item at full band price for exactly this.'
-        const amend = await call('fixer', R.fixer, FIX_SCHEMA, amendHead + ' Address EVERY gap below with the minimal correct change (or state in note precisely why that ' + axis + ' is already satisfied or no longer applicable). Then re-verify the touched surface (code: `' + BT + ' build <touched .csproj> 2>&1 | tee -a ' + RAW + '` + `' + BT + ' filter <test .csproj> "<TestClassName>" 2>&1 | tee -a ' + RAW + '`; doc/config: the spec\'s grep) and REGENERATE the review pack: `' + PACKCMD + '`. GAPS: ' + JSON.stringify(pc.gaps.slice(0, 8)) + claimsHint, 'EdgeScan')
+        amend = await call('fixer', R.fixer, FIX_SCHEMA, amendHead + ' Address EVERY gap below with the minimal correct change (or state in note precisely why that ' + axis + ' is already satisfied or no longer applicable). Then re-verify the touched surface (code: `' + BT + ' build <touched .csproj> 2>&1 | tee -a ' + RAW + '` + `' + BT + ' filter <test .csproj> "<TestClassName>" 2>&1 | tee -a ' + RAW + '`; doc/config: the spec\'s grep) and REGENERATE the review pack: `' + PACKCMD + '`. GAPS: ' + JSON.stringify(pc.gaps.slice(0, 8)) + claimsHint, 'EdgeScan')
         if (amend && amend.scopeStop) return await frameAndBlock('fixer scope-stop during plan-commitment amend — ' + (amend.summary || ''))
         // Fix (multi-lens review, 2026-08-25): the prompt above explicitly OFFERS the fixer a
         // note-only response ("or state in note precisely why the commitment is already satisfied
@@ -1200,7 +1249,34 @@ async function runItem(item) {
         }
         if (!pc.honored) {
           const gapNote = (pc.gaps || []).slice(0, 6).map(function (g) { return String(g.commitment || '').slice(0, 90) }).join(' | ')
-          return finish('FAILED', 'plan-commitment-scan (' + (stepMode ? 'KI-E101 STEP mode' : 'KI-E87 PROSE mode') + '): the plan\'s own ' + axis + '(s) have NO evidence in the diff after one bounded amend — ' + (gapNote || 'see gateDetails') + '. Pre-band fail (cheap — no gate band was spent); the fix must cover every ' + axis + ' the plan itself laid out.')
+          // KI-E142B (ported from a host-mount session): not every unhonored commitment is a genuine
+          // gap — a step can legitimately turn out unnecessary, already-satisfied elsewhere, or
+          // superseded by a better approach the fixer found mid-implementation. A SILENT gap (the fixer
+          // never said why) still fails exactly as before — explaining a deviation is required, never
+          // optional, and this never rewards silence. Only a DECLARED, explained deviation
+          // (fix.json.deviations, from the bounded amend above) earns an INDEPENDENT adjudicator
+          // judgment before the fail — deliberately NOT re-asked of the same cheap probe that just
+          // found the gap (grading its own homework), but of the SAME high-effort adjudicator role
+          // already trusted to break a gate-review tie on the merits of the diff.
+          const declared = (amend && Array.isArray(amend.deviations))
+            ? amend.deviations.filter(function (d) { return d && String(d.reason || '').trim() })
+            : []
+          if (declared.length) {
+            const adj = await call('adjudicator', R.adjudicator, ADJUDICATE_SCHEMA,
+              'PLAN-DEVIATION ADJUDICATION (KI-E142B): a pre-band probe found ' + axis + '(s) with no evidence in the diff. The fixer declares these as DELIBERATE deviations, not oversights — judge on the merits whether EVERY declared deviation is legitimate (the ' + axis + ' no longer applies, is satisfied a different way, or the plan\'s own premise was wrong) or is a rationalization for a genuine gap. Read the actual worktree diff (`git -C ' + wtPath + ' diff`) and the original plan\'s ' + axis + '(s) before ruling — do not take either side\'s word for it. Default to UPHELD when genuinely uncertain (fail-safe: back to the fixer, not a coin-flip pass). OVERRULED means EVERY remaining gap below is legitimately explained; if even one is not, this is UPHELD.\nREMAINING GAPS: ' + JSON.stringify((pc.gaps || []).slice(0, 8)) + '\nFIXER\'S DECLARED DEVIATIONS: ' + JSON.stringify(declared.slice(0, 8)), 'EdgeScan')
+            res.gates['adjudicator:plan-deviation'] = adj ? adj.verdict : 'NULL'
+            res.gateDetails['adjudicator:plan-deviation'] = adj ? { verdict: adj.verdict, headline: adj.headline, reasons: adj.reasons } : null
+            if (adj && adj.verdict === 'OVERRULED') {
+              res.gates['probe:plan-commitment-scan'] = 'APPROVED'
+              res.gateDetails['probe:plan-commitment-scan'].verdict = 'APPROVED'
+              res.gateDetails['probe:plan-commitment-scan'].headline += ' — deviation(s) adjudicated legitimate (KI-E142B)'
+              // fall through — the item proceeds; nothing fails the item on this path.
+            } else {
+              return finish('FAILED', 'plan-commitment-scan (' + (stepMode ? 'KI-E101 STEP mode' : 'KI-E87 PROSE mode') + '): ' + (pc.gaps || []).length + ' ' + axis + '(s) with a declared deviation, but adjudicator ' + (adj ? adj.verdict : 'NULL') + ' — ' + (gapNote || 'see gateDetails') + '. Pre-band fail (cheap — no gate band was spent).')
+            }
+          } else {
+            return finish('FAILED', 'plan-commitment-scan (' + (stepMode ? 'KI-E101 STEP mode' : 'KI-E87 PROSE mode') + '): the plan\'s own ' + axis + '(s) have NO evidence in the diff after one bounded amend — ' + (gapNote || 'see gateDetails') + '. Pre-band fail (cheap — no gate band was spent); the fix must cover every ' + axis + ' the plan itself laid out.')
+          }
         }
       }
     }

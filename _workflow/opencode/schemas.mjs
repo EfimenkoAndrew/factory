@@ -36,7 +36,11 @@ export const TEST_SCHEMA = { type: 'object', additionalProperties: false, requir
 // `['string','null']` typing rejected on a real, brief-conforming fixer response (live 2026-07-28).
 // Nothing downstream (driver.mjs, lib/*.mjs, factory.js itself) reads `.divergence`
 // programmatically — it is purely informational for human fold review.
-export const FIX_SCHEMA = { type: 'object', additionalProperties: false, required: ['applied', 'scopeStop', 'summary'], properties: { applied: { type: 'boolean' }, filesChanged: { type: 'array', items: { type: 'string' } }, summary: { type: 'string' }, scopeStop: { type: 'boolean' }, divergence: { type: ['string', 'null', 'object'] }, note: { type: 'string' } } };
+// KI-E142B (ported from a host-mount session): `deviations` added for schema-parity with factory.js's
+// FIX_SCHEMA — a plan-commitment deviation declared by a fixer here would have nowhere to be
+// adjudicated (plan-feasibility-probe/plan-quality-probe and the KI-E142B adjudication routing are
+// UNPORTED, see stage-parity.mjs), so this field is structurally inert in this runtime today.
+export const FIX_SCHEMA = { type: 'object', additionalProperties: false, required: ['applied', 'scopeStop', 'summary'], properties: { applied: { type: 'boolean' }, filesChanged: { type: 'array', items: { type: 'string' } }, summary: { type: 'string' }, scopeStop: { type: 'boolean' }, divergence: { type: ['string', 'null', 'object'] }, note: { type: 'string' }, deviations: { type: 'array', items: { type: 'object', additionalProperties: false, required: ['commitment', 'reason'], properties: { commitment: { type: 'string' }, reason: { type: 'string' } } } } } };
 
 const STRARR = { type: 'array', items: { type: 'string' } };
 
