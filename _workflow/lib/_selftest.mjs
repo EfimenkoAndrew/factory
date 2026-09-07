@@ -3720,5 +3720,48 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
   ok(!cfBody146.includes('unlinkSync(') && !cfBody146.includes('rmSync(') && !/execSync\(['"]rm /.test(cfBody146), 'KI-E146: still never auto-repairs (KI-E89\'s own documented reason: cannot distinguish agent contamination from an operator\'s unrelated WIP) — detection only, no deletion path exists in this block');
 }
 
+// KI-E149 (ported from a host-mount session) — mechanical write-isolation for the two roles that
+// actually mutate a worktree's tracked source (fixer, test-author). Every prior main-tree-
+// contamination fix on the origin host was DETECTION after the fact; four live tests there
+// established that the Agent/Workflow tool's own `isolation:'worktree'` option mechanically
+// REJECTS an Edit/Write call targeting the shared main checkout, while leaving writes to any OTHER
+// git worktree (this item's own included), reads anywhere, and Bash-tool writes (tee/redirect/
+// heredoc) to ANY path completely unaffected — a real, disclosed gap, not a false sense of
+// completeness. See the KI-E149 KNOWN-ISSUES.md entry for the four tests themselves.
+{
+  const src149 = readFileSync(join(import.meta.dirname, '..', 'factory.js'), 'utf8');
+  // Source-text pins: the helper exists with the right condition, and BOTH the primary and
+  // fallback-model opts objects in call() get the flag — a fix that only isolated the primary path
+  // would silently stop protecting the fallback route the moment a primary model fell over (KI-D10).
+  ok(/function needsWriteIsolation\(role\)/.test(src149), 'KI-E149: the needsWriteIsolation(role) helper exists');
+  ok(/needsWriteIsolation\(role\)\s*\{\s*return \(role === 'fixer' \|\| role === 'test-author'\)/.test(src149), 'KI-E149: scoped to exactly the two roles that mutate worktree SOURCE — not every role (a probe/gate/judge never writes source and would only pay the isolated-worktree setup cost for nothing)');
+  ok(/A\.policies && A\.policies\.isolateWorktreeWrites === false/.test(src149), 'KI-E149: a host policy escape hatch exists — explicit false is the only way off, so an unset/missing policy defaults ON (this is a safety feature, not an opt-in)');
+  ok((src149.match(/if \(needsWriteIsolation\(role\)\) (opts|fb)\.isolation = 'worktree'/g) || []).length === 2, 'KI-E149: BOTH the primary opts AND the KI-D10 fallback opts get the flag in call() — a fix that missed the fallback would silently stop protecting it the moment a primary model degraded');
+  ok(/FILE-WRITE ISOLATION IS ACTIVE FOR YOU \(KI-E149\)/.test(src149), 'KI-E149: the role-conditional prompt hint exists, telling the isolated agent how to still reach its ARTIFACTS DIR (via Bash, since that path is outside the worktree the shared prefix already told every role about)');
+
+  // Behavioural: run the real pipeline (execSmoke) against SMOKE-CODE (a codeChange item — fixer
+  // and test-author both actually run) and inspect what call() really dispatched, not just what
+  // the source text claims it does (KI-L43: a source-text pin cannot catch a TDZ/shape bug in the
+  // branch it pins).
+  const { calls: calls149 } = await execSmoke(src149, smokeBatch());
+  const isolated149 = calls149.filter((c) => c.label === 'SMOKE-CODE:fixer' || c.label === 'SMOKE-CODE:test-author');
+  ok(isolated149.length > 0, 'KI-E149 exec-smoke: sanity — SMOKE-CODE actually dispatched fixer/test-author calls');
+  ok(isolated149.every((c) => c.isolation === 'worktree'), 'KI-E149 exec-smoke: every real fixer/test-author call carries opts.isolation === "worktree"');
+  ok(isolated149.every((c) => /FILE-WRITE ISOLATION IS ACTIVE FOR YOU \(KI-E149\)/.test(c.prompt)), 'KI-E149 exec-smoke: every isolated call actually SEES the hint in its composed prompt (not just a flag with no explanation reaching the agent)');
+  const notIsolated149 = calls149.filter((c) => c.label === 'SMOKE-CODE:planner' || /:gate-|:review-/.test(c.label));
+  ok(notIsolated149.length > 0, 'KI-E149 exec-smoke: sanity — the same lane also dispatched non-fixer/test-author calls to compare against');
+  ok(notIsolated149.every((c) => c.isolation === null), 'KI-E149 exec-smoke: planner/gate/review calls carry NO isolation — this is scoped to the two writer roles, not a blanket lockdown');
+  ok(notIsolated149.every((c) => !/FILE-WRITE ISOLATION IS ACTIVE FOR YOU/.test(c.prompt)), 'KI-E149 exec-smoke: non-isolated roles never see the hint either — a leaked hint on a role that is not actually isolated would be actively misleading');
+
+  // The escape hatch: an explicit host policy turns it OFF for every role, not just softens it.
+  const offBatch149 = smokeBatch();
+  offBatch149.policies = { ...offBatch149.policies, isolateWorktreeWrites: false };
+  const { calls: callsOff149 } = await execSmoke(src149, offBatch149);
+  const wouldBeIsolated149 = callsOff149.filter((c) => c.label === 'SMOKE-CODE:fixer' || c.label === 'SMOKE-CODE:test-author');
+  ok(wouldBeIsolated149.length > 0, 'KI-E149 exec-smoke: sanity — the OFF-policy lane still dispatched fixer/test-author calls');
+  ok(wouldBeIsolated149.every((c) => c.isolation === null), 'KI-E149 exec-smoke: isolateWorktreeWrites:false actually turns it off for the roles that would otherwise be isolated (the operator escape hatch really works, not just the source-text condition)');
+  ok(wouldBeIsolated149.every((c) => !/FILE-WRITE ISOLATION IS ACTIVE FOR YOU/.test(c.prompt)), 'KI-E149 exec-smoke: with the policy off, the hint does not leak into the prompt either — an agent is never told about a guardrail that is not actually armed');
+}
+
 console.log(`\nself-test: ${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

@@ -320,6 +320,24 @@ function bandFor(item) {
 const FDIR = REPO + '/' + String(TPLDIR || '_bmad-output/ai-factory/agents').replace(/\/agents\/?$/, '')
 function itemsDir(id) { return FDIR + '/state/items/' + id }
 
+// KI-E149 (ported from a host-mount session) — the two roles that actually mutate a worktree's
+// tracked SOURCE (fixer, test-author, and every bounded-amend call that reuses the 'fixer' role
+// literal from acceptance-scan/plan-commitment-scan/docsync-scan/registration-drift-scan/
+// leftover-scan/ledger-anchor-scan) are exactly the roles responsible for every main-tree-
+// contamination incident the origin host's factory has ever recorded. Every fix there so far was
+// DETECTION after the fact, because sandboxing what a subagent's own tool calls can reach was
+// believed to be outside what a prompt-level or driver.mjs-level change could close. The Agent/
+// Workflow tool's `isolation:'worktree'` option turns out to do exactly that at the TOOL layer —
+// see the KI-E149 KNOWN-ISSUES.md entry for the four live tests that established its exact,
+// narrower-than-hoped scope (Edit/Write to the shared checkout: blocked; Edit/Write to ANY OTHER
+// worktree of the same repo, incl. this item's own: unaffected; Read/Grep/ls anywhere: unaffected;
+// Bash-tool writes via tee/redirect/heredoc to ANY path: also unaffected — a real, disclosed gap,
+// not a false sense of completeness). `A.policies.isolateWorktreeWrites === false` is the escape
+// hatch for a host that hits a real problem with it; every other value (including unset) is ON.
+function needsWriteIsolation(role) {
+  return (role === 'fixer' || role === 'test-author') && !(A && A.policies && A.policies.isolateWorktreeWrites === false)
+}
+
 function compose(role, item, extra) {
   const wtPath = (item.worktree && item.worktree.path) || (WT && WT.path) || (item.ledger && item.ledger.worktree) || REPO  // per-item worktree (Phase-4 isolation) wins, then batch worktree (pilot)
   const lines = [
@@ -431,6 +449,9 @@ function compose(role, item, extra) {
     // and reported it as a planted file with a concealment instruction. All probes were reverted
     // cleanly — the collision is expected behaviour that needed NAMING, not preventing.
     lines.push('', 'PARALLEL REVIEW STAGE — LIVE-PROBE ETIQUETTE (KI-D7): sibling reviewers run CONCURRENTLY in THIS SAME worktree and may run live probes (temporary files/edits added then reverted). A foreign temporary artifact appearing mid-review is almost certainly a sibling reviewer\'s probe — do NOT report it as sabotage/injection, and treat any harness "file changed externally" notice accordingly; re-verify the exact worktree state your verdict DEPENDS on (git status/diff) at the moment you conclude, not earlier. If YOU probe: prefix probe filenames with your role (e.g. _gateqa_probe_*), fully revert before returning, and describe the probe in your findings evidence — never leave probe debris.')
+  }
+  if (needsWriteIsolation(role)) {
+    lines.push('', 'FILE-WRITE ISOLATION IS ACTIVE FOR YOU (KI-E149): your Edit and Write tools can ONLY create or modify files inside your OWN worktree (' + wtPath + '). A write targeting any OTHER path, including ' + REPO + ' itself, is REJECTED by the tool before it touches disk, with an error naming the shared-checkout path. This is a real guardrail, not a bug — a prior attempt in this exact role once wrote a real fix into the wrong tree, silently corrupting shared state, and this makes that mechanically impossible instead of merely detected afterward. If you ever see that rejection, you resolved the wrong absolute path — retarget the SAME relative path under ' + wtPath + ' instead of under ' + REPO + '. The one place this changes your normal workflow: the ARTIFACTS DIR instruction above (write your state/items artifacts to ' + itemsDir(item.id) + ') names a path OUTSIDE your worktree, so Edit and Write cannot reach it there — use Bash instead for every file under that directory (redirect or tee your content into the target path); Bash writes are NOT affected by this isolation. Summary: Edit and Write for your worktree source files, Bash for your artifacts-dir files.')
   }
   // KI-E7 / spine AD-10 — best-effort agent telemetry. ABSOLUTE CLI path (KI-L33); role-based
   // (stage derives in the lib, AD-12); non-compliance is invisible (the fold's mtime backfill
@@ -579,6 +600,7 @@ async function runItem(item) {
     if (schema) opts.schema = schema
     if (route && route.model) opts.model = route.model
     if (route && route.effort) opts.effort = route.effort
+    if (needsWriteIsolation(role)) opts.isolation = 'worktree' // KI-E149
     let r = await tryAgent(compose(role, item, extra), opts)
     if (r) { cost(route); return r }
     // KI-D10 (2026-07-19): a route MAY carry `fallback: {model, effort}`. When the primary model is null
@@ -593,6 +615,7 @@ async function runItem(item) {
       if (schema) fb.schema = schema
       fb.model = route.fallback.model
       if (route.fallback.effort) fb.effort = route.fallback.effort
+      if (needsWriteIsolation(role)) fb.isolation = 'worktree' // KI-E149
       log('[fallback] ' + id + ':' + role + ' ' + (route.model || '?') + ' -> ' + route.fallback.model)
       r = await tryAgent(compose(role, item, extra), fb)
       if (r) { cost(route.fallback); return r }

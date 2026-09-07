@@ -61,7 +61,7 @@ export async function execSmoke(factorySrc, batch, options) {
   const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
   const calls = [];
   const agent = async (prompt, opts) => {
-    calls.push({ label: (opts && opts.label) || '', model: (opts && opts.model) || 'inherit' });
+    calls.push({ label: (opts && opts.label) || '', model: (opts && opts.model) || 'inherit', isolation: (opts && opts.isolation) || null, prompt: String(prompt || '').slice(0, 16000) }); // KI-E149 (ported): captures opts.isolation AND a bounded slice of the composed prompt per call, so a test can assert both which calls run write-isolated and that the isolated agent actually SEES the explanatory hint
     if (o.agentOverride) { const r = o.agentOverride(prompt, opts); if (r !== undefined) return r; }
     return defaultAgentStub(opts, o.blockedGate);
   };
