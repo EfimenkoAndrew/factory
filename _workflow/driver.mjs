@@ -185,7 +185,26 @@ function costSnapshot(ledger) {
   const total = Object.values(byModel).reduce((a, b) => a + b, 0);
   const closed = Object.values(ledger.items).filter((r) => r.state === 'CLOSED').length;
   const opus = Object.entries(byModel).filter(([m]) => /opus/i.test(m)).reduce((a, [, t]) => a + t, 0);
-  return { cycle: ledger.cycle, byModel, total, closed, callsPerClosed: closed ? Math.round(total / closed * 10) / 10 : null, opusShare: total ? Math.round(opus / total * 100) / 100 : 0 };
+  // KI-E150 (ported from a host-mount session) — real per-item token totals (factory.js's
+  // concurrency-safe budget.spent() attribution), distinct from byModel/total above which only ever
+  // counted agent CALLS, never tokens. Summed only over CLOSED items with a real tokensUsed figure —
+  // an item folded before this change, or one whose only work was sweep-mode/pre-band-only, may have
+  // no tokensUsed at all; excluded rather than silently counted as 0, so totalTokens/tokensPerClosed
+  // don't understate the true average.
+  const closedWithTokens = Object.values(ledger.items).filter((r) => r.state === 'CLOSED' && typeof r.tokensUsed === 'number' && r.tokensUsed > 0);
+  const totalTokens = closedWithTokens.reduce((a, r) => a + r.tokensUsed, 0);
+  return { cycle: ledger.cycle, byModel, total, closed, callsPerClosed: closed ? Math.round(total / closed * 10) / 10 : null, opusShare: total ? Math.round(opus / total * 100) / 100 : 0, totalTokens, closedWithTokens: closedWithTokens.length, tokensPerClosed: closedWithTokens.length ? Math.round(totalTokens / closedWithTokens.length) : null };
+}
+
+// KI-E150 — the N most token-expensive CLOSED items (real per-item totals, not call counts). Bounded
+// so this stays a report, not a full ledger dump; sorted desc so the costliest work is always visible
+// first regardless of how many items have a recorded tokensUsed.
+function topTokenItems(ledger, n) {
+  return Object.entries(ledger.items)
+    .filter(([, r]) => r.state === 'CLOSED' && typeof r.tokensUsed === 'number' && r.tokensUsed > 0)
+    .sort((a, b) => b[1].tokensUsed - a[1].tokensUsed)
+    .slice(0, n)
+    .map(([id, r]) => ({ id, tokensUsed: r.tokensUsed }));
 }
 
 function readCostHistory(cfg) {
@@ -224,14 +243,25 @@ function costMd(ledger, history) {
     return dCalls > 0 ? `${dCalls}/+0` : '—';
   };
   const trend = hs.slice(-10).map((h) => `| ${h.cycle} | ${h.total} | ${h.closed} | ${h.callsPerClosed ?? '—'} | ${marginalOf(h)} | ${Math.round((h.opusShare || 0) * 100)}% |`).join('\n');
+  // KI-E150 (ported from a host-mount session) — real per-item token totals now exist (factory.js's
+  // concurrency-safe budget.spent() attribution, ledger.mjs's foldResults accumulation). Rendered
+  // alongside the pre-existing call-count table rather than replacing it — call counts are still the
+  // "who did the work" model-routing signal; tokens answer "how expensive was it", a genuinely
+  // different question this report couldn't answer at all before. closedWithTokens can be less than
+  // closed: an item folded before this change, or whose only work was sweep-mode/pre-band-only
+  // (checkpoint-writer bookkeeping calls are deliberately NOT attributed — see the KI-E150
+  // KNOWN-ISSUES.md entry), has no tokensUsed to include.
+  const top = topTokenItems(ledger, 10);
+  const topRows = top.map((t) => `| ${t.id} | ${t.tokensUsed.toLocaleString()} |`).join('\n');
   return [
     '# Cost report — agent calls by model (routing evidence)',
     '',
     `_Generated ${now()} · cycle ${ledger.cycle}_`,
     '',
-    '_Counts are routed agent-calls per model (the faithful "who did the work" signal). Exact token totals',
-    'come from each Workflow run summary (subagent_tokens), recorded per cycle in the cycle report. This',
-    'report is OBSERVABILITY, not a governor — there is no budget gate (owner direction 2026-06-27)._',
+    '_Counts are routed agent-calls per model (the faithful "who did the work" signal) — model routing',
+    'evidence, not a spend total. Real per-item TOKEN totals (KI-E150) are tracked separately below; a',
+    'per-cycle whole-run token total (KI-E23) is still recorded in the cycle report. This report is',
+    'OBSERVABILITY, not a governor — there is no budget gate (owner direction 2026-06-27)._',
     '',
     '| Model | Agent calls | Share |',
     '|---|---|---|',
@@ -243,6 +273,13 @@ function costMd(ledger, history) {
     `- **Closed findings:** ${s.closed}`,
     `- **Agent-calls / closed finding:** ${s.callsPerClosed ?? '— (none closed yet)'}`,
     `- **Opus share of calls:** ${Math.round(s.opusShare * 100)}% _(PLAN §4 goal: opus reserved for hard reasoning + the 3 hard gates + refute)_`,
+    `- **Tokens / closed finding:** ${s.tokensPerClosed ? s.tokensPerClosed.toLocaleString() : '— (no per-item token data yet)'} _(KI-E150 — real total ${s.totalTokens.toLocaleString()} across ${s.closedWithTokens} of ${s.closed} closed item(s) with recorded tokensUsed)_`,
+    '',
+    '## Top 10 closed items by tokens (KI-E150)',
+    '',
+    '| Item | Tokens |',
+    '|---|---|',
+    topRows || '| _(no per-item token data yet)_ |  |',
     '',
     '## Per-cycle trend',
     '',
@@ -975,7 +1012,7 @@ function cmdFold(file, flags) {
           prevMs = s.mtimeMs;
         }
       }
-      temit({ source: 'driver', event: 'item_folded', item: r.id, cycle: cyc, lane: row.runLabel || undefined, outcome: row.state || r.toState, attempts: row.attempts, attrs: { toState: r.toState, band: r.band || undefined, resultId: r.resultId || undefined, direct: isRec || undefined, transitions: (r.transitions || []).slice(0, 12), gates: r.gates || {}, cost: r.cost || {}, infraSuspect: !!r.infraSuspect, verificationOnly: !!r.verificationOnly, priorAttemptReuse: (r.priorAttemptReuse && r.priorAttemptReuse.length) ? r.priorAttemptReuse : undefined, note: String(r.note || '').slice(0, 240) } }); // KI-E23: band stamped so gate-value/cost split LIGHT vs FULL; KI-E46: direct/resultId stamped so recovery closes classify without prose sniffing; KI-E69: priorAttemptReuse visible whenever a relaunch reused a killed run's artifacts
+      temit({ source: 'driver', event: 'item_folded', item: r.id, cycle: cyc, lane: row.runLabel || undefined, outcome: row.state || r.toState, attempts: row.attempts, attrs: { toState: r.toState, band: r.band || undefined, resultId: r.resultId || undefined, direct: isRec || undefined, transitions: (r.transitions || []).slice(0, 12), gates: r.gates || {}, cost: r.cost || {}, tokensUsed: r.tokensUsed || undefined, infraSuspect: !!r.infraSuspect, verificationOnly: !!r.verificationOnly, priorAttemptReuse: (r.priorAttemptReuse && r.priorAttemptReuse.length) ? r.priorAttemptReuse : undefined, note: String(r.note || '').slice(0, 240) } }); // KI-E23: band stamped so gate-value/cost split LIGHT vs FULL; KI-E46: direct/resultId stamped so recovery closes classify without prose sniffing; KI-E69: priorAttemptReuse visible whenever a relaunch reused a killed run's artifacts; KI-E150: tokensUsed is this item's OWN precise total (concurrency-safe attribution), distinct from KI-E23's whole-run usage event
     }
     temit({ source: 'driver', event: 'fold_summary', cycle: cyc, attrs: { file: basename(foldPath), applied: applied.length, rejected: rejected.length, skipped: skipped.length, overrides: overrides.length, infraRetries: infraApplied.length, escalated: escalated.length } });
     // KI-E23 (P6c): the run's token usage, returned by factory.js from the runtime budget counter —

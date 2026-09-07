@@ -3763,5 +3763,94 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
   ok(wouldBeIsolated149.every((c) => !/FILE-WRITE ISOLATION IS ACTIVE FOR YOU/.test(c.prompt)), 'KI-E149 exec-smoke: with the policy off, the hint does not leak into the prompt either — an agent is never told about a guardrail that is not actually armed');
 }
 
+// KI-E150 (ported from a host-mount session) — precise PER-ITEM token attribution. Prompted directly
+// by an owner question there ("how many tasks closed since Thursday, tokens per task?") that the
+// origin factory could not answer: KI-E23's budget.spent() already tracked real output tokens, but
+// only as ONE grand total for the whole Workflow run — every item sharing a batch was invisible
+// individually, and the per-item `cost` field only ever counted agent CALLS, never tokens.
+// budget.spent() is a SHARED, run-wide counter with no per-call breakdown exposed to this sandbox
+// (the Workflow runtime gives a script no other token signal at all) — under concurrent items (the
+// normal case, CONC>1), a naive snapshot-before/snapshot-after around one item's whole lifecycle
+// would double-count or steal tokens a DIFFERENT item spent during the same wall-clock window. The
+// fix: a shared "last claimed" checkpoint (lastSpentGlobal) that every successful agent() completion,
+// inside call()'s recordTokens(), reads and atomically advances (no `await` between the read and the
+// write, so no other item's completion can interleave inside that step — JS resolves one microtask
+// fully before the next runs) — correct under REAL concurrency, not just when items happen to run
+// sequentially.
+{
+  const src150 = readFileSync(join(import.meta.dirname, '..', 'factory.js'), 'utf8');
+  ok(/let lastSpentGlobal = /.test(src150), 'KI-E150: the shared token checkpoint exists at top-level (module) scope, outside runItem, so it persists across ALL concurrently-running items in the batch');
+  ok(/const recordTokens = function \(\) \{/.test(src150), 'KI-E150: the per-item recordTokens helper exists inside runItem, closing over that item\'s own res object');
+  ok(/const now = budget\.spent\(\)\s*\n\s*const delta = now - lastSpentGlobal\s*\n\s*lastSpentGlobal = now/.test(src150), 'KI-E150: the read-then-write is a single synchronous block with no await between reading the counter and advancing the checkpoint — the actual atomicity the whole design depends on');
+  ok((src150.match(/tryAgent\(compose\(role, item, extra\), (opts|fb), recordTokens\)/g) || []).length === 2, 'KI-E150: recordTokens is wired as tryAgent\'s onAttempt callback at BOTH call() sites (primary + KI-D10 fallback) — a fix that missed the fallback would silently under-count the moment a primary model degraded, the same gap class KI-E149 already guards against for isolation');
+  ok(/if \(onAttempt\) onAttempt\(\)\s*\n\s*if \(r\) return r/.test(src150), 'KI-E150: tryAgent claims tokens for EVERY attempt as it resolves, success or not, BEFORE deciding whether to return — a call that exhausts every retry and returns null still spent real tokens on each try, and claiming only on eventual success would leak those retries\' tokens onto whichever call (quite possibly a DIFFERENT item\'s) happens to claim next');
+  ok(/catch \(e\) \{\s*\n(?:[^\n]*\n){0,10}?\s*if \(onAttempt\) onAttempt\(\)/.test(src150), 'KI-E150: a throw (KI-D9 — agent() throws instead of returning null on its own retry-cap/terminal API error) ALSO claims tokens, not only the non-throwing null path — a thrown attempt still spent real tokens up to the point of failure');
+
+  const lsrc150 = readFileSync(join(import.meta.dirname, 'ledger.mjs'), 'utf8');
+  ok(/tokensUsed: 0,/.test(lsrc150), 'KI-E150: a new ledger item defaults tokensUsed to 0 (discoverable field, matching cost\'s own {} default) rather than leaving it silently absent');
+  ok(/if \(typeof r\.tokensUsed === 'number'\) row\.tokensUsed = \(row\.tokensUsed \|\| 0\) \+ r\.tokensUsed;/.test(lsrc150), 'KI-E150: foldResults ACCUMULATES tokensUsed across attempts, same posture as the pre-existing cost accumulation — a relaunched item\'s lifetime total, not just its last attempt');
+
+  const dsrc150 = readFileSync(join(import.meta.dirname, '..', 'driver.mjs'), 'utf8');
+  ok(/tokensUsed: r\.tokensUsed \|\| undefined/.test(dsrc150), 'KI-E150: the item_folded telemetry event carries tokensUsed through — without this, the real per-item number would be computed and persisted to the ledger but invisible to telemetry-report/cost-history consumers');
+  ok(/function topTokenItems\(ledger, n\)/.test(dsrc150), 'KI-E150: a topTokenItems helper exists for the cost report\'s new top-10-by-tokens section');
+
+  // Behavioural: every agent() call advances a shared, deterministic counter by a FIXED amount. If the
+  // atomic-claim attribution had ANY cross-item contamination, a given item's tokensUsed would NOT
+  // exactly equal its own call count times that fixed amount — this discriminates a real bug, it is
+  // not just a "the grand total adds up" sanity check that a broken implementation could still pass.
+  const PER_CALL_TOKENS_150 = 1000;
+  let mockSpent150 = 0;
+  const budget150 = { total: null, spent: () => mockSpent150, remaining: () => Infinity };
+  // KI-E150: a purely-synchronous override lets makeLimiter's pump() dispatch every concurrent
+  // call's underlying "agent resolution" in one contiguous microtask burst — ALL of them increment
+  // mockSpent150 before ANY of them reaches its own onAttempt() claim, so whichever claim happens to
+  // be first in the resulting queue absorbs the whole burst. That never happens for real agent calls
+  // (genuinely different wall-clock completion times mean each call's resolve-then-claim chain drains
+  // fully before the next one starts) — crossing a real macrotask boundary here (a 0ms setTimeout)
+  // reproduces that same one-at-a-time draining instead of the mock's artificial same-tick pile-up.
+  const { result: result150, calls: calls150 } = await execSmoke(src150, smokeBatch(), {
+    budget: budget150,
+    agentOverride: () => new Promise((resolve) => {
+      setTimeout(() => { mockSpent150 += PER_CALL_TOKENS_150; resolve(undefined); }, 0);
+    }), // falls through to defaultAgentStub for the actual response shape
+  });
+  // KI-E150: checkpointProgress (KI-E137) / checkpointResult (KI-L40) also call tryAgent — their
+  // labels are `<id>:progress:<stage>` / `<id>:checkpoint`, so they'd otherwise inflate the "expected"
+  // count below even though claimTokensSilently deliberately keeps their spend OUT of any item's
+  // tokensUsed (same posture as sweep mode's separately-tracked cost). Exclude them from both the
+  // per-item expected tally and the grand-total reconciliation, or this test would fail for the wrong
+  // reason — asserting a real item's tokensUsed against an expected value inflated by infra overhead.
+  // (This repo has only checkpointResult/KI-L40 — checkpointProgress/KI-E137 was not ported here — so
+  // only the `:checkpoint` shape ever actually fires below; the `:progress:` half of the predicate is
+  // harmless dead weight, kept for byte-parity with the origin check rather than trimmed to what this
+  // repo currently exercises.)
+  const isCheckpointLabel150 = (label) => { const seg = label.split(':')[1]; return seg === 'progress' || seg === 'checkpoint'; };
+  const byItem150 = {};
+  for (const c of calls150) {
+    if (isCheckpointLabel150(c.label)) continue;
+    const id = c.label.split(':')[0]; byItem150[id] = (byItem150[id] || 0) + 1;
+  }
+  ok(Object.keys(byItem150).length > 1, 'KI-E150 exec-smoke: sanity — the smoke batch dispatched calls for MULTIPLE items sharing the run (the exact scenario the atomic-claim design exists for)');
+  const resultsById150 = Object.fromEntries((result150.results || []).map((r) => [r.id, r]));
+  let anyChecked150 = false;
+  for (const [id, callCount] of Object.entries(byItem150)) {
+    const r150 = resultsById150[id];
+    if (!r150) continue;
+    anyChecked150 = true;
+    eq(r150.tokensUsed, callCount * PER_CALL_TOKENS_150, 'KI-E150 exec-smoke: ' + id + '\'s tokensUsed exactly equals its OWN call count (' + callCount + ') times the per-call amount — no cross-item contamination under concurrent Promise.all execution');
+  }
+  ok(anyChecked150, 'KI-E150 exec-smoke: sanity — at least one item was actually checked against its own call count');
+  const checkpointCalls150 = calls150.filter((c) => isCheckpointLabel150(c.label)).length;
+  ok(checkpointCalls150 > 0, 'KI-E150 exec-smoke: sanity — the smoke batch actually exercised the checkpoint writers (otherwise the exclusion above is untested)');
+  const totalClaimed150 = (result150.results || []).reduce((a, r) => a + (r.tokensUsed || 0), 0);
+  eq(totalClaimed150, mockSpent150 - checkpointCalls150 * PER_CALL_TOKENS_150, 'KI-E150 exec-smoke: the SUM of every item\'s tokensUsed plus the checkpoint-writer overhead (deliberately discarded by claimTokensSilently, never attributed to any item) exactly equals the total tokens spent across the whole run — checkpoint overhead is the ONLY intentionally-unattributed spend, and nothing else is lost or double-counted');
+
+  // The default exec-smoke budget stub (spent() always 0, used by every OTHER test in this suite) must
+  // stay fully inert for this new field — no existing test's result-shape assertions should ever see a
+  // populated tokensUsed they were not written to expect.
+  const { result: resultDefault150 } = await execSmoke(src150, smokeBatch());
+  ok((resultDefault150.results || []).every((r) => r.tokensUsed === undefined), 'KI-E150 exec-smoke: with the default (non-incrementing) budget stub every OTHER test in this suite already relies on, tokensUsed stays undefined — this feature is fully inert until a host actually wires a real budget');
+}
+
 console.log(`\nself-test: ${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

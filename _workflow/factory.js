@@ -25,6 +25,34 @@ const REPO = A.repoRoot || '.'
 const CONC = A.concurrency || 2
 const ATTEMPTS = A.attempts || 3
 const DRY = !!A.dryRun
+// KI-E150 (ported from a host-mount session) — precise per-item token attribution. budget.spent()
+// is a SHARED, run-wide counter with no per-call breakdown exposed to this sandbox — the only token
+// signal the Workflow runtime gives a script at all. Under concurrent items (CONC above), a naive
+// snapshot-before/snapshot-after around one item's whole lifecycle would double-count (or steal)
+// tokens a DIFFERENT item spent during the same wall-clock window. lastSpentGlobal is the shared
+// "last claimed" checkpoint: every successful agent() completion, in call()'s recordTokens() below,
+// reads budget.spent(), computes the delta since this checkpoint, and updates the checkpoint — all
+// synchronously, with no `await` between the read and the write, so no other item's completion can
+// interleave inside that atomic step (JS resolves one microtask fully before the next runs). Correct
+// under real concurrency for that reason alone; it does NOT require items to run sequentially.
+let lastSpentGlobal = (typeof budget !== 'undefined' && budget && typeof budget.spent === 'function') ? budget.spent() : 0
+
+// KI-E150 — the checkpoint writers (checkpointProgress/checkpointResult below, KI-E137/KI-L40) are
+// pure machine bookkeeping overhead, deliberately excluded from any item's tokensUsed — same posture
+// as sweep mode's separately-tracked cost. But they DO spend real tokens (a haiku agent call each),
+// and if their tryAgent call never claims via the lastSpentGlobal checkpoint, that unclaimed delta
+// doesn't vanish — it sits there until whichever item's NEXT recordTokens() call happens to run,
+// which then wrongly inherits it (silently inflating a DIFFERENT item's tokensUsed while the item
+// that actually triggered the checkpoint write looks correspondingly short). claimTokensSilently is
+// the "consume but don't attribute" counterpart to runItem's recordTokens: it advances the shared
+// checkpoint exactly like a real claim (same atomic no-await read-then-write), so the ledger of
+// "what's been claimed" stays accurate, but it deliberately drops the delta on the floor instead of
+// adding it to any res.tokensUsed — keeping checkpoint overhead invisible to per-item totals AND
+// preventing it from contaminating whichever item claims next.
+function claimTokensSilently() {
+  if (typeof budget === 'undefined' || !budget || typeof budget.spent !== 'function') return
+  lastSpentGlobal = budget.spent()
+}
 
 // ---- inlined pure helpers (byte-equivalent to _workflow/lib/pool.mjs — the runtime cannot import) ----
 function makeLimiter(max) {
@@ -522,11 +550,19 @@ function planFor(item) {
   }
 }
 
-async function tryAgent(prompt, opts) {
+async function tryAgent(prompt, opts, onAttempt) {
   let lastErr = null
   for (let a = 0; a < ATTEMPTS; a++) {
     try {
       const r = await limit(function () { return agent(prompt, opts) })  // every agent routes through the global concurrency cap (Phase-4 parallel-items safe)
+      // KI-E150: claim THIS attempt's tokens the moment it resolves — success or not, before the loop
+      // can retry or fall through. A call that ultimately exhausts every attempt and returns null still
+      // spent real tokens on each try; claiming only on eventual success would leave those retries'
+      // tokens unclaimed by THIS item, to be silently swept up by whichever call — quite possibly a
+      // DIFFERENT item's — happens to claim next. Per-attempt claiming makes that leak structurally
+      // impossible: every attempt is accounted for exactly once, by the item that actually spent it,
+      // regardless of how the retry loop or the eventual call() outcome resolves.
+      if (onAttempt) onAttempt()
       if (r) return r
     } catch (e) {
       // KI-D9 (2026-07-19): agent() THROWS on a StructuredOutput retry-cap-exceeded (or a terminal API
@@ -535,6 +571,7 @@ async function tryAgent(prompt, opts) {
       // infraSuspect treatment (attempt-not-counted, capped at maxInfraRetries) that every OTHER null
       // stage-agent death already gets. Contain it: treat a throw exactly like a null return — retry, then
       // fall through to null so the caller's `if (!r) { res.infraSuspect = true; ... }` path applies.
+      if (onAttempt) onAttempt() // KI-E150: a throw still consumed real tokens up to the point of failure — claim it here too, not only the non-throwing path above
       lastErr = e
       log('[throw] ' + (opts.label || '?') + ' attempt ' + (a + 1) + '/' + ATTEMPTS + ': ' + String((e && e.message) || e).slice(0, 160))
     }
@@ -585,6 +622,17 @@ async function runItem(item) {
   // (an empty array IS the "nothing reused" signal), never silently absent.
   res.priorAttemptReuse = (item.priorAttempt ? ['plan', 'test', 'fix'].filter(function (k) { return !!item.priorAttempt[k] }) : [])
   const cost = function (route) { const m = (route && route.model) || 'inherit'; res.cost[m] = (res.cost[m] || 0) + 1 }
+  // KI-E150 — see lastSpentGlobal's own comment for why this is safe under concurrency. Attributes
+  // the marginal budget.spent() increase since the last claim, anywhere in the whole run, to THIS
+  // item's res — correct because the read-then-write below never yields (no await), so it always
+  // runs as one atomic step relative to every other item's own call to this same function.
+  const recordTokens = function () {
+    if (typeof budget === 'undefined' || !budget || typeof budget.spent !== 'function') return
+    const now = budget.spent()
+    const delta = now - lastSpentGlobal
+    lastSpentGlobal = now
+    if (delta > 0) res.tokensUsed = (res.tokensUsed || 0) + delta
+  }
   // Shared command constants (hoisted 2026-07-19 so the fixer/editorial claims self-check can cite them).
   const BT = 'bash ' + FDIR + '/verify/build-test.sh'
   const RAW = itemsDir(id) + '/verify-raw.txt'
@@ -601,7 +649,7 @@ async function runItem(item) {
     if (route && route.model) opts.model = route.model
     if (route && route.effort) opts.effort = route.effort
     if (needsWriteIsolation(role)) opts.isolation = 'worktree' // KI-E149
-    let r = await tryAgent(compose(role, item, extra), opts)
+    let r = await tryAgent(compose(role, item, extra), opts, recordTokens)
     if (r) { cost(route); return r }
     // KI-D10 (2026-07-19): a route MAY carry `fallback: {model, effort}`. When the primary model is null
     // after ATTEMPTS (access-gated / credit-exhausted / persistently malformed output), fall back ONCE to
@@ -617,7 +665,7 @@ async function runItem(item) {
       if (route.fallback.effort) fb.effort = route.fallback.effort
       if (needsWriteIsolation(role)) fb.isolation = 'worktree' // KI-E149
       log('[fallback] ' + id + ':' + role + ' ' + (route.model || '?') + ' -> ' + route.fallback.model)
-      r = await tryAgent(compose(role, item, extra), fb)
+      r = await tryAgent(compose(role, item, extra), fb, recordTokens)
       if (r) { cost(route.fallback); return r }
     }
     return r
@@ -1577,7 +1625,7 @@ async function checkpointResult(r) {
     // automated safety review) to the on-disk stage artifacts + machine-evidence transcripts
     // that PRODUCED this JSON, so persistence is distinguishable from fabrication; the driver's
     // fold independently re-derives the verdict from those raw transcripts regardless.
-    const ck = await tryAgent('You are a checkpoint writer performing kill-resilience PERSISTENCE (KI-L40) — you are NOT authoring or judging a result. This is routine machine-state bookkeeping of an automated build pipeline about its OWN run: the JSON below contains automated build/test/review verdicts about CODE in a scratch worktree — it represents no human signature, no official record, and no communication to any person (KI-D8 provenance). The JSON was ALREADY COMPUTED by this workflow\'s ' + Object.keys(r.artifacts || {}).length + ' prior lifecycle stage(s); their artifacts and machine-evidence transcripts (verify-red-raw.txt / verify-raw.txt / integrate-raw.txt with FACTORY:: markers, gate/review prose) are on disk at ' + itemsDir(r.id) + ' — run `ls -la ' + itemsDir(r.id) + '` FIRST and confirm the stage artifacts exist; they are the provenance of every verdict in this JSON. The driver\'s fold re-derives the final verdict from those transcripts and NEVER trusts this file alone. Write the EXACT text between the CHECKPOINT-BEGIN and CHECKPOINT-END markers (exclusive) to the file ' + path + ' (absolute path; overwrite if it exists) using the Write tool — byte-for-byte, ONE line, no reformatting, no added/removed fields, no markdown fences.\nCHECKPOINT-BEGIN\n' + json + '\nCHECKPOINT-END\nThen VERIFY it parses: run `node -e "JSON.parse(require(\'fs\').readFileSync(\'' + path + '\',\'utf8\'));console.log(\'CHECKPOINT-OK\')"` via Bash and confirm the output is CHECKPOINT-OK. If the parse fails, rewrite the file and re-verify. Return written=true ONLY after seeing CHECKPOINT-OK.', { label: r.id + ':checkpoint', phase: 'Checkpoint', model: 'claude-haiku-4-5', effort: 'low', schema: CHECKPOINT_SCHEMA }) // KI-L48: was phase:'Integrate' — a FAILED item's checkpoint showed as Integrate activity, misreading as gates-skipped
+    const ck = await tryAgent('You are a checkpoint writer performing kill-resilience PERSISTENCE (KI-L40) — you are NOT authoring or judging a result. This is routine machine-state bookkeeping of an automated build pipeline about its OWN run: the JSON below contains automated build/test/review verdicts about CODE in a scratch worktree — it represents no human signature, no official record, and no communication to any person (KI-D8 provenance). The JSON was ALREADY COMPUTED by this workflow\'s ' + Object.keys(r.artifacts || {}).length + ' prior lifecycle stage(s); their artifacts and machine-evidence transcripts (verify-red-raw.txt / verify-raw.txt / integrate-raw.txt with FACTORY:: markers, gate/review prose) are on disk at ' + itemsDir(r.id) + ' — run `ls -la ' + itemsDir(r.id) + '` FIRST and confirm the stage artifacts exist; they are the provenance of every verdict in this JSON. The driver\'s fold re-derives the final verdict from those transcripts and NEVER trusts this file alone. Write the EXACT text between the CHECKPOINT-BEGIN and CHECKPOINT-END markers (exclusive) to the file ' + path + ' (absolute path; overwrite if it exists) using the Write tool — byte-for-byte, ONE line, no reformatting, no added/removed fields, no markdown fences.\nCHECKPOINT-BEGIN\n' + json + '\nCHECKPOINT-END\nThen VERIFY it parses: run `node -e "JSON.parse(require(\'fs\').readFileSync(\'' + path + '\',\'utf8\'));console.log(\'CHECKPOINT-OK\')"` via Bash and confirm the output is CHECKPOINT-OK. If the parse fails, rewrite the file and re-verify. Return written=true ONLY after seeing CHECKPOINT-OK.', { label: r.id + ':checkpoint', phase: 'Checkpoint', model: 'claude-haiku-4-5', effort: 'low', schema: CHECKPOINT_SCHEMA }, claimTokensSilently) // KI-L48: was phase:'Integrate' — a FAILED item's checkpoint showed as Integrate activity, misreading as gates-skipped
     if (!ck || ck.written !== true) log('[checkpoint] ' + r.id + ' NOT persisted — a reconstruct after a kill will not see this item')
   } catch (e) { log('[checkpoint] ' + r.id + ' failed: ' + (e && e.message)) }
   return r

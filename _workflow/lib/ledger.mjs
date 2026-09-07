@@ -212,6 +212,7 @@ export function syncFromGraph(ledger, graph) {
       artifacts: {},
       gates: {},
       cost: {},
+      tokensUsed: 0,
       note: blocked ? (wi.ownerDecision || 'owner decision required') : (wi.ownerDecisionResolved === true && wi.ownerDecision != null ? 'owner-ruled: ' + wi.ownerDecision : null),
       history: [{ from: null, to: state, at: now(), note: 'sync-from-graph' }],
       updatedAt: now(),
@@ -304,6 +305,7 @@ export function foldResults(ledger, results) {
     if (r.artifacts) row.artifacts = { ...row.artifacts, ...r.artifacts };
     if (r.gates) row.gates = { ...row.gates, ...r.gates };
     if (r.cost) for (const [m, t] of Object.entries(r.cost)) row.cost[m] = (row.cost[m] || 0) + t;
+    if (typeof r.tokensUsed === 'number') row.tokensUsed = (row.tokensUsed || 0) + r.tokensUsed; // KI-E150 — accumulates across attempts, same posture as cost above
     if (r.worktree !== undefined) row.worktree = r.worktree;
     if (r.branch !== undefined) row.branch = r.branch;
     if (typeof r.attemptsDelta === 'number') row.attempts += r.attemptsDelta;
