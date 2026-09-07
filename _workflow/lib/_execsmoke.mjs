@@ -22,6 +22,7 @@ export function defaultAgentStub(opts, blockedGate) {
   const req = s.required || [];
   const label = (opts && opts.label) || '';
   if (p.written) return { written: true };
+  if (p.hash) return { hash: 'deadbeef'.repeat(8) } // KI-E139 pack-hash probe (happy path — a stable, deterministic 64-hex-char stub hash)
   if (p.covered !== undefined) return { covered: true, gaps: [] }; // KI-E18 AcceptanceScan probe (happy path)
   if (p.honored !== undefined) return { honored: true, gaps: [] }; // KI-E87/E101 PlanCommitment/PlanStep probe (happy path)
   if (p.count !== undefined) return { count: 0, hits: [] }; // KI-E59 CommentScan probe (happy path — zero new comments)

@@ -89,6 +89,15 @@ export const SWEEP_DESIGN_SCHEMA = { type: 'object', additionalProperties: false
 
 export const CHECKPOINT_SCHEMA = { type: 'object', additionalProperties: false, required: ['written'], properties: { written: { type: 'boolean' }, note: { type: 'string' } } };
 
+// KI-E139 (ported from a host-mount session) — pack-hash probe (schema-parity ONLY, same
+// disclosed-gap shape as other UNPORTED-with-a-reason schemas): the content-hash fencing token
+// gate-band reuse compares against a prior attempt's progress.json is a genuinely UNPORTED
+// mechanism in this runtime (see stage-parity.mjs's UNPORTED['pack-hash-probe'] for the reason) —
+// no mechanical or agent-dispatched equivalent exists here, so it is intentionally absent from the
+// SCHEMAS registry below (nothing in this runtime ever needs to validate against it) while still
+// satisfying byte/structure parity with factory.js.
+export const PACK_HASH_SCHEMA = { type: 'object', additionalProperties: false, required: ['hash'], properties: { hash: { type: 'string' } } };
+
 // Registry keyed by the same schema-name string the runtime.mjs CLI accepts on `submit --schema <name>`.
 export const SCHEMAS = {
   PLAN_SCHEMA, PLAN_STEPS_NUDGE_SCHEMA, TEST_SCHEMA, FIX_SCHEMA, VERIFY_SCHEMA, GATE_SCHEMA, REFUTE_SCHEMA, REAUDIT_SCHEMA,

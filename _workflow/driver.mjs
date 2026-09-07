@@ -1168,6 +1168,15 @@ function cmdResume(flags) {
             const pa = loadPriorAttempt(itemDir, claimMs || undefined);
             const stages = priorAttemptStages(pa);
             if (stages.length) { it.priorAttempt = pa; reusedAny = true; console.log(`    KI-E69: ${id} will REUSE {${stages.join(', ')}} from its already-on-disk attempt — verify onward still runs fresh`); }
+            // KI-E139 (ported from a host-mount session): attach a mid-pipeline progress.json
+            // (KI-E137), UNGATED by claimMs/clock — unlike plan/test/fix reuse above, this carries NO
+            // trust on its own; factory.js re-derives a FRESH content hash of the CURRENT worktree and
+            // only ever adopts the gate-band verdict on a proven match (see runItem's KI-E139 block).
+            // Still cycle-fenced (readProgressCheckpoint requires resultId === id#cyc, the SAME
+            // fold-idempotency convention result.json uses) so a truly ancient checkpoint is never even
+            // offered up for the hash check to evaluate.
+            const priorProgress = readProgressCheckpoint(itemDir, id, cyc);
+            if (priorProgress) { it.priorProgress = priorProgress; reusedAny = true; console.log(`    KI-E139: ${id} carries a progress.json at stage '${priorProgress.progressStage}' — factory.js hash-verifies the CURRENT worktree before trusting any of it (gate-band reuse only, never assumed)`); }
           }
           if (reusedAny) {
             const labelSlug = ((ledger.items[ids[0]] || {}).runLabel) || null;

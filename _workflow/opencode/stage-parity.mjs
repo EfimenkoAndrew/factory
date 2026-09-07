@@ -31,6 +31,7 @@ export const MECHANICAL = {
 // so an item can pass here that canon would have failed. Listed with the evidence class it protects
 // against so the cost of the gap is legible rather than implied.
 export const UNPORTED = {
+  'pack-hash-probe': 'KI-E139 (ported from a host-mount session) — canon can now SKIP re-running its expensive opus gate band on a relaunch, when a fresh content-hash of review-pack.md proves the reviewable diff is byte-identical to what a prior attempt already gated to a resolved GATED state (state/items/<id>/progress.json, KI-E137). This port has no equivalent: planNext/applyPhaseResults have no relaunch-reuse concept at all, so every relaunch here always re-pays the FULL gate band regardless of whether the diff changed. Cost of the gap: purely economic, not a correctness hole — a relaunched item here can never silently skip a review it should have gotten (the reuse only ever SKIPS an identical re-review, never substitutes for a real one), it just cannot avoid paying for one it already earned. Not ported because this runtime\'s phase-driven state machine has no notion of "prior attempt" progress to fast-forward from at all; adding one is a materially larger, separately-scoped change than adding a single stage.',
 };
 
 export const STAGE_PARITY = { mechanical: MECHANICAL, unported: UNPORTED };

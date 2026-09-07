@@ -1218,13 +1218,15 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
       ok(typeof why === 'string' && why.trim().length >= 40, 'KI-E103: stage-parity ' + bucket + '.' + role + ' states a substantive reason, not a placeholder');
     }
   }
-  // the three genuinely-absent stages are named explicitly, so closing one is a visible manifest edit
-  // KI-E112: the UNPORTED set is now EMPTY — every canonical agent stage is either dispatched by the
-  // port or implemented mechanically. This assertion is deliberately an equality against `[]` rather
+  // the genuinely-absent stages are named explicitly, so closing (or re-opening) one is a visible
+  // manifest edit. This assertion is deliberately an equality against the EXACT expected set rather
   // than a "<= N" bound: re-opening a gap must be a visible, arguable edit to this line, not a
   // quietly-growing list. If a future stage genuinely cannot be ported, add it to UNPORTED with a
-  // reason AND change this assertion in the same commit.
-  eq(Object.keys(STAGE_PARITY.unported), [], 'KI-E112: NO canonical stage is unported — the four KI-E103 disclosed gaps (red-proof KI-E83, plan-commitment/plan-step KI-E87+E101, ledger-anchor KI-E91, rootcause KI-E104) are all closed');
+  // reason AND change this assertion in the same commit — exactly what KI-E139 (ported from a
+  // host-mount session) just did: `pack-hash-probe` (the gate-band-reuse content-hash probe) has no
+  // relaunch-reuse concept in this runtime to fast-forward from at all, so it is genuinely UNPORTED,
+  // not a silent regression.
+  eq(Object.keys(STAGE_PARITY.unported), ['pack-hash-probe'], 'KI-E112/KI-E139: the UNPORTED set contains EXACTLY pack-hash-probe — the four original KI-E103 disclosed gaps (red-proof KI-E83, plan-commitment/plan-step KI-E87+E101, ledger-anchor KI-E91, rootcause KI-E104) are still all closed; pack-hash-probe is the one new, deliberately-disclosed gap KI-E139 introduces');
   ok(Object.keys(STAGE_PARITY.mechanical).length >= 5, 'KI-E112: the mechanical set carries the stages implemented deterministically instead of via an agent (runner, marker, comment, red-proof, rootcause)');
   // --- shared-constant byte parity (the KI-E97 drift class)
   for (const name of SHARED_CONSTANTS) {
@@ -3857,12 +3859,10 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
 // so a Workflow killed anywhere between `fix` and `integrate` (10-25+ agent calls: the whole pre-band
 // scan chain, then the entire opus gate band, then refute+re-audit) left reconstruct with NOTHING,
 // discarding every already-paid-for stage no matter how close to done it was.
-// NOTE on scope: this port deliberately lands WITHOUT KI-E139 (content-hash-fenced gate-band reuse),
-// which the origin repo shipped in the SAME commit — the post-preband checkpoint call here is the
-// plain 2-arg form (`checkpointProgress(res, 'post-preband')`), not yet the 3-arg form carrying a
-// reviewPackHash, since there is no PACK_HASH_SCHEMA/prebandHash probe here yet to produce one. E139
-// is a separate, later port; the assertion below is adapted to match this repo's CURRENT 2-arg call
-// rather than assuming the 3-arg shape the origin's own test (written after E137+E139 together) pins.
+// The origin repo shipped this together with KI-E139 (content-hash-fenced gate-band reuse) in one
+// commit; landed here as two separate commits instead, since checkpointProgress's `extra` parameter
+// is optional and the post-preband call site cleanly upgrades from 2-arg to 3-arg once KI-E139 (below)
+// adds PACK_HASH_SCHEMA/the prebandHash probe.
 {
   const fac137 = readFileSync(join(import.meta.dirname, '..', 'factory.js'), 'utf8');
   ok(/async function checkpointProgress\(res, stage, extra\)/.test(fac137), 'KI-E137: checkpointProgress is defined as its own function, mirroring checkpointResult (KI-L40) — extra merges additional fields into the snapshot only, never onto res itself');
@@ -3875,7 +3875,7 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
   // Structural order: each checkpoint call sits AFTER its milestone res.transitions.push(...) and
   // BEFORE the next expensive phase begins — source-text position as a proxy for control-flow order.
   const iCallPV = fac137.indexOf("checkpointProgress(res, 'post-verify')");
-  const iCallPP = fac137.indexOf("checkpointProgress(res, 'post-preband')"); // this repo: still 2-arg (no KI-E139 hash yet)
+  const iCallPP = fac137.indexOf("checkpointProgress(res, 'post-preband',"); // KI-E139 gave this ONE call a 3rd arg (the review-pack hash) — the other three stay 2-arg
   const iCallPG = fac137.indexOf("checkpointProgress(res, 'post-gates')");
   const iCallPR = fac137.indexOf("checkpointProgress(res, 'post-reaudit')");
   ok(iCallPV > 0 && iCallPP > iCallPV && iCallPG > iCallPP && iCallPR > iCallPG, 'KI-E137: the four checkpoint call sites appear in pipeline order in the source (post-verify < post-preband < post-gates < post-reaudit)');
@@ -3912,9 +3912,9 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
 
 // KI-E137 (read side, ported from a host-mount session) — lib/progress-checkpoint.mjs: parse/
 // validate/summarize a mid-pipeline progress.json, shared by cmdResume + cmdReconstruct so a killed
-// run's reached stage is visible instead of a bare "no checkpoint — must re-run". Deliberately
-// read-only/advisory (does not feed loadPriorAttempt or any relaunch-reuse decision — that is
-// KI-E139, not yet ported here).
+// run's reached stage is visible instead of a bare "no checkpoint — must re-run". This module itself
+// stays read-only/advisory — it does not feed loadPriorAttempt or decide anything about reuse; KI-E139
+// (below) is what actually attaches its output to item.priorProgress and acts on it.
 {
   const PC = await import('./progress-checkpoint.mjs');
   const pdir137 = mkdtempSync(join(tmpdir(), 'factory-progresscheckpoint-'));
@@ -3952,6 +3952,64 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
   ok(drv137.includes("import { readProgressCheckpoint, summarizeProgress } from './lib/progress-checkpoint.mjs';"), 'KI-E137: driver.mjs imports the read-side module');
   ok(drv137.includes('readProgressCheckpoint(abs(join(cfg.paths.items, r.id)), r.id, cyc)'), 'KI-E137: cmdResume\'s per-item inflight line consults progress.json when there is no final checkpoint');
   eq((drv137.match(/readProgressCheckpoint\(join\(itemsRoot, id\), id, cyc\)/g) || []).length, 2, 'KI-E137: cmdReconstruct consults progress.json in BOTH the zero-results and partial-results missing-item branches');
+  // KI-E139: `cyc` is DELIBERATELY optional — cmdGroup's KI-E121 CONTINUING re-claim stamps a brand
+  // NEW cycle number, so a strict fence would make gate-band reuse permanently unreachable from the
+  // documented, PREFERRED recovery route. Safety comes from runItem()'s own hash check downstream,
+  // not from this read, so id-only matching here is a deliberate design choice, not a loosened guard.
+  const prNoCyc = PC.readProgressCheckpoint(d1, 'X');
+  ok(prNoCyc && prNoCyc.progressStage === 'post-gates', 'KI-E139: omitting cyc matches on id ALONE (no cycle fence) — the shape cmdGroup\'s fresh re-claim needs, since it cannot know the OLD cycle number the checkpoint was written under');
+  eq(PC.readProgressCheckpoint(d1, 'Y'), null, 'KI-E139: even with cyc omitted, an id mismatch still returns null — dropping the cycle fence never means dropping the id check');
+}
+
+// KI-E139 (ported from a host-mount session) — GATE-BAND REUSE, content-hash-fenced. Building on
+// KI-E137's checkpoints: when a relaunch's item.priorProgress proves the gate band already reached a
+// resolved GATED state against a review-pack whose hash matches the JUST-regenerated one, the
+// (expensive) opus gate band is skipped and its recorded verdicts are adopted instead. The hash is
+// NEVER trusted from the prior attempt alone; a FRESH probe recomputes it right now, so a genuinely
+// changed (or stale/wrong) diff always falls through to a full, independent re-gate — proven below
+// for both the hit AND every miss shape, not assumed from the hit alone.
+{
+  const fac139 = readFileSync(join(import.meta.dirname, '..', 'factory.js'), 'utf8');
+  ok(fac139.includes("PACK_HASH_SCHEMA = { type: 'object'"), 'KI-E139: PACK_HASH_SCHEMA is defined');
+  ok(fac139.includes("item.priorProgress && ['post-gates', 'post-reaudit'].includes(item.priorProgress.progressStage)"), 'KI-E139: reuse requires the PRIOR attempt to have reached a RESOLVED gate outcome (post-gates or post-reaudit) — post-preband alone (gate band never confirmed complete) is not eligible');
+  ok(fac139.includes('prebandHash && prebandHash === item.priorProgress.reviewPackHash'), 'KI-E139: the hash is recomputed FRESH (prebandHash, from a probe run THIS attempt) and compared, never trusted from item.priorProgress alone');
+  const STUB_HASH139 = 'deadbeef'.repeat(8) // matches _execsmoke.mjs's defaultAgentStub pack-hash-probe stub
+  const gateCallLabels139 = /^SMOKE-CODE:(gate-architect|gate-developer|gate-qa|gate-security|gate-po)$/
+  const soloSmokeCode139 = () => { const b = smokeBatch(); b.items = b.items.filter((it) => it.id === 'SMOKE-CODE'); return b }
+
+  // (1) POSITIVE: a prior attempt reached post-gates with the SAME hash the fresh probe will report
+  // -> the gate band is skipped entirely; the reused verdict is what the final result carries.
+  const b139pos = soloSmokeCode139()
+  b139pos.items[0].priorProgress = { progressStage: 'post-gates', reviewPackHash: STUB_HASH139, gates: { 'gate:architect': 'APPROVED', 'gate:developer': 'APPROVED', 'gate:qa': 'APPROVED', 'gate:security': 'APPROVED', 'gate:po': 'APPROVED' }, gateDetails: {} }
+  const r139pos = await execSmoke(fac139, b139pos, {})
+  eq(r139pos.calls.filter((c) => gateCallLabels139.test(c.label)).length, 0, 'KI-E139 exec-smoke (reuse HIT): zero gate-role calls dispatched — the expensive opus band is genuinely SKIPPED, not merely relabeled after the fact');
+  const res139pos = r139pos.result.results[0]
+  eq(res139pos.toState, 'CLOSED', 'KI-E139 exec-smoke (reuse HIT): the item still CLOSES end-to-end on the reused path (refute+re-audit+integrate still ran fresh, unchanged)');
+  ok(res139pos.gateBandReused === true, 'KI-E139 exec-smoke (reuse HIT): gateBandReused is recorded true on the result — a visible telemetry signal, never a silent shortcut');
+  eq(res139pos.gates['gate:architect'], 'APPROVED', 'KI-E139 exec-smoke (reuse HIT): the REUSED verdict is what ends up on the final result.gates a fold reads');
+
+  // (2) HASH MISMATCH: same eligible prior stage, but the hash does NOT match the fresh probe's
+  // report (a genuinely different diff since the checkpoint, OR a stale/corrupt one) -> never
+  // trusted; falls through to a full, independent re-gate exactly as an unreused item would.
+  const b139miss = soloSmokeCode139()
+  b139miss.items[0].priorProgress = { progressStage: 'post-gates', reviewPackHash: 'f'.repeat(64), gates: { 'gate:architect': 'APPROVED' }, gateDetails: {} }
+  const r139miss = await execSmoke(fac139, b139miss, {})
+  ok(r139miss.calls.filter((c) => gateCallLabels139.test(c.label)).length >= 4, 'KI-E139 exec-smoke (hash MISMATCH): a mismatched hash falls through to a FULL, independent re-gate — the prior (possibly stale, possibly wrong-diff) checkpoint is never trusted on its say-so alone');
+  ok(!r139miss.result.results[0].gateBandReused, 'KI-E139 exec-smoke (hash MISMATCH): gateBandReused is NOT set — the fresh gate band ran for real');
+
+  // (3) PRIOR STAGE TOO EARLY: the prior attempt only reached post-preband — its OWN gate band never
+  // resolved (died mid-band, or is still running elsewhere) — so there is NOTHING to reuse
+  // regardless of hash: replaying an unresolved outcome would be replaying a guess, not a verdict.
+  const b139early = soloSmokeCode139()
+  b139early.items[0].priorProgress = { progressStage: 'post-preband', reviewPackHash: STUB_HASH139, gates: {}, gateDetails: {} }
+  const r139early = await execSmoke(fac139, b139early, {})
+  ok(r139early.calls.filter((c) => gateCallLabels139.test(c.label)).length >= 4, 'KI-E139 exec-smoke (prior stage too early): a post-preband-ONLY checkpoint (gate band never resolved by that attempt) is NOT reuse-eligible even with a matching hash — the full band runs for real');
+  ok(!r139early.result.results[0].gateBandReused, 'KI-E139 exec-smoke (prior stage too early): gateBandReused is NOT set');
+
+  // (4) NO item.priorProgress at all — the common case (every non-relaunch item, and every OTHER
+  // exec-smoke test in this file) — is unaffected: already proven by the KI-E137 block above
+  // (byStage137('post-gates').length === 6 with a plain smokeBatch() carrying no priorProgress
+  // anywhere), cited here for cross-reference rather than re-proven.
 }
 
 console.log(`\nself-test: ${pass} passed, ${fail} failed`);

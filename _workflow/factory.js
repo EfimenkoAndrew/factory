@@ -151,6 +151,10 @@ const ADJUDICATE_SCHEMA = { type: 'object', additionalProperties: false, require
 const DECISION_SCHEMA = { type: 'object', additionalProperties: false, required: ['decision', 'recommendation', 'headline'], properties: { decision: { type: 'string' }, options: { type: 'array', items: { type: 'object', additionalProperties: false, properties: { option: { type: 'string' }, consequence: { type: 'string' } } } }, recommendation: { type: 'string' }, headline: { type: 'string' } } }
 // Checkpoint-writer (KI-L40): persists a finished item's full result object to state/items/<id>/result.json.
 const CHECKPOINT_SCHEMA = { type: 'object', additionalProperties: false, required: ['written'], properties: { written: { type: 'boolean' }, note: { type: 'string' } } }
+// KI-E139 (ported from a host-mount session) — pack-hash probe: ONE disk-authoritative content hash
+// of review-pack.md, the fencing token gate-band reuse compares against a prior attempt's
+// progress.json (see checkpointProgress).
+const PACK_HASH_SCHEMA = { type: 'object', additionalProperties: false, required: ['hash'], properties: { hash: { type: 'string' } } }
 // Marker-probe (KI-E10): ONE disk-authoritative grep of verify-raw.txt for the FACTORY::REALINFRA:: marker.
 // KI-L44 made the runner's RETURNED realInfraExercised field non-fatal in-run (it diverged from disk once);
 // the probe reads the DISK (same file the fold greps) so a genuinely marker-less realInfra item fails fast
@@ -1300,100 +1304,142 @@ async function runItem(item) {
     }
   }
 
-  await checkpointProgress(res, 'post-preband') // KI-E137 — kill-resilience: fix+verify+the whole pre-band scan chain survive a kill during the (expensive) opus gate band. Placed here rather than immediately before phase('Gates') in the origin diff's exact spot because this repo's pre-band scan chain ends one scan earlier (ledger-anchor-scan, KI-E91) — no root-cause-touch-probe (KI-E104's probe form) exists here yet to checkpoint after; this is still the correct "last thing before the gate band" position for THIS repo's actual pipeline.
+  // KI-E139 (ported from a host-mount session) — GATE-BAND REUSE (content-hash-fenced), building on
+  // KI-E137's checkpoints. Everything above (fix, verify, all pre-band scans) ALWAYS re-runs fresh on
+  // a relaunch, unchanged — this freshly-regenerated review-pack.md IS the trustworthy "current" input
+  // the hash below compares against, not a shortcut around producing it. What this skips is ONLY the
+  // expensive part: if a PRIOR attempt's progress.json proves the gate band already reached a
+  // fully-resolved GATED state (its `stage` is 'post-gates' or 'post-reaudit' — a stage the pipeline
+  // only reaches after every dissent/adjudication/re-gate has settled) AND a FRESH hash of the pack
+  // JUST regenerated above matches the hash recorded at THAT prior post-preband checkpoint, the
+  // reviewable diff is byte-identical to what a full gate band already vetted — re-running the SAME
+  // reviewers against the SAME snapshot cannot teach anything a cache can't. The hash is NEVER trusted
+  // from item.priorProgress alone — it is recomputed BY A FRESH PROBE, right now, against the live
+  // worktree; a stale, missing, or mismatched hash always falls through to a full, independent
+  // re-gate, byte-identical to pre-KI-E139 behaviour. Never applies to the pre-band scans themselves
+  // or to refute/re-audit/integrate, which ALWAYS still run fresh regardless (unchanged KI-E69
+  // posture: "gates re-adjudicate the worktree on every relaunch" stays true — this only makes the
+  // RE-adjudication mechanical and cheap instead of an unconditional re-pay, and ONLY on a proof, not
+  // an assumption).
+  let prebandHash = null
+  {
+    const PHRAW = itemsDir(id) + '/review-pack.md'
+    const hp = await call('pack-hash-probe', { model: 'claude-haiku-4-5', effort: 'low' }, PACK_HASH_SCHEMA,
+      'Run EXACTLY this ONE command via Bash: `shasum -a 256 ' + PHRAW + ' | cut -d\' \' -f1` (or `sha256sum` if `shasum` is unavailable) and return its trimmed 64-character lowercase hex output as hash. Do NOTHING else: no edits, no other commands, no interpretation.', 'Gates')
+    if (hp && typeof hp.hash === 'string' && /^[0-9a-f]{64}$/.test(hp.hash)) prebandHash = hp.hash
+  }
+  await checkpointProgress(res, 'post-preband', prebandHash ? { reviewPackHash: prebandHash } : null) // KI-E137/E139 — kill-resilience + the fencing token gate-band reuse compares against. Placed here rather than immediately before phase('Gates') in the origin diff's exact spot because this repo's pre-band scan chain ends one scan earlier (ledger-anchor-scan, KI-E91) — no root-cause-touch-probe (KI-E104's probe form) exists here yet to checkpoint after; this is still the correct "last thing before the gate band" position for THIS repo's actual pipeline.
 
-  // 5. REVIEW band — role gates (Band A) + method review-flows (Band B), EACH a separate adversarial
-  //    subagent (never nested in the doing agent). 4 technical role gates + applicable method flows run
-  //    pooled; the PO role gate runs LAST (functional acceptance after the technical band).
-  phase('Gates')
-  const gateRoles = band === 'LIGHT' ? ['developer', 'qa'] // LIGHT: skip the opus architect/security/po panel
-    : (item.gateSet && item.gateSet.length ? item.gateSet : (CFG.gateSet || ['architect', 'developer', 'qa', 'security', 'po']))
-  const techGates = gateRoles.filter(function (g) { return g !== 'po' })
+  // Hoisted OUT of the `if (!gatesReused)` block below (KI-E139): flowsFor(item)'s method-flow set
+  // does not depend on whether the gate band actually runs, and the LATER Refute+Re-audit section's
+  // `refuteCovered` reads it too — scoping it to the gate band alone would leave it undefined on the
+  // reuse path.
   // KI-E12: the edge-case hunter left the late band ONLY when the early scan produced a verdict
   // (edgeFinal); a null early scan (agent unavailable) falls back to the late-band slot so verdict
   // coverage is never lost.
   const methodFlows = flowsFor(item).filter(function (f) { return f.band === 'method' && f.blocking && !(edgeFinal && f.routeKey === 'review.edgecase') })
-  const blocking = techGates.map(function (g) { return { key: 'gate:' + g, role: 'gate-' + g, route: band === 'LIGHT' ? SONNET : R.gates[g], extra: (staleGuard + voGuard) || null } })
-    .concat(methodFlows.map(function (f) {
-      return { key: 'review:' + f.skill.replace('bmad-', ''), role: SKILL_ROLE[f.skill], route: band === 'LIGHT' ? SONNET : RF[f.routeKey],
-        extra: 'Apply the ' + f.skill + ' BMAD review methodology to the WORKTREE DIFF only (git -C <worktree> diff). Verdict CHANGES_REQUIRED on any CRITICAL/HIGH you find; APPROVED only if the diff is clean by your lens.' + staleGuard + voGuard }
-    }))
-  const brRes = await Promise.all(blocking.map(function (x) { return call(x.role, x.route, GATE_SCHEMA, x.extra, 'Gates') }))  // each agent() routes through the global limiter (caps total concurrency)
-  // KI-E12: the early scan's FINAL verdict joins the band's verdict set — recording, failedBlk,
-  // adjudication membership, and the P8 re-gate loop treat it exactly like an in-band reviewer.
-  if (edgeFinal) { blocking.push({ key: 'review:review-edge-case-hunter', role: 'review-edgecase', route: edgeRoute, extra: edgeExtra }); brRes.push(edgeFinal) }
-  // KI-L31: capture the FULL structured verdict (headline + findings), not just the verdict string —
-  // the driver projects these into state/items/<id>/feedback.md at fold, so the reFix loop never
-  // depends on a reviewer remembering to write its artifact file (a returned-but-unwritten review
-  // otherwise leaves the PRIOR attempt's file as poisoned feedback).
-  res.gateDetails = res.gateDetails || {}
-  const detail = function (gr) { return gr ? { verdict: gr.verdict, headline: gr.headline, acceptanceMet: gr.acceptanceMet, redGreenConfirmed: gr.redGreenConfirmed, findings: (gr.findings || []).slice(0, 12), reasons: gr.reasons } : null }
-  for (let i = 0; i < blocking.length; i++) {
-    const b = blocking[i], gr = brRes[i]
-    res.artifacts[b.key] = 'state/items/' + id + '/' + b.role + '.md'
-    res.gates[b.key] = gr ? gr.verdict : 'NULL'
-    res.gateDetails[b.key] = detail(gr)
-    // KI-L57: honour a gate's scopeViolation flag ONLY when the same gate did NOT approve — a
-    // genuine red-line crossing is never approvable, so {verdict:'APPROVED', scopeViolation:true}
-    // is a self-contradictory agent result (live: ITEM-H9 cycle 33 — the developer gate's
-    // prose said "product-scope: CLEAR", verdict APPROVED, yet the stray boolean hard-stopped the
-    // item into the owner queue on a false premise). The inconsistent flag is preserved on
-    // gateDetails for the audit trail instead of blocking.
-    if (gr && gr.scopeViolation) {
-      if (gr.verdict !== 'APPROVED') return await frameAndBlock(b.key + ': product-scope violation (hard stop)' + (gr.headline ? ' — gate headline: ' + String(gr.headline).slice(0, 200) : ''))
-      if (res.gateDetails[b.key]) res.gateDetails[b.key].scopeViolationIgnored = true
+
+  let gatesReused = false
+  if (item.priorProgress && ['post-gates', 'post-reaudit'].includes(item.priorProgress.progressStage)
+      && typeof item.priorProgress.reviewPackHash === 'string' && prebandHash && prebandHash === item.priorProgress.reviewPackHash) {
+    // Merge so THIS attempt's own freshly-run pre-band probe verdicts (already on res.gates) are never
+    // clobbered by the prior attempt's — only the gate:*/review:*/adjudicator/gate:po keys are new here.
+    res.gates = Object.assign({}, item.priorProgress.gates, res.gates)
+    res.gateDetails = Object.assign({}, item.priorProgress.gateDetails || {}, res.gateDetails)
+    res.gateBandReused = true // telemetry: this relaunch skipped the opus gate band on a content-hash proof, not an assumption
+    res.transitions.push('GATED')
+    gatesReused = true
+  }
+  if (!gatesReused) {
+    // 5. REVIEW band — role gates (Band A) + method review-flows (Band B), EACH a separate adversarial
+    //    subagent (never nested in the doing agent). 4 technical role gates + applicable method flows run
+    //    pooled; the PO role gate runs LAST (functional acceptance after the technical band).
+    phase('Gates')
+    const gateRoles = band === 'LIGHT' ? ['developer', 'qa'] // LIGHT: skip the opus architect/security/po panel
+      : (item.gateSet && item.gateSet.length ? item.gateSet : (CFG.gateSet || ['architect', 'developer', 'qa', 'security', 'po']))
+    const techGates = gateRoles.filter(function (g) { return g !== 'po' })
+    const blocking = techGates.map(function (g) { return { key: 'gate:' + g, role: 'gate-' + g, route: band === 'LIGHT' ? SONNET : R.gates[g], extra: (staleGuard + voGuard) || null } })
+      .concat(methodFlows.map(function (f) {
+        return { key: 'review:' + f.skill.replace('bmad-', ''), role: SKILL_ROLE[f.skill], route: band === 'LIGHT' ? SONNET : RF[f.routeKey],
+          extra: 'Apply the ' + f.skill + ' BMAD review methodology to the WORKTREE DIFF only (git -C <worktree> diff). Verdict CHANGES_REQUIRED on any CRITICAL/HIGH you find; APPROVED only if the diff is clean by your lens.' + staleGuard + voGuard }
+      }))
+    const brRes = await Promise.all(blocking.map(function (x) { return call(x.role, x.route, GATE_SCHEMA, x.extra, 'Gates') }))  // each agent() routes through the global limiter (caps total concurrency)
+    // KI-E12: the early scan's FINAL verdict joins the band's verdict set — recording, failedBlk,
+    // adjudication membership, and the P8 re-gate loop treat it exactly like an in-band reviewer.
+    if (edgeFinal) { blocking.push({ key: 'review:review-edge-case-hunter', role: 'review-edgecase', route: edgeRoute, extra: edgeExtra }); brRes.push(edgeFinal) }
+    // KI-L31: capture the FULL structured verdict (headline + findings), not just the verdict string —
+    // the driver projects these into state/items/<id>/feedback.md at fold, so the reFix loop never
+    // depends on a reviewer remembering to write its artifact file (a returned-but-unwritten review
+    // otherwise leaves the PRIOR attempt's file as poisoned feedback).
+    res.gateDetails = res.gateDetails || {}
+    const detail = function (gr) { return gr ? { verdict: gr.verdict, headline: gr.headline, acceptanceMet: gr.acceptanceMet, redGreenConfirmed: gr.redGreenConfirmed, findings: (gr.findings || []).slice(0, 12), reasons: gr.reasons } : null }
+    for (let i = 0; i < blocking.length; i++) {
+      const b = blocking[i], gr = brRes[i]
+      res.artifacts[b.key] = 'state/items/' + id + '/' + b.role + '.md'
+      res.gates[b.key] = gr ? gr.verdict : 'NULL'
+      res.gateDetails[b.key] = detail(gr)
+      // KI-L57: honour a gate's scopeViolation flag ONLY when the same gate did NOT approve — a
+      // genuine red-line crossing is never approvable, so {verdict:'APPROVED', scopeViolation:true}
+      // is a self-contradictory agent result (live: ITEM-H9 cycle 33 — the developer gate's
+      // prose said "product-scope: CLEAR", verdict APPROVED, yet the stray boolean hard-stopped the
+      // item into the owner queue on a false premise). The inconsistent flag is preserved on
+      // gateDetails for the audit trail instead of blocking.
+      if (gr && gr.scopeViolation) {
+        if (gr.verdict !== 'APPROVED') return await frameAndBlock(b.key + ': product-scope violation (hard stop)' + (gr.headline ? ' — gate headline: ' + String(gr.headline).slice(0, 200) : ''))
+        if (res.gateDetails[b.key]) res.gateDetails[b.key].scopeViolationIgnored = true
+      }
     }
-  }
-  const failedBlk = blocking.filter(function (b, i) { return (brRes[i] ? brRes[i].verdict : 'NULL') !== 'APPROVED' })
-  // KI-L53: a NULL gate (agent unavailable after retries) is an INFRA failure, not a dissent — name it
-  // separately in the note (so the fold's auto-infra-retry can spare the attempt) and never send a
-  // null-only "dispute" to the adjudicator (there are no findings to adjudicate; fail-closed stands).
-  const nullBlk = blocking.filter(function (b, i) { return !brRes[i] })
-  if (nullBlk.length) res.infraSuspect = true
-  const unavailNote = function () { return nullBlk.length ? '; stage agent UNAVAILABLE (null after retries — possible infra/credit failure, NOT a quality verdict): ' + nullBlk.map(function (b) { return b.key }).join(', ') : '' }
-  if (failedBlk.length) {
-    // KI-C8 — a SPLIT verdict on a CRITICAL/HIGH item is contestable: adjudicate (fable-5) rather than an
-    // unconditional bounce. Unanimous CHANGES_REQUIRED, or any MEDIUM/LOW item, fails straight to the fixer.
-    // KI-E15 (2026-07-20): the `band === 'FULL'` guard is DROPPED — a split on ANY CRITICAL/HIGH item
-    // adjudicates, LIGHT band included. Cycle 46 ran two genuine LIGHT-band HIGH splits (ITEM-H17 5-vs-1,
-    // ITEM-H-A6 6-vs-1) that failed straight to the operator, who had to convene the adjudicator
-    // MANUALLY — both dissents were UPHELD with exact bounded remedies that direct-recovered same-session.
-    // In-band adjudication turns "FAILED, unexplained dispute" into "FAILED + authoritative §5 remedy"
-    // (or OVERRULED → proceeds), at a cost bounded to genuine splits only (unanimous fails and MEDIUM/LOW
-    // items still skip it; the KI-L53 null-only outage guard is unchanged).
-    const heavy = item.severity === 'CRITICAL' || item.severity === 'HIGH'
-    const disputed = heavy && failedBlk.length < blocking.length && failedBlk.length > nullBlk.length // a null-only "dispute" is an outage, not a dissent
-    if (disputed) {
-      // P8: an adjudicator can never wave through the SECURITY gate on a security/crypto CRITICAL — that dissent
-      // is non-adjudicable; the fix must SATISFY the gate, not be overruled past it.
-      const securityDissent = failedBlk.some(function (b) { return b.key === 'gate:security' || b.key === 'review:review-security' })
-      const securityCrit = item.severity === 'CRITICAL' && (item.theme === 'security-multitenancy' || /crypto|secret|token|auth|tls|pii/i.test(item.theme + ' ' + (item.title || '')))
-      if (securityDissent && securityCrit) return finish('FAILED', 'security gate dissented on a security/crypto CRITICAL — non-adjudicable; the fix must satisfy the security gate (P8), it cannot be overruled')
-      const adj = await call('adjudicator', R.adjudicator, ADJUDICATE_SCHEMA, 'DISPUTED ' + item.severity + ': review(s) [' + failedBlk.map(function (b) { return b.key }).join(', ') + '] returned CHANGES_REQUIRED while ' + (blocking.length - failedBlk.length) + ' other(s) APPROVED the SAME diff. Adjudicate on the merits of the worktree diff: is the fix genuinely defective (UPHELD -> back to the fixer) or were the dissenting review(s) wrong (OVERRULED -> the fix proceeds)? WRITE state/items/' + id + '/adjudication.md.', 'Gates')
-      res.artifacts.adjudication = 'state/items/' + id + '/adjudication.md'
-      res.gates['adjudicator'] = adj ? adj.verdict : 'NULL'
-      res.gateDetails['adjudicator'] = detail(adj)
-      if (!adj || adj.verdict !== 'OVERRULED') return finish('FAILED', 'review(s) not APPROVED + adjudicator ' + (adj ? adj.verdict : 'NULL') + ': ' + failedBlk.map(function (b) { return b.key }).join(', '))
-      // P8: OVERRULE is not a free pass — RE-RUN the dissenting gate(s) once against the (unchanged) diff and
-      // proceed ONLY if they now APPROVE. The adjudicator breaks a genuine tie; it does not silence a gate.
-      const reRes = await Promise.all(failedBlk.map(function (b) { return call(b.role, b.route, GATE_SCHEMA, (b.extra || 'Re-gate this worktree diff.') + ' RE-GATE: adjudication OVERRULED the prior dissent as wrong-on-the-merits; judge the SAME diff strictly and independently. APPROVED only if it is genuinely clean by your lens.', 'Gates') }))
-      for (let i = 0; i < failedBlk.length; i++) res.gateDetails[failedBlk[i].key + ':re-gate'] = detail(reRes[i])
-      const stillFailed = failedBlk.filter(function (b, i) { return (reRes[i] ? reRes[i].verdict : 'NULL') !== 'APPROVED' })
-      if (stillFailed.length) return finish('FAILED', 'adjudicator OVERRULED but the re-gate still not APPROVED (P8): ' + stillFailed.map(function (b) { return b.key }).join(', '))
-      // re-gate APPROVED: proceed past the gate band.
-    } else {
-      return finish('FAILED', 'review(s) not APPROVED: ' + failedBlk.map(function (b) { return b.key }).join(', ') + unavailNote())
+    const failedBlk = blocking.filter(function (b, i) { return (brRes[i] ? brRes[i].verdict : 'NULL') !== 'APPROVED' })
+    // KI-L53: a NULL gate (agent unavailable after retries) is an INFRA failure, not a dissent — name it
+    // separately in the note (so the fold's auto-infra-retry can spare the attempt) and never send a
+    // null-only "dispute" to the adjudicator (there are no findings to adjudicate; fail-closed stands).
+    const nullBlk = blocking.filter(function (b, i) { return !brRes[i] })
+    if (nullBlk.length) res.infraSuspect = true
+    const unavailNote = function () { return nullBlk.length ? '; stage agent UNAVAILABLE (null after retries — possible infra/credit failure, NOT a quality verdict): ' + nullBlk.map(function (b) { return b.key }).join(', ') : '' }
+    if (failedBlk.length) {
+      // KI-C8 — a SPLIT verdict on a CRITICAL/HIGH item is contestable: adjudicate (fable-5) rather than an
+      // unconditional bounce. Unanimous CHANGES_REQUIRED, or any MEDIUM/LOW item, fails straight to the fixer.
+      // KI-E15 (2026-07-20): the `band === 'FULL'` guard is DROPPED — a split on ANY CRITICAL/HIGH item
+      // adjudicates, LIGHT band included. Cycle 46 ran two genuine LIGHT-band HIGH splits (ITEM-H17 5-vs-1,
+      // ITEM-H-A6 6-vs-1) that failed straight to the operator, who had to convene the adjudicator
+      // MANUALLY — both dissents were UPHELD with exact bounded remedies that direct-recovered same-session.
+      // In-band adjudication turns "FAILED, unexplained dispute" into "FAILED + authoritative §5 remedy"
+      // (or OVERRULED → proceeds), at a cost bounded to genuine splits only (unanimous fails and MEDIUM/LOW
+      // items still skip it; the KI-L53 null-only outage guard is unchanged).
+      const heavy = item.severity === 'CRITICAL' || item.severity === 'HIGH'
+      const disputed = heavy && failedBlk.length < blocking.length && failedBlk.length > nullBlk.length // a null-only "dispute" is an outage, not a dissent
+      if (disputed) {
+        // P8: an adjudicator can never wave through the SECURITY gate on a security/crypto CRITICAL — that dissent
+        // is non-adjudicable; the fix must SATISFY the gate, not be overruled past it.
+        const securityDissent = failedBlk.some(function (b) { return b.key === 'gate:security' || b.key === 'review:review-security' })
+        const securityCrit = item.severity === 'CRITICAL' && (item.theme === 'security-multitenancy' || /crypto|secret|token|auth|tls|pii/i.test(item.theme + ' ' + (item.title || '')))
+        if (securityDissent && securityCrit) return finish('FAILED', 'security gate dissented on a security/crypto CRITICAL — non-adjudicable; the fix must satisfy the security gate (P8), it cannot be overruled')
+        const adj = await call('adjudicator', R.adjudicator, ADJUDICATE_SCHEMA, 'DISPUTED ' + item.severity + ': review(s) [' + failedBlk.map(function (b) { return b.key }).join(', ') + '] returned CHANGES_REQUIRED while ' + (blocking.length - failedBlk.length) + ' other(s) APPROVED the SAME diff. Adjudicate on the merits of the worktree diff: is the fix genuinely defective (UPHELD -> back to the fixer) or were the dissenting review(s) wrong (OVERRULED -> the fix proceeds)? WRITE state/items/' + id + '/adjudication.md.', 'Gates')
+        res.artifacts.adjudication = 'state/items/' + id + '/adjudication.md'
+        res.gates['adjudicator'] = adj ? adj.verdict : 'NULL'
+        res.gateDetails['adjudicator'] = detail(adj)
+        if (!adj || adj.verdict !== 'OVERRULED') return finish('FAILED', 'review(s) not APPROVED + adjudicator ' + (adj ? adj.verdict : 'NULL') + ': ' + failedBlk.map(function (b) { return b.key }).join(', '))
+        // P8: OVERRULE is not a free pass — RE-RUN the dissenting gate(s) once against the (unchanged) diff and
+        // proceed ONLY if they now APPROVE. The adjudicator breaks a genuine tie; it does not silence a gate.
+        const reRes = await Promise.all(failedBlk.map(function (b) { return call(b.role, b.route, GATE_SCHEMA, (b.extra || 'Re-gate this worktree diff.') + ' RE-GATE: adjudication OVERRULED the prior dissent as wrong-on-the-merits; judge the SAME diff strictly and independently. APPROVED only if it is genuinely clean by your lens.', 'Gates') }))
+        for (let i = 0; i < failedBlk.length; i++) res.gateDetails[failedBlk[i].key + ':re-gate'] = detail(reRes[i])
+        const stillFailed = failedBlk.filter(function (b, i) { return (reRes[i] ? reRes[i].verdict : 'NULL') !== 'APPROVED' })
+        if (stillFailed.length) return finish('FAILED', 'adjudicator OVERRULED but the re-gate still not APPROVED (P8): ' + stillFailed.map(function (b) { return b.key }).join(', '))
+        // re-gate APPROVED: proceed past the gate band.
+      } else {
+        return finish('FAILED', 'review(s) not APPROVED: ' + failedBlk.map(function (b) { return b.key }).join(', ') + unavailNote())
+      }
     }
+    if (gateRoles.includes('po')) {
+      const po = await call('gate-po', R.gates.po, GATE_SCHEMA, null, 'Gates')
+      res.artifacts['gate:po'] = 'state/items/' + id + '/gate-po.md'
+      res.gates['gate:po'] = po ? po.verdict : 'NULL'
+      res.gateDetails['gate:po'] = detail(po)
+      if (!po) { res.infraSuspect = true; return finish('FAILED', 'PO gate agent UNAVAILABLE (null after retries — possible infra/credit failure, NOT a quality verdict)') } // KI-L53
+      if (res.gates['gate:po'] !== 'APPROVED') return finish('FAILED', 'PO gate not APPROVED')
+    }
+    res.transitions.push('GATED')
   }
-  if (gateRoles.includes('po')) {
-    const po = await call('gate-po', R.gates.po, GATE_SCHEMA, null, 'Gates')
-    res.artifacts['gate:po'] = 'state/items/' + id + '/gate-po.md'
-    res.gates['gate:po'] = po ? po.verdict : 'NULL'
-    res.gateDetails['gate:po'] = detail(po)
-    if (!po) { res.infraSuspect = true; return finish('FAILED', 'PO gate agent UNAVAILABLE (null after retries — possible infra/credit failure, NOT a quality verdict)') } // KI-L53
-    if (res.gates['gate:po'] !== 'APPROVED') return finish('FAILED', 'PO gate not APPROVED')
-  }
-  res.transitions.push('GATED')
   await checkpointProgress(res, 'post-gates') // KI-E137 — kill-resilience: the whole (expensive) opus gate band survives a kill during refute+re-audit
 
   // 6+7. REFUTE + RE-AUDIT — two INDEPENDENT adversarial passes over the SAME verified+gated diff: the refuter
