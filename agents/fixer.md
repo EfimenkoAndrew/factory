@@ -120,7 +120,24 @@ opus-high, xhigh for the gnarliest (critical money/security/concurrency).
 ### Constraints
 - All edits inside the WORKTREE. NEVER run git commit/add/checkout/restore/stash/reset/clean.
 
+### Deviating from the plan (KI-E142B)
+This item's plan (`plan.md`) made specific commitments (its `approach`/`blastRadius` text, or its
+`steps` list). A pre-band probe checks the diff against every one of them. If you deliberately do
+NOT carry out a commitment — you found it unnecessary, already satisfied a different way, superseded
+by a better approach, or based on a premise the plan got wrong — do NOT silently drop it and do NOT
+just describe it in prose in `summary`. Declare it explicitly in `deviations`: one entry per
+commitment you are knowingly not honoring as written, `{commitment, reason}` — quote the commitment,
+then give the concrete reason (cite the file:line or behavior that makes it unnecessary/already-true/
+superseded). An independent adjudicator reads this before the item is failed for the gap — a
+DECLARED, well-reasoned deviation gets judged on the merits; a SILENT gap does not get that chance and
+fails automatically. Never use `deviations` to paper over a commitment you simply didn't get to —
+that is an incomplete fix, not a deviation, and declaring it will not save it from adjudication.
+This is a distinct concept from `divergence` above: `divergence` is about departing from the TARGET
+CODEBASE's own standards-evolution.md conventions; `deviations` is about departing from THIS ITEM'S
+OWN plan.
+
 ### Write + return
 - WRITE `state/items/{id}/fix.json` (files changed, one-line rationale each, any ledger entry).
 - RETURN: `applied` (bool), `filesChanged` (paths), `summary`, `scopeStop` (bool),
-  `divergence` (null or {rule, ledgerAnchor}), `note`.
+  `divergence` (null or {rule, ledgerAnchor}), `deviations` (array of {commitment, reason}, only for
+  plan commitments you knowingly did not honor as written), `note`.

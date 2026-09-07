@@ -52,6 +52,7 @@ import { loadPolicies, renderPolicies, POLICY_TEXT } from './lib/policy.mjs'; //
 import { emit as temit, deriveStageTimeline, readEvents, aggregateEvents, renderTelemetryReport, telemetryFile, GAP_FENCE_MS, nonCanonicalArtifacts, isRecoveryResultId, isDirectRecoveryFold } from './lib/telemetry.mjs';
 import { parseTokenUsageVector, buildTokenUsageQuery, tokenUsageSummary } from './lib/token-usage.mjs'; // KI-E66 — cache-hit-rate bridge
 import { loadPriorAttempt, priorAttemptStages } from './lib/prior-attempt.mjs'; // KI-E69 — cross-session plan/test/fix reuse on relaunch
+import { readProgressCheckpoint, summarizeProgress } from './lib/progress-checkpoint.mjs'; // KI-E137 — incremental mid-pipeline checkpoint read/summarize (resume/reconstruct diagnostics)
 import { lintWorktreeDocClaims } from './lib/doclint.mjs'; // F2 — phantom doc-path detection aid at fold (WARN-only)
 import { findLeftovers } from './lib/leftover-scan.mjs'; // KI-D12 — deferral/tech-debt lexicon detection aid at fold (WARN-only)
 import { findComments } from './lib/comment-scan.mjs'; // KI-E59 — no-new-comments detection aid at fold (WARN-only)
@@ -185,7 +186,26 @@ function costSnapshot(ledger) {
   const total = Object.values(byModel).reduce((a, b) => a + b, 0);
   const closed = Object.values(ledger.items).filter((r) => r.state === 'CLOSED').length;
   const opus = Object.entries(byModel).filter(([m]) => /opus/i.test(m)).reduce((a, [, t]) => a + t, 0);
-  return { cycle: ledger.cycle, byModel, total, closed, callsPerClosed: closed ? Math.round(total / closed * 10) / 10 : null, opusShare: total ? Math.round(opus / total * 100) / 100 : 0 };
+  // KI-E150 (ported from a host-mount session) — real per-item token totals (factory.js's
+  // concurrency-safe budget.spent() attribution), distinct from byModel/total above which only ever
+  // counted agent CALLS, never tokens. Summed only over CLOSED items with a real tokensUsed figure —
+  // an item folded before this change, or one whose only work was sweep-mode/pre-band-only, may have
+  // no tokensUsed at all; excluded rather than silently counted as 0, so totalTokens/tokensPerClosed
+  // don't understate the true average.
+  const closedWithTokens = Object.values(ledger.items).filter((r) => r.state === 'CLOSED' && typeof r.tokensUsed === 'number' && r.tokensUsed > 0);
+  const totalTokens = closedWithTokens.reduce((a, r) => a + r.tokensUsed, 0);
+  return { cycle: ledger.cycle, byModel, total, closed, callsPerClosed: closed ? Math.round(total / closed * 10) / 10 : null, opusShare: total ? Math.round(opus / total * 100) / 100 : 0, totalTokens, closedWithTokens: closedWithTokens.length, tokensPerClosed: closedWithTokens.length ? Math.round(totalTokens / closedWithTokens.length) : null };
+}
+
+// KI-E150 — the N most token-expensive CLOSED items (real per-item totals, not call counts). Bounded
+// so this stays a report, not a full ledger dump; sorted desc so the costliest work is always visible
+// first regardless of how many items have a recorded tokensUsed.
+function topTokenItems(ledger, n) {
+  return Object.entries(ledger.items)
+    .filter(([, r]) => r.state === 'CLOSED' && typeof r.tokensUsed === 'number' && r.tokensUsed > 0)
+    .sort((a, b) => b[1].tokensUsed - a[1].tokensUsed)
+    .slice(0, n)
+    .map(([id, r]) => ({ id, tokensUsed: r.tokensUsed }));
 }
 
 function readCostHistory(cfg) {
@@ -224,14 +244,25 @@ function costMd(ledger, history) {
     return dCalls > 0 ? `${dCalls}/+0` : '—';
   };
   const trend = hs.slice(-10).map((h) => `| ${h.cycle} | ${h.total} | ${h.closed} | ${h.callsPerClosed ?? '—'} | ${marginalOf(h)} | ${Math.round((h.opusShare || 0) * 100)}% |`).join('\n');
+  // KI-E150 (ported from a host-mount session) — real per-item token totals now exist (factory.js's
+  // concurrency-safe budget.spent() attribution, ledger.mjs's foldResults accumulation). Rendered
+  // alongside the pre-existing call-count table rather than replacing it — call counts are still the
+  // "who did the work" model-routing signal; tokens answer "how expensive was it", a genuinely
+  // different question this report couldn't answer at all before. closedWithTokens can be less than
+  // closed: an item folded before this change, or whose only work was sweep-mode/pre-band-only
+  // (checkpoint-writer bookkeeping calls are deliberately NOT attributed — see the KI-E150
+  // KNOWN-ISSUES.md entry), has no tokensUsed to include.
+  const top = topTokenItems(ledger, 10);
+  const topRows = top.map((t) => `| ${t.id} | ${t.tokensUsed.toLocaleString()} |`).join('\n');
   return [
     '# Cost report — agent calls by model (routing evidence)',
     '',
     `_Generated ${now()} · cycle ${ledger.cycle}_`,
     '',
-    '_Counts are routed agent-calls per model (the faithful "who did the work" signal). Exact token totals',
-    'come from each Workflow run summary (subagent_tokens), recorded per cycle in the cycle report. This',
-    'report is OBSERVABILITY, not a governor — there is no budget gate (owner direction 2026-06-27)._',
+    '_Counts are routed agent-calls per model (the faithful "who did the work" signal) — model routing',
+    'evidence, not a spend total. Real per-item TOKEN totals (KI-E150) are tracked separately below; a',
+    'per-cycle whole-run token total (KI-E23) is still recorded in the cycle report. This report is',
+    'OBSERVABILITY, not a governor — there is no budget gate (owner direction 2026-06-27)._',
     '',
     '| Model | Agent calls | Share |',
     '|---|---|---|',
@@ -243,6 +274,13 @@ function costMd(ledger, history) {
     `- **Closed findings:** ${s.closed}`,
     `- **Agent-calls / closed finding:** ${s.callsPerClosed ?? '— (none closed yet)'}`,
     `- **Opus share of calls:** ${Math.round(s.opusShare * 100)}% _(PLAN §4 goal: opus reserved for hard reasoning + the 3 hard gates + refute)_`,
+    `- **Tokens / closed finding:** ${s.tokensPerClosed ? s.tokensPerClosed.toLocaleString() : '— (no per-item token data yet)'} _(KI-E150 — real total ${s.totalTokens.toLocaleString()} across ${s.closedWithTokens} of ${s.closed} closed item(s) with recorded tokensUsed)_`,
+    '',
+    '## Top 10 closed items by tokens (KI-E150)',
+    '',
+    '| Item | Tokens |',
+    '|---|---|',
+    topRows || '| _(no per-item token data yet)_ |  |',
     '',
     '## Per-cycle trend',
     '',
@@ -522,7 +560,29 @@ function deterministicVerifyOverride(cfg, ledger, wi, r) {
   // (FACTORY::RED::0) — machine proof the acceptance already holds. A missing transcript still fails.
   if (codeChange) {
     const red = parseRedRaw(readIf('verify-red-raw.txt'));
-    if (r.verificationOnly === true) {
+    // KI-E132: r.verificationOnly is a copy captured when this checkpoint was produced — it goes STALE
+    // when an item is re-claimed for a later re-verification round whose fresh test.json/verify-red-raw.txt
+    // overwrite the very files this check reads, without ever updating the embedded r object (itself often
+    // reconstructed from an EARLIER, now-superseded checkpoint — live: PAYMENTS-M4/MARKETING-M3/RISK-M3,
+    // cycle 82, each a fully-13-gates-APPROVED item re-claimed for a redundant "is this still fixed?" pass
+    // whose legitimate exit=0 confirmation then read as "vacuous test" against the stale embedded flag).
+    // Re-derive from the on-disk test.json — the SAME freshness tier as verify-red-raw.txt below — and
+    // prefer it on disagreement: it is the test-author's own live attestation for THIS transcript, not a
+    // possibly-older copy. Falls back to r.verificationOnly when test.json is absent/unparseable (pre-KI-E132
+    // results, or a hand-authored recovery fold with no test.json on disk).
+    let effectiveVO = r.verificationOnly === true;
+    try {
+      const tjRaw = readIf('test.json');
+      const tj = tjRaw ? JSON.parse(tjRaw) : null;
+      if (tj) {
+        const diskVO = !!(tj.verificationOnly === true && !tj.red);
+        if (diskVO !== effectiveVO) {
+          console.log(`  KI-E132 ${r.id}: verificationOnly mismatch — embedded result said ${effectiveVO}, on-disk test.json says ${diskVO} (test.json wins: it is the live test-author attestation, not a possibly-stale checkpoint copy)`);
+          effectiveVO = diskVO;
+        }
+      }
+    } catch { /* unparseable test.json — trust the embedded flag, same as pre-KI-E132 behavior */ }
+    if (effectiveVO) {
       if (!red.hasData) return fail('verificationOnly item has no verify-red-raw.txt transcript (FACTORY::RED:: marker) — cannot machine-prove the acceptance already holds on the current tree');
       if (red.red) {
         // KI-E61 — the flag was an in-run MISCLASSIFICATION, but the transcript satisfies the
@@ -533,12 +593,13 @@ function deterministicVerifyOverride(cfg, ledger, wi, r) {
         // the KI-L37 reFix heuristic stamps verificationOnly even when the test-author went on
         // to produce a real red). Clearing the flag also re-arms the P9 root-cause check below.
         console.log(`  KI-E61 ${r.id}: verificationOnly flag contradicted by a GENUINE red (exit=${red.exit}) + machine green — auto-corrected to the normal red-green contract (result closes on the STRONGER evidence)`);
-        r.verificationOnly = false;
+        effectiveVO = false;
       }
     } else {
       if (!red.hasData) return fail('no RED proof (verify-red-raw.txt absent / no FACTORY::RED:: marker) — cannot prove the regression test fails on old code (vacuous-test risk)');
       if (!red.red) return fail('RED proof shows the test PASSED on old code (exit=' + red.exit + ') — vacuous test (passes on both old and new code)');
     }
+    r.verificationOnly = effectiveVO; // keep it consistent for the P9/filesChanged checks below and every downstream consumer of this result object
   }
 
   // P2 — real-infra: a needsRealInfra item must carry a real container marker (not an EF in-memory green).
@@ -859,6 +920,34 @@ function cmdFold(file, flags) {
       if (committedDrift.length) console.log(`  ℹ COMMITTED DELIVERY ${r.id} (KI-E35): item files changed in main via HUMAN commits during the run window (clean per git status) — likely the operator committed this item's output; verify intent, no repair needed:\n` + committedDrift.map((d) => `      ${d.file} (${d.was} -> ${d.now})`).join('\n'));
     } catch { /* detection aid only */ }
   }
+  // KI-E146 (ported from a host-mount session) — the KI-E89 unclaimed-drift sweep, run here for the
+  // first time. Every prior invocation site was `cmdMainCheck`, a command an operator has to remember
+  // to run manually; `fold` runs automatically every single cycle and, until now, never looked for
+  // this class at all — the per-item loop just above can only ever check a path some item's OWN
+  // snapshot declared, so a stray NEW file an agent creates ad-hoc (never in any files[]) is invisible
+  // to it by construction. Live cost of the gap on the origin host: a stray file left by one item sat
+  // unreported through that cycle's own fold, then poisoned an entire SEPARATE, unrelated batch's
+  // main-check sweep the NEXT cycle (KI-E144) — a whole cycle of silence in between during which
+  // nobody had reason to run `main-check` by hand. This closes the "just happened not to look" window
+  // by surfacing it at the ONE checkpoint that always runs, not the one that sometimes does.
+  // Deliberately still NEVER auto-repaired, same as `cmdMainCheck`'s own posture (KI-E89's header
+  // comment is explicit about why: an unclaimed path could be agent contamination OR an operator's
+  // own unrelated work-in-progress sitting in the same tree, and there is no snapshot to prove which
+  // — auto-deleting the wrong guess would destroy real, uncommitted human work). Read-only, WARN-only,
+  // same posture as every other detection aid in this function.
+  try {
+    const itemsRoot = abs(cfg.paths.items);
+    const claimedPaths = new Set();
+    for (const d of readdirSync(itemsRoot, { withFileTypes: true })) {
+      if (!d.isDirectory()) continue;
+      try {
+        const snapFiles = (readJson(join(itemsRoot, d.name, 'main-snapshot.json')) || {}).files || {};
+        for (const f of Object.keys(snapFiles)) claimedPaths.add(f);
+      } catch { /* no snapshot for this item, or unreadable — contributes nothing, matches cmdMainCheck */ }
+    }
+    const unclaimed = unclaimedMainDrift(dirtyMainPaths(REPO_ROOT), MOUNT_REL, claimedPaths);
+    if (unclaimed.length) console.log(`  ⚠ MAIN-DRIFT unclaimed (KI-E89/E146): main-tree path(s) dirty outside the factory mount with NO item snapshot to check against, found during fold — could be leaked factory-worktree contamination (no item has ever claimed this path) OR the operator's own unrelated work-in-progress; this fold cannot tell which, so it surfaces it rather than silently missing the contamination case AGAIN. Eyeball each (never auto-repaired — see KI-E89):\n` + unclaimed.map((p) => `      ${p}`).join('\n'));
+  } catch { /* detection aid only */ }
   const { applied, rejected, skipped } = foldResults(ledger, arr);
   // KI-L41 — convergence bonus BEFORE the exhaustion sweep: a FAILED round whose blocking-finding
   // set is strictly narrower than the prior round's (fewer findings, max severity not worse — both
@@ -924,7 +1013,7 @@ function cmdFold(file, flags) {
           prevMs = s.mtimeMs;
         }
       }
-      temit({ source: 'driver', event: 'item_folded', item: r.id, cycle: cyc, lane: row.runLabel || undefined, outcome: row.state || r.toState, attempts: row.attempts, attrs: { toState: r.toState, band: r.band || undefined, resultId: r.resultId || undefined, direct: isRec || undefined, transitions: (r.transitions || []).slice(0, 12), gates: r.gates || {}, cost: r.cost || {}, infraSuspect: !!r.infraSuspect, verificationOnly: !!r.verificationOnly, priorAttemptReuse: (r.priorAttemptReuse && r.priorAttemptReuse.length) ? r.priorAttemptReuse : undefined, note: String(r.note || '').slice(0, 240) } }); // KI-E23: band stamped so gate-value/cost split LIGHT vs FULL; KI-E46: direct/resultId stamped so recovery closes classify without prose sniffing; KI-E69: priorAttemptReuse visible whenever a relaunch reused a killed run's artifacts
+      temit({ source: 'driver', event: 'item_folded', item: r.id, cycle: cyc, lane: row.runLabel || undefined, outcome: row.state || r.toState, attempts: row.attempts, attrs: { toState: r.toState, band: r.band || undefined, resultId: r.resultId || undefined, direct: isRec || undefined, transitions: (r.transitions || []).slice(0, 12), gates: r.gates || {}, cost: r.cost || {}, tokensUsed: r.tokensUsed || undefined, infraSuspect: !!r.infraSuspect, verificationOnly: !!r.verificationOnly, priorAttemptReuse: (r.priorAttemptReuse && r.priorAttemptReuse.length) ? r.priorAttemptReuse : undefined, note: String(r.note || '').slice(0, 240) } }); // KI-E23: band stamped so gate-value/cost split LIGHT vs FULL; KI-E46: direct/resultId stamped so recovery closes classify without prose sniffing; KI-E69: priorAttemptReuse visible whenever a relaunch reused a killed run's artifacts; KI-E150: tokensUsed is this item's OWN precise total (concurrency-safe attribution), distinct from KI-E23's whole-run usage event
     }
     temit({ source: 'driver', event: 'fold_summary', cycle: cyc, attrs: { file: basename(foldPath), applied: applied.length, rejected: rejected.length, skipped: skipped.length, overrides: overrides.length, infraRetries: infraApplied.length, escalated: escalated.length } });
     // KI-E23 (P6c): the run's token usage, returned by factory.js from the runtime budget counter —
@@ -942,6 +1031,35 @@ function cmdFold(file, flags) {
   if (escalated.length) console.log('  auto-escalated (retry-bound exhausted -> queue):', escalated.join(', '));
   if (skipped.length) console.log('  skipped (already folded, idempotent):', skipped.map((s) => s.resultId).join(', '));
   if (rejected.length) console.log('  rejected:', JSON.stringify(rejected));
+}
+
+// KI-E140 (ported from a host-mount session) — record what launched, for the ONE thing the driver
+// structurally cannot check itself: whether a PRIOR attempt's Workflow task is actually dead before a
+// NEW one relaunches into the SAME worktree path. Only the controller session holds a
+// TaskOutput/TaskStop handle on its own launches — the driver is a separate Node process with no
+// visibility into the harness's task registry — so this command exists purely so the controller can
+// hand the driver something to remember and SURFACE later (cmdResume's KI-E140 reminder), instead of
+// relying on the controller's own memory across a session boundary. Best-effort, read-nothing,
+// writes-only: a bad flag combination logs and no-ops rather than throwing, since this command sits
+// on the hot path right after a real Workflow launch and must never be the reason a controller loses
+// track of what it just started.
+function cmdMarkLaunched(flags) {
+  const cfg = loadConfig();
+  const ids = (flags.ids || '').split(',').map((s) => s.trim()).filter(Boolean);
+  const taskId = flags.taskId || flags.task || '';
+  const runId = flags.runId || flags.run || '';
+  if (!ids.length || !taskId) { console.log('mark-launched: need --ids a,b,c --taskId <id> (--runId <id> optional) — no-op'); return; }
+  const meta = { taskId, runId: runId || undefined, launchedAt: now() };
+  let n = 0;
+  for (const id of ids) {
+    try {
+      const dir = abs(join(cfg.paths.items, id));
+      if (!existsSync(dir)) { console.log(`  mark-launched ${id} SKIPPED — no state/items/${id}/ dir (not a claimed item)`); continue; }
+      writeJsonAtomic(join(dir, 'launch-meta.json'), meta);
+      n++;
+    } catch (e) { console.log(`  mark-launched ${id} SKIPPED (${e && e.message})`); }
+  }
+  console.log(`mark-launched: recorded taskId=${taskId}${runId ? ` runId=${runId}` : ''} for ${n}/${ids.length} item(s) — cmdResume will surface this before a relaunch (KI-E140)`);
 }
 
 function cmdResume(flags) {
@@ -969,6 +1087,13 @@ function cmdResume(flags) {
     }
     const ck = hasCheckpoint(r.id);
     console.log(`  ${r.id}: ${r.state}${wtState}${r.runLabel ? ` [label=${r.runLabel}]` : ''}${ck ? ' [checkpointed #' + cyc + ' — reconstruct+fold will pick it up]' : ''}`);
+    // KI-E137 (ported from a host-mount session): no FINAL checkpoint, but a mid-pipeline
+    // progress.json may still show how far this attempt got before dying — surfaced here so "must
+    // re-run" is never mistaken for "nothing happened".
+    if (!ck) {
+      const pr = readProgressCheckpoint(abs(join(cfg.paths.items, r.id)), r.id, cyc);
+      if (pr) console.log(`    ${summarizeProgress(pr)}`);
+    }
     if (!ck && r.runScript && existsSync(presolve(REPO_ROOT, r.runScript))) {
       const k = r.runScript; if (!relaunch.has(k)) relaunch.set(k, []); relaunch.get(k).push(r.id);
     }
@@ -1012,6 +1137,23 @@ function cmdResume(flags) {
         }
         if (committed.length) console.log(`    ℹ MAIN-GUARD ${id} (KI-E41/KI-E35): item files changed in main via HUMAN commits since claim (clean per git status) — verify the relaunch is still meaningful against the new main:\n` + committed.map((d) => `        ${d.file}`).join('\n'));
       } catch (e) { console.log(`    MAIN-GUARD ${id} SKIPPED (${e && e.message}) — treat as UNCHECKED, not clean (KI-E41; never blocks the relaunch listing)`); }
+    }
+    // KI-E140 (ported from a host-mount session) — TASK-LIVENESS REMINDER. A relaunch issued before a
+    // JUST-killed attempt's task is confirmed torn down risks two live attempts racing the SAME
+    // worktree path. The driver cannot check this itself — only the controller session holds a
+    // TaskOutput/TaskStop handle — so this is a REMINDER, mechanically surfaced instead of left to
+    // memory: if the controller recorded {runId, taskId} to state/items/<id>/launch-meta.json right
+    // after ITS OWN prior launch, print it here so the relaunch line is never copied without a
+    // liveness check. Read-only; a missing file (nothing recorded, or an old session that predates
+    // this convention) is silent, never a warning — this is a best-effort aid for controller
+    // behaviour this file cannot enforce, not a detector with a false-negative to worry about.
+    for (const id of relaunchIds) {
+      try {
+        const metaPath = abs(join(cfg.paths.items, id, 'launch-meta.json'));
+        if (!existsSync(metaPath)) continue;
+        const meta = readJson(metaPath);
+        if (meta && meta.taskId) console.log(`    ⚠ TASK-LIVENESS (KI-E140) ${id}: a prior launch recorded taskId=${meta.taskId}${meta.runId ? ` runId=${meta.runId}` : ''}${meta.launchedAt ? ` (launched ${meta.launchedAt})` : ''} — verify it is NOT still running (TaskOutput ${meta.taskId} block:false) BEFORE relaunching into the same worktree.`);
+      } catch (e) { console.log(`    TASK-LIVENESS ${id} SKIPPED (${e && e.message}) — treat as UNCHECKED (KI-E140; never blocks the relaunch listing)`); }
     }
     // KI-E42 — killed-run artifact quarantine. A dead attempt's improvised artifacts (cycle 47: a stray
     // RESULT.md claiming "false positive — already fixed, no action taken") survive into the relaunch's
@@ -1072,6 +1214,15 @@ function cmdResume(flags) {
             const pa = loadPriorAttempt(itemDir, claimMs || undefined);
             const stages = priorAttemptStages(pa);
             if (stages.length) { it.priorAttempt = pa; reusedAny = true; console.log(`    KI-E69: ${id} will REUSE {${stages.join(', ')}} from its already-on-disk attempt — verify onward still runs fresh`); }
+            // KI-E139 (ported from a host-mount session): attach a mid-pipeline progress.json
+            // (KI-E137), UNGATED by claimMs/clock — unlike plan/test/fix reuse above, this carries NO
+            // trust on its own; factory.js re-derives a FRESH content hash of the CURRENT worktree and
+            // only ever adopts the gate-band verdict on a proven match (see runItem's KI-E139 block).
+            // Still cycle-fenced (readProgressCheckpoint requires resultId === id#cyc, the SAME
+            // fold-idempotency convention result.json uses) so a truly ancient checkpoint is never even
+            // offered up for the hash check to evaluate.
+            const priorProgress = readProgressCheckpoint(itemDir, id, cyc);
+            if (priorProgress) { it.priorProgress = priorProgress; reusedAny = true; console.log(`    KI-E139: ${id} carries a progress.json at stage '${priorProgress.progressStage}' — factory.js hash-verifies the CURRENT worktree before trusting any of it (gate-band reuse only, never assumed)`); }
           }
           if (reusedAny) {
             const labelSlug = ((ledger.items[ids[0]] || {}).runLabel) || null;
@@ -1121,7 +1272,16 @@ function cmdReconstruct(flags) {
   const out = abs(join(String(cfg.root || '_bmad-output/ai-factory'), 'state', `results-cycle-${cyc}.json`));
   if (!results.length) {
     console.log(`reconstruct: NO cycle-${cyc} checkpoints found under ${cfg.paths.items} — nothing to fold`);
-    if (missing.length) console.log(`  in-flight with no checkpoint (must re-run): ${missing.join(', ')}`);
+    if (missing.length) {
+      console.log(`  in-flight with no FINAL checkpoint (must re-run): ${missing.join(', ')}`);
+      // KI-E137 (ported from a host-mount session): a missing result.json no longer means "nothing
+      // recoverable" — print each item's latest mid-pipeline progress.json (if any) so the operator
+      // can see how far a dead attempt got.
+      for (const id of missing) {
+        const pr = readProgressCheckpoint(join(itemsRoot, id), id, cyc);
+        if (pr) console.log(`    ${id}: ${summarizeProgress(pr)}`);
+      }
+    }
     return;
   }
   // KI-E44 — usage passthrough: checkpoints carry NO usage (factory.js reports the run total only at
@@ -1141,7 +1301,14 @@ function cmdReconstruct(flags) {
   for (const r of results) console.log(`  ${r.id}: ${r.toState} — ${String(r.note || '').slice(0, 110)}`);
   if (already.length) console.log(`  already folded (skipped): ${already.join(', ')}`);
   if (stale.length) console.log(`  stale checkpoints from other cycles (ignored): ${stale.join(', ')}`);
-  if (missing.length) console.log(`  in-flight with NO checkpoint — re-run only these after \`resume --reset-stale\`: ${missing.join(', ')}`);
+  if (missing.length) {
+    console.log(`  in-flight with NO FINAL checkpoint — re-run only these after \`resume --reset-stale\`: ${missing.join(', ')}`);
+    // KI-E137 (ported from a host-mount session): same mid-pipeline visibility as the zero-results branch above.
+    for (const id of missing) {
+      const pr = readProgressCheckpoint(join(itemsRoot, id), id, cyc);
+      if (pr) console.log(`    ${id}: ${summarizeProgress(pr)}`);
+    }
+  }
   console.log(`  next: node _bmad-output/ai-factory/_workflow/driver.mjs fold ${join(String(cfg.root || '_bmad-output/ai-factory'), 'state', `results-cycle-${cyc}.json`)}`);
 }
 
@@ -2789,6 +2956,7 @@ function dispatch(cmd, flags, rest) {
     case 'decisions-digest': return cmdDecisionsDigest(); // KI-E24 — ranked owner-decision digest (severity x age + one-line reply format)
     case 'realinfra-lint': return cmdRealinfraLint(); // KI-L42 — report realInfra=true items with no .cs (KI-L38 false-fail shape)
     case 'resume': return cmdResume(flags);
+    case 'mark-launched': return cmdMarkLaunched(flags); // KI-E140 — record {taskId, runId} for a just-launched Workflow, surfaced later by resume's task-liveness reminder
     case 'progress': return cmdReport('progress');
     case 'burndown': return cmdReport('burndown');
     case 'cost': return cmdReport('cost');
@@ -2809,7 +2977,7 @@ function dispatch(cmd, flags, rest) {
     case 'telemetry-report': return cmdTelemetryReport(flags); // KI-E7 / spine AD-9 — evaluation report from events.jsonl
     case 'main-check': return cmdMainCheck(rest, flags); // KI-E50 — mid-band main-drift check (read-only, warn-only); KI-E82 — --all sweep
     default:
-      console.log('commands: init | status | select | claim | reset | fold | reconstruct | recover | resume | progress | burndown | cost | escalations | decisions-digest | group | suggest | cycle | sweep | sweep-fold | gc | preflight | graph-audit | realinfra-lint | report-cycle | ingest | merge-graph | controller | telemetry-report | main-check | worktree-add|remove|list');
+      console.log('commands: init | status | select | claim | reset | fold | reconstruct | recover | resume | mark-launched | progress | burndown | cost | escalations | decisions-digest | group | suggest | cycle | sweep | sweep-fold | gc | preflight | graph-audit | realinfra-lint | report-cycle | ingest | merge-graph | controller | telemetry-report | main-check | worktree-add|remove|list');
   }
 }
 

@@ -22,6 +22,7 @@ export function defaultAgentStub(opts, blockedGate) {
   const req = s.required || [];
   const label = (opts && opts.label) || '';
   if (p.written) return { written: true };
+  if (p.hash) return { hash: 'deadbeef'.repeat(8) } // KI-E139 pack-hash probe (happy path — a stable, deterministic 64-hex-char stub hash)
   if (p.covered !== undefined) return { covered: true, gaps: [] }; // KI-E18 AcceptanceScan probe (happy path)
   if (p.honored !== undefined) return { honored: true, gaps: [] }; // KI-E87/E101 PlanCommitment/PlanStep probe (happy path)
   if (p.count !== undefined) return { count: 0, hits: [] }; // KI-E59 CommentScan probe (happy path — zero new comments)
@@ -61,8 +62,15 @@ export async function execSmoke(factorySrc, batch, options) {
   const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
   const calls = [];
   const agent = async (prompt, opts) => {
-    calls.push({ label: (opts && opts.label) || '', model: (opts && opts.model) || 'inherit' });
-    if (o.agentOverride) { const r = o.agentOverride(prompt, opts); if (r !== undefined) return r; }
+    calls.push({ label: (opts && opts.label) || '', model: (opts && opts.model) || 'inherit', isolation: (opts && opts.isolation) || null, prompt: String(prompt || '').slice(0, 16000) }); // KI-E149 (ported): captures opts.isolation AND a bounded slice of the composed prompt per call, so a test can assert both which calls run write-isolated and that the isolated agent actually SEES the explanatory hint
+    // KI-E150 (ported from a host-mount session): awaited (not just called) so a test's agentOverride
+    // MAY be async and cross a real macrotask boundary (e.g. a 0ms setTimeout) to simulate genuinely-
+    // staggered real agent-call completions — needed to test atomic-claim token attribution under
+    // concurrency without the false batching a purely-synchronous override creates (see the KI-E150
+    // exec-smoke test below). Transparent for every pre-existing synchronous override: awaiting a
+    // plain value just resolves it on the next microtask tick with the same value, so `r !== undefined`
+    // behaves identically.
+    if (o.agentOverride) { const r = await o.agentOverride(prompt, opts); if (r !== undefined) return r; }
     return defaultAgentStub(opts, o.blockedGate);
   };
   const parallel = async (thunks) => Promise.all((thunks || []).map((t) => Promise.resolve().then(t).catch(() => null)));
