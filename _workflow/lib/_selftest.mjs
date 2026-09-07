@@ -938,6 +938,62 @@ try {
   ok(String(codeUP.note || '').includes('adjudicator UPHELD'), 'KI-E142B upheld: the note distinguishes this from a silent-gap fail — an operator can tell a deviation was CLAIMED and rejected, not simply never explained');
 }
 
+// KI-E143C (ported from a host-mount session) — realInfra-classification adjudication: a
+// test-author-DECLARED, reasoned override that the adjudicator OVERRULES (agrees is legitimate)
+// proceeds instead of failing pre-band.
+{
+  const src = readFileSync(join(import.meta.dirname, '..', 'factory.js'), 'utf8');
+  const wt = (id) => ({ path: '/tmp/exec-smoke-wt/' + id, branch: 'factory/' + id });
+  const base = { target: 'X', layer: 'service', dependsOn: [], gateSet: [], autonomyTier: 'auto', source: 'smoke', solution: 'X/X.sln', peers: [] };
+  const batch = {
+    cycle: 0, concurrency: 2, attempts: 1, repoRoot: '.', templatesDir: '_bmad-output/ai-factory/agents', config: {}, dryRun: false, policies: {},
+    items: [{ ...base, id: 'SMOKE-REALINFRA', title: 'graph-flagged realInfra item', severity: 'HIGH', theme: 'money-correctness', fixType: 'non-trivial', files: ['X/src/Some.cs'], acceptance: 'exception wrapped correctly', regressionTest: 'test', realInfra: true, worktree: wt('SMOKE-REALINFRA') }],
+  };
+  const overrideReason = 'pure exception-wrapping logic, no transactions/locking/provider-specific SQL involved';
+  const { result, calls } = await execSmoke(src, batch, {
+    agentOverride: (prompt, opts) => {
+      const label = (opts && opts.label) || '';
+      if (label === 'SMOKE-REALINFRA:test-author') return { red: true, testFiles: ['X/src/X.Tests/SomeTests.cs'], runCmd: 'stub', evidence: 'stub', note: 'stub', realInfraOverride: overrideReason };
+      if (label === 'SMOKE-REALINFRA:marker-probe') return { markerFound: false };
+      if (label === 'SMOKE-REALINFRA:adjudicator') return { verdict: 'OVERRULED', reasons: ['genuinely independent of real-DB semantics'], headline: 'override legitimate' };
+      return undefined;
+    },
+  });
+  const codeRI = (result.results || []).find((r) => r.id === 'SMOKE-REALINFRA');
+  ok(!(result.results || []).some((r) => String(r.note || '').startsWith('runItem threw')), 'KI-E143C overruled: no runItem crash');
+  ok(codeRI && codeRI.toState !== 'FAILED', 'KI-E143C overruled: an adjudicated-legitimate realInfra override does NOT fail the item — a graph misclassification does not have to sink a genuinely in-memory-provable defect');
+  eq(codeRI.gates['adjudicator:realinfra-override'], 'OVERRULED', 'KI-E143C overruled: the realinfra-override-specific gate key records OVERRULED');
+  // res.note is transient (later stages overwrite it on the way to a normal CLOSED — the exec-smoke
+  // happy-path default stubs carry this item all the way through); the durable record of WHAT
+  // happened is gateDetails, not the final note.
+  eq(codeRI.gateDetails['adjudicator:realinfra-override'].headline, 'override legitimate', 'KI-E143C overruled: gateDetails carries the adjudicator\'s own headline, durable even though res.note gets overwritten by the item\'s eventual normal close');
+  eq(calls.filter((c) => c.label === 'SMOKE-REALINFRA:adjudicator').length, 1, 'KI-E143C overruled: exactly one adjudicator call for the override');
+}
+
+// KI-E143C — the fail-safe direction: a SILENT realInfra gap (no override declared) still fails
+// exactly as before KI-E143C existed — nothing here weakens the original KI-E10 guarantee.
+{
+  const src = readFileSync(join(import.meta.dirname, '..', 'factory.js'), 'utf8');
+  const wt = (id) => ({ path: '/tmp/exec-smoke-wt/' + id, branch: 'factory/' + id });
+  const base = { target: 'X', layer: 'service', dependsOn: [], gateSet: [], autonomyTier: 'auto', source: 'smoke', solution: 'X/X.sln', peers: [] };
+  const batch = {
+    cycle: 0, concurrency: 2, attempts: 1, repoRoot: '.', templatesDir: '_bmad-output/ai-factory/agents', config: {}, dryRun: false, policies: {},
+    items: [{ ...base, id: 'SMOKE-REALINFRA2', title: 'graph-flagged realInfra item, no override', severity: 'HIGH', theme: 'money-correctness', fixType: 'non-trivial', files: ['X/src/Some.cs'], acceptance: 'concurrent access safe', regressionTest: 'test', realInfra: true, worktree: wt('SMOKE-REALINFRA2') }],
+  };
+  const { result, calls } = await execSmoke(src, batch, {
+    agentOverride: (prompt, opts) => {
+      const label = (opts && opts.label) || '';
+      if (label === 'SMOKE-REALINFRA2:marker-probe') return { markerFound: false };
+      return undefined; // test-author falls to the default stub, which never sets realInfraOverride
+    },
+  });
+  const codeRI2 = (result.results || []).find((r) => r.id === 'SMOKE-REALINFRA2');
+  ok(!(result.results || []).some((r) => String(r.note || '').startsWith('runItem threw')), 'KI-E143C silent gap: no runItem crash');
+  eq(codeRI2 && codeRI2.toState, 'FAILED', 'KI-E143C silent gap: an un-overridden marker absence still fails exactly as before — silence never earns adjudication');
+  ok(!('adjudicator:realinfra-override' in (codeRI2.gates || {})), 'KI-E143C silent gap: the adjudicator is never even called when nothing was declared — no wasted cost on the common case');
+  ok(!calls.some((c) => c.label === 'SMOKE-REALINFRA2:adjudicator'), 'KI-E143C silent gap: confirmed zero adjudicator calls');
+}
+
 // KI-C2 (closed 2026-07-12): the budget-ACTIVE lane — a launch-turn token budget whose remaining()
 // is already inside the reserve must stop every item BEFORE its first agent call: id-less CLAIMED
 // no-op (attempt NOT burned), NOT checkpointed (reconstruct must ignore it; resume must list it as
@@ -1273,7 +1329,7 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
 // re-order, a routing CONSTANT — was invisible: KI-E97's REALINFRA_SIGNAL narrowing landed in canon
 // only and drifted for days with both suites passing. This block is the forcing gate.
 {
-  const { extractFactoryRoles, extractPortRoles, namedConstantSource, parityGaps } = await import('./port-parity.mjs');
+  const { extractFactoryRoles, extractPortRoles, namedConstantSource, parityGaps, extractFactoryGateKeys } = await import('./port-parity.mjs');
   // --- pure-function coverage first (the helpers must be trustworthy before the gate leans on them)
   eq([...extractFactoryRoles("await call('planner', X) ... call( 'red-proof-probe' , Y)")].sort(), ['planner', 'red-proof-probe'], 'KI-E103: extractFactoryRoles finds role literals incl. whitespace-padded call sites');
   eq([...extractFactoryRoles('call(x.role, R, S)')], [], 'KI-E103: a dynamically-constructed role is deliberately NOT extracted (both sides build gates/review-flows the same dynamic way from shared tables, so there is no literal to drift)');
@@ -1281,6 +1337,10 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
   eq(namedConstantSource('export const A = /x/;', 'A'), '/x/', 'KI-E103: namedConstantSource normalises the `export` prefix and trailing semicolon (style, not semantics)');
   eq(namedConstantSource("const A = ['x']", 'A'), "['x']", 'KI-E103: a semicolon-less canonical-style declaration reads identically');
   eq(namedConstantSource('const B = 1', 'A'), null, 'KI-E103: an absent constant returns null, never a partial read');
+  // KI-E138 (ported from a host-mount session): extractFactoryGateKeys — the colon-qualified sibling
+  // of extractFactoryRoles, for manifest entries about a SPECIFIC call-site of an already-covered role.
+  eq([...extractFactoryGateKeys("res.gates['adjudicator:realinfra-override'] = 'CHANGES_REQUIRED' ... res.gates['adjudicator:realinfra-override'] = 'APPROVED'")], ['adjudicator:realinfra-override'], 'KI-E138: extractFactoryGateKeys finds a gate key assigned twice as ONE entry (Set dedup), not two');
+  eq([...extractFactoryGateKeys("res.gates[k] = v")], [], 'KI-E138: a dynamically-keyed assignment is deliberately NOT extracted — no literal to compare');
   {
     const g = parityGaps(new Set(['a', 'b', 'c', 'd']), new Set(['a']), { mechanical: { b: 'why' }, unported: { c: 'why' } });
     eq(g.undeclared, ['d'], 'KI-E103: a canonical stage that is neither dispatched nor declared is reported — the silent-fork class this gate exists for');
@@ -1289,6 +1349,14 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
     eq(g2.staleDeclared, ['a'], 'KI-E103: declaring a stage the port actually DISPATCHES is reported — the manifest cannot claim a gap that no longer exists');
     eq(g2.deadDeclared, ['gone'], 'KI-E103: declaring a stage factory.js no longer has is reported — dead manifest entries cannot accumulate');
     eq(parityGaps(new Set(['a']), new Set(), { mechanical: { a: 'x' }, unported: { a: 'y' } }).doubleDeclared, ['a'], 'KI-E103: a stage declared BOTH mechanical and unported is contradictory and reported');
+    // KI-E138: a colon-qualified declared key is checked against gateKeys, NOT factoryRoles/portRoles —
+    // a bare-role match (even of the SAME pre-colon text) must never satisfy or falsely retire it.
+    const g3 = parityGaps(new Set(['adjudicator']), new Set(['adjudicator']), { unported: { 'adjudicator:realinfra-override': 'why' } }, new Set(['adjudicator:realinfra-override']));
+    eq(g3.deadDeclared, [], 'KI-E138: a gate-keyed entry whose key IS present in factoryGateKeys is NOT dead, even though the composite string is absent from factoryRoles entirely');
+    eq(g3.staleDeclared, [], 'KI-E138: a gate-keyed entry is NEVER staleDeclared, even when the port dispatches the SAME bare role (`adjudicator`) for its OTHER, already-mechanical call-site — role-level dispatch cannot prove THIS specific call-site is covered');
+    const g4 = parityGaps(new Set(['adjudicator']), new Set(['adjudicator']), { unported: { 'adjudicator:realinfra-override': 'why' } }, new Set()); // the mechanism's gate key no longer exists in factory.js at all
+    eq(g4.deadDeclared, ['adjudicator:realinfra-override'], 'KI-E138: a gate-keyed entry IS deadDeclared once its own gate key is gone from factory.js — the manifest cannot outlive the mechanism it describes');
+    eq(parityGaps(new Set(['a']), new Set(), { unported: { 'x:y': 'why' } }).deadDeclared, ['x:y'], 'KI-E138: omitting factoryGateKeys entirely (older call sites, backward compat) treats every gate-keyed entry as dead rather than silently passing it — fail-visible, never fail-open, on a caller that has not been updated');
   }
   // --- the live gate against the real files
   const facSrc103 = readFileSync(new URL('../factory.js', import.meta.url), 'utf8');
@@ -1296,7 +1364,7 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
   const routeSrc103 = readFileSync(new URL('../opencode/routing.mjs', import.meta.url), 'utf8');
   const { STAGE_PARITY, SHARED_CONSTANTS } = await import('../opencode/stage-parity.mjs');
   const facRoles103 = extractFactoryRoles(facSrc103);
-  const gaps103 = parityGaps(facRoles103, extractPortRoles(rtSrc103), STAGE_PARITY);
+  const gaps103 = parityGaps(facRoles103, extractPortRoles(rtSrc103), STAGE_PARITY, extractFactoryGateKeys(facSrc103)); // KI-E138 (ported): 4th arg routes a colon-qualified declared entry through the gate-key set instead of the role set
   ok(facRoles103.size >= 15, 'KI-E103: the extractor actually finds factory.js\'s agent stages (guard against a silent regex break making this whole gate vacuous) — found ' + facRoles103.size);
   eq(gaps103.undeclared, [], 'KI-E103 PARITY GATE: every factory.js agent stage is either dispatched by the port, or declared MECHANICAL/UNPORTED in _workflow/opencode/stage-parity.mjs. Undeclared stage(s) found — implement it in runtime.mjs planNext/applyPhaseResults, or add it to that manifest with a reason');
   eq(gaps103.staleDeclared, [], 'KI-E103 PARITY GATE: no manifest entry claims a gap for a stage the port now dispatches (delete the stale entry)');
@@ -1317,7 +1385,7 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
   // host-mount session) just did: `pack-hash-probe` (the gate-band-reuse content-hash probe) has no
   // relaunch-reuse concept in this runtime to fast-forward from at all, so it is genuinely UNPORTED,
   // not a silent regression.
-  eq(Object.keys(STAGE_PARITY.unported).sort(), ['pack-hash-probe', 'plan-feasibility-probe', 'plan-quality-probe'].sort(), 'KI-E112/KI-E139/KI-E142A: the UNPORTED set contains EXACTLY the reviewed, dated entries — the four original KI-E103 disclosed gaps (red-proof KI-E83, plan-commitment/plan-step KI-E87+E101, ledger-anchor KI-E91, rootcause KI-E104) are still all closed; a name added here without ALSO updating this pinned list (in the same change) is precisely the silent-growth failure mode KI-E112 exists to catch');
+  eq(Object.keys(STAGE_PARITY.unported).sort(), ['adjudicator:realinfra-override', 'pack-hash-probe', 'plan-feasibility-probe', 'plan-quality-probe'].sort(), 'KI-E112/KI-E139/KI-E142A/KI-E143C: the UNPORTED set contains EXACTLY the reviewed, dated entries — the four original KI-E103 disclosed gaps (red-proof KI-E83, plan-commitment/plan-step KI-E87+E101, ledger-anchor KI-E91, rootcause KI-E104) are still all closed; a name added here without ALSO updating this pinned list (in the same change) is precisely the silent-growth failure mode KI-E112 exists to catch');
   ok(Object.keys(STAGE_PARITY.mechanical).length >= 5, 'KI-E112: the mechanical set carries the stages implemented deterministically instead of via an agent (runner, marker, comment, red-proof, rootcause)');
   // --- shared-constant byte parity (the KI-E97 drift class)
   for (const name of SHARED_CONSTANTS) {

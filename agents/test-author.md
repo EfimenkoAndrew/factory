@@ -53,7 +53,22 @@ reproduce the defect).
 - WRITE a short note to `state/items/{id}/test.json` (the test files, the run command, the red
   evidence excerpt).
 - RETURN: `red` (bool — did it fail on old code), `testFiles` (paths), `runCmd`, `evidence`
-  (the failing assertion / error, trimmed), `note`.
+  (the failing assertion / error, trimmed), `note`, `realInfraOverride` (string or omit — see below).
+
+### Declaring a realInfra override (KI-E143C)
+The work-item graph may pre-flag an item `needsRealInfra=true` — but that classification was made
+before any test existed, and per "REAL-INFRA TESTS" above, YOU are the one who actually judges the
+defect shape. If you judge (per that section's own test) that the defect is pure in-process logic
+genuinely provable in-memory, and you write an in-memory/Moq test instead of a Testcontainers one,
+do NOT just say so in `note` and hope for the best — the mechanical marker probe cannot read prose
+in `note`, only the presence of a `FACTORY::REALINFRA::` marker, and will fail the item before your
+reasoning is ever seen. Set `realInfraOverride` to a concrete, specific sentence naming exactly why
+this defect is independent of real-DB semantics (cite the mechanism: "pure exception-wrapping
+logic, no transactions/locking/provider-specific SQL involved" — not "doesn't need it"). An
+independent adjudicator reads this before the item is failed. Leave it unset/null when you DID
+write the real-infra test, or when you have no reasoned basis to override the classification —
+an override with no real justification is worse than none: it will not save the item, and a
+vague one reads as evasion, not judgment.
 
 ### CLEANLINESS & TEST-DESIGN (hardened — pilot lessons, non-negotiable)
 - **Exactly ONE new test file** at a deterministic path (`…Tests/<area>/<Thing>Tests.cs`). Do NOT

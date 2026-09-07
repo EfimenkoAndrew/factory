@@ -27,7 +27,10 @@ export const PLAN_SCHEMA = { type: 'object', additionalProperties: false, requir
 // bounded call (never a second full plan). Byte-identical to factory.js's copy (schema-parity gate).
 export const PLAN_STEPS_NUDGE_SCHEMA = { type: 'object', additionalProperties: false, required: ['steps', 'note'], properties: { steps: { type: 'array', items: { type: 'string' } }, note: { type: 'string' } } };
 
-export const TEST_SCHEMA = { type: 'object', additionalProperties: false, required: ['red', 'note'], properties: { red: { type: 'boolean' }, verificationOnly: { type: 'boolean' }, testFiles: { type: 'array', items: { type: 'string' } }, runCmd: { type: 'string' }, baselineFailures: { type: 'array', items: { type: 'string' } }, evidence: { type: 'string' }, note: { type: 'string' } } };
+// KI-E143C (ported from a host-mount session): `realInfraOverride` added for schema-parity with
+// factory.js's TEST_SCHEMA — structurally inert here (this runtime has no adjudication routing for
+// it, see stage-parity.mjs), same posture as FIX_SCHEMA's `deviations` field above.
+export const TEST_SCHEMA = { type: 'object', additionalProperties: false, required: ['red', 'note'], properties: { red: { type: 'boolean' }, verificationOnly: { type: 'boolean' }, testFiles: { type: 'array', items: { type: 'string' } }, runCmd: { type: 'string' }, baselineFailures: { type: 'array', items: { type: 'string' } }, evidence: { type: 'string' }, note: { type: 'string' }, realInfraOverride: { type: ['string', 'null'] } } };
 
 // KI-O2: `divergence` is typed `['string','null','object']` — factory.js's FIX_SCHEMA in this PR
 // already carries the same widened type (the upstream fix landed; both copies are in sync, and the
