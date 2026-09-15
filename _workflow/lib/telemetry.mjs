@@ -479,3 +479,22 @@ export function renderTelemetryReport(agg, meta = {}) {
     renderCallsByOutcome(agg.callsByOutcome), '',
   ].join('\n');
 }
+
+// KI-E176 (ported from a host-mount session) — durable, human-readable log of every CONTINUED run:
+// a Workflow the controller stopped mid-flight (a deliberate pause, a crash, a laptop sleep) and
+// relaunched into the SAME claim/worktree (the `resume` + relaunch shape KI-E140 already prints),
+// as opposed to an independent fresh attempt from a new `group` claim. `cmdMarkLaunched --continued`
+// emits the `run_continued` source-of-truth event (AD-3: one append-only stream, this report is a
+// derived view); this function renders that history. Pure — takes the already-read event array,
+// never reads the stream itself, so it is directly unit-testable without a telemetry file on disk.
+export function continuedRunsMd(events) {
+  const rows = (events || []).filter((e) => e && e.event === 'run_continued');
+  const lines = ['# Continued runs', '', 'Every run stopped mid-flight and relaunched into the SAME claim/worktree (`resume` + relaunch, KI-E140/KI-E176) — never a fresh `group` claim.', ''];
+  if (!rows.length) { lines.push('_None yet._'); return lines.join('\n') + '\n'; }
+  lines.push('| Item | Cycle | Stopped (task / run) | Relaunched (task / run) | Logged at |', '|---|---|---|---|---|');
+  for (const e of rows) {
+    const a = e.attrs || {};
+    lines.push(`| ${e.item || ''} | ${e.cycle ?? ''} | ${a.previousTaskId || '?'} / ${a.previousRunId || '?'} | ${a.newTaskId || '?'} / ${a.newRunId || '?'} | ${e.ts || ''} |`);
+  }
+  return lines.join('\n') + '\n';
+}

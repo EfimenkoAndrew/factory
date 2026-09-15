@@ -18,8 +18,8 @@
 // The check never blocks the fold — the ledger verdict concerns the WORKTREE; repairing main is
 // operator judgment (restore from HEAD or apply the gated worktree copy).
 import { createHash } from 'node:crypto'
-import { readFileSync } from 'node:fs'
-import { join } from 'node:path'
+import { readFileSync, readdirSync, statSync } from 'node:fs'
+import { join, sep } from 'node:path'
 import { execFileSync } from 'node:child_process'
 
 /** sha256 hex of a file, or null when missing/unreadable (null is a valid snapshot value: "absent"). */
@@ -188,4 +188,35 @@ export function unclaimedMainDrift(dirty, mountRel, claimedPaths) {
   const files = d.paths.filter((p) => !underMount(p) && !claimed.has(p))
   const dirs = d.dirs.filter((p) => !underMount(p) && !dirClaimed(p))
   return [...files, ...dirs]
+}
+
+// KI-E177 (ported from a host-mount session) — an UNCLAIMED main-tree path (KI-E89's own blind
+// spot: no item's snapshot ever declared it, so the snapshot-based checks above cannot even look)
+// is not equally likely to be leaked write-isolation contamination (KI-E149-class) vs the
+// operator's own unrelated work-in-progress — KI-E89's header comment treats the two as
+// indistinguishable, but a real, checkable signal exists: does the SAME relative path, with
+// BYTE-IDENTICAL content, already exist inside one of the just-folded items' OWN worktree? An
+// operator's genuine new file would have to coincidentally match both the exact path AND the exact
+// bytes of some item's worktree copy for that to happen by chance — it does not. Deliberately
+// still returns a SIGNAL only — KI-E89's own "never auto-repair an unclaimed path" posture is
+// UNCHANGED (an unclaimed path still has no snapshot to prove what "repair" would even mean, and a
+// human still confirms before anything is deleted from the shared main tree) — this only makes
+// the signal strong enough that a human does not have to manually re-derive the diff-check by hand.
+function listFilesUnder(dir) {
+  try { return readdirSync(dir, { recursive: true }).map((p) => p.split(sep).join('/')).filter((p) => { try { return statSync(join(dir, p)).isFile() } catch { return false } }) }
+  catch { return [] }
+}
+export function matchWorktreeDebris(repoRoot, unclaimedPaths, itemIds, worktreesRoot) {
+  return (unclaimedPaths || []).map((p) => {
+    const isDir = p.endsWith('/')
+    const relFiles = isDir ? listFilesUnder(join(repoRoot, p)).map((f) => p + f) : [p]
+    for (const f of relFiles) {
+      const mainHash = hashFile(join(repoRoot, f))
+      if (mainHash === null) continue
+      for (const id of itemIds || []) {
+        if (hashFile(join(worktreesRoot, id, f)) === mainHash) return { path: p, matchedItem: id, matchedFile: f }
+      }
+    }
+    return { path: p, matchedItem: null, matchedFile: null }
+  })
 }

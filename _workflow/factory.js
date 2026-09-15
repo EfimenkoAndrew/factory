@@ -162,6 +162,17 @@ const PACK_HASH_SCHEMA = { type: 'object', additionalProperties: false, required
 const PROBE_SCHEMA = { type: 'object', additionalProperties: false, required: ['markerFound'], properties: { markerFound: { type: 'boolean' }, line: { type: 'string' } } }
 // KI-E83 — RED-proof marker probe: same shape as PROBE_SCHEMA plus the parsed exit code.
 const RED_PROOF_SCHEMA = { type: 'object', additionalProperties: false, required: ['markerFound', 'exitCode'], properties: { markerFound: { type: 'boolean' }, exitCode: { type: 'number' }, line: { type: 'string' } } }
+// KI-E175 (ported from a host-mount session) — red-proof COVERAGE probe: KI-E83 proves a marker
+// exists somewhere in verify-red-raw.txt, but says nothing about WHICH test class that marker
+// belongs to. Live incident on the origin host: test-author's red-proof covered ONLY an inherited
+// convention test (a verificationOnly judgment); the plan separately mandated a NEW test file,
+// which the FIXER created afterward with no red-proof of its own -- and the final verify.json
+// targeted THAT unproven file, with an evidence string that falsely claimed a specific request
+// header was set. KI-E83's marker check was satisfied (a marker existed, from the OTHER file)
+// while the actually-shipped, actually-verified test class was never proven to fail on unfixed
+// code. This probe asks the same question cheaply, pre-band: does verify.json's targetedTestName
+// reference the SAME class(es) test.json's red-proof (testFiles/runCmd) actually covered?
+const RED_COVERAGE_SCHEMA = { type: 'object', additionalProperties: false, required: ['covered'], properties: { covered: { type: 'boolean' }, gap: { type: ['string', 'null'] } } }
 // KI-D12 — LeftoverScan probe: a haiku agent runs the deterministic `build-test.sh leftovers` linter,
 // then classifies each FACTORY::LEFTOVER-HIT candidate as a genuine fixer PUNT (incomplete work deferred —
 // execution-policy.md §4) vs LEGIT (UI placeholder attr, a test asserting the behaviour, a
@@ -179,6 +190,12 @@ const LEDGER_ANCHOR_SCHEMA = { type: 'object', additionalProperties: false, requ
 // full price). A haiku probe answers per deterministic clause "does the diff carry evidence?";
 // gaps feed ONE bounded fixer amend; a malformed/unavailable probe never sinks the item.
 const ACCEPT_SCHEMA = { type: 'object', additionalProperties: false, required: ['covered'], properties: { covered: { type: 'boolean' }, gaps: { type: 'array', items: { type: 'object', additionalProperties: false, required: ['clause', 'why'], properties: { clause: { type: 'string' }, why: { type: 'string' } } } } } }
+// KI-E179 (ported from a host-mount session) — cheap, zero-cost trigger for the breadth-claim
+// verification probe below: does this item's OWN acceptance text make an absolute,
+// universal-quantifier claim at all? Deliberately a plain string check (no agent call) so the
+// probe itself is gated to only the items where an under-scoped "prove completeness" test is
+// actually a live risk, not the majority of ordinary, bounded-scope items.
+const BREADTH_CLAIM_RE = /\b(every|all|no participating|no consumer|no handler|no site|across all|platform-?wide)\b/i
 const PLAN_COMMITMENT_SCHEMA = { type: 'object', additionalProperties: false, required: ['honored'], properties: { honored: { type: 'boolean' }, gaps: { type: 'array', items: { type: 'object', additionalProperties: false, required: ['commitment', 'why'], properties: { commitment: { type: 'string' }, why: { type: 'string' } } } } } }
 // KI-E104 — root-cause touch probe: reports `verify/build-test.sh rootcause`'s markers verbatim (the
 // pre-band half of the fold's P9). No classify step — like KI-E59's comment probe, the linter has
@@ -369,6 +386,23 @@ function itemsDir(id) { return FDIR + '/state/items/' + id }
 function needsWriteIsolation(role) {
   return (role === 'fixer' || role === 'test-author') && !(A && A.policies && A.policies.isolateWorktreeWrites === false)
 }
+// KI-E170/E172 (ported from a host-mount session; the origin's stepwise-fixer call sites do not
+// exist in this repo, so this ports only to the two sites that DO: test-author and the single-shot
+// fixer) — a write that stays inside the agent's OWN isolation sandbox (KI-E149) is NOT rejected by
+// the tool; it succeeds silently in the wrong place, indistinguishable from a correct write until a
+// LATER stage discovers the claimed change is not where it should be. outOfTreePaths is a pure,
+// zero-cost string-prefix check: any ABSOLUTE claimed path not rooted at this item's own assigned
+// worktree is definitive proof of that exact mismatch. recoverOutOfTree gives the SAME call one
+// bounded retry with an explicit path-correction instruction before the item fails over it —
+// mirroring this codebase's own established "one bounded amend" idiom.
+function outOfTreePaths(paths, wtPath) {
+  return (paths || []).filter(function (p) { return typeof p === 'string' && p.startsWith('/') && !p.startsWith(wtPath) })
+}
+async function recoverOutOfTree(callFn, role, route, schema, wtPath, badPaths, fieldName, priorExtra, phaseName) {
+  return callFn(role, route, schema,
+    priorExtra + '\n\nPATH-CORRECTION RETRY (KI-E170/E172): your last response for this SAME call reported ' + fieldName + ' path(s) OUTSIDE your assigned worktree — ' + badPaths.slice(0, 8).join(', ') + '. This means your Edit/Write calls resolved against the WRONG base (almost certainly a bare relative path, resolved against your OWN isolated sandbox rather than your assigned worktree — see the FILE-WRITE ISOLATION note above). Redo the SAME work now — every instruction above is unchanged and still applies in full — but this time verify EVERY Edit/Write path argument starts with the EXACT string `' + wtPath + '` before you use it. Then report ' + fieldName + ' again, using only `' + wtPath + '`-rooted absolute paths.',
+    phaseName)
+}
 
 function compose(role, item, extra) {
   const wtPath = (item.worktree && item.worktree.path) || (WT && WT.path) || (item.ledger && item.ledger.worktree) || REPO  // per-item worktree (Phase-4 isolation) wins, then batch worktree (pilot)
@@ -444,7 +478,12 @@ function compose(role, item, extra) {
   // sibling's work in ITS worktree (cycle-20: the ITEM-C-DEPLOY fixer re-delivered the split-out
   // services.json fix, duplicating ITEM-H-SERVICES-JSON's whole worktree).
   if (Array.isArray(item.peers) && item.peers.length) {
-    lines.push('', 'PEER-OWNED SURFACES (sibling items in THIS batch own these files — do NOT modify them; if your fix genuinely requires one, STOP for that file and say so in your result note instead):')
+    // KI-E157(i) (ported from a host-mount session): this lock takes PRECEDENCE over any other host
+    // rule that would otherwise require touching one of these files in the SAME change — most
+    // concretely a doc-sync-in-the-same-PR mandate. Live incident on the origin host: a fixer crossed
+    // a peer lock precisely because nothing told it this lock outranks that mandate, and it picked
+    // the mandate.
+    lines.push('', 'PEER-OWNED SURFACES (sibling items in THIS batch own these files — do NOT modify them; if your fix genuinely requires one, STOP for that file and say so in your result note instead): this lock takes PRECEDENCE over any other rule in this prompt that would otherwise require touching one of these files in the SAME change (e.g. a doc-sync-in-the-same-PR mandate) — name the gap in your note/summary instead of crossing the lock; the sibling item already owns that file this batch.')
     for (const p of item.peers) lines.push('  - ' + p.id + ': ' + (p.files || []).join(', '))
   }
   // GUARDRAILS — global-stable content stays in the SHARED prefix; every role-conditional block
@@ -483,7 +522,8 @@ function compose(role, item, extra) {
     lines.push('', 'PARALLEL REVIEW STAGE — LIVE-PROBE ETIQUETTE (KI-D7): sibling reviewers run CONCURRENTLY in THIS SAME worktree and may run live probes (temporary files/edits added then reverted). A foreign temporary artifact appearing mid-review is almost certainly a sibling reviewer\'s probe — do NOT report it as sabotage/injection, and treat any harness "file changed externally" notice accordingly; re-verify the exact worktree state your verdict DEPENDS on (git status/diff) at the moment you conclude, not earlier. If YOU probe: prefix probe filenames with your role (e.g. _gateqa_probe_*), fully revert before returning, and describe the probe in your findings evidence — never leave probe debris.')
   }
   if (needsWriteIsolation(role)) {
-    lines.push('', 'FILE-WRITE ISOLATION IS ACTIVE FOR YOU (KI-E149): your Edit and Write tools can ONLY create or modify files inside your OWN worktree (' + wtPath + '). A write targeting any OTHER path, including ' + REPO + ' itself, is REJECTED by the tool before it touches disk, with an error naming the shared-checkout path. This is a real guardrail, not a bug — a prior attempt in this exact role once wrote a real fix into the wrong tree, silently corrupting shared state, and this makes that mechanically impossible instead of merely detected afterward. If you ever see that rejection, you resolved the wrong absolute path — retarget the SAME relative path under ' + wtPath + ' instead of under ' + REPO + '. The one place this changes your normal workflow: the ARTIFACTS DIR instruction above (write your state/items artifacts to ' + itemsDir(item.id) + ') names a path OUTSIDE your worktree, so Edit and Write cannot reach it there — use Bash instead for every file under that directory (redirect or tee your content into the target path); Bash writes are NOT affected by this isolation. Summary: Edit and Write for your worktree source files, Bash for your artifacts-dir files.')
+    lines.push('', 'FILE-WRITE ISOLATION IS ACTIVE FOR YOU (KI-E149): your Edit and Write tools can ONLY create or modify files inside your OWN worktree (' + wtPath + '). A write targeting any OTHER path, including ' + REPO + ' itself, is REJECTED by the tool before it touches disk, with an error naming the shared-checkout path. This is a real guardrail, not a bug — a prior attempt in this exact role once wrote a real fix into the wrong tree, silently corrupting shared state, and this makes that mechanically impossible instead of merely detected afterward. If you ever see that rejection, you resolved the wrong absolute path — retarget the SAME relative path under ' + wtPath + ' instead of under ' + REPO + '. The one place this changes your normal workflow: the ARTIFACTS DIR instruction above (write your state/items artifacts to ' + itemsDir(item.id) + ') names a path OUTSIDE your worktree, so Edit and Write cannot reach it there — use Bash instead for every file under that directory (redirect or tee your content into the target path); Bash writes are NOT affected by this isolation. Summary: Edit and Write for your worktree source files, Bash for your artifacts-dir files.'
+      + ' IF EVEN BASH IS REFUSED FOR A TARGET PATH (KI-E177, ported from a host-mount session): a session in this exact role hit Edit, Write, AND a Bash heredoc all refused for both its assigned worktree and its artifacts dir — genuinely contradicting the guarantee above, not agent error. Do NOT guess or give up on writing the file if this happens to you. Two fallbacks confirmed to work when the above did not: a PLAIN SINGLE-LINE Bash redirect instead of a heredoc (redirect a single echo/printf straight into the target path, no here-doc), or a short Bash-invoked Python one-liner that opens the target path itself and writes the content directly. Whichever method lands the write, Read the file back afterward and confirm the content is correct before trusting it — never assume success from a clean exit code alone. This is a tooling-level inconsistency, not a rule you are breaking — note it briefly in your own summary/note field if it happens so it can be tracked, but do not let it stop you from completing the work.')
   }
   // KI-E7 / spine AD-10 — best-effort agent telemetry. ABSOLUTE CLI path (KI-L33); role-based
   // (stage derives in the lib, AD-12); non-compliance is invisible (the fold's mtime backfill
@@ -804,11 +844,25 @@ async function runItem(item) {
     : ' STALE-FINDING PROTOCOL: if you determine the finding is ALREADY RESOLVED on the current tree (the acceptance criterion demonstrably holds — trace the actual wiring, do not stop at the cited lines), do NOT fabricate a red. Write a PASSING pinning test that empirically proves the acceptance holds, RUN it, tee the raw output + `FACTORY::RED::0` to verify-red-raw.txt, and return red=false + verificationOnly=true with file:line + provenance evidence in note. The full gate band adjudicates the claim — a wrong stale-claim will be CHANGES_REQUIRED\'d.')
   // KI-E69: reuse a prior (killed) attempt's test-author output when test.json already exists and
   // is fresh (from THIS claim, not a stale prior cycle) — skips the test-author call entirely.
-  const test = (item.priorAttempt && item.priorAttempt.test) || await call('test-author', R.testAuthor, TEST_SCHEMA, (item.reFix ? (reFixNote + 'Write the red proof for what is STILL broken per that feedback — do NOT duplicate an already-passing test; the proof MUST fail on the current worktree state. If NOTHING is still broken (you re-verified every prior finding against the CURRENT tree and each is fixed with an already-passing pinning test, or explicitly out of scope), return red=false + verificationOnly=true and document the full re-verification (files read, suites run, counts) in evidence/note — do NOT invent a vacuous duplicate test just to produce a red. ') : '') + redHint + testVoHint + testRealInfraHint, 'Test')
+  const testExtra = (item.reFix ? (reFixNote + 'Write the red proof for what is STILL broken per that feedback — do NOT duplicate an already-passing test; the proof MUST fail on the current worktree state. If NOTHING is still broken (you re-verified every prior finding against the CURRENT tree and each is fixed with an already-passing pinning test, or explicitly out of scope), return red=false + verificationOnly=true and document the full re-verification (files read, suites run, counts) in evidence/note — do NOT invent a vacuous duplicate test just to produce a red. ') : '') + redHint + testVoHint + testRealInfraHint
+  const testReused = !!(item.priorAttempt && item.priorAttempt.test)
+  let test = testReused ? item.priorAttempt.test : await call('test-author', R.testAuthor, TEST_SCHEMA, testExtra, 'Test')
   res.artifacts.test = 'state/items/' + id + '/test.json'
   // KI-L53: a null stage agent (retries exhausted / skipped) is an INFRA failure, not a quality
   // verdict — mark infraSuspect so the fold's auto-infra-retry does not burn the item's attempt.
   if (!test) { res.infraSuspect = true; return finish('FAILED', 'test-author agent UNAVAILABLE (null after retries — possible infra/credit failure, NOT a quality verdict)') }
+  // KI-E170/E172 (ported from a host-mount session) — skipped entirely when test came from
+  // item.priorAttempt.test: that result was already produced (and, if it ran under this same
+  // check in an earlier attempt, already validated) — nothing NEW ran this round to retry.
+  if (!testReused) {
+    const oot = outOfTreePaths(test.testFiles, wtPath)
+    if (oot.length) {
+      const recovered = await recoverOutOfTree(call, 'test-author', R.testAuthor, TEST_SCHEMA, wtPath, oot, 'testFiles', testExtra, 'Test')
+      const oot2 = recovered ? outOfTreePaths(recovered.testFiles, wtPath) : oot
+      if (!recovered || oot2.length) return finish('FAILED', 'worktree-isolation mismatch (KI-E170' + (recovered ? '/E172' : '') + '): test-author reports testFiles path(s) OUTSIDE this item\'s assigned worktree (' + wtPath + ')' + (recovered ? ' even after one path-correction retry' : '') + ': ' + (recovered ? oot2 : oot).join(', ') + ' — the isolation sandbox (KI-E149) diverged from the real target; this work never reached the tracked worktree. Pre-band fail; re-run the item fresh.')
+      test = recovered
+    }
+  }
   // KI-L37 — verification-only reFix: a PRE-APPLIED reFix (operator or prior round already landed the
   // fix + its tests) has, by definition, nothing NEW to red-prove — the defect's red proof was
   // produced in an earlier round and lives in verify-red-raw.txt (the fold's P1 re-greps that file,
@@ -831,9 +885,33 @@ async function runItem(item) {
     // KI-E69: reuse a prior (killed) attempt's fixer output when fix.json already exists and is
     // fresh (from THIS claim) — skips the fixer call; the worktree's own diff IS the expensive,
     // already-done work this exists to preserve.
-    const fix = (item.priorAttempt && item.priorAttempt.fix) || await call('fixer', R.fixer, FIX_SCHEMA, reFixNote + 'The red regression test is already in the worktree. Make it green with the minimal correct fix' + (item.reFix ? ', addressing EVERY CHANGES_REQUIRED finding — the prior fix is PARTIAL, so COMPLETE it (do not just repeat it).' : '.') + claimsHint, 'Fix')
+    const fixExtra = reFixNote + 'The red regression test is already in the worktree. Make it green with the minimal correct fix' + (item.reFix ? ', addressing EVERY CHANGES_REQUIRED finding — the prior fix is PARTIAL, so COMPLETE it (do not just repeat it).' : '.') + claimsHint
+      // KI-E156 (ported from a host-mount session; adapted from a stepwise-consolidation-only check to
+      // this repo's single-shot fixer, since no stepwise pass exists here to attach it to) —
+      // PLAN-EXCLUSION ADHERENCE: re-read plan.md's approach/blastRadius for any explicit
+      // negative/exclusion statement ("no X edits needed", "Y is unchanged", "do NOT touch Z") and
+      // confirm your diff genuinely honors each one before returning applied:true — revert anything it
+      // doesn't, or declare it via deviations if you have since learned it really is required. Live
+      // incident on the origin host: a plan explicitly said a certain edit was not needed because an
+      // existing shared dependency already gave the required visibility; the shipped diff made that
+      // unneeded edit anyway, breaking a pre-existing architecture-fitness test for a change the plan
+      // had already ruled out.
+      + ' PLAN-EXCLUSION ADHERENCE (KI-E156): before returning applied:true, re-read plan.md\'s approach/blastRadius for any explicit negative/exclusion statement ("no X edits needed", "Y is unchanged", "do NOT touch Z") and confirm your diff genuinely honors each one — revert anything it doesn\'t, or declare it via deviations if you have since learned it really is required.'
+    const fixReused = !!(item.priorAttempt && item.priorAttempt.fix)
+    let fix = fixReused ? item.priorAttempt.fix : await call('fixer', R.fixer, FIX_SCHEMA, fixExtra, 'Fix')
     res.artifacts.fix = 'state/items/' + id + '/fix.json'
     if (!fix) { res.infraSuspect = true; return finish('FAILED', 'fixer agent UNAVAILABLE (null after retries — possible infra/credit failure, NOT a quality verdict)') } // KI-L53
+    // KI-E170/E172 (ported from a host-mount session) — skipped when fix came from
+    // item.priorAttempt.fix: nothing NEW ran this round to retry.
+    if (!fixReused) {
+      const oot = outOfTreePaths(fix.filesChanged, wtPath)
+      if (oot.length) {
+        const recovered = await recoverOutOfTree(call, 'fixer', R.fixer, FIX_SCHEMA, wtPath, oot, 'filesChanged', fixExtra, 'Fix')
+        const oot2 = recovered ? outOfTreePaths(recovered.filesChanged, wtPath) : oot
+        if (!recovered || oot2.length) return finish('FAILED', 'worktree-isolation mismatch (KI-E170' + (recovered ? '/E172' : '') + '): fixer reports filesChanged path(s) OUTSIDE this item\'s assigned worktree (' + wtPath + ')' + (recovered ? ' even after one path-correction retry' : '') + ': ' + (recovered ? oot2 : oot).join(', ') + ' — the isolation sandbox (KI-E149) diverged from the real target; this work never reached the tracked worktree. Pre-band fail; re-run the item fresh.')
+        fix = recovered
+      }
+    }
     if (fix.scopeStop) return await frameAndBlock('fixer scope-stop — ' + (fix.summary || ''))
     if (!fix.applied) return finish('FAILED', 'fixer did not apply: ' + (fix.note || fix.summary || ''))
   }
@@ -1011,6 +1089,19 @@ async function runItem(item) {
     ? test.baselineFailures
     : (Array.isArray(verify.baselineFailures) ? verify.baselineFailures : [])
   res.transitions.push('GREEN', 'BUILT', 'TESTED')
+
+  // KI-E152 (ported from a host-mount session) — deterministic verify evidence, surfaced directly in
+  // every review-role prompt (edge-scan, the technical gates, method-flow reviews, PO, refuter,
+  // re-auditor). Origin incident: a diff collected unanimous APPROVED verdicts across the whole gate
+  // band on a runner's confident summary, then failed the deterministic integrate step with hundreds
+  // of new test regressions — neither the shared REVIEW PACK hint (diff snapshot only) nor any gate
+  // brief ever quoted the runner's own verify.json fields, so a reviewer judging code quality had zero
+  // visibility into whether the fix even builds, unless they independently re-ran the build themselves
+  // (never instructed anywhere). This makes that evidence unmissable instead of relying on the diff
+  // alone to imply it — a second, independent, disk-derived signal placed directly in front of every
+  // verdict, on top of (not instead of) the worktree spot-check the REVIEW PACK hint already requires.
+  const verifyEvidenceHint = ' DETERMINISTIC VERIFY EVIDENCE (machine-run, not the runner\'s prose — cross-check your own read of the diff against this): build=' + (verify.build || '?') + ', targetedTest=' + (verify.targetedTest || '?') + ', suite={passed:' + ((verify.suite && verify.suite.passed) || 0) + ',failed:' + ((verify.suite && verify.suite.failed) || 0) + ',skipped:' + ((verify.suite && verify.suite.skipped) || 0) + '}' + (verify.realInfraExercised ? ', realInfraExercised=true' : '') + '. A `build=fail` or `targetedTest=fail` or any nonzero `suite.failed` means the change does NOT work at a mechanical level RIGHT NOW, regardless of how clean the diff reads — verdict CHANGES_REQUIRED unless the failure is a known, already-ledgered baseline (see baselineFailures) and not caused by this diff.'
+
   await checkpointProgress(res, 'post-verify') // KI-E137 — kill-resilience: fix+verify survive a kill during the 8-scan pre-band chain
 
   // TESTED-pre. RED-PROOF MARKER PROBE (KI-E83) — the KI-E10 realInfra-marker-probe pattern applied
@@ -1044,6 +1135,25 @@ async function runItem(item) {
     }
     // redProbe null (infra failure / agent unavailable) -> proceed; the fold-time deterministic
     // P1 check is the backstop either way, same fail-open posture as every sibling pre-band probe.
+  }
+
+  // TESTED-pre2. RED-PROOF COVERAGE PROBE (KI-E175, ported from a host-mount session) — KI-E83
+  //     proves A marker exists; this proves it belongs to the test class that actually shipped.
+  //     Only meaningful when test-author recorded a real testFiles/runCmd target to compare
+  //     against (skip silently otherwise — fail-open, same posture as every sibling pre-band probe
+  //     when its own precondition data is missing).
+  if (codeChange && test && test.runCmd) {
+    const coverageProbe = await call('red-coverage-probe', { model: 'claude-haiku-4-5', effort: 'low' }, RED_COVERAGE_SCHEMA,
+      'READ-ONLY EVIDENCE PROBE (KI-E175). Read ' + itemsDir(id) + '/test.json — note its `runCmd` (the exact test-author red-proof command, ending in a dotnet --filter test CLASS name) and `testFiles`. Then read ' + itemsDir(id) + '/verify.json — note its `evidence` text and any other field describing which test class the FINAL verify run actually targeted (do not assume a fixed field name; read the prose). '
+      + 'Compare the test CLASS name(s): does verify.json\'s final targeted test class match (or is it a strict superset run of) the SAME class(es) test.json\'s runCmd red-proved? If verify targeted a DIFFERENT class not covered by test.json\'s red-proof, that class was never proven to FAIL on unfixed code — only proven to pass now, which is not the same thing. '
+      + 'If they match (or verify.json is missing/empty, or test.json shows verificationOnly with no new class needed), return covered=true. '
+      + 'If they diverge, independently Read the ACTUAL test source file verify.json named (do not trust its evidence prose — that text can be wrong) and check whether its own request/setup genuinely depends on the exact code path the fix changed (read ' + (item.files || []).join(', ') + ') — if it plainly does not (e.g. a claimed header/precondition is simply absent from the test\'s own request setup), return covered=false with `gap` naming the exact missing precondition and file:line.',
+      'Verify')
+    if (coverageProbe && coverageProbe.covered === false) {
+      return finish('FAILED', 'RED-proof coverage probe (KI-E175): the test class verify.json actually targeted was never red-proved by test.json\'s own runCmd, and its setup does not appear to reach the fix\'s code path — ' + (coverageProbe.gap || 'no discriminating precondition found') + '. Failing BEFORE the gate band (cheap); a vacuous test that passes identically on reverted code is not evidence the fix works.')
+    }
+    // coverageProbe null (infra failure) or covered:true -> proceed; the gate band's own reviewers
+    // remain the backstop either way, same fail-open posture as every sibling pre-band probe.
   }
 
   // 4a4. ROOT-CAUSE TOUCH PROBE (KI-E104) — the PRE-BAND half of the fold's deterministic P9
@@ -1123,7 +1233,7 @@ async function runItem(item) {
   if (edgeFlow) {
     phase('EdgeScan')
     edgeRoute = band === 'LIGHT' ? SONNET : (RF[edgeFlow.routeKey] || RT.rEdge)
-    edgeExtra = 'Apply the ' + edgeFlow.skill + ' BMAD review methodology to the WORKTREE DIFF only (git -C <worktree> diff). Verdict CHANGES_REQUIRED on any CRITICAL/HIGH you find; APPROVED only if the diff is clean by your lens.' + staleGuard + voGuard + ' EARLY SCAN (pre-band, KI-E12): you run BEFORE the full gate band so unhandled boundaries get fixed cheaply now instead of failing the whole item after the band. Findings-only discipline as usual.'
+    edgeExtra = 'Apply the ' + edgeFlow.skill + ' BMAD review methodology to the WORKTREE DIFF only (git -C <worktree> diff). Verdict CHANGES_REQUIRED on any CRITICAL/HIGH you find; APPROVED only if the diff is clean by your lens.' + staleGuard + voGuard + ' EARLY SCAN (pre-band, KI-E12): you run BEFORE the full gate band so unhandled boundaries get fixed cheaply now instead of failing the whole item after the band. Findings-only discipline as usual.' + verifyEvidenceHint
     edgeFinal = await call('review-edgecase', edgeRoute, GATE_SCHEMA, edgeExtra, 'EdgeScan')
     res.artifacts['review:review-edge-case-hunter'] = 'state/items/' + id + '/review-edgecase.md'
     const edgeFindings = (edgeFinal && edgeFinal.findings) || []
@@ -1190,6 +1300,50 @@ async function runItem(item) {
           const gapNote = (ac.gaps || []).slice(0, 6).map(function (g) { return String(g.clause || '').slice(0, 90) }).join(' | ')
           return finish('FAILED', 'acceptance-scan (KI-E18): acceptance clause(s) with NO evidence in the diff after one bounded amend — ' + (gapNote || 'see gateDetails') + '. Pre-band fail (cheap — no gate band was spent); the fix must address EVERY acceptance clause.')
         }
+      }
+    }
+  }
+
+  // 4c-ter. BREADTH-CLAIM VERIFICATION PROBE (KI-E179, ported from a host-mount session) —
+  //     acceptance-scan (KI-E18) proves each acceptance CLAUSE has evidence in the diff; it never
+  //     questions whether a clause making an ABSOLUTE, universal-quantifier claim ("no
+  //     consumer...", "every X...") is PROVEN AS WIDELY AS IT CLAIMS. Live incident on the origin
+  //     host: a breadth-scan regression test (written to prove "no participating consumer
+  //     re-persists a plaintext body") had a regex that matched one call-site shape but not a
+  //     dotted-member-access variant of the exact same call, and a scan root covering one
+  //     directory while a sibling directory (same interface, same service) held both the unswept
+  //     offender and several already-converted consumers — the sweep and its own proof test shared
+  //     the identical blind spot, so the test stayed green over a real, undocumented gap. Three
+  //     opus-class gate reviewers each independently rediscovered this, expensively, only after
+  //     the full band ran. Gated on the ACCEPTANCE TEXT itself naming a universal/breadth claim — a
+  //     cheap, zero-cost string check — so this never fires on the (large) majority of items making
+  //     ordinary, bounded claims.
+  if (!verificationOnly && BREADTH_CLAIM_RE.test(item.acceptance || '')) {
+    phase('EdgeScan')
+    let bc = await call('breadth-claim-probe', { model: 'claude-sonnet-4-6', effort: 'medium' }, ACCEPT_SCHEMA,
+      'BREADTH-CLAIM VERIFICATION (KI-E179 — pre-band completeness-sweep probe). This item\'s acceptance criteria makes an ABSOLUTE, universal-quantifier claim — the kind a narrow regression test can silently under-cover without anyone noticing (live incident this guards against: a breadth-scan test\'s regex matched one call-site shape but not a dotted-member-access variant of the exact same call, and its scan root covered one consumer directory while a sibling directory — same interface, same service — held both the unswept offender and several already-converted consumers; the sweep and its own proof test shared the identical blind spot). STEP 1: read the ACCEPTANCE CLAIM below and name exactly what universal set it claims to cover. STEP 2: read ' + itemsDir(id) + '/review-pack.md for the new/modified regression test(s) meant to PROVE this claim — find their actual scan boundary (directory roots, regex patterns, hardcoded lists). STEP 3: independently search the REAL worktree yourself (grep/glob under ' + wtPath + ') for anything that plausibly falls inside the claimed universal set but OUTSIDE the test\'s own scan boundary — do not trust the test\'s stated scope, verify it against the actual codebase structure. Return covered=true only if the test\'s real implementation genuinely reaches everything the claim implies; otherwise covered=false with each gap in gaps (clause = the specific site or boundary the test misses, why = the evidence). ACCEPTANCE CLAIM: ' + (item.acceptance || ''), 'EdgeScan')
+    if (bc && bc.covered === false && Array.isArray(bc.gaps) && bc.gaps.length) {
+      res.amended = true
+      const bcAmend = await call('fixer', R.fixer, FIX_SCHEMA, 'BREADTH-CLAIM GAP AMEND (KI-E179): a pre-band probe found that your breadth-claiming regression test\'s own scan boundary does NOT actually cover everything your acceptance criteria universally claims — the gate band would independently rediscover this at full price. Address EVERY gap below: either widen the test\'s scan boundary/regex to genuinely cover the missed site(s), or fix the missed site(s) themselves (whichever the gap actually calls for), or state in note precisely why a gap is already covered or legitimately out of scope. Then re-verify the touched surface and REGENERATE the review pack: `' + PACKCMD + '`. GAPS: ' + JSON.stringify(bc.gaps.slice(0, 8)) + claimsHint, 'EdgeScan')
+      if (bcAmend && bcAmend.scopeStop) return await frameAndBlock('fixer scope-stop during breadth-claim amend — ' + (bcAmend.summary || ''))
+      if (bcAmend && (bcAmend.applied || (bcAmend.note && String(bcAmend.note).trim()))) {
+        const bcNoteHint = bcAmend.applied ? '' : ('\nFIXER\'S EXPLANATION (no code change was applied — judge whether this genuinely justifies every gap as already-covered or out of scope, do NOT rubber-stamp a bare assertion): ' + bcAmend.note)
+        const bcRe = await call('breadth-claim-probe', { model: 'claude-sonnet-4-6', effort: 'medium' }, ACCEPT_SCHEMA,
+          'BREADTH-CLAIM VERIFICATION, RE-SCAN (KI-E179): an amend just addressed the prior gaps — independently re-verify the AMENDED diff and worktree fresh; prior gaps are hypotheses to re-check, never conclusions to copy forward.' + bcNoteHint, 'EdgeScan')
+        if (bcRe && typeof bcRe.covered === 'boolean') bc = bcRe
+      }
+    }
+    if (bc && typeof bc.covered === 'boolean') {
+      res.gates['probe:breadth-claim'] = bc.covered ? 'APPROVED' : 'CHANGES_REQUIRED'
+      res.gateDetails = res.gateDetails || {}
+      res.gateDetails['probe:breadth-claim'] = {
+        verdict: bc.covered ? 'APPROVED' : 'CHANGES_REQUIRED',
+        headline: bc.covered ? 'the breadth-claiming test\'s own scan genuinely covers the universal claim' : ((bc.gaps || []).length + ' site(s)/boundary gap(s) the breadth-claiming test does not actually reach'),
+        findings: (bc.gaps || []).slice(0, 12).map(function (g) { return { severity: 'HIGH', title: 'breadth-claim gap: ' + String(g.clause || '').slice(0, 140), fix: String(g.why || '') } }),
+      }
+      if (!bc.covered) {
+        const bcGapNote = (bc.gaps || []).slice(0, 6).map(function (g) { return String(g.clause || '').slice(0, 90) }).join(' | ')
+        return finish('FAILED', 'breadth-claim probe (KI-E179): the universal claim in this item\'s acceptance criteria is NOT actually proven as widely as claimed, even after one bounded amend — ' + (bcGapNote || 'see gateDetails') + '. Pre-band fail (cheap — no gate band was spent); a completeness sweep is only as good as its own scan boundary.')
       }
     }
   }
@@ -1463,10 +1617,10 @@ async function runItem(item) {
     const gateRoles = band === 'LIGHT' ? ['developer', 'qa'] // LIGHT: skip the opus architect/security/po panel
       : (item.gateSet && item.gateSet.length ? item.gateSet : (CFG.gateSet || ['architect', 'developer', 'qa', 'security', 'po']))
     const techGates = gateRoles.filter(function (g) { return g !== 'po' })
-    const blocking = techGates.map(function (g) { return { key: 'gate:' + g, role: 'gate-' + g, route: band === 'LIGHT' ? SONNET : R.gates[g], extra: (staleGuard + voGuard) || null } })
+    const blocking = techGates.map(function (g) { return { key: 'gate:' + g, role: 'gate-' + g, route: band === 'LIGHT' ? SONNET : R.gates[g], extra: staleGuard + voGuard + verifyEvidenceHint } })
       .concat(methodFlows.map(function (f) {
         return { key: 'review:' + f.skill.replace('bmad-', ''), role: SKILL_ROLE[f.skill], route: band === 'LIGHT' ? SONNET : RF[f.routeKey],
-          extra: 'Apply the ' + f.skill + ' BMAD review methodology to the WORKTREE DIFF only (git -C <worktree> diff). Verdict CHANGES_REQUIRED on any CRITICAL/HIGH you find; APPROVED only if the diff is clean by your lens.' + staleGuard + voGuard }
+          extra: 'Apply the ' + f.skill + ' BMAD review methodology to the WORKTREE DIFF only (git -C <worktree> diff). Verdict CHANGES_REQUIRED on any CRITICAL/HIGH you find; APPROVED only if the diff is clean by your lens.' + staleGuard + voGuard + verifyEvidenceHint }
       }))
     const brRes = await Promise.all(blocking.map(function (x) { return call(x.role, x.route, GATE_SCHEMA, x.extra, 'Gates') }))  // each agent() routes through the global limiter (caps total concurrency)
     // KI-E12: the early scan's FINAL verdict joins the band's verdict set — recording, failedBlk,
@@ -1536,7 +1690,7 @@ async function runItem(item) {
       }
     }
     if (gateRoles.includes('po')) {
-      const po = await call('gate-po', R.gates.po, GATE_SCHEMA, null, 'Gates')
+      const po = await call('gate-po', R.gates.po, GATE_SCHEMA, verifyEvidenceHint, 'Gates')
       res.artifacts['gate:po'] = 'state/items/' + id + '/gate-po.md'
       res.gates['gate:po'] = po ? po.verdict : 'NULL'
       res.gateDetails['gate:po'] = detail(po)
@@ -1564,8 +1718,8 @@ async function runItem(item) {
   for (const lens of lenses) pv.push({ kind: 'lens', lens: lens })
   const pvRes = await Promise.all(pv.map(function (t) {
     return t.kind === 'refute'
-      ? call('refuter', R.refuter, REFUTE_SCHEMA, null, 'Refute+Re-audit')
-      : call('re-auditor', R.reauditor, REAUDIT_SCHEMA, 'Apply the ' + t.lens + ' audit lens ONLY, scoped to the worktree diff + its immediate blast radius. Confirm the ORIGINAL finding is gone (cite the now-correct file:line, not the test) AND that THIS lens finds no new CRITICAL/HIGH in the change.', 'Refute+Re-audit')
+      ? call('refuter', R.refuter, REFUTE_SCHEMA, verifyEvidenceHint, 'Refute+Re-audit')
+      : call('re-auditor', R.reauditor, REAUDIT_SCHEMA, 'Apply the ' + t.lens + ' audit lens ONLY, scoped to the worktree diff + its immediate blast radius. Confirm the ORIGINAL finding is gone (cite the now-correct file:line, not the test) AND that THIS lens finds no new CRITICAL/HIGH in the change.' + verifyEvidenceHint, 'Refute+Re-audit')
   }))
   // refuter verdict (slot 0 when present)
   if (!refuteCovered) {

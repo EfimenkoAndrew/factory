@@ -1202,7 +1202,7 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
   rmF(rootQ, { recursive: true, force: true });
   // driver wiring pins
   const dsrc89 = readFileSync(new URL('../driver.mjs', import.meta.url), 'utf8');
-  ok(dsrc89.includes("import { snapshotMainFiles, driftAgainstSnapshot, dirtyMainPaths, filesOverlapDirty, splitDriftByStatus, repairDirtyDrift, unclaimedMainDrift } from './lib/mainguard.mjs';"), 'KI-E89: driver.mjs imports unclaimedMainDrift alongside its KI-E14/E61 siblings');
+  ok(dsrc89.includes("import { snapshotMainFiles, driftAgainstSnapshot, dirtyMainPaths, filesOverlapDirty, splitDriftByStatus, repairDirtyDrift, unclaimedMainDrift, matchWorktreeDebris } from './lib/mainguard.mjs';"), 'KI-E89: driver.mjs imports unclaimedMainDrift (and KI-E177\'s matchWorktreeDebris) alongside its KI-E14/E61 siblings');
   const cmcBody = dsrc89.slice(dsrc89.indexOf('function cmdMainCheck'), dsrc89.indexOf('function cmdMainCheck') + 9000);
   ok(cmcBody.includes('const claimedPaths = new Set();') && cmcBody.includes('for (const f of Object.keys(snapFiles)) claimedPaths.add(f);'), 'KI-E89: claimedPaths is accumulated from every claimed item\'s snapshot files — the true ceiling of what the unclaimed sweep can see');
   ok(cmcBody.includes('unclaimedMainDrift(dirtyMainPaths(REPO_ROOT), MOUNT_REL, claimedPaths)'), 'KI-E89: cmdMainCheck wires the real REPO_ROOT/MOUNT_REL/claimedPaths into the pure helper — reuses dirtyMainPaths (KI-E14), does not hand-roll a fresh git call');
@@ -1381,11 +1381,13 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
   // manifest edit. This assertion is deliberately an equality against the EXACT expected set rather
   // than a "<= N" bound: re-opening a gap must be a visible, arguable edit to this line, not a
   // quietly-growing list. If a future stage genuinely cannot be ported, add it to UNPORTED with a
-  // reason AND change this assertion in the same commit — exactly what KI-E139 (ported from a
-  // host-mount session) just did: `pack-hash-probe` (the gate-band-reuse content-hash probe) has no
-  // relaunch-reuse concept in this runtime to fast-forward from at all, so it is genuinely UNPORTED,
-  // not a silent regression.
-  eq(Object.keys(STAGE_PARITY.unported).sort(), ['adjudicator:realinfra-override', 'main-drift-probe', 'pack-hash-probe', 'plan-feasibility-probe', 'plan-quality-probe'].sort(), 'KI-E112/KI-E139/KI-E142A/KI-E143C/KI-E145: the UNPORTED set contains EXACTLY the reviewed, dated entries — the four original KI-E103 disclosed gaps (red-proof KI-E83, plan-commitment/plan-step KI-E87+E101, ledger-anchor KI-E91, rootcause KI-E104) are still all closed; a name added here without ALSO updating this pinned list (in the same change) is precisely the silent-growth failure mode KI-E112 exists to catch');
+  // reason AND change this assertion in the same commit — exactly what KI-E175/E179 (ported from a
+  // host-mount session) just did: `red-coverage-probe` (the test.json-vs-verify.json class-name
+  // cross-check) and `breadth-claim-probe` (the universal-quantifier scan-boundary re-verification)
+  // are both hours-old, separately-scoped pre-band scans on the origin host with no equivalent
+  // planNext/applyPhaseResults phase in this runtime, so they are genuinely UNPORTED, not a silent
+  // regression.
+  eq(Object.keys(STAGE_PARITY.unported).sort(), ['adjudicator:realinfra-override', 'breadth-claim-probe', 'main-drift-probe', 'pack-hash-probe', 'plan-feasibility-probe', 'plan-quality-probe', 'red-coverage-probe'].sort(), 'KI-E112/KI-E139/KI-E142A/KI-E143C/KI-E145/KI-E175/KI-E179: the UNPORTED set contains EXACTLY the reviewed, dated entries — the four original KI-E103 disclosed gaps (red-proof KI-E83, plan-commitment/plan-step KI-E87+E101, ledger-anchor KI-E91, rootcause KI-E104) are still all closed; a name added here without ALSO updating this pinned list (in the same change) is precisely the silent-growth failure mode KI-E112 exists to catch');
   ok(Object.keys(STAGE_PARITY.mechanical).length >= 5, 'KI-E112: the mechanical set carries the stages implemented deterministically instead of via an agent (runner, marker, comment, red-proof, rootcause)');
   // --- shared-constant byte parity (the KI-E97 drift class)
   for (const name of SHARED_CONSTANTS) {
@@ -3417,17 +3419,52 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
   eq(pa3.test, null, 'KI-E69: malformed test.json -> null, never a throw');
   ok(pa3.fix && pa3.fix.applied === true, 'KI-E69: a sibling malformed file never poisons an otherwise-valid one');
 
+  // KI-E158(i) (ported from a host-mount session) — a REJECTED attempt (real review verdict, not a
+  // killed-mid-flight run) must never reuse test/fix verbatim: the rejection's own feedback would
+  // never reach a fresh fixer/test-author call. isReFix unconditionally disables ALL reuse.
+  const { utimesSync: utimesE158 } = await import('node:fs');
+  const dReFix = join(pdir, 'd-refix'); mkdirSync(dReFix, { recursive: true });
+  fsWrite(join(dReFix, 'plan.md'), '# Plan\nproceed.');
+  fsWrite(join(dReFix, 'test.json'), JSON.stringify({ red: true, testFiles: ['a.cs'] }));
+  fsWrite(join(dReFix, 'fix.json'), JSON.stringify({ applied: true, scopeStop: false, summary: 'did it' }));
+  eq(P.loadPriorAttempt(dReFix, beforeWrite, true), { plan: null, test: null, fix: null }, 'KI-E158(i): isReFix=true disables ALL reuse even though plan/test/fix are all fresh and well-formed — a rejected attempt is not a crash to recover from');
+  const paNotReFix = P.loadPriorAttempt(dReFix, beforeWrite, false);
+  ok(paNotReFix.test && paNotReFix.test.red === true, 'KI-E158(i): isReFix=false (or omitted) preserves the pre-existing KI-E69 reuse behavior');
+
+  // KI-E158(ii) (ported from a host-mount session) — a REPLAN (a fresh plan.md written after
+  // test.json/fix.json already exist) supersedes whatever test/fix were authored against the OLDER
+  // plan; a test/fix predating the current plan.md must not be reused even though it is otherwise
+  // fresh and well-formed (the KI-E69 "artifacts older than the claim" guard alone does not catch
+  // this, since the replan can happen AFTER the current claim too).
+  const dReplan = join(pdir, 'd-replan'); mkdirSync(dReplan, { recursive: true });
+  const oldMs = Date.now() - 10000;
+  fsWrite(join(dReplan, 'test.json'), JSON.stringify({ red: true, testFiles: ['old.cs'] }));
+  fsWrite(join(dReplan, 'fix.json'), JSON.stringify({ applied: true, scopeStop: false, summary: 'old fix' }));
+  utimesE158(join(dReplan, 'test.json'), new Date(oldMs), new Date(oldMs));
+  utimesE158(join(dReplan, 'fix.json'), new Date(oldMs), new Date(oldMs));
+  fsWrite(join(dReplan, 'plan.md'), '# Replan\nthe old approach is superseded.'); // written AFTER test/fix -> newer mtime
+  const paReplan = P.loadPriorAttempt(dReplan, beforeWrite);
+  eq(paReplan.test, null, 'KI-E158(ii): test.json predating a later plan.md is NOT reused, even though it is fresh relative to the claim and well-formed');
+  eq(paReplan.fix, null, 'KI-E158(ii): fix.json predating a later plan.md is NOT reused, for the same reason');
+  // Sanity: without a replan (plan.md absent, or older than test/fix), the pre-existing behavior
+  // (d1/d2 above) is unaffected — already covered by pa1/pa2's own assertions using the 3-param call.
+
   // Wiring: factory.js consults item.priorAttempt at exactly the plan/test/fix call sites, never at
   // verify (which must ALWAYS run fresh — the shape-mismatch risk above is exactly why).
   const facText69 = readFileSync(join(import.meta.dirname, '..', 'factory.js'), 'utf8');
   ok(facText69.includes("(item.priorAttempt && item.priorAttempt.plan) ||"), 'KI-E69: runItem() plan stage consults item.priorAttempt.plan');
-  ok(facText69.includes("(item.priorAttempt && item.priorAttempt.test) ||"), 'KI-E69: runItem() test stage consults item.priorAttempt.test');
-  ok(facText69.includes("(item.priorAttempt && item.priorAttempt.fix) ||"), 'KI-E69: runItem() fix stage consults item.priorAttempt.fix');
+  // KI-E170/E172 (ported from a host-mount session) restructured the test/fix reuse check from an
+  // inline `(item.priorAttempt && item.priorAttempt.X) || await call(...)` into an explicit
+  // `xReused` flag + `let x = xReused ? item.priorAttempt.x : await call(...)`, so the reuse
+  // consults the SAME field via a different, still-source-text-pinnable shape.
+  ok(facText69.includes("const testReused = !!(item.priorAttempt && item.priorAttempt.test)"), 'KI-E69: runItem() test stage consults item.priorAttempt.test');
+  ok(facText69.includes("const fixReused = !!(item.priorAttempt && item.priorAttempt.fix)"), 'KI-E69: runItem() fix stage consults item.priorAttempt.fix');
   ok(!facText69.includes('item.priorAttempt.verify') && !facText69.includes('item.priorAttempt && item.priorAttempt.verify'), 'KI-E69: verify is NEVER read from item.priorAttempt — always runs fresh (unsafe on-disk shape)');
   ok(facText69.includes('res.priorAttemptReuse'), 'KI-E69: the result always carries priorAttemptReuse (empty array when nothing was reused) — never silently absent');
 
   const drvText69 = readFileSync(join(import.meta.dirname, '..', 'driver.mjs'), 'utf8');
   ok(drvText69.includes("if (flags.reuse) {") && drvText69.includes('loadPriorAttempt(itemDir'), 'KI-E69: cmdResume gates the regeneration behind an explicit --reuse flag (never a silent default-behavior change)');
+  ok(drvText69.includes('loadPriorAttempt(itemDir, claimMs || undefined, it.reFix)'), 'KI-E158(i): cmdResume passes it.reFix through to loadPriorAttempt, so a relaunched reFix item never reuses a rejected test/fix');
   ok(drvText69.includes('priorAttemptReuse: (r.priorAttemptReuse'), 'KI-E69: item_folded telemetry surfaces priorAttemptReuse whenever a relaunch reused a killed run\'s artifacts');
   // Live-caught review fix (same day, cutting the actual cycle-58 recovery): run-args.json is a
   // group-time snapshot that does not see a LATER hand-edit to the emitted run-script (exactly what
@@ -4199,6 +4236,143 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
   ok(tlBlock.includes('if (!existsSync(metaPath)) continue;'), 'KI-E140: a missing launch-meta.json (no prior session recorded one, or it predates this convention) is silent — never a warning, since this is a best-effort aid this file cannot enforce, not a detector with a false-negative to worry about');
   ok(tlBlock.includes('verify it is NOT still running') && tlBlock.includes('block:false'), 'KI-E140: the printed reminder names the EXACT check to run (TaskOutput with block:false) — not just "be careful"');
   ok(tlBlock.includes("} catch (e)") && tlBlock.includes('never blocks the relaunch listing'), 'KI-E140: a read failure degrades to UNCHECKED and never blocks the relaunch line, matching KI-E41\'s own MAIN-GUARD posture exactly');
+}
+
+// KI-E151 (ported from a host-mount session) — cmdDecisionsDigest's `question` field rendered the
+// literal text "[object Object]" for a row whose wi.ownerDecision is a structured
+// {date, ruling, rationale, source} object rather than a plain string. Behavioral, not source-text:
+// extract the ACTUAL shipped expression and execute it via new Function against fixtures covering
+// both real shapes, so the test would catch a regression even if the fix were rewritten differently.
+{
+  const drv151 = readFileSync(join(import.meta.dirname, '..', 'driver.mjs'), 'utf8');
+  const marker = 'let question = ';
+  const start = drv151.indexOf(marker);
+  ok(start !== -1, 'KI-E151: cmdDecisionsDigest still declares `let question = ...`');
+  const stmt = drv151.slice(start + marker.length, drv151.indexOf(';', start));
+  const evalQuestion = new Function('wi', 'return (' + stmt + ')');
+  eq(evalQuestion({ ownerDecision: 'plain string ruling' }), 'plain string ruling', 'KI-E151: a plain-string ownerDecision passes through unchanged (zero behavior change for the common case)');
+  eq(evalQuestion({ ownerDecision: { date: '2026-08-03', ruling: 'ship it', rationale: 'x', source: 'owner' } }), 'ship it', 'KI-E151: a structured ownerDecision object extracts .ruling instead of stringifying the whole object');
+  eq(evalQuestion({ ownerDecision: { decision: 'fallback field', source: 'owner' } }), 'fallback field', 'KI-E151: falls back to .decision when .ruling is absent');
+  eq(evalQuestion({ ownerDecision: null }), '', 'KI-E151: a null/absent ownerDecision still yields empty string, not "null" or a throw');
+  ok(String(evalQuestion({ ownerDecision: { ruling: 'x' } })) !== '[object Object]', 'KI-E151: regression guard — the exact observed bug string never reappears for a structured ownerDecision');
+}
+
+// KI-E152 (ported from a host-mount session) — deterministic verify evidence surfaced in every
+// review-role prompt (edge-scan, gates, method-flow reviews, PO, refuter, re-auditor), so a reviewer
+// judging code quality has the runner's own build/targetedTest/suite result in front of it instead of
+// only a diff snapshot. Verified via exec-smoke (real prompt rendering), not a source-text pin, since
+// the whole point is what the AGENT actually SEES.
+{
+  const { execSmoke: esE152, smokeBatch: sbE152 } = await import('./_execsmoke.mjs');
+  const facSrcE152 = readFileSync(join(import.meta.dirname, '..', 'factory.js'), 'utf8');
+  const { calls: callsE152 } = await esE152(facSrcE152, sbE152(), {});
+  const hintedRoles = ['review-edgecase', 'gate-developer', 'gate-qa', 'gate-po', 'refuter', 're-auditor'];
+  for (const role of hintedRoles) {
+    const call = callsE152.find((c) => c.label === 'SMOKE-CODE:' + role);
+    ok(call, 'KI-E152: SMOKE-CODE (FULL band) dispatches ' + role);
+    ok(call && call.prompt.includes('DETERMINISTIC VERIFY EVIDENCE') && call.prompt.includes('build=pass') && call.prompt.includes('targetedTest=pass'), 'KI-E152: ' + role + '\'s prompt carries the deterministic verify evidence hint with the real build/targetedTest verdicts');
+  }
+}
+
+// KI-E154 (ported from a host-mount session) — mtime-based stall detection: a Workflow can survive a
+// laptop sleep in the harness's own task tracker (status stays "running") while the item's own
+// directory sits frozen. stallSuspected is pure and disk-only; direct-import tested against real
+// fixtures rather than through cmdResume's console output.
+{
+  const drv154Src = readFileSync(join(import.meta.dirname, '..', 'driver.mjs'), 'utf8');
+  const fnStart = drv154Src.indexOf('function stallSuspected(');
+  ok(fnStart !== -1, 'KI-E154: stallSuspected is defined in driver.mjs');
+  const fnEnd = drv154Src.indexOf('\nfunction cmdResume', fnStart);
+  const fnSrc = drv154Src.slice(fnStart, fnEnd);
+  // Evaluate the real function body against live fixtures (mirrors the KI-E151 new-Function technique
+  // above) — needs readdirSync/statSync/join in scope, matching the module's own imports.
+  const { readdirSync: realReaddir154, statSync: realStat154, mkdtempSync: mkE154, writeFileSync: wfE154 } = await import('node:fs');
+  const stallSuspected = new Function('readdirSync', 'statSync', 'join', 'return (' + fnSrc.replace('function stallSuspected', 'function ') + ')')(realReaddir154, realStat154, join);
+  const dir154 = mkE154(join(tmpdir(), 'factory-stall-'));
+  eq(stallSuspected(dir154, null, 30), null, 'KI-E154: no recorded launchedAt -> cannot judge, never a false positive');
+  eq(stallSuspected(dir154, 'not-a-date', 30), null, 'KI-E154: an unparseable launchedAt -> cannot judge, never a throw');
+  const recentIso = new Date(Date.now() - 5 * 60000).toISOString(); // 5 minutes ago, within the 30min grace
+  const withinGrace = stallSuspected(dir154, recentIso, 30);
+  ok(withinGrace && withinGrace.suspected === false && withinGrace.ageMinutes < 30, 'KI-E154: within the grace period, never flagged regardless of file activity (too soon to judge)');
+  const oldIso = new Date(Date.now() - 60 * 60000).toISOString(); // 1 hour ago, past the 30min grace
+  eq(stallSuspected(dir154, oldIso, 30).suspected, true, 'KI-E154: past grace with ZERO files in the item dir -> suspected (matches the live 12+ hour stalled-Workflow incident)');
+  wfE154(join(dir154, 'test.json'), '{}'); // activity AFTER launch
+  eq(stallSuspected(dir154, oldIso, 30).suspected, false, 'KI-E154: any file newer than launchedAt (real run activity) -> not suspected');
+  const metaOnlyDir154 = mkE154(join(tmpdir(), 'factory-stall-metaonly-'));
+  wfE154(join(metaOnlyDir154, 'launch-meta.json'), '{}');
+  eq(stallSuspected(metaOnlyDir154, oldIso, 30).suspected, true, 'KI-E154: launch-meta.json itself (the controller\'s own bookkeeping write) is excluded from the activity scan — it would otherwise always mask genuine staleness');
+  eq(stallSuspected(join(dir154, 'does-not-exist'), oldIso, 30), null, 'KI-E154: an unreadable item dir -> cannot judge, never a false positive');
+
+  // Wiring: cmdResume's KI-E140 TASK-LIVENESS line calls stallSuspected and appends its verdict.
+  ok(drv154Src.includes("const stall = stallSuspected(abs(join(cfg.paths.items, id)), meta.launchedAt, 30)"), 'KI-E154: cmdResume computes stall evidence for every recorded launch-meta.json, alongside (never instead of) the TaskOutput reminder');
+  ok(drv154Src.includes('STALL SUSPECTED (KI-E154)'), 'KI-E154: a suspected stall is surfaced with an explicit, distinctly-labeled warning in the relaunch listing');
+}
+
+// KI-E156 (ported from a host-mount session) — PLAN-EXCLUSION ADHERENCE: a plan's explicit negative
+// statements ("no X edits needed") are just as binding as its positive commitments; nothing checked
+// the diff against what the plan said NOT to do. Adapted here to the single-shot fixer prompt (this
+// repo has no stepwise consolidation pass to attach the origin's version to) plus fixer.md item 12.
+{
+  const facText156 = readFileSync(join(import.meta.dirname, '..', 'factory.js'), 'utf8');
+  ok(facText156.includes('PLAN-EXCLUSION ADHERENCE (KI-E156)'), 'KI-E156: the single-shot fixer prompt carries the plan-exclusion-adherence check');
+  ok(facText156.includes("re-read plan.md\\'s approach/blastRadius for any explicit negative/exclusion statement"), 'KI-E156: the check explicitly names re-reading plan.md\'s negative/exclusion statements, not just its positive commitments');
+  const fixerMd156 = readFileSync(join(import.meta.dirname, '..', '..', 'agents', 'fixer.md'), 'utf8');
+  ok(fixerMd156.includes('12. **PLAN-EXCLUSION ADHERENCE (KI-E156') , 'KI-E156: fixer.md gains item 12 documenting the same discipline for a human/agent reading the brief directly');
+}
+
+// KI-E157 (ported from a host-mount session) — (i) the PEER-OWNED SURFACES lock now states it
+// outranks a same-PR doc-sync mandate that might otherwise justify crossing it; (ii) fixer.md gains
+// the same never-scratch-in-worktree discipline runner.md already had.
+{
+  const facText157 = readFileSync(join(import.meta.dirname, '..', 'factory.js'), 'utf8');
+  ok(facText157.includes('this lock takes PRECEDENCE over any other rule in this prompt'), 'KI-E157(i): the PEER-OWNED SURFACES prompt states its precedence over a conflicting same-PR mandate');
+  const fixerMd157 = readFileSync(join(import.meta.dirname, '..', '..', 'agents', 'fixer.md'), 'utf8');
+  ok(fixerMd157.includes('NEVER drop a build/test transcript, scratch file, or diagnostic output inside the WORKTREE'), 'KI-E157(ii): fixer.md gains the same DEBRIS-GUARD discipline runner.md already had');
+  ok(fixerMd157.includes('ARTIFACTS DIR'), 'KI-E157(ii): fixer.md\'s new discipline names the ARTIFACTS DIR as the correct redirect target for self-check transcripts');
+}
+
+// KI-E159 (ported from a host-mount session) — a BLOCKED/ESCALATED item's decision.md is generated
+// ONCE; a LATER review/gate pass in the SAME item directory can independently reverse the finding it
+// was built from, with nothing telling the human reading the queue. staleDecisionHint is pure and
+// disk-only; direct-import tested, plus wiring pins into both human-facing queue surfaces.
+{
+  const drv159Src = readFileSync(join(import.meta.dirname, '..', 'driver.mjs'), 'utf8');
+  const fnStart159 = drv159Src.indexOf('function staleDecisionHint(');
+  ok(fnStart159 !== -1, 'KI-E159: staleDecisionHint is defined in driver.mjs');
+  const fnEnd159 = drv159Src.indexOf('\nfunction cmdEscalationsSync', fnStart159);
+  const fnSrc159 = drv159Src.slice(fnStart159, fnEnd159);
+  const { readdirSync: rd159, statSync: st159, existsSync: ex159, mkdtempSync: mk159, writeFileSync: wf159, utimesSync: ut159 } = await import('node:fs');
+  const staleDecisionHint = new Function('readdirSync', 'statSync', 'existsSync', 'join', 'return (' + fnSrc159.replace('function staleDecisionHint', 'function ') + ')')(rd159, st159, ex159, join);
+  const dir159 = mk159(join(tmpdir(), 'factory-staledec-'));
+  eq(staleDecisionHint(dir159), '', 'KI-E159: no decision.md at all -> empty hint, never a throw');
+  wf159(join(dir159, 'decision.md'), '# Decision\nBLOCKED pending owner ruling.');
+  eq(staleDecisionHint(dir159), '', 'KI-E159: decision.md alone, no sibling review/gate files -> not stale');
+  wf159(join(dir159, 'gate-developer.md'), 'older, written before decision.md'); // written after decision.md in wall-clock order, so backdate its mtime to simulate the pre-decision case
+  const oldMtime = new Date(Date.now() - 60000);
+  ut159(join(dir159, 'gate-developer.md'), oldMtime, oldMtime);
+  eq(staleDecisionHint(dir159), '', 'KI-E159: a review/gate file OLDER than decision.md is not evidence of staleness');
+  wf159(join(dir159, 'review-edgecase.md'), 'written AFTER decision.md — the later pass that may have reversed the finding');
+  const hint159 = staleDecisionHint(dir159);
+  ok(hint159.includes('POSSIBLY STALE (KI-E159)') && hint159.includes('review-edgecase.md'), 'KI-E159: a review/gate file NEWER than decision.md is flagged by name, naming the file to re-read');
+
+  ok(drv159Src.includes("const staleHint = staleDecisionHint(abs(join(cfg.paths.items, id)))") && drv159Src.includes("staleHint ? '\\n- ' + staleHint : ''"), 'KI-E159: cmdEscalationsSync renders the stale-decision hint per item, appended alongside the KI-E36 delivered-in-HEAD hint');
+  ok(drv159Src.includes('stale: !!staleDecisionHint(') , 'KI-E159: cmdDecisionsDigest computes the same stale flag per row');
+  ok(drv159Src.includes('## Possibly stale decisions (KI-E159)'), 'KI-E159: the digest gains its own dedicated section for stale decisions, mirroring the KI-E36 delivered-in-HEAD section');
+}
+
+// KI-E160 (ported from a host-mount session) — cmdResume's relaunch line trusted a recorded launcher
+// script PATH, never whether that path's CURRENT content still corresponds to the ids being
+// relaunched — a later, unrelated `group` call sharing the same default (unlabeled) path can silently
+// overwrite it, so a copied relaunch line re-runs the WRONG items entirely. Behavioral: a real temp
+// directory standing in for state/, exercised via the actual driver CLI.
+{
+  const drv160Src = readFileSync(join(import.meta.dirname, '..', 'driver.mjs'), 'utf8');
+  ok(drv160Src.includes('STALE-LAUNCHER-CHECK (KI-E160)') || drv160Src.includes('STALE LAUNCHER (KI-E160)'), 'KI-E160: cmdResume\'s relaunch-line printer carries the stale-launcher check');
+  const runArgsDerivation = drv160Src.match(/const runArgsPath = abs\(script\)\.replace\([^;]+;/);
+  ok(runArgsDerivation, 'KI-E160: derives run-args.json from the relaunch script path, the SAME derivation --reuse already uses (KI-E69)');
+  ok(drv160Src.includes("staleIds = ids.filter((id) => !raIds.has(id))"), 'KI-E160: computes staleIds as exactly the relaunch ids NOT present in the CURRENT run-args.json items[]');
+  ok(drv160Src.includes('resume --reset-stale') && drv160Src.includes("group --ids"), 'KI-E160: the warning names the concrete recovery (reset + a freshly-labeled group call), not just "something is wrong"');
+  ok(drv160Src.includes('UNVERIFIED, never silently "clean"') || drv160Src.includes('UNVERIFIED, not confirmed fresh'), 'KI-E160: an unreadable run-args.json fails OPEN (a warning-layer check, never a hard block on the relaunch listing itself) — mirroring KI-E140\'s own posture for a read failure');
 }
 
 console.log(`\nself-test: ${pass} passed, ${fail} failed`);

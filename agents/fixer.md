@@ -92,6 +92,17 @@ opus-high, xhigh for the gnarliest (critical money/security/concurrency).
    need to touch.
 8. Build the touched project to catch obvious breaks before handing off (the independent runner
    re-verifies). Do NOT self-certify the suite — that is the runner's + gates' job.
+   **NEVER drop a build/test transcript, scratch file, or diagnostic output inside the WORKTREE**
+   (ported from a host-mount session) — redirect/tee any self-check command's output into your
+   ARTIFACTS DIR (e.g. `> <ARTIFACTS DIR>/fixer-build-check.txt`), never a bare `> verify-build.txt`
+   in the worktree's own directory. This mirrors `agents/runner.md`'s own DEBRIS-GUARD, which has
+   this instruction and you did not: a stray transcript file the runner never created is exactly the
+   "genuine junk" its debris check exists to catch, and it is a deterministic FAIL at fold regardless
+   of which role left it there. Live incident on the origin host: this role's own self-verification
+   left build-transcript files sitting in the worktree cwd, with multiple independent reviewers all
+   attributing the debris to the fixer, none to the runner, triggering a deterministic FAILED
+   override that `runner.md`'s hardened discipline exists to prevent — for a role that, until now,
+   had no equivalent instruction at all (KI-E157).
 9. **RE-FIX (a prior attempt FAILED review).** If the prompt says RE-FIX, the prior fix is ALREADY in this
    worktree but was rejected. READ every `state/items/{id}/gate-*.md` + `review-*.md` carrying a
    CHANGES_REQUIRED verdict and address EVERY finding — the prior fix was PARTIAL/wrong, so COMPLETE or
@@ -116,6 +127,18 @@ opus-high, xhigh for the gnarliest (critical money/security/concurrency).
     Live incident (ported from a host-mount session): a fixer accepted a `CancellationToken` but
     never forwarded it at multiple call sites — and the SAME gap, at the SAME call sites, survived
     unfixed from one review round into the next.
+12. **PLAN-EXCLUSION ADHERENCE (KI-E156, ported from a host-mount session).** Your plan (`plan.md`)
+    may explicitly say a certain kind of change is NOT needed ("no `<X>` edits needed", "`<Y>` is
+    unchanged", "do NOT touch `<Z>`") — these are just as binding as its positive commitments (the
+    "Deviating from the plan" section below covers the OPPOSITE direction: skipping something the
+    plan said TO do). Before finishing, re-read every negative/exclusion statement in plan.md's
+    approach/blastRadius/steps text and confirm your diff genuinely honors each one. If it does not,
+    either revert the unneeded change (the fastest fix — the plan already told you it wasn't
+    required) or, if you have since learned it genuinely IS required, declare it via `deviations`
+    like any other plan departure. Live incident on the origin host: a plan stated a certain
+    ProjectReference edit was not needed because an existing shared dependency already gave
+    transitive compile visibility; the shipped diff added exactly that unneeded reference anyway,
+    breaking a pre-existing architecture-fitness test for a change the plan had already ruled out.
 
 ### Constraints
 - All edits inside the WORKTREE. NEVER run git commit/add/checkout/restore/stash/reset/clean.

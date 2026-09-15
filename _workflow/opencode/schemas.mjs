@@ -75,6 +75,9 @@ export const PROBE_SCHEMA = { type: 'object', additionalProperties: false, requi
 // polarity), so this schema is kept for parity with canon's agent-relay shape rather than because the
 // check is missing. See opencode/stage-parity.mjs, which the selftest enforces against both files.
 export const RED_PROOF_SCHEMA = { type: 'object', additionalProperties: false, required: ['markerFound', 'exitCode'], properties: { markerFound: { type: 'boolean' }, exitCode: { type: 'number' }, line: { type: 'string' } } };
+// KI-E175 (ported from a host-mount session) — schema-parity only; the stage itself stays UNPORTED
+// (see opencode/stage-parity.mjs).
+export const RED_COVERAGE_SCHEMA = { type: 'object', additionalProperties: false, required: ['covered'], properties: { covered: { type: 'boolean' }, gap: { type: ['string', 'null'] } } };
 
 // KI-E87 + KI-E101 — the plan-commitment/plan-step contract. KI-E112: this stage IS dispatched by the
 // port (the plancommit/plancommit_amend/plancommit_reprobe trio in planNext), so this schema is live,
