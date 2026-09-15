@@ -34,10 +34,10 @@ import { projectBatch, renderProjection } from './lib/band-cost.mjs';
 import { loadRouting, resolve as routeResolve, concurrencyFor } from './lib/router.mjs';
 import { addWorktree, removeWorktree, pruneStaleBranch, listWorktrees, changedFiles, pruneWorktrees, isFactoryWorktreePath, parseComposeLs, strayComposeProjects } from './lib/worktree.mjs';
 import { acquireLock, releaseLock } from './lib/lock.mjs';
-import { parseVerifyRaw, verdictFromParse, debrisFiles, parseRedRaw, hasRealInfraMarker, touchedRootCause, effectiveBaseline, decodeTranscript, flakeSuspects } from './lib/verify.mjs';
+import { parseVerifyRaw, verdictFromParse, debrisFiles, parseRedRaw, hasRealInfraMarker, touchedRootCause, effectiveBaseline, decodeTranscript, flakeSuspects, isPhantomBaseline, annotateBaselineReason } from './lib/verify.mjs';
 import { preflight, dockerAvailable } from './lib/preflight.mjs';
 import { classifyFilesEntry, buildBasenameIndex, acceptanceSurfaceGaps } from './lib/graphaudit.mjs';
-import { renderFeedback } from './lib/feedback.mjs';
+import { renderFeedback, mergeFeedbackHistory } from './lib/feedback.mjs';
 import { dissentersFrom, roleForGateKey, recoveryFoldSkeleton, priorCycleOf, missingStageFrom } from './lib/recover.mjs'; // KI-E20 — the direct-recovery scaffold; KI-E81 — missing-stage auto-detection
 import { applyConvergenceBonus, effectiveRetryBound, applyStallDetection, isStalled } from './lib/convergence.mjs';
 import { clusterBySimilarity, sharedLabel, perCliqueBatchPatterns, bestClosedPrecedent, sig as simSig, similarSigs } from './lib/similarity.mjs';
@@ -510,6 +510,19 @@ function deterministicVerifyOverride(cfg, ledger, wi, r) {
     return parseVerifyRaw(decodeTranscript(readFileSync(p))); // KI-E54: BOM-aware decode
   })();
   const baseline = effectiveBaseline(r.baselineFailures, baselineParse);
+  // KI-E163 (ported from a host-mount session) — defense-in-depth for KI-E162's upstream fix.
+  // `baseline` reads as 0 for two very different reasons that are indistinguishable in the number
+  // alone: a REAL measurement (a baseline run genuinely found zero pre-existing failures) or a
+  // PHANTOM default (nothing was EVER captured or reported, so effectiveBaseline's Math.max(0,0)
+  // silently reads identically to "measured clean"). A phantom 0 is exactly what let a deterministic
+  // override deterministically FAIL an item repeatedly on failures independently reproduced on a
+  // completely clean checkout with zero relation to the item's own diff, on the origin host. KI-E162
+  // closes the upstream gap (a reFix round now captures a baseline when none exists) — but a prompt
+  // instruction is not a guarantee an agent follows it every time, on every item shape. This is the
+  // downstream half: even when the prompt-side fix does not take, the override's own message stops
+  // presenting a phantom 0 with the same unqualified confidence as a real measurement.
+  const baselineIsPhantom = isPhantomBaseline(baseline, r.baselineFailures, baselineParse);
+  const annotateBaseline = (reason) => annotateBaselineReason(reason, baselineIsPhantom);
   const fail = (reason) => {
     r.transitions = ['FAILED']; r.toState = 'FAILED';
     r.note = 'deterministic fold-time override: ' + reason + (r.note ? ' [agent claimed: ' + r.note + ']' : '');
@@ -527,8 +540,8 @@ function deterministicVerifyOverride(cfg, ledger, wi, r) {
   const intText = readIf('integrate-raw.txt');
   const vVerdict = rawText ? verdictFromParse(parseVerifyRaw(rawText), baseline) : { pass: true, reason: 'no-machine-evidence' };
   const iVerdict = intText ? verdictFromParse(parseVerifyRaw(intText), baseline) : { pass: true, reason: 'no-machine-evidence' };
-  if (!vVerdict.pass) return fail('verify transcript: ' + vVerdict.reason);
-  if (!iVerdict.pass) return fail('integrate transcript: ' + iVerdict.reason);
+  if (!vVerdict.pass) return fail('verify transcript: ' + annotateBaseline(vVerdict.reason));
+  if (!iVerdict.pass) return fail('integrate transcript: ' + annotateBaseline(iVerdict.reason));
   // P3 — a CODE item MUST carry machine green in EITHER transcript; absence in BOTH is agent-trust → FAIL.
   const hasMachineGreen = (rawText && vVerdict.reason !== 'no-machine-evidence') || (intText && iVerdict.reason !== 'no-machine-evidence');
   if (codeChange && !hasMachineGreen) {
@@ -658,10 +671,19 @@ function escalateExhausted(ledger, cfg) {
     // never disagree: the retry budget is spent, OR the trajectory has stalled (consecutive rounds
     // with no reduction in blocking findings — spending the remaining band is near-certain waste).
     const stalled = isStalled(cfg, row);
+    // KI-E167 (ported from a host-mount session) — the stall may have been detected via the original
+    // gate-band finding-count trend OR the pre-band failure-signature fallback (row.stallReason,
+    // persisted by applyStallDetection since neither this function nor its caller sees that
+    // function's per-call return value) — phrase the escalation note to match the evidence that
+    // actually fired, instead of always claiming "blocking findings did not shrink" for a trajectory
+    // that may never have reached the gate band at all.
+    const stallNote = stalled
+      ? (row.stallReason === 'signature'
+        ? `auto-escalated: NO-PROGRESS on ${row.stallRounds} consecutive round(s) — the SAME pre-band failure ("${row.lastFailSignature}") repeated verbatim with no gate-band data to compare — after ${row.attempts} attempt(s); another band is near-certain waste — needs a human`
+        : `auto-escalated: NO-PROGRESS on ${row.stallRounds} consecutive round(s) (blocking findings did not shrink) after ${row.attempts} attempt(s); another band is near-certain waste — needs a human`)
+      : `auto-escalated: exhausted ${row.attempts} fix attempt(s) (bound ${bound}${row.retryBonus ? ` incl. +${row.retryBonus} convergence bonus` : ''}); needs a human`;
     if (row.state === 'FAILED' && (row.attempts > bound || stalled) &&
-        transition(ledger, id, 'ESCALATED', stalled
-          ? `auto-escalated: NO-PROGRESS on ${row.stallRounds} consecutive round(s) (blocking findings did not shrink) after ${row.attempts} attempt(s); another band is near-certain waste — needs a human`
-          : `auto-escalated: exhausted ${row.attempts} fix attempt(s) (bound ${bound}${row.retryBonus ? ` incl. +${row.retryBonus} convergence bonus` : ''}); needs a human`)) {
+        transition(ledger, id, 'ESCALATED', stallNote)) {
       out.push(id);
       temit({ source: 'driver', event: 'transition', item: id, cycle: ledger.cycle, outcome: 'ESCALATED' }); // KI-E7 finding #12
     }
@@ -760,7 +782,13 @@ function cmdFold(file, flags) {
       if (!fb) continue;
       const dir = abs(join(cfg.paths.items, r.id));
       if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
-      writeFileSync(join(dir, 'feedback.md'), fb);
+      const fbPath = join(dir, 'feedback.md');
+      // KI-E166 (ported from a host-mount session) — preserve prior-cycle feedback instead of
+      // silently discarding a still-open finding the instant a LATER cycle fails for a different
+      // reason — see lib/feedback.mjs's own comment for the incident this closes.
+      let priorFb = null;
+      try { if (existsSync(fbPath)) priorFb = readFileSync(fbPath, 'utf8'); } catch { /* best-effort — no prior file readable is the same as none existing */ }
+      writeFileSync(fbPath, mergeFeedbackHistory(fb, priorFb));
     } catch { /* best-effort feedback artifact — never block the fold on it */ }
   }
   // P11 — persist every FAILED reason so a re-fix is not blind. A verify/fold-stage FAIL runs NO gates, so
@@ -973,7 +1001,14 @@ function cmdFold(file, flags) {
   // means the trajectory is not converging, so the remaining band(s) are near-certain waste. Park it
   // for a human instead (escalateExhausted below applies the transition).
   const stalls = applyStallDetection(ledger, cfg, arr, priorConvergence);
-  for (const s of stalls) console.log(`  KI-E105 ${s.id}: NO-PROGRESS streak ${s.stallRounds} (findings ${s.from ? s.from.findings : '?'} -> ${s.to.findings}) — parking for a human instead of spending another band`);
+  // KI-E167 (ported from a host-mount session) — a stall can now be REPORTED via two distinct
+  // evidence shapes — the original gate-band finding-count trend (`from`/`to`), or a pre-band failure
+  // whose `note` signature repeated verbatim across consecutive rounds with no gate-band data to
+  // compare at all. Log each in its own terms rather than forcing the signature case through a
+  // "findings ? -> ?" template it never populates.
+  for (const s of stalls) console.log(s.reason === 'signature'
+    ? `  KI-E167 ${s.id}: NO-PROGRESS streak ${s.stallRounds} — the SAME pre-band failure ("${s.signature}") repeated verbatim with no gate-band data to compare — parking for a human instead of spending another band`
+    : `  KI-E105 ${s.id}: NO-PROGRESS streak ${s.stallRounds} (findings ${s.from ? s.from.findings : '?'} -> ${s.to.findings}) — parking for a human instead of spending another band`);
   const escalated = escalateExhausted(ledger, cfg);
   writeJsonAtomic(abs(cfg.paths.ledger), ledger);
   recordCostSnapshot(cfg, ledger); // per-cycle cost snapshot for the trend (observability, not a gate)

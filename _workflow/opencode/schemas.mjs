@@ -108,6 +108,14 @@ export const CHECKPOINT_SCHEMA = { type: 'object', additionalProperties: false, 
 // satisfying byte/structure parity with factory.js.
 export const PACK_HASH_SCHEMA = { type: 'object', additionalProperties: false, required: ['hash'], properties: { hash: { type: 'string' } } };
 
+// KI-E169 (ported from a host-mount session) — shadow-mode consolidated-scan probe (schema-parity
+// ONLY, same disclosed-gap shape as PACK_HASH_SCHEMA immediately above): a genuinely UNPORTED, purely
+// observational data-collection mechanism in this runtime (see stage-parity.mjs's
+// UNPORTED['consolidated-scan-shadow'] for the reason) — no mechanical or agent-dispatched equivalent
+// exists here, so it is intentionally absent from the SCHEMAS registry below while still satisfying
+// byte/structure parity with factory.js.
+export const SHADOW_SCAN_SCHEMA = { type: 'object', additionalProperties: false, required: ['acceptanceCovered', 'planHonored', 'findingHonored'], properties: { acceptanceCovered: { type: 'boolean' }, planHonored: { type: 'boolean' }, findingHonored: { type: 'boolean' } } };
+
 // Registry keyed by the same schema-name string the runtime.mjs CLI accepts on `submit --schema <name>`.
 export const SCHEMAS = {
   PLAN_SCHEMA, PLAN_STEPS_NUDGE_SCHEMA, TEST_SCHEMA, FIX_SCHEMA, VERIFY_SCHEMA, GATE_SCHEMA, REFUTE_SCHEMA, REAUDIT_SCHEMA,

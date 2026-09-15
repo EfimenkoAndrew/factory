@@ -15,7 +15,7 @@ import { isFactoryWorktreePath } from './worktree.mjs';
 import { makeLimiter, pool, retry } from './pool.mjs';
 import { loadRouting, resolve } from './router.mjs';
 import { conflictFor, lockedFiles } from './locks.mjs';
-import { parseVerifyRaw, verdictFromParse, debrisFiles, parseRedRaw, hasRealInfraMarker, touchedRootCause, effectiveBaseline, decodeTranscript } from './verify.mjs';
+import { parseVerifyRaw, verdictFromParse, debrisFiles, parseRedRaw, hasRealInfraMarker, touchedRootCause, effectiveBaseline, decodeTranscript, isPhantomBaseline, annotateBaselineReason } from './verify.mjs';
 import { acquireLock, releaseLock } from './lock.mjs';
 import { checkRoutingDrift, buildFactoryRouting } from './routing-drift.mjs';
 import { changedFiles } from './worktree.mjs';
@@ -466,6 +466,31 @@ try {
   ok(fb.includes('gate:qa — NULL'), 'feedback: a null (agent-returned-nothing) verdict is visible, fail-closed');
 }
 
+// KI-E166 (ported from a host-mount session) — feedback.md is regenerated on every fold, so a finding
+// raised by an EARLIER cycle is silently lost the moment a LATER cycle's own, different rejection
+// reason overwrites the file. mergeFeedbackHistory keeps the fresh content authoritative but appends
+// the prior file's content below a labeled header instead of discarding it, capped so a chronically-
+// failing item's file cannot grow unbounded.
+{
+  const { mergeFeedbackHistory, FEEDBACK_HISTORY_CAP } = await import('./feedback.mjs');
+  eq(mergeFeedbackHistory('fresh content', null), 'fresh content', 'KI-E166: no prior feedback.md -> byte-identical to fresh content (the common first-attempt case)');
+  eq(mergeFeedbackHistory('fresh content', ''), 'fresh content', 'KI-E166: an empty prior string is treated the same as absent');
+  eq(mergeFeedbackHistory('fresh content', '   \n  '), 'fresh content', 'KI-E166: a whitespace-only prior file is treated the same as absent');
+  const merged = mergeFeedbackHistory('## fold cycle 100\ndocsync gap', '## fold cycle 98\ntest-coverage gap, MEDIUM');
+  ok(merged.startsWith('## fold cycle 100\ndocsync gap'), 'KI-E166: the CURRENT cycle content stays first and authoritative');
+  ok(merged.includes('PRIOR CYCLE(S)\' FEEDBACK (KI-E166)'), 'KI-E166: the prior content is appended below a clearly-labeled header, not silently concatenated');
+  ok(merged.includes('## fold cycle 98\ntest-coverage gap, MEDIUM'), 'KI-E166: the OLDER finding (the SHOPPORTAL-M7-SWEEP incident shape — a still-open finding from an earlier, superseded cycle) survives in the merged file instead of vanishing');
+  ok(merged.includes('Re-verify EACH finding below against the CURRENT tree'), 'KI-E166: the appended section instructs re-verification, not blind trust of stale content');
+  const hugePrior = 'x'.repeat(FEEDBACK_HISTORY_CAP + 5000);
+  const mergedCapped = mergeFeedbackHistory('fresh', hugePrior);
+  ok(mergedCapped.length < 'fresh'.length + FEEDBACK_HISTORY_CAP + 500, 'KI-E166: an oversized prior file is truncated to FEEDBACK_HISTORY_CAP before being re-appended, so the merged file cannot grow unbounded across many cycles');
+  eq(FEEDBACK_HISTORY_CAP, 6000, 'KI-E166: the cap is the documented 6000 chars (mirrors KI-E121\'s PLAN_REUSE_CAP posture)');
+  // driver.mjs wiring
+  const drvTextE166 = readFileSync(join(import.meta.dirname, '..', 'driver.mjs'), 'utf8');
+  ok(drvTextE166.includes("import { renderFeedback, mergeFeedbackHistory } from './lib/feedback.mjs';"), 'KI-E166: driver.mjs imports mergeFeedbackHistory alongside the existing renderFeedback');
+  ok(drvTextE166.includes('writeFileSync(fbPath, mergeFeedbackHistory(fb, priorFb))'), 'KI-E166: the fold reads the existing feedback.md BEFORE overwriting it and routes both through the merge, instead of a bare writeFileSync(fb)');
+}
+
 // KI-L39: pure-coverage exemption — the factory source must gate the P2 text floor AND P9
 // rootCauseFiles on `theme === 'test-coverage' && !item.realInfra` (ITEM-C7 false-fail class:
 // a coverage item's acceptance text names the guards the NEW TEST covers, and its files[] names the
@@ -797,6 +822,22 @@ try {
   eq(by['SMOKE-DISPUTE'] && by['SMOKE-DISPUTE'].toState, 'CLOSED', 'exec-smoke: OVERRULED + re-gate APPROVED proceeds past the gate band (P8)');
   eq(by['SMOKE-VONLY'] && by['SMOKE-VONLY'].toState, 'CLOSED', 'exec-smoke: verification-only reFix lane completes (KI-L37)');
   ok(!calls.some((c) => c.label === 'SMOKE-VONLY:fixer'), 'exec-smoke: verification-only lane SKIPS the fixer');
+  // KI-E161 (ported from a host-mount session) — SMOKE-VONLY is reFix:true, so its test-author prompt
+  // must carry the disk-proof mandate for a reFix verificationOnly claim, not just the prose-only
+  // instruction the pre-KI-E161 shape had.
+  const vonlyTestCall = calls.find((c) => c.label === 'SMOKE-VONLY:test-author');
+  ok(vonlyTestCall && vonlyTestCall.prompt.includes('RE-FIX VERIFICATIONONLY (KI-E161)'), 'KI-E161 exec-smoke: a reFix item\'s test-author prompt carries the KI-E161 disk-proof mandate');
+  ok(vonlyTestCall && vonlyTestCall.prompt.includes('OVERWRITE whatever is already there'), 'KI-E161 exec-smoke: the mandate explicitly instructs overwriting a stale earlier-round capture, the exact MKTADMIN-M10-shaped bug this closes');
+  // KI-E168 (ported from a host-mount session) — prior-finding-scan is gated on item.reFix, NOT on
+  // verificationOnly, so it must ALSO dispatch for the verification-only reFix lane (a claim that a
+  // finding is "already fixed" is exactly the claim most worth checking) and record APPROVED under
+  // the default stub (which returns honored:true for any PLAN_COMMITMENT_SCHEMA call).
+  ok(calls.some((c) => c.label === 'SMOKE-VONLY:prior-finding-probe'), 'KI-E168 exec-smoke: the verification-only reFix lane STILL dispatches prior-finding-scan (KI-E128-style posture)');
+  const vonlyPriorFindingCall = calls.find((c) => c.label === 'SMOKE-VONLY:prior-finding-probe');
+  ok(vonlyPriorFindingCall && vonlyPriorFindingCall.prompt.includes('VERIFICATION-ONLY LANE (mirrors KI-E128)'), 'KI-E168 exec-smoke: the verification-only variant of the prompt is the one actually dispatched, not the default fixer-diff framing');
+  eq(by['SMOKE-VONLY'] && by['SMOKE-VONLY'].gates && by['SMOKE-VONLY'].gates['probe:prior-finding-scan'], 'APPROVED', 'KI-E168 exec-smoke: a satisfied probe records APPROVED under its own gate key');
+  ok(!calls.some((c) => c.label === 'SMOKE-CODE:prior-finding-probe'), 'KI-E168 exec-smoke: a NON-reFix item (SMOKE-CODE) never dispatches prior-finding-scan at all — the probe has nothing to check on a first attempt');
+  ok(!calls.some((c) => c.label === 'SMOKE-DOC:prior-finding-probe'), 'KI-E168 exec-smoke: same for the doc lane — reFix-gating applies regardless of item shape');
   eq(by['SMOKE-SCOPEFLAG'] && by['SMOKE-SCOPEFLAG'].toState, 'CLOSED', 'KI-L57: an APPROVED gate with a stray scopeViolation flag does NOT hard-stop the item');
   ok(by['SMOKE-SCOPEFLAG'] && by['SMOKE-SCOPEFLAG'].gateDetails && by['SMOKE-SCOPEFLAG'].gateDetails['gate:developer'] && by['SMOKE-SCOPEFLAG'].gateDetails['gate:developer'].scopeViolationIgnored === true, 'KI-L57: the inconsistent flag is preserved on gateDetails for the audit trail');
   eq(by['SMOKE-SCOPESTOP'] && by['SMOKE-SCOPESTOP'].toState, 'BLOCKED', 'KI-L57: a CHANGES_REQUIRED gate with scopeViolation still hard-stops (genuine scope-stop path intact)');
@@ -845,6 +886,219 @@ try {
   ok(!calls.some((c) => c.label.startsWith('SMOKE-CODE:gate-')), 'KI-E101 fail-path: the item never reached the gate band — this is the entire economic argument for a pre-band probe (a FULL band is ~5 opus gates + refuter + multi-lens reaudit)');
   // sibling lanes are unaffected — one item's probe verdict must never leak across lanes
   eq(byE101['SMOKE-DOC'] && byE101['SMOKE-DOC'].toState, 'CLOSED', 'KI-E101 fail-path: a sibling lane whose own steps ARE evidenced still closes (per-item isolation holds)');
+}
+
+// KI-E168 (ported from a host-mount session) — prior-finding-scan's full round trip on a reFix item
+// that is NOT verificationOnly (a real fixer runs): a gap on the first probe call is closed by ONE
+// bounded amend + re-probe, and a gap that SURVIVES the amend fails the item pre-band. Custom batch:
+// smokeBatch()'s only reFix item (SMOKE-VONLY) is also verificationOnly, which would conflate this
+// scan's own fixer-amend call with "the lane skips the main fixer" — a fresh reFix+non-VO item keeps
+// the two concerns separate.
+{
+  const src = readFileSync(join(import.meta.dirname, '..', 'factory.js'), 'utf8');
+  const wtE168 = (id) => ({ path: '/tmp/exec-smoke-wt-e168/' + id, branch: 'factory/' + id });
+  const baseE168 = { target: 'X', layer: 'service', dependsOn: [], gateSet: [], autonomyTier: 'auto', source: 'smoke', solution: 'X/X.sln', peers: [] };
+  const batchE168 = {
+    cycle: 0, concurrency: 2, attempts: 1, repoRoot: '.', templatesDir: '_bmad-output/ai-factory/agents', config: {}, dryRun: false,
+    policies: {},
+    items: [{ ...baseE168, id: 'SMOKE-REFIX-GAP', title: 'reFix with a persisting-then-closed prior finding', severity: 'HIGH', theme: 'security-multitenancy', fixType: 'non-trivial', files: ['X/src/Some.cs'], acceptance: 'policy enforced', regressionTest: 'test', realInfra: false, reFix: true, worktree: wtE168('SMOKE-REFIX-GAP') }],
+  };
+  const gapFinding = { commitment: 'gate:security HIGH: missing tenant filter on GetById', why: 'no hunk in the diff touches the query\'s WHERE clause' };
+  let probeCalls = 0;
+  const { result, calls } = await execSmoke(src, batchE168, {
+    agentOverride: (prompt, opts) => {
+      if ((opts && opts.label) === 'SMOKE-REFIX-GAP:prior-finding-probe') {
+        probeCalls++;
+        // first call: a real gap. second call (post-amend re-probe): closed.
+        return probeCalls === 1 ? { honored: false, gaps: [gapFinding] } : { honored: true, gaps: [] };
+      }
+      return undefined;
+    },
+  });
+  const byE168 = Object.fromEntries((result.results || []).map((r) => [r.id, r]));
+  const refix168 = byE168['SMOKE-REFIX-GAP'];
+  ok(!(result.results || []).some((r) => String(r.note || '').startsWith('runItem threw')), 'KI-E168 amend-close: no runItem crash');
+  eq(refix168 && refix168.toState, 'CLOSED', 'KI-E168 amend-close: a gap closed by the bounded amend proceeds normally to CLOSED');
+  eq(refix168.gates['probe:prior-finding-scan'], 'APPROVED', 'KI-E168 amend-close: the FINAL (post-amend) verdict is what gets recorded, not the initial gap');
+  eq(calls.filter((c) => c.label === 'SMOKE-REFIX-GAP:prior-finding-probe').length, 2, 'KI-E168 amend-close: exactly TWO probe calls (initial + ONE re-probe) — the re-probe verdict is final, no further looping');
+  const amendCall = calls.find((c) => c.label === 'SMOKE-REFIX-GAP:fixer' && c.prompt.includes('PRIOR-FINDING AMEND (KI-E168)'));
+  ok(amendCall, 'KI-E168 amend-close: a dedicated fixer amend call carries the KI-E168 brief');
+  ok(amendCall.prompt.includes('missing tenant filter on GetById'), 'KI-E168 amend-close: the actual finding text reaches the fixer, not just a generic "fix findings" instruction');
+}
+{
+  const src = readFileSync(join(import.meta.dirname, '..', 'factory.js'), 'utf8');
+  const wtE168b = (id) => ({ path: '/tmp/exec-smoke-wt-e168b/' + id, branch: 'factory/' + id });
+  const baseE168b = { target: 'X', layer: 'service', dependsOn: [], gateSet: [], autonomyTier: 'auto', source: 'smoke', solution: 'X/X.sln', peers: [] };
+  const batchE168b = {
+    cycle: 0, concurrency: 2, attempts: 1, repoRoot: '.', templatesDir: '_bmad-output/ai-factory/agents', config: {}, dryRun: false,
+    policies: {},
+    items: [{ ...baseE168b, id: 'SMOKE-REFIX-PERSIST', title: 'reFix whose prior finding never gets addressed', severity: 'HIGH', theme: 'security-multitenancy', fixType: 'non-trivial', files: ['X/src/Other.cs'], acceptance: 'policy enforced', regressionTest: 'test', realInfra: false, reFix: true, worktree: wtE168b('SMOKE-REFIX-PERSIST') }],
+  };
+  const persistentGap = { commitment: 'gate:qa HIGH: the same off-by-one from the prior round is still present', why: 'the diff touches an unrelated file only' };
+  const { result, calls } = await execSmoke(src, batchE168b, {
+    agentOverride: (prompt, opts) => {
+      // SAME label covers the probe AND its re-probe — the gap survives the amend, so the item must
+      // fail rather than loop for a second amend.
+      if ((opts && opts.label) === 'SMOKE-REFIX-PERSIST:prior-finding-probe') return { honored: false, gaps: [persistentGap] };
+      return undefined;
+    },
+  });
+  const byE168b = Object.fromEntries((result.results || []).map((r) => [r.id, r]));
+  const persist168 = byE168b['SMOKE-REFIX-PERSIST'];
+  ok(!(result.results || []).some((r) => String(r.note || '').startsWith('runItem threw')), 'KI-E168 persistent-gap: no runItem crash');
+  eq(persist168 && persist168.toState, 'FAILED', 'KI-E168 persistent-gap: a finding that survives the bounded amend FAILS the item');
+  ok(String(persist168.note || '').includes('prior-finding-scan (KI-E168)'), 'KI-E168 persistent-gap: the note names the check that failed it');
+  ok(String(persist168.note || '').includes('the same off-by-one from the prior round'), 'KI-E168 persistent-gap: the actual unaddressed finding text reaches the operator-visible note');
+  ok(String(persist168.note || '').includes('Pre-band fail'), 'KI-E168 persistent-gap: the note states this was cheap — no gate band was spent, the entire economic argument for the probe');
+  eq(calls.filter((c) => c.label === 'SMOKE-REFIX-PERSIST:fixer' && c.prompt.includes('PRIOR-FINDING AMEND (KI-E168)')).length, 1, 'KI-E168 persistent-gap: exactly ONE KI-E168 amend call (on top of the item\'s own separate main fix) — no infinite retry loop on a stubborn finding');
+  eq(calls.filter((c) => c.label === 'SMOKE-REFIX-PERSIST:prior-finding-probe').length, 2, 'KI-E168 persistent-gap: exactly TWO probe calls (initial + ONE re-probe) before giving up');
+  ok(!calls.some((c) => c.label.startsWith('SMOKE-REFIX-PERSIST:gate-')), 'KI-E168 persistent-gap: the item never reached the expensive gate band');
+}
+
+// KI-E164 (ported from a host-mount session) — a HIGH editorial finding (a factual defect editorial
+// deliberately does not self-correct) now routes into ONE bounded fixer amend + a targeted re-scan of
+// just the flow(s) that found something, instead of sailing to the gate band unchanged. Custom batch:
+// a doc-touching item, since editorial only runs for doc-touching items.
+{
+  const src = readFileSync(join(import.meta.dirname, '..', 'factory.js'), 'utf8');
+  const wtE164 = (id) => ({ path: '/tmp/exec-smoke-wt-e164/' + id, branch: 'factory/' + id });
+  const baseE164 = { target: 'X', layer: 'service', dependsOn: [], gateSet: [], autonomyTier: 'auto', source: 'smoke', solution: 'X/X.sln', peers: [] };
+  const batchE164 = {
+    cycle: 0, concurrency: 2, attempts: 1, repoRoot: '.', templatesDir: '_bmad-output/ai-factory/agents', config: {}, dryRun: false,
+    policies: {},
+    items: [{ ...baseE164, id: 'SMOKE-EDITORIAL-HIGH', title: 'doc with a fabricated field name', severity: 'HIGH', theme: 'doc-drift', fixType: 'doc-drift', files: ['doc/data-flows/X.md'], acceptance: 'doc fixed', regressionTest: 'grep', realInfra: false, worktree: wtE164('SMOKE-EDITORIAL-HIGH') }],
+  };
+  let editorialCalls = 0;
+  const { result, calls } = await execSmoke(src, batchE164, {
+    agentOverride: (prompt, opts) => {
+      if ((opts && opts.label) === 'SMOKE-EDITORIAL-HIGH:review-editorial-prose') {
+        editorialCalls++;
+        // first call: a real HIGH factual finding. second call (post-amend re-scan): resolved.
+        return editorialCalls === 1
+          ? { gate: 'review-editorial-prose', verdict: 'CHANGES_REQUIRED', findings: [{ severity: 'HIGH', title: 'fabricated event name FooEvent.Bar', file: 'doc/data-flows/X.md', fix: 'replace with the real field name' }], scopeViolation: false, acceptanceMet: false, redGreenConfirmed: true, headline: 'fabricated field name' }
+          : { gate: 'review-editorial-prose', verdict: 'APPROVED', findings: [], scopeViolation: false, acceptanceMet: true, redGreenConfirmed: true, headline: 'corrected' };
+      }
+      return undefined;
+    },
+  });
+  const byE164 = Object.fromEntries((result.results || []).map((r) => [r.id, r]));
+  const doc164 = byE164['SMOKE-EDITORIAL-HIGH'];
+  ok(!(result.results || []).some((r) => String(r.note || '').startsWith('runItem threw')), 'KI-E164: no runItem crash');
+  eq(doc164 && doc164.toState, 'CLOSED', 'KI-E164: editorial is advisory — even with a HIGH finding, the item still closes once the amend resolves it (editorial never itself blocks)');
+  eq(doc164.gates['editorial:prose'], 'APPROVED', 'KI-E164: the FINAL (post-amend re-scan) verdict is what gets recorded, not the initial HIGH finding');
+  const amendCallE164 = calls.find((c) => c.label === 'SMOKE-EDITORIAL-HIGH:fixer' && c.prompt.includes('EDITORIAL HIGH-FINDING AMEND (KI-E164)'));
+  ok(amendCallE164, 'KI-E164: a dedicated fixer amend call carries the KI-E164 brief');
+  ok(amendCallE164.prompt.includes('fabricated event name FooEvent.Bar'), 'KI-E164: the actual finding text (with its exact replacement already known) reaches the fixer verbatim');
+  eq(calls.filter((c) => c.label === 'SMOKE-EDITORIAL-HIGH:review-editorial-prose').length, 2, 'KI-E164: exactly TWO editorial-prose calls (initial + ONE targeted re-scan) — the re-scan verdict is final');
+  ok(!calls.some((c) => c.label === 'SMOKE-EDITORIAL-HIGH:review-editorial-structure' && c.prompt.includes('RE-SCAN (KI-E164)')), 'KI-E164: only the flow(s) that actually had a HIGH finding get re-scanned — a sibling editorial flow with no finding is not re-run needlessly');
+}
+{
+  // MEDIUM/LOW editorial findings stay purely advisory — they must NEVER trigger an amend, or a mere
+  // style opinion would force an expensive fixer call on every doc-touching item.
+  const src = readFileSync(join(import.meta.dirname, '..', 'factory.js'), 'utf8');
+  const wtE164b = (id) => ({ path: '/tmp/exec-smoke-wt-e164b/' + id, branch: 'factory/' + id });
+  const baseE164b = { target: 'X', layer: 'service', dependsOn: [], gateSet: [], autonomyTier: 'auto', source: 'smoke', solution: 'X/X.sln', peers: [] };
+  const batchE164b = {
+    cycle: 0, concurrency: 2, attempts: 1, repoRoot: '.', templatesDir: '_bmad-output/ai-factory/agents', config: {}, dryRun: false,
+    policies: {},
+    items: [{ ...baseE164b, id: 'SMOKE-EDITORIAL-MED', title: 'doc with a stylistic nit', severity: 'HIGH', theme: 'doc-drift', fixType: 'doc-drift', files: ['doc/data-flows/Y.md'], acceptance: 'doc fixed', regressionTest: 'grep', realInfra: false, worktree: wtE164b('SMOKE-EDITORIAL-MED') }],
+  };
+  const { result, calls } = await execSmoke(src, batchE164b, {
+    agentOverride: (prompt, opts) => {
+      if ((opts && opts.label) === 'SMOKE-EDITORIAL-MED:review-editorial-prose') return { gate: 'review-editorial-prose', verdict: 'CHANGES_REQUIRED', findings: [{ severity: 'MEDIUM', title: 'inconsistent heading capitalization', file: 'doc/data-flows/Y.md', fix: 'Title Case throughout' }], scopeViolation: false, acceptanceMet: true, redGreenConfirmed: true, headline: 'style nit' };
+      return undefined;
+    },
+  });
+  const byE164b = Object.fromEntries((result.results || []).map((r) => [r.id, r]));
+  ok(!(result.results || []).some((r) => String(r.note || '').startsWith('runItem threw')), 'KI-E164 MEDIUM: no runItem crash');
+  eq(byE164b['SMOKE-EDITORIAL-MED'] && byE164b['SMOKE-EDITORIAL-MED'].toState, 'CLOSED', 'KI-E164 MEDIUM: closes normally');
+  ok(!calls.some((c) => c.label === 'SMOKE-EDITORIAL-MED:fixer' && c.prompt.includes('EDITORIAL HIGH-FINDING AMEND')), 'KI-E164 MEDIUM: a MEDIUM-only editorial finding never triggers the amend — scoped to HIGH only, exactly as designed');
+  eq(calls.filter((c) => c.label === 'SMOKE-EDITORIAL-MED:review-editorial-prose').length, 1, 'KI-E164 MEDIUM: exactly ONE editorial-prose call — no re-scan was ever warranted');
+}
+
+// KI-E169 (ported from a host-mount session) — the HOST-POLICY-GATED, purely observational shadow
+// consolidated scan. Fires only when the host opts in AND all three real axes (acceptance/plan-
+// commitment/prior-finding) already ran and APPROVED this round; NEVER touches res.toState regardless
+// of AGREE/DISAGREE. Reuses the SMOKE-REFIX-GAP shape (reFix + non-verificationOnly, so all three real
+// scans are reachable) with no overrides on any of the three real probes, so they all APPROVE under
+// the default stub — isolating the shadow-scan behavior itself as the one variable under test.
+function shadowScanItem(id, extraFiles) {
+  const base = { target: 'X', layer: 'service', dependsOn: [], gateSet: [], autonomyTier: 'auto', source: 'smoke', solution: 'X/X.sln', peers: [] };
+  // Two real sentences (>= 20 chars each) so splitAcceptanceClauses actually yields >= 2 clauses —
+  // acceptance-scan (KI-E18) is deliberately SKIPPED for single-clause acceptances, and this test
+  // needs it to genuinely run and APPROVE so the shadow scan's gating condition can be reached.
+  return { ...base, id, title: 'reFix item, all three real axes clean', severity: 'HIGH', theme: 'security-multitenancy', fixType: 'non-trivial', files: extraFiles || ['X/src/Some.cs'], acceptance: 'Tenant filter is applied to every query. The response never leaks another tenant\'s data.', regressionTest: 'test', realInfra: false, reFix: true, worktree: { path: '/tmp/exec-smoke-wt-e169/' + id, branch: 'factory/' + id } };
+}
+function shadowScanBatch(id, policies, extraFiles) {
+  return { cycle: 0, concurrency: 2, attempts: 1, repoRoot: '.', templatesDir: '_bmad-output/ai-factory/agents', config: {}, dryRun: false, policies: policies || {}, items: [shadowScanItem(id, extraFiles)] };
+}
+{
+  // off by default — never dispatches, even though all three real axes are satisfied and reachable.
+  const src = readFileSync(join(import.meta.dirname, '..', 'factory.js'), 'utf8');
+  const { result, calls } = await execSmoke(src, shadowScanBatch('SMOKE-SHADOW-OFF', {}), {});
+  ok(!(result.results || []).some((r) => String(r.note || '').startsWith('runItem threw')), 'KI-E169 off-by-default: no runItem crash');
+  eq(result.results[0] && result.results[0].toState, 'CLOSED', 'KI-E169 off-by-default: the item closes normally');
+  ok(!calls.some((c) => c.label === 'SMOKE-SHADOW-OFF:consolidated-scan-shadow'), 'KI-E169 off-by-default: with the policy OFF (the shipped-engine default), the shadow probe never dispatches even though every gating condition is otherwise met');
+}
+{
+  // on + agreement — the shadow call's answers match all three real verdicts.
+  const src = readFileSync(join(import.meta.dirname, '..', 'factory.js'), 'utf8');
+  const { result, calls } = await execSmoke(src, shadowScanBatch('SMOKE-SHADOW-AGREE', { shadowConsolidatedScan: true }, ['X/src/Agree.cs']), {
+    agentOverride: (prompt, opts) => {
+      if ((opts && opts.label) === 'SMOKE-SHADOW-AGREE:consolidated-scan-shadow') return { acceptanceCovered: true, planHonored: true, findingHonored: true };
+      return undefined;
+    },
+  });
+  const shadowAgreeResult = result.results[0];
+  ok(!(result.results || []).some((r) => String(r.note || '').startsWith('runItem threw')), 'KI-E169 on+agree: no runItem crash');
+  eq(shadowAgreeResult && shadowAgreeResult.toState, 'CLOSED', 'KI-E169 on+agree: the item still closes normally — the shadow call never affects the outcome');
+  eq(shadowAgreeResult.gates['probe:consolidated-scan-shadow'], 'AGREE', 'KI-E169 on+agree: recorded AGREE when the shadow answers match every real verdict');
+  ok(shadowAgreeResult.gateDetails['probe:consolidated-scan-shadow'].headline.includes('agreed with all 3'), 'KI-E169 on+agree: the headline states agreement plainly');
+  eq(shadowAgreeResult.gateDetails['probe:consolidated-scan-shadow'].findings.length, 0, 'KI-E169 on+agree: no findings recorded on agreement — nothing to flag');
+}
+{
+  // on + a FORCED disagreement on one axis — the critical safety property: outcome is UNCHANGED.
+  const src = readFileSync(join(import.meta.dirname, '..', 'factory.js'), 'utf8');
+  const { result, calls } = await execSmoke(src, shadowScanBatch('SMOKE-SHADOW-DISAGREE', { shadowConsolidatedScan: true }, ['X/src/Disagree.cs']), {
+    agentOverride: (prompt, opts) => {
+      // the shadow call says the PLAN axis is NOT honored, contradicting the real plan-commitment-scan's APPROVED
+      if ((opts && opts.label) === 'SMOKE-SHADOW-DISAGREE:consolidated-scan-shadow') return { acceptanceCovered: true, planHonored: false, findingHonored: true };
+      return undefined;
+    },
+  });
+  const shadowDisagreeResult = result.results[0];
+  ok(!(result.results || []).some((r) => String(r.note || '').startsWith('runItem threw')), 'KI-E169 on+disagree: no runItem crash');
+  eq(shadowDisagreeResult && shadowDisagreeResult.toState, 'CLOSED', 'KI-E169 on+disagree: the item STILL closes normally — a shadow disagreement is data, never a verdict override (the entire point of "shadow mode")');
+  eq(shadowDisagreeResult.gates['probe:consolidated-scan-shadow'], 'DISAGREE', 'KI-E169 on+disagree: recorded DISAGREE when the shadow answer diverges from a real verdict');
+  ok(shadowDisagreeResult.gateDetails['probe:consolidated-scan-shadow'].headline.includes('DISAGREED'), 'KI-E169 on+disagree: the headline names the divergence');
+  ok(shadowDisagreeResult.gateDetails['probe:consolidated-scan-shadow'].findings[0].title.includes('plan false/true'), 'KI-E169 on+disagree: the specific diverging axis (plan) and both values are named for the dataset, not just "something disagreed"');
+}
+{
+  // gating unmet — a NON-reFix item never runs prior-finding-scan, so its gate is never 'APPROVED';
+  // the shadow probe must correctly decline to fire rather than treat a missing axis as satisfied.
+  const src = readFileSync(join(import.meta.dirname, '..', 'factory.js'), 'utf8');
+  const base = { target: 'X', layer: 'service', dependsOn: [], gateSet: [], autonomyTier: 'auto', source: 'smoke', solution: 'X/X.sln', peers: [] };
+  const notReFixItem = { ...base, id: 'SMOKE-SHADOW-GATEUNMET', title: 'non-reFix item', severity: 'HIGH', theme: 'security-multitenancy', fixType: 'non-trivial', files: ['X/src/GateUnmet.cs'], acceptance: 'policy enforced', regressionTest: 'test', realInfra: false, worktree: { path: '/tmp/exec-smoke-wt-e169/SMOKE-SHADOW-GATEUNMET', branch: 'factory/SMOKE-SHADOW-GATEUNMET' } };
+  const batchGateUnmet = { cycle: 0, concurrency: 2, attempts: 1, repoRoot: '.', templatesDir: '_bmad-output/ai-factory/agents', config: {}, dryRun: false, policies: { shadowConsolidatedScan: true }, items: [notReFixItem] };
+  const { result, calls } = await execSmoke(src, batchGateUnmet, {});
+  ok(!(result.results || []).some((r) => String(r.note || '').startsWith('runItem threw')), 'KI-E169 gating-unmet: no runItem crash');
+  eq(result.results[0] && result.results[0].toState, 'CLOSED', 'KI-E169 gating-unmet: the item closes normally regardless');
+  ok(!calls.some((c) => c.label === 'SMOKE-SHADOW-GATEUNMET:consolidated-scan-shadow'), 'KI-E169 gating-unmet: policy ON but prior-finding-scan never ran (not a reFix item) -> the shadow probe correctly declines to fire, never treating a MISSING real axis as an implicitly-satisfied one');
+}
+{
+  // an unavailable shadow probe (null after retries) is infra noise, recorded SKIPPED — never
+  // misread as a disagreement (KI-L53 fail-open posture, same as every other probe in this pipeline).
+  const src = readFileSync(join(import.meta.dirname, '..', 'factory.js'), 'utf8');
+  const { result, calls } = await execSmoke(src, shadowScanBatch('SMOKE-SHADOW-SKIP', { shadowConsolidatedScan: true }, ['X/src/Skip.cs']), {
+    agentOverride: (prompt, opts) => {
+      if ((opts && opts.label) === 'SMOKE-SHADOW-SKIP:consolidated-scan-shadow') return null;
+      return undefined;
+    },
+  });
+  const shadowSkipResult = result.results[0];
+  ok(!(result.results || []).some((r) => String(r.note || '').startsWith('runItem threw')), 'KI-E169 unavailable: no runItem crash');
+  eq(shadowSkipResult && shadowSkipResult.toState, 'CLOSED', 'KI-E169 unavailable: the item closes normally — an infra-unavailable OBSERVATIONAL probe never blocks anything');
+  eq(shadowSkipResult.gates['probe:consolidated-scan-shadow'], 'SKIPPED', 'KI-E169 unavailable: recorded SKIPPED, not DISAGREE — infra noise must never be misread as a real divergence signal');
 }
 
 // KI-E142A (ported from a host-mount session) — PLAN-REVIEW fail path: a feasibility gap that
@@ -1387,7 +1641,7 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
   // are both hours-old, separately-scoped pre-band scans on the origin host with no equivalent
   // planNext/applyPhaseResults phase in this runtime, so they are genuinely UNPORTED, not a silent
   // regression.
-  eq(Object.keys(STAGE_PARITY.unported).sort(), ['adjudicator:realinfra-override', 'breadth-claim-probe', 'main-drift-probe', 'pack-hash-probe', 'plan-feasibility-probe', 'plan-quality-probe', 'red-coverage-probe'].sort(), 'KI-E112/KI-E139/KI-E142A/KI-E143C/KI-E145/KI-E175/KI-E179: the UNPORTED set contains EXACTLY the reviewed, dated entries — the four original KI-E103 disclosed gaps (red-proof KI-E83, plan-commitment/plan-step KI-E87+E101, ledger-anchor KI-E91, rootcause KI-E104) are still all closed; a name added here without ALSO updating this pinned list (in the same change) is precisely the silent-growth failure mode KI-E112 exists to catch');
+  eq(Object.keys(STAGE_PARITY.unported).sort(), ['adjudicator:realinfra-override', 'breadth-claim-probe', 'consolidated-scan-shadow', 'main-drift-probe', 'pack-hash-probe', 'plan-feasibility-probe', 'plan-quality-probe', 'prior-finding-probe', 'red-coverage-probe'].sort(), 'KI-E112/KI-E139/KI-E142A/KI-E143C/KI-E145/KI-E168/KI-E169/KI-E175/KI-E179: the UNPORTED set contains EXACTLY the reviewed, dated entries — the four original KI-E103 disclosed gaps (red-proof KI-E83, plan-commitment/plan-step KI-E87+E101, ledger-anchor KI-E91, rootcause KI-E104) are still all closed; a name added here without ALSO updating this pinned list (in the same change) is precisely the silent-growth failure mode KI-E112 exists to catch');
   ok(Object.keys(STAGE_PARITY.mechanical).length >= 5, 'KI-E112: the mechanical set carries the stages implemented deterministically instead of via an agent (runner, marker, comment, red-proof, rootcause)');
   // --- shared-constant byte parity (the KI-E97 drift class)
   for (const name of SHARED_CONSTANTS) {
@@ -1710,6 +1964,56 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
     eq(led.items.A.stallRounds, 1, 'KI-E105: a pre-gate failure (test/verify/fold stage — no gateDetails) neither increments nor resets: nothing was adjudicated, so there is no trajectory to judge');
     eq(gateFindingsSummary({ toState: 'FAILED' }), null, 'KI-E105: gateFindingsSummary returns null for that shape (the guard this relies on)');
   }
+  // KI-E167 (ported from a host-mount session) — failSignature: a coarse, deterministic fingerprint
+  // of a FAILED result's note, cut at the first ": " or " — " separator (or a 60-char cap).
+  {
+    const { failSignature } = await import('./convergence.mjs');
+    eq(failSignature(null), null, 'KI-E167: no note -> null, never a throw');
+    eq(failSignature(''), null, 'KI-E167: an empty note -> null');
+    eq(failSignature('realInfra marker probe (KI-E10): verify-raw.txt has NO FACTORY::REALINFRA:: marker on disk'), 'realinfra marker probe (ki-e10)', 'KI-E167: cuts at the first ": " separator and lowercases');
+    eq(failSignature('worktree-isolation mismatch (KI-E170) — test-author reports testFiles path(s) OUTSIDE'), 'worktree-isolation mismatch (ki-e170)', 'KI-E167: cuts at the first " — " separator when it comes before any ": "');
+    eq(failSignature('a'.repeat(100)), 'a'.repeat(60), 'KI-E167: a note with neither separator falls back to a 60-char cap');
+  }
+  // KI-E167 fallback: two consecutive PRE-BAND failures (no gateDetails at all) with the SAME
+  // failSignature are a stall the ORIGINAL findings-based mechanism is structurally blind to — this
+  // is the exact ANALYTICS-H5 shape (a realInfra-marker failure repeating verbatim with zero gate-band
+  // data either round).
+  {
+    const cfg = { maxStallRounds: 2 };
+    const led = { items: { A: { state: 'FAILED' } } };
+    const preBandFail = (note) => [{ id: 'A', toState: 'FAILED', note }];
+    applyStallDetection(led, cfg, preBandFail('realInfra marker probe (KI-E10): no marker on disk'), {});
+    eq(led.items.A.stallRounds, undefined, 'KI-E167: the FIRST pre-band failure has no prior signature to compare against — neither branch touches stallRounds, matching the pre-existing "pre-gate failure: not a judgeable trajectory, counter untouched" contract');
+    eq(led.items.A.lastFailSignature, 'realinfra marker probe (ki-e10)', 'KI-E167: the signature is recorded for the NEXT round to compare against');
+    const out = applyStallDetection(led, cfg, preBandFail('realInfra marker probe (KI-E10): no marker on disk'), {});
+    eq(led.items.A.stallRounds, 1, 'KI-E167: a SECOND consecutive round with the IDENTICAL signature increments the SAME stallRounds counter the findings-based path uses');
+    eq(led.items.A.stallReason, 'signature', 'KI-E167: stallReason records WHICH mechanism fired, so the escalation note can match the actual evidence');
+    eq(out.length, 0, 'KI-E167: still below maxStallRounds (2) — not yet reported');
+    const out2 = applyStallDetection(led, cfg, preBandFail('realInfra marker probe (KI-E10): no marker on disk'), {});
+    eq(led.items.A.stallRounds, 2, 'KI-E167: a THIRD consecutive identical-signature round reaches the bound');
+    eq(out2.length, 1, 'KI-E167: ... and is reported, exactly like the findings-based path');
+    eq(out2[0].reason, 'signature', 'KI-E167: the reported stall names its evidence shape');
+    eq(out2[0].signature, 'realinfra marker probe (ki-e10)', 'KI-E167: ... and carries the actual repeating signature for the log line');
+  }
+  {
+    // a DIFFERENT pre-band failure signature the next round is NOT a stall — the fixer's change
+    // demonstrably changed WHICH check failed, even though it is still failing overall.
+    const cfg = { maxStallRounds: 2 };
+    const led = { items: { A: { state: 'FAILED', stallRounds: 1, lastFailSignature: 'realinfra marker probe (ki-e10)' } } };
+    const out = applyStallDetection(led, cfg, [{ id: 'A', toState: 'FAILED', note: 'build failed: CS0103 undeclared identifier' }], {});
+    eq(led.items.A.stallRounds, 1, 'KI-E167: a DIFFERENT signature neither increments (no match) nor resets (no gate-band progress was proven either) — it just stops accumulating on the old, no-longer-applicable signature');
+    eq(out.length, 0, 'KI-E167: never reported for a non-repeating signature');
+  }
+  {
+    // gate-band data ALWAYS wins over the signature fallback, even when a signature also matches —
+    // the richer comparison is never second-guessed by the coarser one.
+    const cfg = { maxStallRounds: 2 };
+    const led = { items: { A: { state: 'FAILED', stallRounds: 1, lastFailSignature: 'gate:qa' } } };
+    const res = [{ id: 'A', toState: 'FAILED', note: 'gate:qa: still failing', gateDetails: { 'gate:qa': { verdict: 'CHANGES_REQUIRED', findings: [{ severity: 'HIGH' }] } } }];
+    applyStallDetection(led, cfg, res, { A: S(3) }); // 3 -> 1 finding: real progress
+    eq(led.items.A.stallRounds, 0, 'KI-E167: gate-band data takes the findings-based branch even though a matching signature ALSO exists — the richer comparison is never overridden by the coarser fallback');
+    eq(led.items.A.stallReason, undefined, 'KI-E167: real progress takes the reset branch, which does not touch stallReason at all (it stays whatever it was — irrelevant once stallRounds is back to 0) — gate-band data still wins over the stale matching signature');
+  }
   // driver wiring
   const dsrc105 = readFileSync(new URL('../driver.mjs', import.meta.url), 'utf8');
   ok(dsrc105.includes('applyStallDetection, isStalled') || (dsrc105.includes('applyStallDetection') && dsrc105.includes('isStalled')), 'KI-E105: driver imports both stall helpers from the single convergence module');
@@ -1717,6 +2021,12 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
   ok(dsrc105.includes('applyStallDetection(ledger, cfg, arr, priorConvergence)'), 'KI-E105: the stall pass receives that snapshot');
   ok(dsrc105.includes('const stalled = isStalled(cfg, row)') && dsrc105.includes('row.attempts > bound || stalled'), 'KI-E105: escalateExhausted parks on EITHER stop condition — one decision point, so scheduling and parking cannot disagree');
   ok(/NO-PROGRESS on \$\{row\.stallRounds\}/.test(dsrc105), 'KI-E105: the parked row records WHY it was parked (stall, not budget exhaustion) in its transition note');
+  // KI-E167 (ported from a host-mount session) — the escalation note and the fold-time stall log line
+  // both branch on the actual evidence shape (row.stallReason / s.reason) instead of always phrasing
+  // the note as if gate-band findings existed, which would be actively misleading for a signature-only
+  // stall (no gate band ever ran).
+  ok(dsrc105.includes("row.stallReason === 'signature'") && dsrc105.includes('repeated verbatim with no gate-band data to compare'), 'KI-E167: the escalation note phrases a signature-based stall in its own terms, not the findings-based template');
+  ok(dsrc105.includes("s.reason === 'signature'") && dsrc105.includes('KI-E167 ${s.id}'), 'KI-E167: the fold-time stall log line also branches on reason, logging under its own KI-E167 tag rather than misattributing to KI-E105');
   const cfg105 = JSON.parse(readFileSync(new URL('../../config/factory.config.json', import.meta.url), 'utf8'));
   eq(cfg105.maxStallRounds, 2, 'KI-E105: the shipped default is 2 consecutive no-progress rounds');
 }
@@ -1756,7 +2066,11 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
   const fsrc104 = readFileSync(new URL('../factory.js', import.meta.url), 'utf8');
   ok(fsrc104.includes("const ROOTCAUSE_SCHEMA = { type: 'object'") && fsrc104.includes("required: ['nonTestCount']"), 'KI-E104: ROOTCAUSE_SCHEMA is defined with the non-colliding nonTestCount field');
   ok(!/ROOTCAUSE_SCHEMA[^\n]*required: \['count'\]/.test(fsrc104), 'KI-E104: the schema does NOT use a bare `count` — COMMENT_SCHEMA already owns that name with the OPPOSITE polarity (zero=good), and shape-sniffing consumers collide on it');
-  const rcBlock = fsrc104.slice(fsrc104.indexOf('4a4. ROOT-CAUSE TOUCH PROBE'), fsrc104.indexOf('Editorial (Band C)'));
+  // KI-E168 (ported from a host-mount session) inserted its OWN pre-band probe — with its own
+  // finish('FAILED') call — between the root-cause-touch probe and the editorial pass, so the slice
+  // isolating THIS probe's block now ends at KI-E168's leading comment rather than at 'Editorial
+  // (Band C)' directly; re-scoped to match the new, intentional boundary rather than widen the count.
+  const rcBlock = fsrc104.slice(fsrc104.indexOf('4a4. ROOT-CAUSE TOUCH PROBE'), fsrc104.indexOf('PRIOR-FINDING SCAN (KI-E168'));
   ok(rcBlock.length > 200, 'KI-E104: the probe block exists between the RED-proof probe and the editorial pass');
   ok(rcBlock.includes("if (codeChange && !verificationOnly && (res.rootCauseFiles || []).length) {"), 'KI-E104: gated exactly as the fold gates P9 — code items, never verificationOnly (KI-L55), only when a non-test touch-set was predicted');
   eq((rcBlock.match(/finish\('FAILED'/g) || []).length, 1, 'KI-E104: exactly one finish(\'FAILED\') call site in the probe block');
@@ -2590,14 +2904,21 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
 // PR#9 review — the host-policy seam itself: lib/policy.mjs loader + the driver/factory wiring.
 {
   const pd = mkdtempSync(join(tmpdir(), 'pol-'));
-  eq(loadPolicies(pd), { noNewComments: false, noSchemaChanges: false, failLaneOnMainDrift: false }, 'policy: no config at all -> all OFF (shipped-engine default; KI-E109 added failLaneOnMainDrift)');
+  eq(loadPolicies(pd), { noNewComments: false, noSchemaChanges: false, failLaneOnMainDrift: false, shadowConsolidatedScan: false }, 'policy: no config at all -> all OFF (shipped-engine default; KI-E109 added failLaneOnMainDrift, KI-E171 shadowConsolidatedScan)');
   mkdirSync(join(pd, 'config'), { recursive: true });
   fsWrite(join(pd, 'config', 'factory.config.json'), JSON.stringify({ policies: { noNewComments: false, noSchemaChanges: false } }));
   fsWrite(join(pd, 'config', 'factory.config.local.json'), JSON.stringify({ policies: { noNewComments: true } }));
-  eq(loadPolicies(pd), { noNewComments: true, noSchemaChanges: false, failLaneOnMainDrift: false }, 'policy: gitignored local overlay flips a policy per host (KI-E17 seam)');
+  eq(loadPolicies(pd), { noNewComments: true, noSchemaChanges: false, failLaneOnMainDrift: false, shadowConsolidatedScan: false }, 'policy: gitignored local overlay flips a policy per host (KI-E17 seam)');
   fsWrite(join(pd, 'config', 'factory.config.local.json'), '{ broken json');
-  eq(loadPolicies(pd), { noNewComments: false, noSchemaChanges: false, failLaneOnMainDrift: false }, 'policy: an unreadable overlay never throws — falls back to the committed config');
-  eq(renderPolicies({ noNewComments: true }), 'noNewComments=on noSchemaChanges=off failLaneOnMainDrift=off', 'policy: renderPolicies one-liner for the driver status prints');
+  eq(loadPolicies(pd), { noNewComments: false, noSchemaChanges: false, failLaneOnMainDrift: false, shadowConsolidatedScan: false }, 'policy: an unreadable overlay never throws — falls back to the committed config');
+  eq(renderPolicies({ noNewComments: true }), 'noNewComments=on noSchemaChanges=off failLaneOnMainDrift=off shadowConsolidatedScan=off', 'policy: renderPolicies one-liner for the driver status prints');
+  // KI-E171 (ported from a host-mount session) — the INTEGRATION gap that let shadowConsolidatedScan
+  // (KI-E169) ship silently inert on the origin host: this is the loader's OWN merge round-trip from a
+  // local-overlay config, the exact path a real group/sweep launch uses — exec-smoke's batch.policies
+  // injection bypasses this loader entirely, so it structurally could not have caught a key missing
+  // from DEFAULTS. A future policy addition MUST have a round-trip assertion here in the SAME change.
+  fsWrite(join(pd, 'config', 'factory.config.local.json'), JSON.stringify({ policies: { shadowConsolidatedScan: true } }));
+  eq(loadPolicies(pd).shadowConsolidatedScan, true, 'KI-E171: shadowConsolidatedScan actually round-trips through the REAL loader from a local overlay — the path a live group/sweep launch uses, not just exec-smoke\'s direct batch.policies injection');
   // Committed config ships BOTH policies OFF — a public engine must not default to one owner's rules.
   const shipped = JSON.parse(readFileSync(join(import.meta.dirname, '..', '..', 'config', 'factory.config.json'), 'utf8'));
   eq(!!(shipped.policies && shipped.policies.noNewComments), false, 'policy: shipped config has noNewComments OFF');
@@ -3028,6 +3349,24 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
   eq(effectiveBaseline(['A', 'B', 'C'], parseVerifyRaw('FACTORY::SUMMARY::suite exit=1 failed=1 passed=9')), 3, 'KI-E43: a bigger reported array is never shrunk by the transcript');
   eq(effectiveBaseline([], parseVerifyRaw('no markers here')), 0, 'KI-E43: an unparseable baseline transcript contributes 0');
   eq(effectiveBaseline([], parseVerifyRaw('FACTORY::SUMMARY::suite exit=0 failed=0 passed=10')), 0, 'KI-E43: a GREEN baseline transcript adds nothing — no free failure allowance');
+  // KI-E163 (ported from a host-mount session) — a phantom baseline (never captured or reported) and
+  // a real baseline that genuinely measured zero both read as effectiveBaseline()===0; isPhantomBaseline
+  // distinguishes them, and annotateBaselineReason appends a caveat ONLY to a real "beyond baseline 0"
+  // failure reason when that 0 is phantom.
+  eq(isPhantomBaseline(0, [], null), true, 'KI-E163: baseline=0, no reported array, no transcript at all -> phantom');
+  eq(isPhantomBaseline(0, undefined, null), true, 'KI-E163: an absent (not just empty) reported array is still phantom');
+  eq(isPhantomBaseline(0, [], parseVerifyRaw('FACTORY::SUMMARY::suite exit=0 failed=0 passed=10')), false, 'KI-E163: a REAL baseline transcript that measured 0 failures is NOT phantom, even though effectiveBaseline is also 0');
+  eq(isPhantomBaseline(0, ['A'], null), false, 'KI-E163: a non-empty reported array (even if effectiveBaseline somehow computed 0) is not phantom');
+  eq(isPhantomBaseline(3, [], null), false, 'KI-E163: a non-zero baseline is never phantom by definition (only 0 is ambiguous)');
+  eq(annotateBaselineReason('integrate transcript: 5 new suite failure(s) beyond baseline 0', true), 'integrate transcript: 5 new suite failure(s) beyond baseline 0 (⚠ KI-E163: baseline=0 here is a DEFAULT, not a measurement — no baseline-raw.txt exists and no baselineFailures were ever reported for this item; if these failures are genuinely pre-existing, capturing a real baseline resolves this, not the diff)', 'KI-E163: a phantom-0 "beyond baseline 0" reason gets the caveat appended');
+  eq(annotateBaselineReason('integrate transcript: 5 new suite failure(s) beyond baseline 0', false), 'integrate transcript: 5 new suite failure(s) beyond baseline 0', 'KI-E163: the SAME reason text is returned byte-identical when the baseline is NOT phantom (a real, measured 0)');
+  eq(annotateBaselineReason('verify transcript: build failed', true), 'verify transcript: build failed', 'KI-E163: a reason that does not even mention "beyond baseline 0" is never touched, regardless of phantom status — an unrelated failure (build/targetedTest) must not get a baseline caveat that has nothing to do with it');
+  eq(annotateBaselineReason('', true), '', 'KI-E163: an empty reason is returned unchanged, never a throw');
+  // driver.mjs wiring
+  const drvTextE163 = readFileSync(join(import.meta.dirname, '..', 'driver.mjs'), 'utf8');
+  ok(drvTextE163.includes("import { parseVerifyRaw, verdictFromParse, debrisFiles, parseRedRaw, hasRealInfraMarker, touchedRootCause, effectiveBaseline, decodeTranscript, flakeSuspects, isPhantomBaseline, annotateBaselineReason } from './lib/verify.mjs';"), 'KI-E163: driver.mjs imports isPhantomBaseline/annotateBaselineReason alongside the existing verify.mjs helpers');
+  ok(drvTextE163.includes('const baselineIsPhantom = isPhantomBaseline(baseline, r.baselineFailures, baselineParse)'), 'KI-E163: deterministicVerifyOverride computes the phantom flag from the SAME baseline/report/transcript inputs effectiveBaseline itself used');
+  ok(drvTextE163.includes("fail('verify transcript: ' + annotateBaseline(vVerdict.reason))") && drvTextE163.includes("fail('integrate transcript: ' + annotateBaseline(iVerdict.reason))"), 'KI-E163: BOTH the verify- and integrate-transcript fail paths route their reason through the annotator — a phantom baseline can fail via either transcript');
   const drvText43 = readFileSync(join(import.meta.dirname, '..', 'driver.mjs'), 'utf8');
   const facText43 = readFileSync(join(import.meta.dirname, '..', 'factory.js'), 'utf8');
   ok(/baseline-raw\.txt/.test(drvText43) && /effectiveBaseline\(/.test(drvText43), 'KI-E43: the fold override merges the RED-time baseline transcript');

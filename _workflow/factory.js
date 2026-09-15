@@ -197,6 +197,10 @@ const ACCEPT_SCHEMA = { type: 'object', additionalProperties: false, required: [
 // actually a live risk, not the majority of ordinary, bounded-scope items.
 const BREADTH_CLAIM_RE = /\b(every|all|no participating|no consumer|no handler|no site|across all|platform-?wide)\b/i
 const PLAN_COMMITMENT_SCHEMA = { type: 'object', additionalProperties: false, required: ['honored'], properties: { honored: { type: 'boolean' }, gaps: { type: 'array', items: { type: 'object', additionalProperties: false, required: ['commitment', 'why'], properties: { commitment: { type: 'string' }, why: { type: 'string' } } } } } }
+// KI-E169 (ported from a host-mount session) — shadow-mode consolidated-scan schema: three
+// INDEPENDENT booleans, no shared/aggregate field, so a schema-level short-circuit can never let one
+// axis's answer stand in for another's.
+const SHADOW_SCAN_SCHEMA = { type: 'object', additionalProperties: false, required: ['acceptanceCovered', 'planHonored', 'findingHonored'], properties: { acceptanceCovered: { type: 'boolean' }, planHonored: { type: 'boolean' }, findingHonored: { type: 'boolean' } } }
 // KI-E104 — root-cause touch probe: reports `verify/build-test.sh rootcause`'s markers verbatim (the
 // pre-band half of the fold's P9). No classify step — like KI-E59's comment probe, the linter has
 // already made the judgment; the agent is a relay. `skipped` distinguishes "the check could not run"
@@ -831,7 +835,7 @@ async function runItem(item) {
     // deterministic fold override false-fails the item (cycle 47: ITEM-H15, 6 env failures vs
     // baseline 0 — a 10/10-APPROVED item FAILED). Docker-present hosts skip the extra suite run (no cost).
     + ' FULL-SUITE BASELINE (KI-E43): FIRST run `docker info >/dev/null 2>&1; echo exit=$?`. If it FAILS (non-zero — no Docker), the integrate stage\'s full suite will hit pre-existing Docker-unavailable failures that are NOT this fix\'s fault: capture the pre-fix baseline NOW, while the tree is still unfixed — run `' + BT + ' suite ' + sln + ' 2>&1 | tee ' + itemsDir(id) + '/baseline-raw.txt` (ABSOLUTE path) and return baselineFailures = the FAILING test names from that run (exclude your new regression test if it appears). If `docker info` SUCCEEDS, skip the baseline run and omit baselineFailures.'
-    + (item.reFix ? ' RE-FIX EXCEPTION (KI-E43): do NOT re-capture the baseline — this worktree already carries the prior attempt\'s fix, so a capture NOW would launder that fix\'s own breakage into the allowance. The FIRST round\'s baseline-raw.txt (already on disk) stands; the driver ignores a re-captured one.' : '')
+    + (item.reFix ? ' RE-FIX EXCEPTION (KI-E43 / KI-E162, ported from a host-mount session): FIRST check whether `' + itemsDir(id) + '/baseline-raw.txt` already EXISTS (`test -f ...`). If it EXISTS, do NOT re-capture it — this worktree already carries the prior attempt\'s fix, so a fresh capture now would launder that fix\'s own breakage into the allowance; the EXISTING file stands as-is, the driver ignores a re-captured one. If it does NOT exist — no earlier round ever captured one — this exception does NOT apply to you: follow the FULL-SUITE BASELINE instruction above and capture one now regardless of reFix status. A baseline that was NEVER captured is read downstream as baseline=0 (not "unmeasured"), which wrongly treats every genuinely pre-existing failure as a regression this fix introduced. Live incident on the origin host: an item ran multiple rounds with no baseline-raw.txt ever on disk, and its integrate stage\'s real, reproducible, environment-unrelated failures (independently confirmed to ALSO fail on a completely clean, unmodified main checkout, with zero relation to this item\'s diff) were folded as "N new suite failures beyond baseline 0" and deterministically FAILED an otherwise fully-APPROVED item repeatedly, until the retry bound exhausted and forced a human escalation for a question a captured baseline would have answered for free.' : '')
   // P2: if the defect shape is real-DB-dependent (normalizer flag OR a concurrency/raw-SQL/constraint keyword),
   // the test MUST be Testcontainers-backed (an in-memory green will be REJECTED at fold). If it is a pure
   // query-LOGIC bug, an in-memory test is correct — do NOT force a container where the provider behaves identically.
@@ -839,9 +843,23 @@ async function runItem(item) {
   // KI-L55 — the two HONEST no-red shapes exist on the FIRST round too (cycle-32 live evidence:
   // ITEM-H8 stale finding, ITEM-HIGH-17 pure coverage — both punished with FAILED for
   // reporting truthfully). Brief them explicitly; the fold requires the SAME transcript either way.
-  const testVoHint = item.reFix ? '' : (pureCoverage
-    ? ' PURE TEST-COVERAGE ITEM: the deliverable IS the new tests — correct production code has no red state, so do NOT fabricate a failing variant. Write the missing tests (they should PASS against the current code), RUN them, tee the raw output + a `FACTORY::RED::<exitcode>` marker (0 expected) to the SAME verify-red-raw.txt path, and return red=false + verificationOnly=true with the coverage delta (targets covered, test counts) in evidence.'
-    : ' STALE-FINDING PROTOCOL: if you determine the finding is ALREADY RESOLVED on the current tree (the acceptance criterion demonstrably holds — trace the actual wiring, do not stop at the cited lines), do NOT fabricate a red. Write a PASSING pinning test that empirically proves the acceptance holds, RUN it, tee the raw output + `FACTORY::RED::0` to verify-red-raw.txt, and return red=false + verificationOnly=true with file:line + provenance evidence in note. The full gate band adjudicates the claim — a wrong stale-claim will be CHANGES_REQUIRED\'d.')
+  const testVoHint = item.reFix
+    // KI-E161 (ported from a host-mount session) — a reFix verificationOnly claim used to get NO
+    // instruction to refresh verify-red-raw.txt — only a prose "document the full re-verification in
+    // evidence/note" mandate (the reFix branch of testExtra below). Prose is not machine-checkable;
+    // the KI-E83 RED-proof probe (and the fold's own P1-inverse) reads ONLY the marker file, whatever
+    // attempt produced it. On a multi-round item, that file was very likely written during an
+    // EARLIER, non-verificationOnly round — correctly showing that round's exit!=0 failure on the
+    // THEN-unfixed code — and a later round's verificationOnly claim, if it never re-runs and re-tees
+    // the test, leaves that stale failing capture in place, where the probe reads it as current
+    // evidence and fails an item whose fix is actually already correct. Live incident on the origin
+    // host: a genuinely correct, fully re-confirmed fix still FAILED because verify-red-raw.txt was
+    // untouched since the ORIGINAL red-authoring round several cycles earlier. Fix: give reFix
+    // verificationOnly the SAME disk-proof mandate the first-round shapes below already have.
+    ? ' RE-FIX VERIFICATIONONLY (KI-E161): if you conclude nothing is still broken, do exactly what a first-round verificationOnly claim does — RUN the pinning/coverage test NOW against the CURRENT (already-fixed) worktree and TEE its output + a `FACTORY::RED::<exitcode>` marker (0 expected) to ' + itemsDir(id) + '/verify-red-raw.txt (ABSOLUTE path — OVERWRITE whatever is already there, even a genuine EARLIER round\'s correctly-failing-on-old-code capture; the fold\'s P1-inverse check reads THIS file expecting exit 0 for ANY verificationOnly claim, current round or not, and a stale non-zero capture from an earlier, different-purpose round will wrongly fail an item whose fix is actually already correct). A prose re-verification in evidence/note is necessary but NOT sufficient — the marker file is the machine proof the driver actually trusts; the prose is only the human-readable trail alongside it.'
+    : (pureCoverage
+      ? ' PURE TEST-COVERAGE ITEM: the deliverable IS the new tests — correct production code has no red state, so do NOT fabricate a failing variant. Write the missing tests (they should PASS against the current code), RUN them, tee the raw output + a `FACTORY::RED::<exitcode>` marker (0 expected) to the SAME verify-red-raw.txt path, and return red=false + verificationOnly=true with the coverage delta (targets covered, test counts) in evidence.'
+      : ' STALE-FINDING PROTOCOL: if you determine the finding is ALREADY RESOLVED on the current tree (the acceptance criterion demonstrably holds — trace the actual wiring, do not stop at the cited lines), do NOT fabricate a red. Write a PASSING pinning test that empirically proves the acceptance holds, RUN it, tee the raw output + `FACTORY::RED::0` to verify-red-raw.txt, and return red=false + verificationOnly=true with file:line + provenance evidence in note. The full gate band adjudicates the claim — a wrong stale-claim will be CHANGES_REQUIRED\'d.')
   // KI-E69: reuse a prior (killed) attempt's test-author output when test.json already exists and
   // is fresh (from THIS claim, not a stale prior cycle) — skips the test-author call entirely.
   const testExtra = (item.reFix ? (reFixNote + 'Write the red proof for what is STILL broken per that feedback — do NOT duplicate an already-passing test; the proof MUST fail on the current worktree state. If NOTHING is still broken (you re-verified every prior finding against the CURRENT tree and each is fixed with an already-passing pinning test, or explicitly out of scope), return red=false + verificationOnly=true and document the full re-verification (files read, suites run, counts) in evidence/note — do NOT invent a vacuous duplicate test just to produce a red. ') : '') + redHint + testVoHint + testRealInfraHint
@@ -1188,6 +1206,54 @@ async function runItem(item) {
     }
   }
 
+  // PRIOR-FINDING SCAN (KI-E168, ported from a host-mount session) — pre-band feedback-vs-diff
+  //     coverage probe, RE-FIX ONLY. A reFix round is TOLD (reFixNote/staleGuard, prose only) to read
+  //     feedback.md and address every prior CHANGES_REQUIRED finding — but nothing MACHINE-VERIFIES
+  //     it actually did, on a THIRD axis distinct from acceptance-scan (KI-E18 — the item's own
+  //     acceptance criteria) and plan-commitment-scan (KI-E87/E101 — the planner's OWN stated intent):
+  //     the SPECIFIC review findings that caused the PRIOR attempt to be rejected. Without this, that
+  //     gap is closed only by the full opus gate band independently re-discovering an unaddressed
+  //     finding from scratch — the most expensive possible point to learn "you didn't fix what broke
+  //     last time". Live incident on the origin host: three separate reFix items each burned a FULL
+  //     gate band before failing on essentially the same unresolved finding again. Mirrors
+  //     acceptance-scan/plan-commitment-scan's exact probe -> ONE bounded amend -> re-probe ->
+  //     pre-band-fail-or-continue shape, and (per KI-E128's lesson for plan-commitment-scan) runs for
+  //     verificationOnly reFix rounds TOO — a claim that a finding is "already fixed in the standing
+  //     tree" is exactly the claim most worth a cheap, independent check before it reaches the gate
+  //     band unverified. Reuses KI-E166's "PRIOR CYCLE(S)' FEEDBACK" divider (present in this repo
+  //     since that port landed) to skip findings this SAME check already covered on an earlier round.
+  if (item.reFix) {
+    phase('EdgeScan')
+    const fbPrompt = (verificationOnly
+      ? 'VERIFICATION-ONLY LANE (mirrors KI-E128): no fixer ran this round — the claim is that every prior finding is ALREADY resolved in the standing worktree. Grade against the diff that is ALREADY THERE (`git -C ' + wtPath + ' diff HEAD`), not new work. A finding whose fix is absent from that diff is UNEVIDENCED — say so; do not credit an intention. '
+      : '') +
+      'PRIOR-FINDING SCAN (KI-E168 — pre-band feedback-vs-diff coverage probe). This item is a RE-FIX: a PRIOR attempt was REJECTED. STEP 1: run `cat ' + itemsDir(id) + '/feedback.md 2>/dev/null || echo NO-FEEDBACK-FILE` — if it prints NO-FEEDBACK-FILE, return honored=true and gaps=[] immediately (nothing to check). STEP 2: otherwise, list EVERY bullet under a "### Findings" heading found ABOVE any "## PRIOR CYCLE(S)\' FEEDBACK" divider (a divider marks OLDER content this SAME check already covered on an earlier round) as one finding each. If there is NO "### Findings" heading at all, return honored=true and gaps=[]. STEP 3: read ' + itemsDir(id) + '/review-pack.md (the machine snapshot of THIS diff). STEP 4: for EACH finding from step 2, decide whether the diff contains CONCRETE evidence it was actually addressed — a specific hunk, file, or test; a prose claim with no matching change is NOT evidence. Return honored=true ONLY if EVERY finding is evidenced; otherwise honored=false with each unaddressed finding in gaps (commitment: quote the finding, why: what is still missing). Do NOT edit anything.'
+    let pf = await call('prior-finding-probe', { model: 'claude-haiku-4-5', effort: 'low' }, PLAN_COMMITMENT_SCHEMA, fbPrompt, 'EdgeScan')
+    if (pf && pf.honored === false && Array.isArray(pf.gaps) && pf.gaps.length) {
+      res.amended = true // KI-E125 — an amend is about to edit the worktree AFTER verify
+      const amend = await call('fixer', R.fixer, FIX_SCHEMA, 'PRIOR-FINDING AMEND (KI-E168): a pre-band probe found PRIOR REVIEW FINDING(S) (from the last rejected attempt) with NO evidence they were addressed in this diff — the gate band would independently re-discover this at full price. Address EVERY finding below with the minimal correct change (or state in note precisely why a finding no longer applies). Then re-verify the touched surface (code: `' + BT + ' build <touched .csproj> 2>&1 | tee -a ' + RAW + '` + `' + BT + ' filter <test .csproj> "<TestClassName>" 2>&1 | tee -a ' + RAW + '`; doc/config: the spec\'s grep) and REGENERATE the review pack: `' + PACKCMD + '`. FINDINGS: ' + JSON.stringify(pf.gaps.slice(0, 8)) + claimsHint, 'EdgeScan')
+      if (amend && amend.scopeStop) return await frameAndBlock('fixer scope-stop during prior-finding amend — ' + (amend.summary || ''))
+      if (amend && (amend.applied || (amend.note && String(amend.note).trim()))) {
+        const noteHint = amend.applied ? '' : ('\nFIXER\'S EXPLANATION (no code change was applied — the diff is UNCHANGED from the first scan; judge whether this explanation genuinely justifies every finding as already-addressed or legitimately no-longer-applicable, do NOT rubber-stamp a bare assertion with no evidence): ' + amend.note)
+        const re = await call('prior-finding-probe', { model: 'claude-haiku-4-5', effort: 'low' }, PLAN_COMMITMENT_SCHEMA, fbPrompt + '\nRE-SCAN: an amend just addressed the prior gaps — judge the AMENDED diff fresh; prior gaps are hypotheses to re-verify, never conclusions to copy forward.' + noteHint, 'EdgeScan')
+        if (re && typeof re.honored === 'boolean') pf = re
+      }
+    }
+    if (pf && typeof pf.honored === 'boolean') {
+      res.gates['probe:prior-finding-scan'] = pf.honored ? 'APPROVED' : 'CHANGES_REQUIRED'
+      res.gateDetails = res.gateDetails || {}
+      res.gateDetails['probe:prior-finding-scan'] = {
+        verdict: pf.honored ? 'APPROVED' : 'CHANGES_REQUIRED',
+        headline: pf.honored ? 'every prior review finding evidenced in the diff' : ((pf.gaps || []).length + ' prior review finding(s) with NO evidence they were addressed'),
+        findings: (pf.gaps || []).slice(0, 12).map(function (g) { return { severity: 'HIGH', title: 'unaddressed prior finding: ' + String(g.commitment || '').slice(0, 140), fix: String(g.why || '') } }),
+      }
+      if (!pf.honored) {
+        const gapNote = (pf.gaps || []).slice(0, 6).map(function (g) { return String(g.commitment || '').slice(0, 90) }).join(' | ')
+        return finish('FAILED', 'prior-finding-scan (KI-E168): prior review finding(s) with NO evidence they were addressed after one bounded amend — ' + (gapNote || 'see gateDetails') + '. Pre-band fail (cheap — no gate band was spent); the fix must address every finding from the last rejected attempt.')
+      }
+    }
+  }
+
   // Editorial (Band C) — advisory, doc items only; applies doc fixes in the worktree, NEVER blocks.
   // KI-L34: runs BEFORE the gate band (it used to run after) so the gates review the editorial
   // output as part of the diff. Invariant: NOTHING mutates the worktree after the gate band — the
@@ -1209,6 +1275,49 @@ async function runItem(item) {
     res.gates[ek] = er ? er.verdict : 'NULL'
     res.gateDetails = res.gateDetails || {}
     res.gateDetails[ek] = er ? { verdict: er.verdict, headline: er.headline, findings: (er.findings || []).slice(0, 6), advisory: true } : null
+  }
+
+  // 4a6. EDITORIAL HIGH-FINDING AMEND (KI-E164, ported from a host-mount session) — editorial
+  //      (KI-L34) deliberately never self-edits FACTUAL content ("content-is-sacrosanct" — a prose
+  //      pass correcting a fact it cannot independently verify against code is exactly the overreach
+  //      that separation avoids) — it only REPORTS. Until now that report went nowhere within the
+  //      SAME attempt: a HIGH-severity, grep-verified factual finding with an exact replacement
+  //      already written sat as advisory prose while the diff proceeded to the hard gate band
+  //      UNCHANGED, so the identical defect had to be independently rediscovered by a later, far more
+  //      expensive reviewer before it blocked anything. Live incident on the origin host: two HIGH
+  //      editorial:prose findings (fabricated event/field names in a planning doc, a false "already
+  //      covered" decrypt claim) shipped completely unapplied all the way to the gate band, which
+  //      independently rediscovered the identical defects at full opus-gate-band price. Mirrors the
+  //      edge-scan/acceptance-scan/plan-commitment-scan "one bounded amend" idiom exactly: the FIXER
+  //      (never editorial itself) applies the correction, preserving the existing discovery/
+  //      application separation of roles. Scoped to HIGH only — MEDIUM/LOW editorial findings stay
+  //      purely advisory (a style opinion forced into every diff via an expensive amend would be
+  //      exactly the over-triggering this fix must not introduce).
+  const editorialHighFindings = []
+  for (const ek of Object.keys(res.gateDetails || {})) {
+    if (!ek.startsWith('editorial:')) continue
+    for (const f of ((res.gateDetails[ek] && res.gateDetails[ek].findings) || [])) {
+      if (String(f.severity || '').toUpperCase() === 'HIGH') editorialHighFindings.push(Object.assign({ gate: ek }, f))
+    }
+  }
+  if (editorialHighFindings.length && !verificationOnly) {
+    res.amended = true // KI-E125 — an amend is about to edit the worktree after verify
+    const edAmend = await call('fixer', R.fixer, FIX_SCHEMA, 'EDITORIAL HIGH-FINDING AMEND (KI-E164): an advisory editorial pass found HIGH-severity, grep-verified factual defect(s) it deliberately did NOT self-correct (editorial never edits facts, only prose/structure). Apply EACH exact fix below now, re-run the targeted build+test via `' + BT + ' build <touched .csproj> 2>&1 | tee -a ' + RAW + '` and `' + BT + ' filter <test .csproj> "<TestClassName>" 2>&1 | tee -a ' + RAW + '` if you touched code, and REGENERATE the review pack as your LAST action: `' + PACKCMD + '`. FINDINGS: ' + JSON.stringify(editorialHighFindings.slice(0, 12)) + claimsHint, 'Verify')
+    if (edAmend && edAmend.scopeStop) return await frameAndBlock('fixer scope-stop during editorial-finding amend — ' + (edAmend.summary || ''))
+    if (edAmend && edAmend.applied) {
+      // Re-run exactly the editorial flows that HAD a HIGH finding, so the recorded verdict reflects
+      // the corrected diff instead of the stale pre-amend finding (same KI-L35 re-verify posture).
+      for (const f of flowsFor(item).filter(function (x) { return x.band === 'editorial' })) {
+        const ek = 'editorial:' + f.skill.replace('bmad-editorial-review-', '')
+        const hadHigh = (res.gateDetails[ek] && res.gateDetails[ek].findings || []).some(function (x) { return String(x.severity || '').toUpperCase() === 'HIGH' })
+        if (!hadHigh) continue
+        const rescan = await call(SKILL_ROLE[f.skill], RF[f.routeKey], GATE_SCHEMA, 'RE-SCAN (KI-E164): a bounded fixer amend just applied the exact correction(s) your prior HIGH finding(s) specified — re-walk the AMENDED diff fresh; treat your own prior finding as a hypothesis to re-verify (KI-L35), not a conclusion to copy forward. Advisory pass; apply doc fixes in the worktree but NEVER block the item. Regenerate the review pack as your LAST action: `' + PACKCMD + '`.', 'Verify')
+        if (rescan) {
+          res.gates[ek] = rescan.verdict
+          res.gateDetails[ek] = { verdict: rescan.verdict, headline: rescan.headline, findings: (rescan.findings || []).slice(0, 6), advisory: true }
+        }
+      }
+    }
   }
 
   // KI-L35: on a reFix round a reviewer that anchors on the PRIOR round's findings (its own old
@@ -1462,6 +1571,60 @@ async function runItem(item) {
           }
         }
       }
+    }
+  }
+
+  // SHADOW-MODE CONSOLIDATED SCAN (KI-E169, ported from a host-mount session) — HOST-POLICY-GATED,
+  //     purely observational. Three independent opus evaluators on the origin host audited whether
+  //     acceptance-scan (KI-E18), plan-commitment-scan (KI-E87/E101), and prior-finding-scan (KI-E168)
+  //     could be merged into ONE haiku call instead of three separate ones, to cut per-call overhead.
+  //     Result: no evidence of cross-axis dilution for a SMALL shape (<=3 axes, one shared diff) — but
+  //     explicitly n=1, and the evaluators named two conditions before trusting it with a real verdict:
+  //     (a) validate the merged response always carries every axis, never silently treating a missing
+  //     one as a pass, and (b) shadow-run it against real data with verdicts diffed, so a regression
+  //     shows up as data, not a missed finding downstream. This block is EXACTLY (b): it changes
+  //     NOTHING about what closes or fails an item — acceptance-scan/plan-commitment-scan/
+  //     prior-finding-scan above remain the sole source of truth, completely unmodified — it only ALSO
+  //     fires one additional, non-blocking consolidated call, and ONLY when all three axes were
+  //     independently active and APPROVED this round (the only shape reachable here: any of the three
+  //     CHANGES_REQUIRED already returned FAILED via the fail-open path above, before this line ever runs).
+  //     Condition (a) is enforced by SHADOW_SCAN_SCHEMA's three independently `required` booleans — a
+  //     malformed/truncated response fails JSON-schema validation before ever reaching this code, never
+  //     silently reads as three passes.
+  //     Off by default (a host opts in only when it wants this dataset collected, KI-E171); never
+  //     amends, never touches the worktree, never blocks. Read `probe:consolidated-scan-shadow` in
+  //     gateDetails across enough real runs before ever considering promoting the merged call to a
+  //     real verdict.
+  if (A.policies && A.policies.shadowConsolidatedScan && !verificationOnly
+      && res.gates['probe:acceptance-scan'] === 'APPROVED'
+      && res.gates['probe:plan-commitment-scan'] === 'APPROVED'
+      && res.gates['probe:prior-finding-scan'] === 'APPROVED') {
+    phase('EdgeScan')
+    const shadowPrompt = 'SHADOW CONSOLIDATED SCAN (KI-E169 — purely observational; nothing you find here affects this item\'s outcome). Check THREE independent things against the SAME diff. STEP 1: read ' + itemsDir(id) + '/review-pack.md (the machine snapshot of this change). STEP 2: run `cat ' + itemsDir(id) + '/feedback.md 2>/dev/null || echo NO-FEEDBACK-FILE` for item (c) below. STEP 3: judge each of the three independently, using ONLY concrete diff evidence (a specific hunk, file, or test) — a prose claim with no matching change is NOT evidence:\n'
+      + '(a) ACCEPTANCE — does the diff evidence every clause of: ' + JSON.stringify(item.acceptance || '') + '\n'
+      + '(b) PLAN — does the diff evidence every commitment/step of: ' + JSON.stringify({ approach: plan && plan.approach, steps: plan && plan.steps }) + '\n'
+      + '(c) PRIOR FINDINGS — does the diff evidence every finding under a "### Findings" heading in the STEP 2 output (ABOVE any "## PRIOR CYCLE(S)\' FEEDBACK" divider); true if the file is absent or has no such section.\n'
+      + 'Return acceptanceCovered, planHonored, findingHonored as three independent booleans. Do NOT edit anything.'
+    const shadow = await call('consolidated-scan-shadow', { model: 'claude-haiku-4-5', effort: 'low' }, SHADOW_SCAN_SCHEMA, shadowPrompt, 'EdgeScan')
+    res.gateDetails = res.gateDetails || {}
+    if (shadow) {
+      // Reachable only when all three real gates are 'APPROVED' (see the guard above) — computed
+      // dynamically rather than assumed, so this stays correct if a future change ever makes one of
+      // the three scans non-fatal.
+      const realAcc = res.gates['probe:acceptance-scan'] === 'APPROVED'
+      const realPlan = res.gates['probe:plan-commitment-scan'] === 'APPROVED'
+      const realFind = res.gates['probe:prior-finding-scan'] === 'APPROVED'
+      const agree = shadow.acceptanceCovered === realAcc && shadow.planHonored === realPlan && shadow.findingHonored === realFind
+      res.gates['probe:consolidated-scan-shadow'] = agree ? 'AGREE' : 'DISAGREE'
+      res.gateDetails['probe:consolidated-scan-shadow'] = {
+        verdict: agree ? 'APPROVED' : 'CHANGES_REQUIRED', // reused vocabulary for reporting only — NEVER read by finish()/fold; this gate is never in any blocking set
+        headline: agree ? 'consolidated shadow call agreed with all 3 separate real verdicts' : 'consolidated shadow call DISAGREED with at least one separate real verdict — data point for KI-E169',
+        findings: agree ? [] : [{ severity: 'INFO', title: 'shadow vs real: acceptance ' + shadow.acceptanceCovered + '/' + realAcc + ', plan ' + shadow.planHonored + '/' + realPlan + ', finding ' + shadow.findingHonored + '/' + realFind, fix: 'observational only — does not affect this item; feeds the KI-E169 consolidation-safety dataset before any promotion decision' }],
+      }
+    } else {
+      // KI-L53 fail-open posture: an unavailable shadow probe is infra noise, never itself a
+      // disagreement signal — announced rather than silently absent (KI-E20/KI-E41 posture).
+      res.gates['probe:consolidated-scan-shadow'] = 'SKIPPED'
     }
   }
 
