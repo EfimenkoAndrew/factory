@@ -8,7 +8,9 @@
 #   build-test.sh red     <test.csproj-or-sln> "<FullyQualified~or~Name>"   # PRE-FIX: proves the test FAILS on old code
 #   build-test.sh filter  <test.csproj-or-sln> "<FullyQualified~or~Name>"   # POST-FIX: proves the test is GREEN
 #   build-test.sh suite   <test.csproj-or-sln>
+#   build-test.sh efmigration <api-project-dir> <persistence-project-relative-path> # KI-E185: EF Core pending-model-change lint (FACTORY::EFMIGRATION::<clean|dirty>) — real dotnet-ef invocation, not a text lint
 #   build-test.sh claims    <worktree-path>       # KI-E11: phantom doc-path lint (FACTORY::CLAIMS::<n>)
+#   build-test.sh countclaims <worktree-path> <item-dir> # KI-E182: stale/invented test-count-claim lint (FACTORY::COUNTCLAIMS::<n>)
 #   build-test.sh leftovers <worktree-path>       # KI-D12: deferral/tech-debt lexicon lint (FACTORY::LEFTOVER::<n>) — engine-owned, runs BEFORE the local-override seam
 #   build-test.sh comments  <worktree-path>       # KI-E59: no-new-comments lint (FACTORY::COMMENT::<n>) — engine-owned, runs BEFORE the local-override seam
 #   build-test.sh ledger-anchor <worktree-path>   # KI-E91: STANDARDS-DIVERGENCE-LEDGER.md duplicate-anchor/false-tag-claim lint (FACTORY::LEDGER-ANCHOR::<n>) — engine-owned, runs BEFORE the local-override seam
@@ -25,6 +27,45 @@ set -uo pipefail
 # under test. Exporting this once, here, covers every dotnet call site in this script (present and
 # future) without touching each one.
 export MSBUILDDISABLENODEREUSE=1
+
+# KI-E134 (2026-09-04) — PREVENTION, not just detection. Every main-tree contamination incident this
+# session traced back to the SAME root cause: `dotnet build $target` (and friends) resolved a
+# worktree-rooted argument against the WRONG cwd — usually because the caller forgot to `cd` into its
+# assigned worktree first. This is unusually dangerous here specifically because every factory
+# worktree AND the main tree are full checkouts of the SAME repo: `dotnet build AdminIdentityService/
+# ...` run from the wrong directory frequently does NOT error (no MSB1009) — it silently SUCCEEDS
+# against the OTHER tree's copy of that same relative path, giving the caller no signal anything is
+# wrong, and (for red/filter, whose exit code and teed transcript become fold evidence) can make the
+# wrong tree's state look like proof about the right one. Refuse instead of silently substituting the
+# wrong tree: the argument must resolve to somewhere under a `state/worktrees/<id>/` directory, or
+# this script exits loud before touching anything.
+#
+# Scoped DELIBERATELY to build/red/filter/suite — the four subcommands that invoke `dotnet` and so
+# carry the "silently succeeds against the wrong tree" danger above. The read-only lints (claims/pack,
+# and any future git-diff-based lint added alongside them) do not share that failure mode —
+# `git -C <path> ...` / a node script over the path either operates correctly or fails cleanly if the
+# path isn't a real worktree, and (confirmed live on the origin host this fix was ported from) a
+# synthetic/placeholder worktree path is a legitimate, useful thing for a caller to pass there when
+# exercising wiring logic
+# rather than real content. Guarding them too would reject exactly that legitimate use for no safety
+# benefit, so they are intentionally left unguarded. This does not replace the fold-time/main-check
+# detection nets (KI-L65/E41/E45/E50/E61/E82/E89) — a direct Edit/Write/Bash-heredoc write that never
+# goes through this script is a separate vector those still cover — it closes the specific,
+# well-evidenced class that flows through the four dotnet-invoking subcommands.
+_guard_worktree_path() {
+  raw="$1"; label="$2"
+  case "$raw" in
+    /*) abs="$raw" ;;
+    *) abs="$(pwd)/$raw" ;;
+  esac
+  case "$abs" in
+    */state/worktrees/*) ;;
+    *)
+      echo "FACTORY::WORKTREE-GUARD::REFUSED $label '$raw' resolves to '$abs' (cwd=$(pwd)) — that path is NOT inside any state/worktrees/<id>/ directory. You are very likely operating against the MAIN tree instead of your assigned worktree (both are full checkouts of the same repo, so this often does not fail the way you'd expect it to). cd into your worktree first, or pass an absolute .../state/worktrees/<id>/... path." >&2
+      exit 65
+      ;;
+  esac
+}
 
 # Engine-owned diff lints run BEFORE the host-override seam below: leftovers/comments are
 # stack-agnostic (pure git-diff + node — no dotnet), so a host's build-test.local.sh never needs to
@@ -75,6 +116,7 @@ cmd="${1:-}"; target="${2:-}"; filter="${3:-}"
 
 case "$cmd" in
   build)
+    _guard_worktree_path "$target" "target"
     echo "FACTORY::BUILD::START $target"
     out=$(dotnet build "$target" --nologo -clp:ErrorsOnly 2>&1)
     code=$?
@@ -85,6 +127,7 @@ case "$cmd" in
     exit $code
     ;;
   red)
+    _guard_worktree_path "$target" "target"
     # Run the NEW regression test against the CURRENT (unfixed) worktree. A non-zero exit (compile-or-assert
     # failure) is the REQUIRED red proof — it shows the test genuinely fails on old code (non-vacuous).
     echo "FACTORY::RED::START $target :: $filter"
@@ -96,6 +139,7 @@ case "$cmd" in
     exit $code
     ;;
   filter)
+    _guard_worktree_path "$target" "target"
     # NOTE (KI-L22, 2026-06-28): run the TARGETED test at DETAILED console-logger verbosity. At dotnet
     # test's default verbosity the VSTest host SUPPRESSES test stdout, so a regression test's
     # `FACTORY::REALINFRA::<kind>` marker (and the testcontainers/ryuk container lifecycle logs) never
@@ -114,6 +158,7 @@ case "$cmd" in
     exit $code
     ;;
   suite)
+    _guard_worktree_path "$target" "target"
     echo "FACTORY::TEST::SUITE::START $target"
     out=$(dotnet test "$target" --nologo 2>&1)
     code=$?
@@ -130,6 +175,44 @@ case "$cmd" in
     echo "FACTORY::SUMMARY::suite exit=$code failed=${sf:--1} passed=${sp:--1} skipped=${ss:--1}"
     exit $code
     ;;
+  efmigration)
+    # KI-E185 (ported from a host-mount session): EF Core pending-model-change detector. Unlike every
+    # sibling lint dispatched above (leftovers/comments/ledger-anchor/rootcause) or below
+    # (claims/countclaims), this is NOT a text/AST-shape diff scan — "does the persisted model match
+    # the migration history" is a question only the real EF tooling can answer, which is exactly why
+    # 5 independent gate/review roles on the origin host each had to run this SAME command by hand to
+    # catch a persisted-entity schema change shipping with no migration and a stale ModelSnapshot.
+    # $target = the API (startup) project's DIRECTORY (dotnet ef resolves the startup project from
+    # cwd); $filter = the --project path to the *.Persistence project, relative to $target.
+    #   usage: build-test.sh efmigration <worktree-path-to-Service.Api-dir> <../Service.Persistence>
+    _guard_worktree_path "$target" "target"
+    if [ -z "$filter" ]; then echo "usage: build-test.sh efmigration <api-project-dir> <persistence-project-relative-path>" >&2; exit 64; fi
+    echo "FACTORY::EFMIGRATION::START $target :: $filter"
+    out=$(cd "$target" 2>/dev/null && dotnet ef migrations has-pending-model-changes --project "$filter" 2>&1)
+    code=$?
+    printf '%s\n' "$out" | tail -20
+    # Exit 1 is ALSO what this command returns on an unrelated build failure (it builds the project
+    # first) — only the specific "pending changes" message is a genuine dirty verdict; any other
+    # non-zero exit is inconclusive (fail-open, same posture as every pre-band probe here), not a
+    # false CRITICAL. A clean run is exit 0 with no such message.
+    # KI-E185 (ported from a host-mount session, folding in a same-session self-correction there): the
+    # CLEAN message is "No changes have been made to the model since the last migration." — an
+    # UNANCHORED substring grep for "Changes have been made to the model" matches that too (it is a
+    # literal substring of the clean message), which on the origin host reported verdict=dirty
+    # unconditionally regardless of actual EF state until caught by a live gate re-check. Anchored to
+    # line-start here from the start: only the dirty message ("Changes have been made...") begins the
+    # line; the clean message begins with "No ".
+    if printf '%s\n' "$out" | grep -qi '^Changes have been made to the model'; then
+      verdict=dirty
+    elif [ "$code" -eq 0 ]; then
+      verdict=clean
+    else
+      verdict=inconclusive
+    fi
+    echo "FACTORY::EFMIGRATION::RESULT verdict=$verdict exit=$code"
+    echo "FACTORY::SUMMARY::efmigration exit=$code verdict=$verdict"  # KI-E19 evidence manifest
+    exit $code
+    ;;
   claims)
     # KI-E11 (2026-07-19): deterministic phantom-path linter for doc claims, run EARLY (fix/editorial/
     # verify time) — same lib the driver's fold-time F2 WARN uses (single source of truth). Emits
@@ -139,6 +222,18 @@ case "$cmd" in
     if [ -z "$wt" ]; then echo "usage: build-test.sh claims <worktree>" >&2; exit 64; fi
     SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
     node "$SCRIPT_DIR/../_workflow/claims-lint.mjs" "$wt"
+    exit $?
+    ;;
+  countclaims)
+    # KI-E182 (2026-09-18): deterministic stale/invented test-count-claim linter, run EARLY (fix/
+    # editorial/verify time) or during a manual recovery — same lib a future fold-time check would
+    # use (single source of truth). Emits FACTORY::COUNTCLAIMS-MISS::<claim> per unevidenced "N/M
+    # passed" claim + FACTORY::COUNTCLAIMS::<count>; exit 1 when count>0.
+    #   usage: build-test.sh countclaims <worktree-path> <item-artifacts-dir>
+    wt="$target"; itemdir="$filter"
+    if [ -z "$wt" ]; then echo "usage: build-test.sh countclaims <worktree> <item-artifacts-dir>" >&2; exit 64; fi
+    SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
+    node "$SCRIPT_DIR/../_workflow/countclaims-lint.mjs" "$wt" "$itemdir"
     exit $?
     ;;
   pack)
@@ -175,7 +270,7 @@ case "$cmd" in
     exit 0
     ;;
   *)
-    echo "usage: build-test.sh build|red|filter|suite|claims|leftovers|comments|ledger-anchor|rootcause|pack <target> [filter|outfile]" >&2
+    echo "usage: build-test.sh build|red|filter|suite|efmigration|claims|countclaims|leftovers|comments|ledger-anchor|rootcause|pack <target> [filter|outfile]" >&2
     exit 64
     ;;
 esac

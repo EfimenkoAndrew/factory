@@ -93,7 +93,16 @@ export function stageForArtifact(name) {
 // stray RESULT.md claiming "false positive — already fixed, no action taken" from dead run #1 was
 // read mid-run #2; two gates burned findings on the debris). Pure classification over FILE names —
 // the driver owns directory filtering and the actual move (`resume --quarantine`).
-export const CONTROL_ARTIFACTS = ['feedback.md', 'last-failure.md', 'main-snapshot.json', 'review-pack.md', 'baseline-raw.txt'];
+// KI-E137/KI-E140 (ported from a host-mount session): progress.json (incremental mid-pipeline
+// checkpoints) and launch-meta.json (recorded {taskId, runId} for the KI-E140 task-liveness reminder)
+// are control files a LIVE attempt still needs — caught live on the origin host: the very first
+// `resume` run after launch-meta.json existed flagged it as non-canonical debris, meaning the
+// documented `resume --quarantine` step would have swept away the ONE file the KI-E140 reminder
+// exists to surface, and a stale progress.json missing this entry would equally have silently broken
+// KI-E137's diagnostics and KI-E139's gate-band reuse the next time a real relaunch ran quarantine
+// first. progress.json's own omission here was a gap in this repo's own KI-E137 port, not caught
+// until KI-E140 (this same commit) needed launch-meta.json added alongside it — both close together.
+export const CONTROL_ARTIFACTS = ['feedback.md', 'last-failure.md', 'main-snapshot.json', 'review-pack.md', 'baseline-raw.txt', 'progress.json', 'launch-meta.json'];
 export function nonCanonicalArtifacts(names) {
   return (names || []).filter((n) => !stageForArtifact(n) && !CONTROL_ARTIFACTS.includes(n));
 }
@@ -469,4 +478,23 @@ export function renderTelemetryReport(agg, meta = {}) {
     '_The share of the factory\'s work that reached a CLOSED item. Call counts are the only per-item cost unit that is real and measured — KI-E66 established that per-item TOKEN counts are structurally unavailable inside the Workflow runtime (`budget` exposes a whole-run counter only, and a direct empirical test confirmed an `agent()` call\'s own cost is not recoverable from outside the sandbox). So this is a call-weighted proxy: directional, never a bill. It is the one number that makes a cost argument settleable — an optimisation that lowers total calls but lowers the CLOSED share is not a saving._', '',
     renderCallsByOutcome(agg.callsByOutcome), '',
   ].join('\n');
+}
+
+// KI-E176 (ported from a host-mount session) — durable, human-readable log of every CONTINUED run:
+// a Workflow the controller stopped mid-flight (a deliberate pause, a crash, a laptop sleep) and
+// relaunched into the SAME claim/worktree (the `resume` + relaunch shape KI-E140 already prints),
+// as opposed to an independent fresh attempt from a new `group` claim. `cmdMarkLaunched --continued`
+// emits the `run_continued` source-of-truth event (AD-3: one append-only stream, this report is a
+// derived view); this function renders that history. Pure — takes the already-read event array,
+// never reads the stream itself, so it is directly unit-testable without a telemetry file on disk.
+export function continuedRunsMd(events) {
+  const rows = (events || []).filter((e) => e && e.event === 'run_continued');
+  const lines = ['# Continued runs', '', 'Every run stopped mid-flight and relaunched into the SAME claim/worktree (`resume` + relaunch, KI-E140/KI-E176) — never a fresh `group` claim.', ''];
+  if (!rows.length) { lines.push('_None yet._'); return lines.join('\n') + '\n'; }
+  lines.push('| Item | Cycle | Stopped (task / run) | Relaunched (task / run) | Logged at |', '|---|---|---|---|---|');
+  for (const e of rows) {
+    const a = e.attrs || {};
+    lines.push(`| ${e.item || ''} | ${e.cycle ?? ''} | ${a.previousTaskId || '?'} / ${a.previousRunId || '?'} | ${a.newTaskId || '?'} / ${a.newRunId || '?'} | ${e.ts || ''} |`);
+  }
+  return lines.join('\n') + '\n';
 }

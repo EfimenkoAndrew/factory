@@ -231,6 +231,13 @@ function planNext(progress) {
   if (phase === 'plan') {
     return agentStep(progress, 'plan', [{ role: 'planner', phaseLabel: 'Plan', schema: 'PLAN_SCHEMA', extra: null }]);
   }
+  // KI-E134 — PLAN-DRIFT PREVENTION at the source (ported from factory.js; this runtime has no
+  // KI-E69 plan-reuse concept, so every plan call here is inherently "fresh" — no extra guard
+  // needed). Routed into by applyPhaseResults' 'plan' case, ONLY when the plan's own approach/
+  // blastRadius used commitment language but steps came back missing/under-decomposed.
+  if (phase === 'plan-steps-nudge') {
+    return agentStep(progress, 'plan-steps-nudge', [{ role: 'planner', phaseLabel: 'Plan', schema: 'PLAN_STEPS_NUDGE_SCHEMA', extra: 'Your own approach/blastRadius above uses commitment language ("MUST" / "required to") describing substantive, checkable work, but you did not decompose it into `steps` (brief point 6) — or decomposed fewer than 2. Re-read that point now. Return ONLY: `steps` — 2-8 ordered, individually checkable one-sentence steps covering the commitments your own approach/blastRadius text just made; leave it empty ONLY if the work is genuinely one atomic edit despite the commitment wording. `note` (required either way) — if steps is non-empty, one sentence is fine; if empty, EXPLICITLY justify why the commitment language does not actually decompose (do not just restate the approach).' }]);
+  }
   if (phase === 'test') {
     const reFixNote = progress.reFix ? ' RE-FIX: read the prior feedback (state/items/' + progress.id + '/gate-*.md + review-*.md) and write the red proof for what is STILL broken.' : '';
     // Parity: factory.js redHint's FULL-SUITE BASELINE clause (KI-E43) — the Docker-less environmental
@@ -530,6 +537,26 @@ function applyPhaseResults(progress) {
     // self-reported `files` overwrite it means the port graded the diff against the planner's own
     // opinion of scope rather than the work item's, which is exactly the self-certification P9 exists
     // to prevent. plan.files stays informational (it is written into plan.md above).
+    // KI-E134 — PLAN-DRIFT PREVENTION at the source (ported from factory.js). A plan whose OWN
+    // approach/blastRadius uses commitment language ("MUST"/"required to") describes substantive,
+    // checkable work — but if `steps` is missing/under-decomposed, that work never gets machine-
+    // checked against the diff (PROSE mode's hasPlanCommitmentLanguage prefilter is a coarser
+    // keyword heuristic than STEP mode's per-step evidence check). Route to ONE cheap bounded
+    // follow-up instead of advancing straight to 'test'; skipped entirely for the common case (no
+    // commitment language, or steps already present) — zero extra cost there.
+    if (normalizePlanSteps(plan.steps).length < 2 && hasPlanCommitmentLanguage((plan.approach || '') + ' ' + (plan.blastRadius || ''))) {
+      progress.phase = 'plan-steps-nudge';
+      return;
+    }
+    progress.phase = 'test';
+    return;
+  }
+  if (phaseKey === 'plan-steps-nudge') {
+    const nudge = recv['planner'];
+    if (nudge && Array.isArray(nudge.steps) && normalizePlanSteps(nudge.steps).length >= 2) {
+      progress.plan = Object.assign({}, progress.plan, { steps: nudge.steps });
+      writeArtifact(progress, 'plan', 'plan.md', '# Plan\n\n' + JSON.stringify(progress.plan, null, 2) + '\n\n## Steps nudge (KI-E134)\n\n' + (nudge.note || ''));
+    }
     progress.phase = 'test';
     return;
   }

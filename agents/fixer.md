@@ -40,10 +40,30 @@ opus-high, xhigh for the gnarliest (critical money/security/concurrency).
    not a product-scope violation. When NO such block is present, schema changes follow the host's
    normal engineering rules (e.g. CLI-generated EF migrations per its service-design conventions)
    and are in bounds when the finding genuinely requires one.
+   **Self-check before finishing (KI-E185, ported from a host-mount session):** if your diff touches
+   ANY entity/domain-model or EF configuration file (a class under `{Service}.Core/Domain/**` or an
+   `IEntityTypeConfiguration<T>` under `{Service}.Persistence/**`), run, from
+   `{Service}/src/{Service}.Api`: `dotnet ef migrations has-pending-model-changes --project
+   ../{Service}.Persistence` — a "Changes have been made to the model" result means you changed a
+   PERSISTED shape without adding the migration, and `dotnet ef migrations add <Name> --project
+   ../{Service}.Persistence` is not optional cleanup, it is part of making the fix real. A green
+   in-memory-provider test suite proves nothing here — the in-memory provider has no schema to
+   diverge from. This is not hypothetical: a live incident on the origin host shipped a
+   persisted-entity rewrite this way and 5 independent gate/review roles each caught it by running
+   this exact command by hand.
 6. **Divergence → ledger.** If the fix deviates from an established pattern, update the rule +
-   add a `STANDARDS-LEDGER.md` entry + tag the site in the SAME change
+   add a `STANDARDS-DIVERGENCE-LEDGER.md` entry + tag the site in the SAME change
    (`standards-evolution.md`). When the `HOST POLICY — NO NEW COMMENTS` block is active, the
    call-site tag (itself a comment) is waived — record the divergence in the ledger entry alone.
+   **Do NOT read this file in full to do so (KI-E183)** — it is append-only and can run to
+   thousands of lines; `tail -150 _bmad-output/tech-debt/STANDARDS-DIVERGENCE-LEDGER.md` (or
+   `grep -n "^### "` for the last few anchors) is enough to find the insertion point and check
+   the nearest anchors for a naming collision — a full read buys nothing a reviewer's own anchor
+   scan doesn't already re-verify. Live incident (ported from a host-mount session, EGS-4-4): a
+   fixer step's own `filesChanged` bundled this ledger alongside several other 900+-line docs and
+   thrashed Claude Code's own autocompact (context refilled to the limit within 3 turns of a
+   compact, 3 times in a row) before the item ever reached a gate, with nothing here bounding how
+   much of the ledger a single entry actually requires reading.
 7. Leave **no** `TODO/FIXME/HACK/XXX/"for now"` and no stub. Update the relevant
    `doc/data-flows/{Service}.md` if you changed an endpoint/consumer/event/job (`dataflow.md`
    doc-sync contract). **DOC-CLAIM SELF-CHECK (KI-E11):** if you added/edited any `.md` prose,
@@ -57,6 +77,14 @@ opus-high, xhigh for the gnarliest (critical money/security/concurrency).
    claims — a wrong count in your own additions is the #1 recent rejection class
    ("fix-introduced defects", cycle 47 3/4: an epic-count claim the tree grep-disproved; a
    false cross-reference clause contradicting the adjacent row). Verify, don't recall.
+   **For a "N/M passed" TEST-COUNT claim specifically, this is now mechanically checked
+   (KI-E182):** run `verify/build-test.sh countclaims <worktree> <item-artifacts-dir>` near the
+   end if your diff quotes one — every `FACTORY::COUNTCLAIMS-MISS` line is a count no test run in
+   this item's OWN `verify-raw.txt`/`integrate-raw.txt` evidence actually produced (typically a
+   count left stale after a LATER step added/removed a test). Fix the prose (re-derive from a
+   fresh suite run) until it reports `FACTORY::COUNTCLAIMS::0`. Live incident: EGS-4-3's recovery
+   corrected a stale contract-test claim, added one new test, and left the OLD overall suite count
+   standing in 3 other places — caught only by a full extra gate-developer round, not for free.
    **NO-INVENTION SELF-CHECK (KI-E95):** every factual claim you write or edit in prose — a
    config key name, a default value, a described behavior, a class/method/file name — MUST be
    traceable to an actual grep/read of the real source in THIS worktree, not recalled from a
@@ -92,6 +120,17 @@ opus-high, xhigh for the gnarliest (critical money/security/concurrency).
    need to touch.
 8. Build the touched project to catch obvious breaks before handing off (the independent runner
    re-verifies). Do NOT self-certify the suite — that is the runner's + gates' job.
+   **NEVER drop a build/test transcript, scratch file, or diagnostic output inside the WORKTREE**
+   (ported from a host-mount session) — redirect/tee any self-check command's output into your
+   ARTIFACTS DIR (e.g. `> <ARTIFACTS DIR>/fixer-build-check.txt`), never a bare `> verify-build.txt`
+   in the worktree's own directory. This mirrors `agents/runner.md`'s own DEBRIS-GUARD, which has
+   this instruction and you did not: a stray transcript file the runner never created is exactly the
+   "genuine junk" its debris check exists to catch, and it is a deterministic FAIL at fold regardless
+   of which role left it there. Live incident on the origin host: this role's own self-verification
+   left build-transcript files sitting in the worktree cwd, with multiple independent reviewers all
+   attributing the debris to the fixer, none to the runner, triggering a deterministic FAILED
+   override that `runner.md`'s hardened discipline exists to prevent — for a role that, until now,
+   had no equivalent instruction at all (KI-E157).
 9. **RE-FIX (a prior attempt FAILED review).** If the prompt says RE-FIX, the prior fix is ALREADY in this
    worktree but was rejected. READ every `state/items/{id}/gate-*.md` + `review-*.md` carrying a
    CHANGES_REQUIRED verdict and address EVERY finding — the prior fix was PARTIAL/wrong, so COMPLETE or
@@ -116,11 +155,60 @@ opus-high, xhigh for the gnarliest (critical money/security/concurrency).
     Live incident (ported from a host-mount session): a fixer accepted a `CancellationToken` but
     never forwarded it at multiple call sites — and the SAME gap, at the SAME call sites, survived
     unfixed from one review round into the next.
+12. **PLAN-EXCLUSION ADHERENCE (KI-E156, ported from a host-mount session).** Your plan (`plan.md`)
+    may explicitly say a certain kind of change is NOT needed ("no `<X>` edits needed", "`<Y>` is
+    unchanged", "do NOT touch `<Z>`") — these are just as binding as its positive commitments (the
+    "Deviating from the plan" section below covers the OPPOSITE direction: skipping something the
+    plan said TO do). Before finishing, re-read every negative/exclusion statement in plan.md's
+    approach/blastRadius/steps text and confirm your diff genuinely honors each one. If it does not,
+    either revert the unneeded change (the fastest fix — the plan already told you it wasn't
+    required) or, if you have since learned it genuinely IS required, declare it via `deviations`
+    like any other plan departure. Live incident on the origin host: a plan stated a certain
+    ProjectReference edit was not needed because an existing shared dependency already gave
+    transitive compile visibility; the shipped diff added exactly that unneeded reference anyway,
+    breaking a pre-existing architecture-fitness test for a change the plan had already ruled out.
+13. **`filesChanged` MEANS "I EDITED THIS" — NOTHING ELSE (KI-E181, ported from a host-mount
+    session; adapted).** List a path ONLY if you created or modified it via a tool call as part of
+    THIS fix. Do NOT include a file merely because you read it, verified it still compiles, relied
+    on its content, or confirmed a test in it still passes — including the test-author's own red
+    test, which is already correct and does not need to be re-listed just because you looked at it.
+    A fix that made no edit to a file it merely consulted returns that file OUT of `filesChanged`,
+    never in it — the field records what you changed, not what you found relevant. This is not
+    cosmetic here: `filesChanged` feeds the KI-E180 cross-service verify-scope check above, which
+    derives which services your fix touched purely from this list — an inflated claim can fabricate
+    a false extra service and fail an otherwise-correct item, and an incomplete claim can hide a
+    real touched service from that same check. Live incident on the origin host (EGS-4-3,
+    2026-09-17): a STEPWISE fixer step there genuinely edited one file but also re-listed the
+    test-author's already-correct red-test file, untouched since long before that step ran, simply
+    because its own summary described that file's content; the origin's per-step phantom-manifest
+    check caught the false claim, but because its retry prompt at the time offered only "your edit
+    silently failed to persist" as an explanation, the retry reproduced the identical two-file claim
+    byte-for-byte and the item failed for nothing recoverable. **This repo has no per-step
+    phantom-manifest check to attach that retry-prompt fix to** (this fixer runs as one monolithic
+    call, not the origin's stepwise per-step loop — see the KI-E153/155/165/173/174/178 entry in
+    `KNOWN-ISSUES.md`), so only this PREVENTION half of the origin's two-part fix applies here.
 
 ### Constraints
 - All edits inside the WORKTREE. NEVER run git commit/add/checkout/restore/stash/reset/clean.
 
+### Deviating from the plan (KI-E142B)
+This item's plan (`plan.md`) made specific commitments (its `approach`/`blastRadius` text, or its
+`steps` list). A pre-band probe checks the diff against every one of them. If you deliberately do
+NOT carry out a commitment — you found it unnecessary, already satisfied a different way, superseded
+by a better approach, or based on a premise the plan got wrong — do NOT silently drop it and do NOT
+just describe it in prose in `summary`. Declare it explicitly in `deviations`: one entry per
+commitment you are knowingly not honoring as written, `{commitment, reason}` — quote the commitment,
+then give the concrete reason (cite the file:line or behavior that makes it unnecessary/already-true/
+superseded). An independent adjudicator reads this before the item is failed for the gap — a
+DECLARED, well-reasoned deviation gets judged on the merits; a SILENT gap does not get that chance and
+fails automatically. Never use `deviations` to paper over a commitment you simply didn't get to —
+that is an incomplete fix, not a deviation, and declaring it will not save it from adjudication.
+This is a distinct concept from `divergence` above: `divergence` is about departing from the TARGET
+CODEBASE's own standards-evolution.md conventions; `deviations` is about departing from THIS ITEM'S
+OWN plan.
+
 ### Write + return
 - WRITE `state/items/{id}/fix.json` (files changed, one-line rationale each, any ledger entry).
 - RETURN: `applied` (bool), `filesChanged` (paths), `summary`, `scopeStop` (bool),
-  `divergence` (null or {rule, ledgerAnchor}), `note`.
+  `divergence` (null or {rule, ledgerAnchor}), `deviations` (array of {commitment, reason}, only for
+  plan commitments you knowingly did not honor as written), `note`.

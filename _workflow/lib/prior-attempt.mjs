@@ -57,14 +57,39 @@ function readJsonSafe(p) {
 // Pure-ish (one fs read pass, no writes): given an item's state/items/<id>/ dir and its CURRENT
 // claim timestamp (ms since epoch — artifacts older than this are a stale prior attempt, never
 // reused), return { plan, test, fix }, each either the reused object or null. Never throws.
-export function loadPriorAttempt(itemDir, sinceMs) {
+// `isReFix` — see KI-E158(i) below.
+export function loadPriorAttempt(itemDir, sinceMs, isReFix) {
   const out = { plan: null, test: null, fix: null };
+  // KI-E158(i) (ported from a host-mount session) — a killed-run recovery and a REJECTED-attempt
+  // re-fix are NOT the same situation, but this function used to treat them identically. `isReFix`
+  // is the caller's reFix flag (a real, completed review verdict REJECTED the last attempt) — reusing
+  // test.json/fix.json in that case resurrects the EXACT artifacts review just rejected, verbatim,
+  // and skips the fixer/test-author call entirely, so the rejection's feedback never reaches any
+  // agent. Reuse is unconditionally disabled for a reFix item — the fixer/test-author MUST run fresh,
+  // with feedback.md in hand, so the rejection has an actual chance of being corrected instead of
+  // replayed. Plan reuse needs no separate carve-out: it falls out disabled too, via the existing
+  // `out.test && planPath` gate below.
+  if (isReFix) return out;
   try {
-    const testPath = freshFile(itemDir, 'test.json', sinceMs);
+    // KI-E158(ii) (ported from a host-mount session) — a REPLAN (a fresh plan.md written after
+    // test.json/fix.json already exist) supersedes whatever test/fix were authored against the OLDER
+    // plan; a test/fix predating the current plan.md can describe an approach the plan no longer
+    // takes. A plan.md strictly newer than test.json/fix.json is a cheap, unambiguous, mechanical
+    // signal that the design underneath them changed since they were written.
+    let planMs = null;
+    try { planMs = statSync(join(itemDir, 'plan.md')).mtimeMs; } catch { /* no plan.md yet -> no fence */ }
+    const predatesReplan = (name) => {
+      if (planMs === null) return false;
+      try { return statSync(join(itemDir, name)).mtimeMs < planMs; } catch { return false; }
+    };
+    const testPredatesReplan = predatesReplan('test.json');
+    const fixPredatesReplan = predatesReplan('fix.json');
+
+    const testPath = testPredatesReplan ? null : freshFile(itemDir, 'test.json', sinceMs);
     const test = testPath ? readJsonSafe(testPath) : null;
     if (test && typeof test === 'object') out.test = test;
 
-    const fixPath = freshFile(itemDir, 'fix.json', sinceMs);
+    const fixPath = fixPredatesReplan ? null : freshFile(itemDir, 'fix.json', sinceMs);
     const fix = fixPath ? readJsonSafe(fixPath) : null;
     if (fix && typeof fix === 'object') out.fix = fix;
 

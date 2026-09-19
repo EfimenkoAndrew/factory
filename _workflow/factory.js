@@ -1,6 +1,6 @@
 export const meta = {
   name: 'impl-factory',
-  description: 'AI Implementation Factory control plane. Receives a batch of READY work items (audit findings / stories) + agent templates + per-item model routing via args (emitted by driver.mjs select), then drives each item through the implement-and-auto-evaluate lifecycle: (plan) -> test-author(red) -> fixer -> verify(build+test) -> RED-proof marker probe (disk-authoritative FACTORY::RED:: re-check, pre-band, KI-E83) -> early edge-scan (pre-band edge-case hunt + one bounded amend, every code item) -> acceptance-scan (pre-band clause-coverage probe + one bounded amend, KI-E18) -> plan-commitment scan (pre-band plan-vs-diff self-consistency probe + one bounded amend, KI-E87; STEP mode probes the planner\'s own steps[] one-by-one when present, PROSE mode falls back to the commitment-language prefilter, KI-E101) -> cheap haiku leftover-scan (pre-band deferral/tech-debt lint, KI-D12) -> comment-scan (host-policy-gated zero-new-comments lint, KI-E59) -> ledger-anchor scan (duplicate/contradictory standards-ledger anchors, KI-E91) -> root-cause touch probe (pre-band P9: the diff must change a non-test file, KI-E104) -> the review stage (5 role gates + applicable BMAD review-named flows: code/adversarial/testreview + editorial) as separate adversarial subagents -> refuter -> scoped re-audit -> integrate. Worktree-isolated, model-routed, low-concurrency under throttle. Each agent writes its artifact to disk; the factory returns compact per-item results (a transition path) the driver folds into the ledger (single writer, resumable). NEVER runs mutating git — fixes stay on a factory/<id> branch in a worktree for the human to commit.',
+  description: 'AI Implementation Factory control plane. Receives a batch of READY work items (audit findings / stories) + agent templates + per-item model routing via args (emitted by driver.mjs select), then drives each item through the implement-and-auto-evaluate lifecycle: (plan) -> plan-review (pre-implementation multi-lens plan critique: mechanical feasibility [incl. verifying specific code-level claims a step makes, not just that a file exists, KI-E143A] + LLM quality/edge-case/cross-service-blast-radius, one bounded revision, KI-E142A) -> test-author(red) -> fixer -> verify(build+test; a graph-flagged needsRealInfra item with no real-container marker but a test-author-DECLARED, reasoned override goes to independent adjudication rather than an automatic fail, KI-E143C) -> RED-proof marker probe (disk-authoritative FACTORY::RED:: re-check, pre-band, KI-E83) -> early edge-scan (pre-band edge-case hunt + one bounded amend, every code item) -> acceptance-scan (pre-band clause-coverage probe + one bounded amend, KI-E18) -> plan-commitment scan (pre-band plan-vs-diff self-consistency probe + one bounded amend, KI-E87; STEP mode probes the planner\'s own steps[] one-by-one when present, PROSE mode falls back to the commitment-language prefilter, KI-E101; an unhonored commitment the fixer DECLARES as a deliberate deviation goes to independent adjudication rather than an automatic fail, KI-E142B) -> cheap haiku leftover-scan (pre-band deferral/tech-debt lint, KI-D12) -> comment-scan (host-policy-gated zero-new-comments lint, KI-E59) -> ledger-anchor scan (duplicate/contradictory standards-ledger anchors, KI-E91) -> root-cause touch probe (pre-band P9: the diff must change a non-test file, KI-E104) -> the review stage (5 role gates + applicable BMAD review-named flows: code/adversarial/testreview + editorial) as separate adversarial subagents -> refuter -> scoped re-audit -> integrate. Worktree-isolated, model-routed, low-concurrency under throttle. Each agent writes its artifact to disk; 4 incremental progress checkpoints (post-verify/post-preband/post-gates/post-reaudit, KI-E137) survive a mid-pipeline kill so a resumed item does not lose already-paid-for stages; the factory returns compact per-item results (a transition path) the driver folds into the ledger (single writer, resumable). NEVER runs mutating git — fixes stay on a factory/<id> branch in a worktree for the human to commit.',
   phases: [
     { title: 'Plan' }, { title: 'Test' }, { title: 'Fix' }, { title: 'Verify' },
     { title: 'EdgeScan' }, // KI-E12: the edge-case hunter runs EARLY (pre-band) for every code item; findings feed one bounded amend
@@ -25,6 +25,34 @@ const REPO = A.repoRoot || '.'
 const CONC = A.concurrency || 2
 const ATTEMPTS = A.attempts || 3
 const DRY = !!A.dryRun
+// KI-E150 (ported from a host-mount session) — precise per-item token attribution. budget.spent()
+// is a SHARED, run-wide counter with no per-call breakdown exposed to this sandbox — the only token
+// signal the Workflow runtime gives a script at all. Under concurrent items (CONC above), a naive
+// snapshot-before/snapshot-after around one item's whole lifecycle would double-count (or steal)
+// tokens a DIFFERENT item spent during the same wall-clock window. lastSpentGlobal is the shared
+// "last claimed" checkpoint: every successful agent() completion, in call()'s recordTokens() below,
+// reads budget.spent(), computes the delta since this checkpoint, and updates the checkpoint — all
+// synchronously, with no `await` between the read and the write, so no other item's completion can
+// interleave inside that atomic step (JS resolves one microtask fully before the next runs). Correct
+// under real concurrency for that reason alone; it does NOT require items to run sequentially.
+let lastSpentGlobal = (typeof budget !== 'undefined' && budget && typeof budget.spent === 'function') ? budget.spent() : 0
+
+// KI-E150 — the checkpoint writers (checkpointProgress/checkpointResult below, KI-E137/KI-L40) are
+// pure machine bookkeeping overhead, deliberately excluded from any item's tokensUsed — same posture
+// as sweep mode's separately-tracked cost. But they DO spend real tokens (a haiku agent call each),
+// and if their tryAgent call never claims via the lastSpentGlobal checkpoint, that unclaimed delta
+// doesn't vanish — it sits there until whichever item's NEXT recordTokens() call happens to run,
+// which then wrongly inherits it (silently inflating a DIFFERENT item's tokensUsed while the item
+// that actually triggered the checkpoint write looks correspondingly short). claimTokensSilently is
+// the "consume but don't attribute" counterpart to runItem's recordTokens: it advances the shared
+// checkpoint exactly like a real claim (same atomic no-await read-then-write), so the ledger of
+// "what's been claimed" stays accurate, but it deliberately drops the delta on the floor instead of
+// adding it to any res.tokensUsed — keeping checkpoint overhead invisible to per-item totals AND
+// preventing it from contaminating whichever item claims next.
+function claimTokensSilently() {
+  if (typeof budget === 'undefined' || !budget || typeof budget.spent !== 'function') return
+  lastSpentGlobal = budget.spent()
+}
 
 // ---- inlined pure helpers (byte-equivalent to _workflow/lib/pool.mjs — the runtime cannot import) ----
 function makeLimiter(max) {
@@ -95,17 +123,23 @@ const FINDING = { type: 'object', additionalProperties: false, required: ['sever
 // prior-attempt plan authored before this field existed, both fall through to the original KI-E87
 // PROSE mode unchanged — the silent-no-op posture buildDocMap/solutionFor/precedent already use.
 const PLAN_SCHEMA = { type: 'object', additionalProperties: false, required: ['rootCause', 'approach', 'recommendScopeStop', 'recommendEscalate'], properties: { rootCause: { type: 'string' }, approach: { type: 'string' }, steps: { type: 'array', items: { type: 'string' } }, files: { type: 'array', items: { type: 'string' } }, testStrategy: { type: 'string' }, blastRadius: { type: 'string' }, ruleRisks: { type: 'string' }, recommendEscalate: { type: 'boolean' }, recommendScopeStop: { type: 'boolean' } } }
+// KI-E134 — the narrow follow-up ask fired when a fresh plan's own approach/blastRadius carries
+// commitment language ("MUST"/"required to") but `steps` came back missing/under-decomposed: a
+// SINGLE cheap bounded call (never a second full plan), same shape as the "one bounded amend"
+// pattern used everywhere else in this pipeline. `note` is required so a planner that maintains the
+// omission is genuinely atomic must say so explicitly, not just return an empty array silently.
+const PLAN_STEPS_NUDGE_SCHEMA = { type: 'object', additionalProperties: false, required: ['steps', 'note'], properties: { steps: { type: 'array', items: { type: 'string' } }, note: { type: 'string' } } }
 // KI-L37: verificationOnly (reFix only) — the test-author attests every prior finding is already
 // addressed in the CURRENT tree (or explicitly out of scope) and no NEW red is possible; the item
 // skips the fixer and proceeds to verify + gates on the standing prior-round red proof.
-const TEST_SCHEMA = { type: 'object', additionalProperties: false, required: ['red', 'note'], properties: { red: { type: 'boolean' }, verificationOnly: { type: 'boolean' }, testFiles: { type: 'array', items: { type: 'string' } }, runCmd: { type: 'string' }, baselineFailures: { type: 'array', items: { type: 'string' } }, evidence: { type: 'string' }, note: { type: 'string' } } }
-const FIX_SCHEMA = { type: 'object', additionalProperties: false, required: ['applied', 'scopeStop', 'summary'], properties: { applied: { type: 'boolean' }, filesChanged: { type: 'array', items: { type: 'string' } }, summary: { type: 'string' }, scopeStop: { type: 'boolean' }, divergence: { type: ['string', 'null', 'object'] }, note: { type: 'string' } } } // KI-O2: widened string|null -> +object; agents/fixer.md's brief asks for "divergence (null or {rule, ledgerAnchor})", an object shape the schema never accepted (a real fixer response hit this live, 2026-07-28). Nothing downstream reads .divergence programmatically (grepped driver.mjs/lib/*.mjs/factory.js) -- purely informational for human fold review -- so the schema now matches what the brief actually asks for instead of silently rejecting a brief-conforming answer.
+const TEST_SCHEMA = { type: 'object', additionalProperties: false, required: ['red', 'note'], properties: { red: { type: 'boolean' }, verificationOnly: { type: 'boolean' }, testFiles: { type: 'array', items: { type: 'string' } }, runCmd: { type: 'string' }, baselineFailures: { type: 'array', items: { type: 'string' } }, evidence: { type: 'string' }, note: { type: 'string' }, realInfraOverride: { type: ['string', 'null'] } } } // KI-E143C (ported from a host-mount session): `realInfraOverride` is a REASONED, explicit claim that a graph-flagged needsRealInfra item does NOT actually need a real container for THIS specific defect (e.g. "pure exception-wrapping logic testable via Moq — the defect is not Postgres-provider-specific"). Distinct from just omitting the marker: an override without a reason is not adjudicated, only a stated one is (mirrors KI-E142B's deviations — silence never earns adjudication, an explanation does).
+const FIX_SCHEMA = { type: 'object', additionalProperties: false, required: ['applied', 'scopeStop', 'summary'], properties: { applied: { type: 'boolean' }, filesChanged: { type: 'array', items: { type: 'string' }, description: "ONLY files this fix itself created or modified via a tool call. Never include a file you merely read, referenced, relied on, or re-verified — including one the test-author's own red test already wrote correctly. A file you consulted but did not change stays OUT of this list; it feeds the KI-E180 cross-service verify-scope check (above), so an inflated or incomplete claim can misfire that check in either direction (KI-E181)." }, summary: { type: 'string' }, scopeStop: { type: 'boolean' }, divergence: { type: ['string', 'null', 'object'] }, note: { type: 'string' }, deviations: { type: 'array', items: { type: 'object', additionalProperties: false, required: ['commitment', 'reason'], properties: { commitment: { type: 'string' }, reason: { type: 'string' } } } } } } // KI-E181 (ported from a host-mount session): filesChanged.description above tells the model exactly what the field means, since it now feeds the KI-E180 cross-service check's svcDirs derivation and a bad claim (over- or under-inclusive) can misfire that check. KI-O2: widened string|null -> +object; agents/fixer.md's brief asks for "divergence (null or {rule, ledgerAnchor})", an object shape the schema never accepted (a real fixer response hit this live, 2026-07-28). Nothing downstream reads .divergence programmatically (grepped driver.mjs/lib/*.mjs/factory.js) -- purely informational for human fold review -- so the schema now matches what the brief actually asks for instead of silently rejecting a brief-conforming answer. KI-E142B (ported from a host-mount session): `deviations` is a DIFFERENT concept from `divergence` -- divergence is about departing from the TARGET CODEBASE's own standards-evolution.md conventions; deviations is about knowingly not honoring one of THIS ITEM'S OWN plan.md commitments (a step turned out unnecessary/wrong/already-satisfied/superseded). plan-commitment-scan reads this to route an unhonored commitment to an independent adjudicator instead of an automatic fail -- see the plan-commitment-scan block below.
 const STRARR = { type: 'array', items: { type: 'string' } }
 // KI-L28: build/targetedTest are VERDICTS — the lifecycle gate tests /^pass/i on the RETURNED field.
 // Two cycle-20 runners put the TEST NAME in targetedTest ("ServicesJsonServiceBMappingTests
 // (all 5 ... pass)") while writing the correct verdict to verify.json on disk → both GREEN fixes
 // false-failed pre-gates. The schema pattern makes the tool-call layer reject-and-retry instead.
-const VERIFY_SCHEMA = { type: 'object', additionalProperties: false, required: ['build', 'targetedTest', 'suite'], properties: { build: { type: 'string', pattern: '^(pass|fail)' }, targetedTest: { type: 'string', pattern: '^(pass|fail)' }, suite: { type: 'object', additionalProperties: true }, realInfraExercised: {}, realInfraKind: { type: 'string' }, dockerAbsent: { type: 'boolean' }, failingTests: STRARR, newFailures: STRARR, baselineFailures: STRARR, debris: STRARR, evidence: { type: 'string' }, note: { type: 'string' } } }
+const VERIFY_SCHEMA = { type: 'object', additionalProperties: false, required: ['build', 'targetedTest', 'suite'], properties: { build: { type: 'string', pattern: '^(pass|fail)' }, targetedTest: { type: 'string', pattern: '^(pass|fail)' }, suite: { type: 'object', additionalProperties: true }, realInfraExercised: {}, realInfraKind: { type: 'string' }, dockerAbsent: { type: 'boolean' }, failingTests: STRARR, newFailures: STRARR, baselineFailures: STRARR, debris: STRARR, evidence: { type: 'string' }, note: { type: 'string' } } } // KI-E145 (ported from a host-mount session): briefly carried mainDriftOwnFiles here (KI-E144B) as the runner's OWN closed boolean answer — an improvement on free-text regex-matching, but still a self-report. Now superseded: an INDEPENDENT probe (main-drift-probe, PROBE_SCHEMA below) re-derives the fact directly from the teed evidence file, matching this pipeline's own established posture (KI-E10/E83/E104) of never trusting an agent's claim about its own evidence. Removed from here rather than left as a dead field nothing reads.
 const GATE_SCHEMA = { type: 'object', additionalProperties: false, required: ['gate', 'verdict', 'headline'], properties: { gate: { type: 'string' }, verdict: { type: 'string', enum: ['APPROVED', 'CHANGES_REQUIRED'] }, findings: { type: 'array', items: FINDING }, scopeViolation: { type: 'boolean' }, acceptanceMet: { type: 'boolean' }, redGreenConfirmed: { type: 'boolean' }, headline: { type: 'string' } } }
 const REFUTE_SCHEMA = { type: 'object', additionalProperties: false, required: ['refuted', 'headline'], properties: { refuted: { type: 'boolean' }, severity: { type: 'string' }, attack: { type: 'string' }, reasons: { type: 'array', items: { type: 'string' } }, headline: { type: 'string' } } }
 const REAUDIT_SCHEMA = { type: 'object', additionalProperties: false, required: ['converged', 'findingGone', 'headline'], properties: { converged: { type: 'boolean' }, findingGone: { type: 'boolean' }, newFindings: { type: 'array', items: FINDING }, headline: { type: 'string' } } }
@@ -117,6 +151,10 @@ const ADJUDICATE_SCHEMA = { type: 'object', additionalProperties: false, require
 const DECISION_SCHEMA = { type: 'object', additionalProperties: false, required: ['decision', 'recommendation', 'headline'], properties: { decision: { type: 'string' }, options: { type: 'array', items: { type: 'object', additionalProperties: false, properties: { option: { type: 'string' }, consequence: { type: 'string' } } } }, recommendation: { type: 'string' }, headline: { type: 'string' } } }
 // Checkpoint-writer (KI-L40): persists a finished item's full result object to state/items/<id>/result.json.
 const CHECKPOINT_SCHEMA = { type: 'object', additionalProperties: false, required: ['written'], properties: { written: { type: 'boolean' }, note: { type: 'string' } } }
+// KI-E139 (ported from a host-mount session) — pack-hash probe: ONE disk-authoritative content hash
+// of review-pack.md, the fencing token gate-band reuse compares against a prior attempt's
+// progress.json (see checkpointProgress).
+const PACK_HASH_SCHEMA = { type: 'object', additionalProperties: false, required: ['hash'], properties: { hash: { type: 'string' } } }
 // Marker-probe (KI-E10): ONE disk-authoritative grep of verify-raw.txt for the FACTORY::REALINFRA:: marker.
 // KI-L44 made the runner's RETURNED realInfraExercised field non-fatal in-run (it diverged from disk once);
 // the probe reads the DISK (same file the fold greps) so a genuinely marker-less realInfra item fails fast
@@ -124,6 +162,17 @@ const CHECKPOINT_SCHEMA = { type: 'object', additionalProperties: false, require
 const PROBE_SCHEMA = { type: 'object', additionalProperties: false, required: ['markerFound'], properties: { markerFound: { type: 'boolean' }, line: { type: 'string' } } }
 // KI-E83 — RED-proof marker probe: same shape as PROBE_SCHEMA plus the parsed exit code.
 const RED_PROOF_SCHEMA = { type: 'object', additionalProperties: false, required: ['markerFound', 'exitCode'], properties: { markerFound: { type: 'boolean' }, exitCode: { type: 'number' }, line: { type: 'string' } } }
+// KI-E175 (ported from a host-mount session) — red-proof COVERAGE probe: KI-E83 proves a marker
+// exists somewhere in verify-red-raw.txt, but says nothing about WHICH test class that marker
+// belongs to. Live incident on the origin host: test-author's red-proof covered ONLY an inherited
+// convention test (a verificationOnly judgment); the plan separately mandated a NEW test file,
+// which the FIXER created afterward with no red-proof of its own -- and the final verify.json
+// targeted THAT unproven file, with an evidence string that falsely claimed a specific request
+// header was set. KI-E83's marker check was satisfied (a marker existed, from the OTHER file)
+// while the actually-shipped, actually-verified test class was never proven to fail on unfixed
+// code. This probe asks the same question cheaply, pre-band: does verify.json's targetedTestName
+// reference the SAME class(es) test.json's red-proof (testFiles/runCmd) actually covered?
+const RED_COVERAGE_SCHEMA = { type: 'object', additionalProperties: false, required: ['covered'], properties: { covered: { type: 'boolean' }, gap: { type: ['string', 'null'] } } }
 // KI-D12 — LeftoverScan probe: a haiku agent runs the deterministic `build-test.sh leftovers` linter,
 // then classifies each FACTORY::LEFTOVER-HIT candidate as a genuine fixer PUNT (incomplete work deferred —
 // execution-policy.md §4) vs LEGIT (UI placeholder attr, a test asserting the behaviour, a
@@ -141,7 +190,17 @@ const LEDGER_ANCHOR_SCHEMA = { type: 'object', additionalProperties: false, requ
 // full price). A haiku probe answers per deterministic clause "does the diff carry evidence?";
 // gaps feed ONE bounded fixer amend; a malformed/unavailable probe never sinks the item.
 const ACCEPT_SCHEMA = { type: 'object', additionalProperties: false, required: ['covered'], properties: { covered: { type: 'boolean' }, gaps: { type: 'array', items: { type: 'object', additionalProperties: false, required: ['clause', 'why'], properties: { clause: { type: 'string' }, why: { type: 'string' } } } } } }
+// KI-E179 (ported from a host-mount session) — cheap, zero-cost trigger for the breadth-claim
+// verification probe below: does this item's OWN acceptance text make an absolute,
+// universal-quantifier claim at all? Deliberately a plain string check (no agent call) so the
+// probe itself is gated to only the items where an under-scoped "prove completeness" test is
+// actually a live risk, not the majority of ordinary, bounded-scope items.
+const BREADTH_CLAIM_RE = /\b(every|all|no participating|no consumer|no handler|no site|across all|platform-?wide)\b/i
 const PLAN_COMMITMENT_SCHEMA = { type: 'object', additionalProperties: false, required: ['honored'], properties: { honored: { type: 'boolean' }, gaps: { type: 'array', items: { type: 'object', additionalProperties: false, required: ['commitment', 'why'], properties: { commitment: { type: 'string' }, why: { type: 'string' } } } } } }
+// KI-E169 (ported from a host-mount session) — shadow-mode consolidated-scan schema: three
+// INDEPENDENT booleans, no shared/aggregate field, so a schema-level short-circuit can never let one
+// axis's answer stand in for another's.
+const SHADOW_SCAN_SCHEMA = { type: 'object', additionalProperties: false, required: ['acceptanceCovered', 'planHonored', 'findingHonored'], properties: { acceptanceCovered: { type: 'boolean' }, planHonored: { type: 'boolean' }, findingHonored: { type: 'boolean' } } }
 // KI-E104 — root-cause touch probe: reports `verify/build-test.sh rootcause`'s markers verbatim (the
 // pre-band half of the fold's P9). No classify step — like KI-E59's comment probe, the linter has
 // already made the judgment; the agent is a relay. `skipped` distinguishes "the check could not run"
@@ -151,6 +210,11 @@ const PLAN_COMMITMENT_SCHEMA = { type: 'object', additionalProperties: false, re
 // with inverted polarity is a genuine footgun for any consumer keying off shape (the exec-smoke
 // harness sniffs exactly that way and did in fact mis-stub this probe into failing every lane).
 const ROOTCAUSE_SCHEMA = { type: 'object', additionalProperties: false, required: ['nonTestCount'], properties: { nonTestCount: { type: 'number' }, files: { type: 'array', items: { type: 'string' } }, skipped: { type: 'boolean' } } }
+// KI-E185 (ported from a host-mount session) — EfMigration probe: one entry per service actually
+// checked (a service in efMigrationServices whose check errored before printing the RESULT line is
+// simply omitted, not force-fit into this array — the JS-side loop below treats a missing entry the
+// same as SKIPPED, fail-open, same posture as every sibling probe here).
+const EFMIGRATION_SCHEMA = { type: 'object', additionalProperties: false, required: ['results'], properties: { results: { type: 'array', items: { type: 'object', additionalProperties: false, required: ['service', 'verdict'], properties: { service: { type: 'string' }, verdict: { type: 'string' } } } } } }
 // Sweep-designer: the canonical fix pattern for a whole root-cause cluster (designed once, applied N times).
 const SWEEP_DESIGN_SCHEMA = { type: 'object', additionalProperties: false, required: ['pattern', 'headline'], properties: { pattern: { type: 'string' }, applicationNotes: { type: 'string' }, conformanceCheck: { type: 'string' }, headline: { type: 'string' } } }
 
@@ -314,6 +378,41 @@ function bandFor(item) {
 const FDIR = REPO + '/' + String(TPLDIR || '_bmad-output/ai-factory/agents').replace(/\/agents\/?$/, '')
 function itemsDir(id) { return FDIR + '/state/items/' + id }
 
+// KI-E149 (ported from a host-mount session) — the two roles that actually mutate a worktree's
+// tracked SOURCE (fixer, test-author, and every bounded-amend call that reuses the 'fixer' role
+// literal from acceptance-scan/plan-commitment-scan/docsync-scan/registration-drift-scan/
+// leftover-scan/ledger-anchor-scan) are exactly the roles responsible for every main-tree-
+// contamination incident the origin host's factory has ever recorded. Every fix there so far was
+// DETECTION after the fact, because sandboxing what a subagent's own tool calls can reach was
+// believed to be outside what a prompt-level or driver.mjs-level change could close. The Agent/
+// Workflow tool's `isolation:'worktree'` option turns out to do exactly that at the TOOL layer —
+// see the KI-E149 KNOWN-ISSUES.md entry for the four live tests that established its exact,
+// narrower-than-hoped scope (Edit/Write to the shared checkout: blocked; Edit/Write to ANY OTHER
+// worktree of the same repo, incl. this item's own: unaffected; Read/Grep/ls anywhere: unaffected;
+// Bash-tool writes via tee/redirect/heredoc to ANY path: also unaffected — a real, disclosed gap,
+// not a false sense of completeness). `A.policies.isolateWorktreeWrites === false` is the escape
+// hatch for a host that hits a real problem with it; every other value (including unset) is ON.
+function needsWriteIsolation(role) {
+  return (role === 'fixer' || role === 'test-author') && !(A && A.policies && A.policies.isolateWorktreeWrites === false)
+}
+// KI-E170/E172 (ported from a host-mount session; the origin's stepwise-fixer call sites do not
+// exist in this repo, so this ports only to the two sites that DO: test-author and the single-shot
+// fixer) — a write that stays inside the agent's OWN isolation sandbox (KI-E149) is NOT rejected by
+// the tool; it succeeds silently in the wrong place, indistinguishable from a correct write until a
+// LATER stage discovers the claimed change is not where it should be. outOfTreePaths is a pure,
+// zero-cost string-prefix check: any ABSOLUTE claimed path not rooted at this item's own assigned
+// worktree is definitive proof of that exact mismatch. recoverOutOfTree gives the SAME call one
+// bounded retry with an explicit path-correction instruction before the item fails over it —
+// mirroring this codebase's own established "one bounded amend" idiom.
+function outOfTreePaths(paths, wtPath) {
+  return (paths || []).filter(function (p) { return typeof p === 'string' && p.startsWith('/') && !p.startsWith(wtPath) })
+}
+async function recoverOutOfTree(callFn, role, route, schema, wtPath, badPaths, fieldName, priorExtra, phaseName) {
+  return callFn(role, route, schema,
+    priorExtra + '\n\nPATH-CORRECTION RETRY (KI-E170/E172): your last response for this SAME call reported ' + fieldName + ' path(s) OUTSIDE your assigned worktree — ' + badPaths.slice(0, 8).join(', ') + '. This means your Edit/Write calls resolved against the WRONG base (almost certainly a bare relative path, resolved against your OWN isolated sandbox rather than your assigned worktree — see the FILE-WRITE ISOLATION note above). Redo the SAME work now — every instruction above is unchanged and still applies in full — but this time verify EVERY Edit/Write path argument starts with the EXACT string `' + wtPath + '` before you use it. Then report ' + fieldName + ' again, using only `' + wtPath + '`-rooted absolute paths.',
+    phaseName)
+}
+
 function compose(role, item, extra) {
   const wtPath = (item.worktree && item.worktree.path) || (WT && WT.path) || (item.ledger && item.ledger.worktree) || REPO  // per-item worktree (Phase-4 isolation) wins, then batch worktree (pilot)
   const lines = [
@@ -388,7 +487,12 @@ function compose(role, item, extra) {
   // sibling's work in ITS worktree (cycle-20: the ITEM-C-DEPLOY fixer re-delivered the split-out
   // services.json fix, duplicating ITEM-H-SERVICES-JSON's whole worktree).
   if (Array.isArray(item.peers) && item.peers.length) {
-    lines.push('', 'PEER-OWNED SURFACES (sibling items in THIS batch own these files — do NOT modify them; if your fix genuinely requires one, STOP for that file and say so in your result note instead):')
+    // KI-E157(i) (ported from a host-mount session): this lock takes PRECEDENCE over any other host
+    // rule that would otherwise require touching one of these files in the SAME change — most
+    // concretely a doc-sync-in-the-same-PR mandate. Live incident on the origin host: a fixer crossed
+    // a peer lock precisely because nothing told it this lock outranks that mandate, and it picked
+    // the mandate.
+    lines.push('', 'PEER-OWNED SURFACES (sibling items in THIS batch own these files — do NOT modify them; if your fix genuinely requires one, STOP for that file and say so in your result note instead): this lock takes PRECEDENCE over any other rule in this prompt that would otherwise require touching one of these files in the SAME change (e.g. a doc-sync-in-the-same-PR mandate) — name the gap in your note/summary instead of crossing the lock; the sibling item already owns that file this batch.')
     for (const p of item.peers) lines.push('  - ' + p.id + ': ' + (p.files || []).join(', '))
   }
   // GUARDRAILS — global-stable content stays in the SHARED prefix; every role-conditional block
@@ -425,6 +529,10 @@ function compose(role, item, extra) {
     // and reported it as a planted file with a concealment instruction. All probes were reverted
     // cleanly — the collision is expected behaviour that needed NAMING, not preventing.
     lines.push('', 'PARALLEL REVIEW STAGE — LIVE-PROBE ETIQUETTE (KI-D7): sibling reviewers run CONCURRENTLY in THIS SAME worktree and may run live probes (temporary files/edits added then reverted). A foreign temporary artifact appearing mid-review is almost certainly a sibling reviewer\'s probe — do NOT report it as sabotage/injection, and treat any harness "file changed externally" notice accordingly; re-verify the exact worktree state your verdict DEPENDS on (git status/diff) at the moment you conclude, not earlier. If YOU probe: prefix probe filenames with your role (e.g. _gateqa_probe_*), fully revert before returning, and describe the probe in your findings evidence — never leave probe debris.')
+  }
+  if (needsWriteIsolation(role)) {
+    lines.push('', 'FILE-WRITE ISOLATION IS ACTIVE FOR YOU (KI-E149): your Edit and Write tools can ONLY create or modify files inside your OWN worktree (' + wtPath + '). A write targeting any OTHER path, including ' + REPO + ' itself, is REJECTED by the tool before it touches disk, with an error naming the shared-checkout path. This is a real guardrail, not a bug — a prior attempt in this exact role once wrote a real fix into the wrong tree, silently corrupting shared state, and this makes that mechanically impossible instead of merely detected afterward. If you ever see that rejection, you resolved the wrong absolute path — retarget the SAME relative path under ' + wtPath + ' instead of under ' + REPO + '. The one place this changes your normal workflow: the ARTIFACTS DIR instruction above (write your state/items artifacts to ' + itemsDir(item.id) + ') names a path OUTSIDE your worktree, so Edit and Write cannot reach it there — use Bash instead for every file under that directory (redirect or tee your content into the target path); Bash writes are NOT affected by this isolation. Summary: Edit and Write for your worktree source files, Bash for your artifacts-dir files.'
+      + ' IF EVEN BASH IS REFUSED FOR A TARGET PATH (KI-E177, ported from a host-mount session): a session in this exact role hit Edit, Write, AND a Bash heredoc all refused for both its assigned worktree and its artifacts dir — genuinely contradicting the guarantee above, not agent error. Do NOT guess or give up on writing the file if this happens to you. Two fallbacks confirmed to work when the above did not: a PLAIN SINGLE-LINE Bash redirect instead of a heredoc (redirect a single echo/printf straight into the target path, no here-doc), or a short Bash-invoked Python one-liner that opens the target path itself and writes the content directly. Whichever method lands the write, Read the file back afterward and confirm the content is correct before trusting it — never assume success from a clean exit code alone. This is a tooling-level inconsistency, not a rule you are breaking — note it briefly in your own summary/note field if it happens so it can be tracked, but do not let it stop you from completing the work.')
   }
   // KI-E7 / spine AD-10 — best-effort agent telemetry. ABSOLUTE CLI path (KI-L33); role-based
   // (stage derives in the lib, AD-12); non-compliance is invisible (the fold's mtime backfill
@@ -495,11 +603,19 @@ function planFor(item) {
   }
 }
 
-async function tryAgent(prompt, opts) {
+async function tryAgent(prompt, opts, onAttempt) {
   let lastErr = null
   for (let a = 0; a < ATTEMPTS; a++) {
     try {
       const r = await limit(function () { return agent(prompt, opts) })  // every agent routes through the global concurrency cap (Phase-4 parallel-items safe)
+      // KI-E150: claim THIS attempt's tokens the moment it resolves — success or not, before the loop
+      // can retry or fall through. A call that ultimately exhausts every attempt and returns null still
+      // spent real tokens on each try; claiming only on eventual success would leave those retries'
+      // tokens unclaimed by THIS item, to be silently swept up by whichever call — quite possibly a
+      // DIFFERENT item's — happens to claim next. Per-attempt claiming makes that leak structurally
+      // impossible: every attempt is accounted for exactly once, by the item that actually spent it,
+      // regardless of how the retry loop or the eventual call() outcome resolves.
+      if (onAttempt) onAttempt()
       if (r) return r
     } catch (e) {
       // KI-D9 (2026-07-19): agent() THROWS on a StructuredOutput retry-cap-exceeded (or a terminal API
@@ -508,6 +624,7 @@ async function tryAgent(prompt, opts) {
       // infraSuspect treatment (attempt-not-counted, capped at maxInfraRetries) that every OTHER null
       // stage-agent death already gets. Contain it: treat a throw exactly like a null return — retry, then
       // fall through to null so the caller's `if (!r) { res.infraSuspect = true; ... }` path applies.
+      if (onAttempt) onAttempt() // KI-E150: a throw still consumed real tokens up to the point of failure — claim it here too, not only the non-throwing path above
       lastErr = e
       log('[throw] ' + (opts.label || '?') + ' attempt ' + (a + 1) + '/' + ATTEMPTS + ': ' + String((e && e.message) || e).slice(0, 160))
     }
@@ -558,6 +675,17 @@ async function runItem(item) {
   // (an empty array IS the "nothing reused" signal), never silently absent.
   res.priorAttemptReuse = (item.priorAttempt ? ['plan', 'test', 'fix'].filter(function (k) { return !!item.priorAttempt[k] }) : [])
   const cost = function (route) { const m = (route && route.model) || 'inherit'; res.cost[m] = (res.cost[m] || 0) + 1 }
+  // KI-E150 — see lastSpentGlobal's own comment for why this is safe under concurrency. Attributes
+  // the marginal budget.spent() increase since the last claim, anywhere in the whole run, to THIS
+  // item's res — correct because the read-then-write below never yields (no await), so it always
+  // runs as one atomic step relative to every other item's own call to this same function.
+  const recordTokens = function () {
+    if (typeof budget === 'undefined' || !budget || typeof budget.spent !== 'function') return
+    const now = budget.spent()
+    const delta = now - lastSpentGlobal
+    lastSpentGlobal = now
+    if (delta > 0) res.tokensUsed = (res.tokensUsed || 0) + delta
+  }
   // Shared command constants (hoisted 2026-07-19 so the fixer/editorial claims self-check can cite them).
   const BT = 'bash ' + FDIR + '/verify/build-test.sh'
   const RAW = itemsDir(id) + '/verify-raw.txt'
@@ -568,12 +696,20 @@ async function runItem(item) {
   // full FAILED review round). The fixer runs it BEFORE handing off; the fold's F2 WARN stays the backstop.
   const docTouch = (item.files || []).some(function (f) { return /\.md$/i.test(f) || /(^|\/)docs?\//i.test(f) })
   const claimsHint = ' DOC-CLAIM SELF-CHECK (KI-E11): if your change ADDS or EDITS any .md prose, run `' + BT + ' claims ' + wtPath + '` as one of your LAST actions — every FACTORY::CLAIMS-MISS line is a path your prose asserts but the tree does NOT contain (the fabricated-path class that fails adversarial review). Fix the prose (or the path) until it reports FACTORY::CLAIMS::0; a claim that is INTENTIONALLY a future/external path must be reworded so it does not read as an existing tree path.'
+  // KI-E182 (2026-09-18): sibling self-check to KI-E11, same shape, different claim class — a
+  // "N/M passed" test-count claim in prose instead of a file-path claim. Live incident: EGS-4-3's
+  // direct recovery added a test (changing a real count from 2257/2282 to 2258/2283) but left the
+  // OLD count standing in 3 prose locations, caught only by an expensive fresh gate-developer
+  // dispatch instead of for free. Checked against THIS item's own verify-raw.txt/integrate-raw.txt —
+  // the same evidence transcripts the fold itself reads — never against a guess.
+  const countClaimsHint = ' COUNT-CLAIM SELF-CHECK (KI-E182): if your change ADDS or EDITS any .md prose that quotes a test-count ("N/M passed"), run `' + BT + ' countclaims ' + wtPath + ' ' + itemsDir(id) + '` as one of your LAST actions — every FACTORY::COUNTCLAIMS-MISS line is a count your prose asserts that no test run recorded in this item\'s OWN verify-raw.txt/integrate-raw.txt evidence actually produced (a stale count left behind after a later test was added/removed, or an invented one). Fix the prose (re-derive the real count from a fresh `' + BT + ' suite` run, never from memory) until it reports FACTORY::COUNTCLAIMS::0; a line honestly narrating a SUPERSEDED count ("was N/M") is exempt.'
   async function call(role, route, schema, extra, phaseName) {
     const opts = { label: id + ':' + role, phase: phaseName }
     if (schema) opts.schema = schema
     if (route && route.model) opts.model = route.model
     if (route && route.effort) opts.effort = route.effort
-    let r = await tryAgent(compose(role, item, extra), opts)
+    if (needsWriteIsolation(role)) opts.isolation = 'worktree' // KI-E149
+    let r = await tryAgent(compose(role, item, extra), opts, recordTokens)
     if (r) { cost(route); return r }
     // KI-D10 (2026-07-19): a route MAY carry `fallback: {model, effort}`. When the primary model is null
     // after ATTEMPTS (access-gated / credit-exhausted / persistently malformed output), fall back ONCE to
@@ -587,8 +723,9 @@ async function runItem(item) {
       if (schema) fb.schema = schema
       fb.model = route.fallback.model
       if (route.fallback.effort) fb.effort = route.fallback.effort
+      if (needsWriteIsolation(role)) fb.isolation = 'worktree' // KI-E149
       log('[fallback] ' + id + ':' + role + ' ' + (route.model || '?') + ' -> ' + route.fallback.model)
-      r = await tryAgent(compose(role, item, extra), fb)
+      r = await tryAgent(compose(role, item, extra), fb, recordTokens)
       if (r) { cost(route.fallback); return r }
     }
     return r
@@ -620,10 +757,81 @@ async function runItem(item) {
   if (R.planner) {
     // KI-E69: reuse a prior (killed) attempt's plan when its two control-flow fields are provably
     // safe to stand in for (lib/prior-attempt.mjs) — skips the planner call entirely on a relaunch.
+    const freshPlanCall = !(item.priorAttempt && item.priorAttempt.plan)
     plan = (item.priorAttempt && item.priorAttempt.plan) || await call('planner', R.planner, PLAN_SCHEMA, null, 'Plan')
     res.artifacts.plan = 'state/items/' + id + '/plan.md'
     if (plan && plan.recommendScopeStop) return await frameAndBlock('planner scope-stop — ' + (plan.ruleRisks || plan.approach || ''))
     if (plan && plan.recommendEscalate) item._escalate = true
+    // KI-E134 — PLAN-DRIFT PREVENTION at the source, not just detection downstream. A plan whose OWN
+    // approach/blastRadius text uses commitment language ("MUST"/"required to") is describing
+    // substantive, individually-checkable work — but if `steps` came back missing/under-decomposed,
+    // that work never gets machine-checked against the diff: PROSE mode's hasPlanCommitmentLanguage
+    // prefilter (below, pre-band) is a much coarser keyword heuristic than STEP mode's per-step
+    // evidence check, and PROSE mode's own bounded amend works from vague prose rather than a
+    // concrete target — live, this session: AUDIT-M11 and WEBSHARED-M3 both died in PROSE mode with
+    // "no evidence in the diff after one bounded amend", where a STEP-mode probe would have named the
+    // exact missing piece instead. Only for a FRESH call (never a KI-E69 reused plan — re-asking about
+    // someone else's prior-attempt authorship makes no sense, and reuse exists specifically to skip
+    // the planner call for cost) and only when the mismatch is real: skip the extra call entirely for
+    // the common case (no commitment language, or steps already present).
+    if (plan && freshPlanCall && normalizePlanSteps(plan.steps).length < 2
+        && hasPlanCommitmentLanguage((plan.approach || '') + ' ' + (plan.blastRadius || ''))) {
+      const nudge = await call('planner', R.planner, PLAN_STEPS_NUDGE_SCHEMA,
+        'Your own approach/blastRadius above uses commitment language ("MUST" / "required to") describing substantive, checkable work, but you did not decompose it into `steps` (brief point 6) — or decomposed fewer than 2. Re-read that point now. Return ONLY: `steps` — 2-8 ordered, individually checkable one-sentence steps covering the commitments your own approach/blastRadius text just made; leave it empty ONLY if the work is genuinely one atomic edit despite the commitment wording. `note` (required either way) — if steps is non-empty, one sentence is fine; if empty, EXPLICITLY justify why the commitment language does not actually decompose (do not just restate the approach).',
+        'Plan')
+      if (nudge && Array.isArray(nudge.steps) && normalizePlanSteps(nudge.steps).length >= 2) {
+        plan = Object.assign({}, plan, { steps: nudge.steps })
+        res.planStepsNudged = true
+      }
+    }
+    // KI-E142A (ported from a host-mount session) — PLAN-REVIEW: the earliest possible point to fail
+    // cheap. Everything before this line costs one planner call; test-author/fixer/verify below cost a
+    // full red-test + implementation + build+test cycle. Two lenses: a MECHANICAL feasibility check (do
+    // the files/approach the plan names actually hold up against the real worktree?) and an LLM
+    // quality/edge-case reviewer (does the plan cover every acceptance criterion and the edge-case
+    // categories that plainly apply?). Only for a FRESH plan — same reasoning as the KI-E134 nudge just
+    // above: a KI-E69-reused plan is already backed by real, on-disk diff evidence, so "review it
+    // before implementation" is a non-question.
+    // A feasibility gap that survives ONE bounded revision is an OBJECTIVELY broken premise (a named
+    // file does not exist and was never declared new) — fail here, before test-author/fixer/verify ever
+    // run. A quality/edge-case gap is a JUDGMENT call with no diff yet to ground it in; it drives the
+    // SAME bounded revision but NEVER hard-fails on its own — failing pre-emptively on a reviewer's
+    // opinion, with nothing yet to verify it against, is exactly the false-positive risk this factory's
+    // own KI-E43/KI-E67 history exists to warn against. It only ever informs the revision + rides along
+    // as visible telemetry for whoever reviews the item later.
+    if (plan && freshPlanCall) {
+      phase('Plan')
+      const planSnap = function (p) { return JSON.stringify({ approach: p.approach, steps: p.steps, files: p.files, blastRadius: p.blastRadius }, null, 1) }
+      const feas = await call('plan-feasibility-probe', { model: 'claude-haiku-4-5', effort: 'low' }, PLAN_COMMITMENT_SCHEMA,
+        'PLAN-FEASIBILITY PROBE (KI-E142A). Before any implementation, sanity-check this plan against the REAL worktree (' + wtPath + '). For each file path named in `files` or clearly implied by `approach`/`steps`, run `test -f <path> && echo EXISTS || echo MISSING` (or `ls`) UNLESS the plan\'s own text says that file is being newly created. THEN — this is the part a mere file-existence check misses (KI-E143A, ported from a host-mount session — live incident there: a plan whose named file existed but whose step described a SPECIFIC CODE-LEVEL claim about that file — "delete the redundant instance constructor added at lines 83-90" — that provably did not exist in the worktree at all, recurring unfixed across multiple relaunch cycles because nothing ever checked the claim itself, only that the file was real): for any step that asserts a SPECIFIC, falsifiable fact about existing code (a method/constructor/field exists at a location, a pattern is duplicated, a config key is present, a comment says X), actually `grep`/read the relevant file and verify that fact is TRUE right now — do not just confirm the file exists and assume the described code inside it does too. Also flag any step too vague to independently implement and verify (e.g. "improve error handling" with no concrete target). Return honored=true ONLY if every existing-file claim resolves, every asserted code-level fact is verified true, and every step is concrete; otherwise honored=false with each problem in gaps ({commitment: quote the claim, why: what is wrong — cite what you actually found instead}). Do NOT edit anything.\nPLAN:\n' + planSnap(plan), 'Plan')
+      const cov = await call('plan-quality-probe', R.planner, PLAN_COMMITMENT_SCHEMA,
+        'PLAN-QUALITY REVIEW (KI-E142A — pre-implementation, before ANY code is written). Read this item\'s acceptance criteria and the plan below. Judge THREE things: (1) does the plan address EVERY acceptance criterion? (2) does it account for the edge-case categories that plainly apply to this kind of change (null/empty input, concurrency, boundary values, auth/multi-tenancy, error paths) — or is it silent on ones that obviously matter here? (3) CROSS-SERVICE BLAST RADIUS (KI-E143B, ported from a host-mount session — live incidents there, same batch: one plan broke a downstream consumer\'s tests by adding a required constructor param to a shared library; another added an overflow guard to one translator but missed a documented field-for-field MIRROR of it in a sibling service — both plans were scoped to one service and never checked whether anything they touched has a consumer or a mirror elsewhere): if the plan touches a SHARED library, or a pattern/class this repo\'s own docs describe as mirrored/duplicated in another service, check that service\'s `CONTEXT.md` "Service Dependencies" section (and `doc/architecture/PORTAL-DATA-FLOWS-AND-TRUST-BOUNDARIES.md` if present) for a documented consumer or sibling implementation — does the plan account for updating it too, or at minimum explicitly note it as out of scope with a reason? Any internal contradiction, or a step that does not follow from the stated approach, also counts against readiness. Return honored=true ONLY if the plan is genuinely ready to implement from on ALL THREE counts; otherwise honored=false with each gap in gaps ({commitment: the specific missing/contradictory/unaccounted-for thing, why: why it matters, citing the consumer/mirror by name for a blast-radius gap}) — a generic "consider edge cases" or "check dependencies" is not a usable finding; name the specific case or the specific consumer. Do NOT edit anything.\nPLAN:\n' + planSnap(plan), 'Plan')
+      const feasGaps = (feas && feas.honored === false && Array.isArray(feas.gaps)) ? feas.gaps : []
+      const covGaps = (cov && cov.honored === false && Array.isArray(cov.gaps)) ? cov.gaps : []
+      res.gateDetails = res.gateDetails || {}
+      if (feasGaps.length || covGaps.length) {
+        const revise = await call('planner', R.planner, PLAN_SCHEMA,
+          'PLAN-REVIEW AMEND (KI-E142A): an independent pre-implementation review found gap(s) below BEFORE any test/fix work started — this is the cheapest possible point to fix a plan problem. Revise approach/steps/files/blastRadius to address EVERY gap (or, if a gap genuinely does not apply, leave that part unchanged and say why in ruleRisks). FEASIBILITY GAPS: ' + JSON.stringify(feasGaps.slice(0, 6)) + '. QUALITY/EDGE-CASE GAPS: ' + JSON.stringify(covGaps.slice(0, 6)), 'Plan')
+        if (revise && revise.recommendScopeStop) return await frameAndBlock('planner scope-stop during plan-review amend — ' + (revise.ruleRisks || revise.approach || ''))
+        if (revise) plan = revise
+        // Re-probe feasibility ONLY (objective + cheap) — a revised plan whose file claims are STILL
+        // broken means the premise itself cannot be salvaged by one more implementation attempt.
+        const reFeas = await call('plan-feasibility-probe', { model: 'claude-haiku-4-5', effort: 'low' }, PLAN_COMMITMENT_SCHEMA,
+          'RE-SCAN (KI-E142A): the plan was just revised in response to your prior gaps — judge the REVISED plan fresh against the REAL worktree; prior gaps are hypotheses to re-verify, never conclusions to copy forward.\nREVISED PLAN:\n' + planSnap(plan), 'Plan')
+        const stillBroken = (reFeas && reFeas.honored === false && Array.isArray(reFeas.gaps)) ? reFeas.gaps : []
+        const allGaps = feasGaps.concat(covGaps)
+        if (stillBroken.length) {
+          res.gates['probe:plan-review'] = 'CHANGES_REQUIRED'
+          res.gateDetails['probe:plan-review'] = { verdict: 'CHANGES_REQUIRED', headline: stillBroken.length + ' plan-feasibility gap(s) survive one revision [feasibility+quality lenses]', findings: allGaps.slice(0, 12).map(function (g) { return { severity: 'HIGH', title: String(g.commitment || '').slice(0, 140), fix: String(g.why || '') } }) }
+          return finish('FAILED', 'plan-review (KI-E142A): ' + stillBroken.length + ' plan-feasibility gap(s) survive one revision, BEFORE any test/fix cost was paid — ' + stillBroken.slice(0, 4).map(function (g) { return String(g.commitment || '').slice(0, 90) }).join(' | ') + '. Cheapest possible fail (no test-author, no fixer, no verify ran).')
+        }
+        res.gates['probe:plan-review'] = 'APPROVED'
+        res.gateDetails['probe:plan-review'] = { verdict: 'APPROVED', headline: 'plan revised once to address ' + feasGaps.length + ' feasibility + ' + covGaps.length + ' quality gap(s) [feasibility+quality lenses]', findings: allGaps.slice(0, 12).map(function (g) { return { severity: 'HIGH', title: String(g.commitment || '').slice(0, 140), fix: String(g.why || '') } }) }
+      } else {
+        res.gates['probe:plan-review'] = 'APPROVED'
+        res.gateDetails['probe:plan-review'] = { verdict: 'APPROVED', headline: 'plan reviewed clean on the first pass [feasibility+quality lenses]', findings: [] }
+      }
+    }
   }
 
   // 2. test-author -> RED
@@ -639,7 +847,7 @@ async function runItem(item) {
     // deterministic fold override false-fails the item (cycle 47: ITEM-H15, 6 env failures vs
     // baseline 0 — a 10/10-APPROVED item FAILED). Docker-present hosts skip the extra suite run (no cost).
     + ' FULL-SUITE BASELINE (KI-E43): FIRST run `docker info >/dev/null 2>&1; echo exit=$?`. If it FAILS (non-zero — no Docker), the integrate stage\'s full suite will hit pre-existing Docker-unavailable failures that are NOT this fix\'s fault: capture the pre-fix baseline NOW, while the tree is still unfixed — run `' + BT + ' suite ' + sln + ' 2>&1 | tee ' + itemsDir(id) + '/baseline-raw.txt` (ABSOLUTE path) and return baselineFailures = the FAILING test names from that run (exclude your new regression test if it appears). If `docker info` SUCCEEDS, skip the baseline run and omit baselineFailures.'
-    + (item.reFix ? ' RE-FIX EXCEPTION (KI-E43): do NOT re-capture the baseline — this worktree already carries the prior attempt\'s fix, so a capture NOW would launder that fix\'s own breakage into the allowance. The FIRST round\'s baseline-raw.txt (already on disk) stands; the driver ignores a re-captured one.' : '')
+    + (item.reFix ? ' RE-FIX EXCEPTION (KI-E43 / KI-E162, ported from a host-mount session): FIRST check whether `' + itemsDir(id) + '/baseline-raw.txt` already EXISTS (`test -f ...`). If it EXISTS, do NOT re-capture it — this worktree already carries the prior attempt\'s fix, so a fresh capture now would launder that fix\'s own breakage into the allowance; the EXISTING file stands as-is, the driver ignores a re-captured one. If it does NOT exist — no earlier round ever captured one — this exception does NOT apply to you: follow the FULL-SUITE BASELINE instruction above and capture one now regardless of reFix status. A baseline that was NEVER captured is read downstream as baseline=0 (not "unmeasured"), which wrongly treats every genuinely pre-existing failure as a regression this fix introduced. Live incident on the origin host: an item ran multiple rounds with no baseline-raw.txt ever on disk, and its integrate stage\'s real, reproducible, environment-unrelated failures (independently confirmed to ALSO fail on a completely clean, unmodified main checkout, with zero relation to this item\'s diff) were folded as "N new suite failures beyond baseline 0" and deterministically FAILED an otherwise fully-APPROVED item repeatedly, until the retry bound exhausted and forced a human escalation for a question a captured baseline would have answered for free.' : '')
   // P2: if the defect shape is real-DB-dependent (normalizer flag OR a concurrency/raw-SQL/constraint keyword),
   // the test MUST be Testcontainers-backed (an in-memory green will be REJECTED at fold). If it is a pure
   // query-LOGIC bug, an in-memory test is correct — do NOT force a container where the provider behaves identically.
@@ -647,16 +855,44 @@ async function runItem(item) {
   // KI-L55 — the two HONEST no-red shapes exist on the FIRST round too (cycle-32 live evidence:
   // ITEM-H8 stale finding, ITEM-HIGH-17 pure coverage — both punished with FAILED for
   // reporting truthfully). Brief them explicitly; the fold requires the SAME transcript either way.
-  const testVoHint = item.reFix ? '' : (pureCoverage
-    ? ' PURE TEST-COVERAGE ITEM: the deliverable IS the new tests — correct production code has no red state, so do NOT fabricate a failing variant. Write the missing tests (they should PASS against the current code), RUN them, tee the raw output + a `FACTORY::RED::<exitcode>` marker (0 expected) to the SAME verify-red-raw.txt path, and return red=false + verificationOnly=true with the coverage delta (targets covered, test counts) in evidence.'
-    : ' STALE-FINDING PROTOCOL: if you determine the finding is ALREADY RESOLVED on the current tree (the acceptance criterion demonstrably holds — trace the actual wiring, do not stop at the cited lines), do NOT fabricate a red. Write a PASSING pinning test that empirically proves the acceptance holds, RUN it, tee the raw output + `FACTORY::RED::0` to verify-red-raw.txt, and return red=false + verificationOnly=true with file:line + provenance evidence in note. The full gate band adjudicates the claim — a wrong stale-claim will be CHANGES_REQUIRED\'d.')
+  const testVoHint = item.reFix
+    // KI-E161 (ported from a host-mount session) — a reFix verificationOnly claim used to get NO
+    // instruction to refresh verify-red-raw.txt — only a prose "document the full re-verification in
+    // evidence/note" mandate (the reFix branch of testExtra below). Prose is not machine-checkable;
+    // the KI-E83 RED-proof probe (and the fold's own P1-inverse) reads ONLY the marker file, whatever
+    // attempt produced it. On a multi-round item, that file was very likely written during an
+    // EARLIER, non-verificationOnly round — correctly showing that round's exit!=0 failure on the
+    // THEN-unfixed code — and a later round's verificationOnly claim, if it never re-runs and re-tees
+    // the test, leaves that stale failing capture in place, where the probe reads it as current
+    // evidence and fails an item whose fix is actually already correct. Live incident on the origin
+    // host: a genuinely correct, fully re-confirmed fix still FAILED because verify-red-raw.txt was
+    // untouched since the ORIGINAL red-authoring round several cycles earlier. Fix: give reFix
+    // verificationOnly the SAME disk-proof mandate the first-round shapes below already have.
+    ? ' RE-FIX VERIFICATIONONLY (KI-E161): if you conclude nothing is still broken, do exactly what a first-round verificationOnly claim does — RUN the pinning/coverage test NOW against the CURRENT (already-fixed) worktree and TEE its output + a `FACTORY::RED::<exitcode>` marker (0 expected) to ' + itemsDir(id) + '/verify-red-raw.txt (ABSOLUTE path — OVERWRITE whatever is already there, even a genuine EARLIER round\'s correctly-failing-on-old-code capture; the fold\'s P1-inverse check reads THIS file expecting exit 0 for ANY verificationOnly claim, current round or not, and a stale non-zero capture from an earlier, different-purpose round will wrongly fail an item whose fix is actually already correct). A prose re-verification in evidence/note is necessary but NOT sufficient — the marker file is the machine proof the driver actually trusts; the prose is only the human-readable trail alongside it.'
+    : (pureCoverage
+      ? ' PURE TEST-COVERAGE ITEM: the deliverable IS the new tests — correct production code has no red state, so do NOT fabricate a failing variant. Write the missing tests (they should PASS against the current code), RUN them, tee the raw output + a `FACTORY::RED::<exitcode>` marker (0 expected) to the SAME verify-red-raw.txt path, and return red=false + verificationOnly=true with the coverage delta (targets covered, test counts) in evidence.'
+      : ' STALE-FINDING PROTOCOL: if you determine the finding is ALREADY RESOLVED on the current tree (the acceptance criterion demonstrably holds — trace the actual wiring, do not stop at the cited lines), do NOT fabricate a red. Write a PASSING pinning test that empirically proves the acceptance holds, RUN it, tee the raw output + `FACTORY::RED::0` to verify-red-raw.txt, and return red=false + verificationOnly=true with file:line + provenance evidence in note. The full gate band adjudicates the claim — a wrong stale-claim will be CHANGES_REQUIRED\'d.')
   // KI-E69: reuse a prior (killed) attempt's test-author output when test.json already exists and
   // is fresh (from THIS claim, not a stale prior cycle) — skips the test-author call entirely.
-  const test = (item.priorAttempt && item.priorAttempt.test) || await call('test-author', R.testAuthor, TEST_SCHEMA, (item.reFix ? (reFixNote + 'Write the red proof for what is STILL broken per that feedback — do NOT duplicate an already-passing test; the proof MUST fail on the current worktree state. If NOTHING is still broken (you re-verified every prior finding against the CURRENT tree and each is fixed with an already-passing pinning test, or explicitly out of scope), return red=false + verificationOnly=true and document the full re-verification (files read, suites run, counts) in evidence/note — do NOT invent a vacuous duplicate test just to produce a red. ') : '') + redHint + testVoHint + testRealInfraHint, 'Test')
+  const testExtra = (item.reFix ? (reFixNote + 'Write the red proof for what is STILL broken per that feedback — do NOT duplicate an already-passing test; the proof MUST fail on the current worktree state. If NOTHING is still broken (you re-verified every prior finding against the CURRENT tree and each is fixed with an already-passing pinning test, or explicitly out of scope), return red=false + verificationOnly=true and document the full re-verification (files read, suites run, counts) in evidence/note — do NOT invent a vacuous duplicate test just to produce a red. ') : '') + redHint + testVoHint + testRealInfraHint
+  const testReused = !!(item.priorAttempt && item.priorAttempt.test)
+  let test = testReused ? item.priorAttempt.test : await call('test-author', R.testAuthor, TEST_SCHEMA, testExtra, 'Test')
   res.artifacts.test = 'state/items/' + id + '/test.json'
   // KI-L53: a null stage agent (retries exhausted / skipped) is an INFRA failure, not a quality
   // verdict — mark infraSuspect so the fold's auto-infra-retry does not burn the item's attempt.
   if (!test) { res.infraSuspect = true; return finish('FAILED', 'test-author agent UNAVAILABLE (null after retries — possible infra/credit failure, NOT a quality verdict)') }
+  // KI-E170/E172 (ported from a host-mount session) — skipped entirely when test came from
+  // item.priorAttempt.test: that result was already produced (and, if it ran under this same
+  // check in an earlier attempt, already validated) — nothing NEW ran this round to retry.
+  if (!testReused) {
+    const oot = outOfTreePaths(test.testFiles, wtPath)
+    if (oot.length) {
+      const recovered = await recoverOutOfTree(call, 'test-author', R.testAuthor, TEST_SCHEMA, wtPath, oot, 'testFiles', testExtra, 'Test')
+      const oot2 = recovered ? outOfTreePaths(recovered.testFiles, wtPath) : oot
+      if (!recovered || oot2.length) return finish('FAILED', 'worktree-isolation mismatch (KI-E170' + (recovered ? '/E172' : '') + '): test-author reports testFiles path(s) OUTSIDE this item\'s assigned worktree (' + wtPath + ')' + (recovered ? ' even after one path-correction retry' : '') + ': ' + (recovered ? oot2 : oot).join(', ') + ' — the isolation sandbox (KI-E149) diverged from the real target; this work never reached the tracked worktree. Pre-band fail; re-run the item fresh.')
+      test = recovered
+    }
+  }
   // KI-L37 — verification-only reFix: a PRE-APPLIED reFix (operator or prior round already landed the
   // fix + its tests) has, by definition, nothing NEW to red-prove — the defect's red proof was
   // produced in an earlier round and lives in verify-red-raw.txt (the fold's P1 re-greps that file,
@@ -679,11 +915,43 @@ async function runItem(item) {
     // KI-E69: reuse a prior (killed) attempt's fixer output when fix.json already exists and is
     // fresh (from THIS claim) — skips the fixer call; the worktree's own diff IS the expensive,
     // already-done work this exists to preserve.
-    const fix = (item.priorAttempt && item.priorAttempt.fix) || await call('fixer', R.fixer, FIX_SCHEMA, reFixNote + 'The red regression test is already in the worktree. Make it green with the minimal correct fix' + (item.reFix ? ', addressing EVERY CHANGES_REQUIRED finding — the prior fix is PARTIAL, so COMPLETE it (do not just repeat it).' : '.') + claimsHint, 'Fix')
+    const fixExtra = reFixNote + 'The red regression test is already in the worktree. Make it green with the minimal correct fix' + (item.reFix ? ', addressing EVERY CHANGES_REQUIRED finding — the prior fix is PARTIAL, so COMPLETE it (do not just repeat it).' : '.') + claimsHint + countClaimsHint
+      // KI-E156 (ported from a host-mount session; adapted from a stepwise-consolidation-only check to
+      // this repo's single-shot fixer, since no stepwise pass exists here to attach it to) —
+      // PLAN-EXCLUSION ADHERENCE: re-read plan.md's approach/blastRadius for any explicit
+      // negative/exclusion statement ("no X edits needed", "Y is unchanged", "do NOT touch Z") and
+      // confirm your diff genuinely honors each one before returning applied:true — revert anything it
+      // doesn't, or declare it via deviations if you have since learned it really is required. Live
+      // incident on the origin host: a plan explicitly said a certain edit was not needed because an
+      // existing shared dependency already gave the required visibility; the shipped diff made that
+      // unneeded edit anyway, breaking a pre-existing architecture-fitness test for a change the plan
+      // had already ruled out.
+      + ' PLAN-EXCLUSION ADHERENCE (KI-E156): before returning applied:true, re-read plan.md\'s approach/blastRadius for any explicit negative/exclusion statement ("no X edits needed", "Y is unchanged", "do NOT touch Z") and confirm your diff genuinely honors each one — revert anything it doesn\'t, or declare it via deviations if you have since learned it really is required.'
+    const fixReused = !!(item.priorAttempt && item.priorAttempt.fix)
+    let fix = fixReused ? item.priorAttempt.fix : await call('fixer', R.fixer, FIX_SCHEMA, fixExtra, 'Fix')
     res.artifacts.fix = 'state/items/' + id + '/fix.json'
     if (!fix) { res.infraSuspect = true; return finish('FAILED', 'fixer agent UNAVAILABLE (null after retries — possible infra/credit failure, NOT a quality verdict)') } // KI-L53
+    // KI-E170/E172 (ported from a host-mount session) — skipped when fix came from
+    // item.priorAttempt.fix: nothing NEW ran this round to retry.
+    if (!fixReused) {
+      const oot = outOfTreePaths(fix.filesChanged, wtPath)
+      if (oot.length) {
+        const recovered = await recoverOutOfTree(call, 'fixer', R.fixer, FIX_SCHEMA, wtPath, oot, 'filesChanged', fixExtra, 'Fix')
+        const oot2 = recovered ? outOfTreePaths(recovered.filesChanged, wtPath) : oot
+        if (!recovered || oot2.length) return finish('FAILED', 'worktree-isolation mismatch (KI-E170' + (recovered ? '/E172' : '') + '): fixer reports filesChanged path(s) OUTSIDE this item\'s assigned worktree (' + wtPath + ')' + (recovered ? ' even after one path-correction retry' : '') + ': ' + (recovered ? oot2 : oot).join(', ') + ' — the isolation sandbox (KI-E149) diverged from the real target; this work never reached the tracked worktree. Pre-band fail; re-run the item fresh.')
+        fix = recovered
+      }
+    }
     if (fix.scopeStop) return await frameAndBlock('fixer scope-stop — ' + (fix.summary || ''))
     if (!fix.applied) return finish('FAILED', 'fixer did not apply: ' + (fix.note || fix.summary || ''))
+    // KI-E180 (ported from a host-mount session; adapted) — persist the fix's touch-set onto `res`
+    // (mirroring the origin's own `res.filesChanged` convention, there populated for KI-E141's
+    // phantom-manifest probe — confirmed absent in this repo, see KNOWN-ISSUES.md KI-E168) so the
+    // cross-service verify-scope check further below — which runs AFTER this block closes and the
+    // block-scoped `fix` goes out of scope — can still read it. This repo's fixer is single-shot (no
+    // KI-E117 stepwise/consolidation — see KNOWN-ISSUES.md KI-E153/155/165/173/174/178), so unlike the
+    // origin there is no multi-step accumulation: just this one call's own filesChanged, persisted.
+    if (Array.isArray(fix.filesChanged)) res.filesChanged = fix.filesChanged
   }
 
   // 4. runner (independent build + green + suite)
@@ -716,16 +984,27 @@ async function runItem(item) {
   // KI-E11 — the runner ALSO tees the claims lint into the machine transcript for doc-touching items,
   // so reviewers (and the fold's F2 WARN) see the same deterministic phantom-path evidence.
   const claimsVerifyHint = docTouch ? ' DOC-CLAIM LINT (KI-E11): also run `' + BT + ' claims ' + wtPath + ' 2>&1 | tee -a ' + RAW + '` — FACTORY::CLAIMS-MISS lines are path claims the tree does not contain; report them in note (the fixer was briefed to leave this at FACTORY::CLAIMS::0).' : ''
+  // KI-E182 — the runner ALSO tees the count-claims lint into the machine transcript for doc-touching
+  // items, run AFTER the suite command above so verify-raw.txt already carries this run's own fresh
+  // counts — the exact evidence the lint checks prose claims against.
+  const countClaimsVerifyHint = docTouch ? ' COUNT-CLAIM LINT (KI-E182): also run `' + BT + ' countclaims ' + wtPath + ' ' + itemsDir(id) + ' 2>&1 | tee -a ' + RAW + '` — FACTORY::COUNTCLAIMS-MISS lines are "N/M passed" claims no evidenced test run in this item produced; report them in note (the fixer was briefed to leave this at FACTORY::COUNTCLAIMS::0).' : ''
   const verifyHint = (!codeChange
     ? 'DOC/CONFIG item — the fix touches NO .cs files, so do NOT run dotnet build/test. Run the regression-test check from the spec (the grep/script assertion) + confirm the acceptance. Report build="pass (n-a: no code change)", targetedTest per the grep, suite={"passed":0,"failed":0,"skipped":0}.'
     : (band === 'LIGHT'
       ? 'LIGHT code item — run EXACTLY these two commands (substitute only the touched test .csproj + the new test\'s filter), nothing hand-rolled: (1) `' + BT + ' build <touched .csproj> 2>&1 | tee -a ' + RAW + '` (2) `' + BT + ' filter <test .csproj> "<TestClassName>" 2>&1 | tee -a ' + RAW + '`. SKIP the full-solution build + full suite for speed. The FACTORY:: markers those commands emit into ' + RAW + ' ARE the machine evidence the fold requires — without them a green fix is overridden to FAILED.'
-      : 'FULL code item — run EXACTLY these three commands (substitute only the test .csproj + filter): (1) `' + BT + ' build ' + sln + ' 2>&1 | tee -a ' + RAW + '` (2) `' + BT + ' filter <test .csproj> "<TestClassName>" 2>&1 | tee -a ' + RAW + '` (3) `' + BT + ' suite ' + sln + ' 2>&1 | tee -a ' + RAW + '`. The FACTORY:: markers in ' + RAW + ' ARE the machine evidence the fold requires.')) + claimsVerifyHint + packHint
+      : 'FULL code item — run EXACTLY these three commands (substitute only the test .csproj + filter): (1) `' + BT + ' build ' + sln + ' 2>&1 | tee -a ' + RAW + '` (2) `' + BT + ' filter <test .csproj> "<TestClassName>" 2>&1 | tee -a ' + RAW + '` (3) `' + BT + ' suite ' + sln + ' 2>&1 | tee -a ' + RAW + '`. The FACTORY:: markers in ' + RAW + ' ARE the machine evidence the fold requires.')) + claimsVerifyHint + countClaimsVerifyHint + packHint
   const realInfraHint = needsRealInfra ? ' REAL-INFRA MANDATORY (' + item.theme + '/' + item.severity + '): the targeted test MUST run against real Postgres/Redis via Testcontainers, NOT EF in-memory. Emit a machine marker line `FACTORY::REALINFRA::<kind>` (e.g. Testcontainers-Postgres) into verify-raw.txt ONLY when a real container actually started and the test bound to it; if Docker is unavailable set dockerAbsent=true and DO NOT emit the marker. The driver re-greps verify-raw.txt for that marker — a self-reported realInfraExercised without the marker does NOT close the item. GREP-ANCHORED SELF-REPORT (KI-E10): before returning, run `grep -c "FACTORY::REALINFRA::" ' + RAW + '` and set realInfraExercised STRICTLY from that output (>0 -> true, 0 -> false); quote the grep command + its output in evidence — never report the field from memory.' : ''
   // KI-E50 — mid-band main-drift check: fold/resume detection ran HOURS after the write (cycle 48:
   // 4/6 lanes wrote main mid-band). The runner runs the read-only driver check between verify and
   // the gate band so drift is visible to the gates + checkpoint the moment it exists. Warn-only.
-  const mainCheckHint = ' MAIN-DRIFT CHECK (KI-E50): run `node ' + FDIR + '/_workflow/driver.mjs main-check ' + id + '` (read-only, never blocks you). If it prints a ⚠ MAIN-DRIFT line, copy that line VERBATIM into your note and do NOT edit/repair the main tree — the worktree stays your only edit surface; repair is operator judgment.'
+  // KI-E145 (ported from a host-mount session): this used to end with "set a boolean field to convey
+  // what you saw" — but that is STILL a self-report, just a shorter one, and this pipeline's own
+  // established pattern (KI-E10/E83/E104's marker-probes) never trusts an agent's claim about its own
+  // evidence — it dispatches an INDEPENDENT cheap probe to re-grep the SAME raw file. Applied here:
+  // the runner's only job is to TEE the check output to disk; a separate probe below decides the
+  // verdict from that file directly.
+  const MCRAW = itemsDir(id) + '/main-check-raw.txt'
+  const mainCheckHint = ' MAIN-DRIFT CHECK (KI-E50/KI-E145): run `node ' + FDIR + '/_workflow/driver.mjs main-check ' + id + ' 2>&1 | tee ' + MCRAW + '` (read-only, never blocks you) — an independent probe re-checks this file directly, so just tee it; do not interpret, summarize, or set any field about its result yourself. Do NOT edit/repair the main tree — the worktree stays your only edit surface; repair is operator judgment.'
   const verify = await call('runner', R.runner, VERIFY_SCHEMA, verifyHint + realInfraHint + mainCheckHint + (item.reFix ? ' RE-FIX: the PRIOR attempt\'s test file(s) are EXPECTED in this worktree alongside the new one — do NOT report them as debris; only flag genuine scratch/diagnostic/duplicate files.' : ''), 'Verify')
   res.artifacts.verify = 'state/items/' + id + '/verify.json'
   if (!verify) { res.infraSuspect = true; return finish('FAILED', 'runner agent UNAVAILABLE (null after retries — possible infra/credit failure, NOT a quality verdict)') } // KI-L53
@@ -769,8 +1048,24 @@ async function runItem(item) {
   // gate band — rather than after it, and long before the fold's KI-L65 check. OFF by default, which
   // is byte-for-byte the historical warn-only behaviour. Detection is unchanged either way; this only
   // decides what the factory DOES with a signal it already has.
-  if (A.policies && A.policies.failLaneOnMainDrift && /⚠\s*MAIN-DRIFT/.test(String(verify.note || ''))) {
-    return finish('FAILED', 'main-tree contamination (KI-E109, host policy failLaneOnMainDrift=ON): the mid-band main-check reported drift and the runner recorded it — ' + String(verify.note || '').slice(0, 400) + ' — failing the lane NOW instead of spending the gate band on a run that has already written outside its worktree. Repair main (operator judgment, never the factory) before re-running.')
+  // KI-E144/KI-E144B (see the KNOWN-ISSUES.md entries above — one batch failed 6-for-6 off ONE
+  // unrelated stray file, then the id-anchored regex fix broke AGAIN on a runner's own negation of
+  // the marker it was quoting to disprove) both tried to get this right by reading a SELF-REPORT of
+  // what the runner saw — first free prose, then a boolean field. Both are still an agent's OWN claim
+  // about its own evidence, unverified. KI-E145 (ported from a host-mount session): this pipeline
+  // already has a standing answer for exactly that shape of risk — never trust the claim, dispatch an
+  // INDEPENDENT cheap probe to re-derive the fact from disk (the same posture KI-E10/E83/E104's
+  // marker-probes take for realInfra/RED-proof/root-cause). Applied here: the runner only tees
+  // `main-check`'s output to `MCRAW` above; this probe alone decides the verdict, by grepping that
+  // file directly for the item's OWN id-specific line — mirroring the realInfra marker-probe's exact
+  // `grep -m1` idiom (a "did it print anything" question a cheap model answers reliably, not a "count
+  // and don't double-echo on no-match" one).
+  if (A.policies && A.policies.failLaneOnMainDrift) {
+    const mcProbe = await call('main-drift-probe', { model: 'claude-haiku-4-5', effort: 'low' }, PROBE_SCHEMA,
+      'Run EXACTLY this ONE command via Bash: `grep -m1 "^⚠ MAIN-DRIFT ' + id + ' (" ' + MCRAW + '` — if it prints a line, return markerFound=true with that line. If it prints nothing (exit 1, no match) or the file does not exist (exit 2), return markerFound=false. Do NOTHING else: no edits, no other commands, no interpretation of what the line MEANS — just whether it is there.', 'Verify')
+    if (mcProbe && mcProbe.markerFound === true) {
+      return finish('FAILED', 'main-tree contamination (KI-E109/E145, host policy failLaneOnMainDrift=ON): an independent probe confirmed a real `⚠ MAIN-DRIFT ' + id + ' (` line in main-check-raw.txt — ' + String(mcProbe.line || '').slice(0, 300) + ' — failing the lane NOW instead of spending the gate band on a run that has already written outside its worktree. Repair main (operator judgment, never the factory) before re-running.')
+    }
   }
   if (Array.isArray(verify.newFailures)) {
     if (verify.newFailures.length) return finish('FAILED', 'fix introduced ' + verify.newFailures.length + ' new test failure(s): ' + verify.newFailures.join(', '))
@@ -798,7 +1093,30 @@ async function runItem(item) {
     // (ITEM-C7B cycle 39: a full band incl. 8 opus calls burned on exactly this) — fail fast
     // with precise feedback. Probe null (infra) or true -> proceed; the fold grep stays the authority.
     const probe = await call('marker-probe', { model: 'claude-haiku-4-5', effort: 'low' }, PROBE_SCHEMA, 'Run EXACTLY this ONE command via Bash: `grep -m1 "FACTORY::REALINFRA::" ' + RAW + '` — if it prints a line return markerFound=true with that line; if it prints nothing (exit 1) return markerFound=false. Do NOTHING else: no edits, no other commands, no interpretation.', 'Verify')
-    if (probe && probe.markerFound === false) return finish('FAILED', 'realInfra marker probe (KI-E10): verify-raw.txt has NO FACTORY::REALINFRA:: marker on disk — the regression test never bound a real container (in-memory green). Failing BEFORE the gate band; write/fix the Testcontainers test (the fold-time grep remains the close authority).')
+    if (probe && probe.markerFound === false) {
+      // KI-E143C (ported from a host-mount session): the graph's needsRealInfra flag is a static,
+      // per-item classification made before any test existed — it can be WRONG for the specific
+      // defect a test-author ends up writing. Before KI-E142B's "declare + adjudicate" pattern
+      // existed, a reasoned test-author had NOWHERE to put that judgment — the mechanical marker
+      // check simply overruled it. A SILENT absence (no override, or an override with no reason)
+      // still fails exactly as before; ONLY a declared, explained override earns an independent
+      // ruling — mirrors plan-commitment-scan's deviation branch precisely, same fail-safe default.
+      const overrideReason = test && typeof test.realInfraOverride === 'string' ? test.realInfraOverride.trim() : ''
+      if (overrideReason) {
+        const adj = await call('adjudicator', R.adjudicator, ADJUDICATE_SCHEMA,
+          'REALINFRA-CLASSIFICATION ADJUDICATION (KI-E143C): this item is graph-flagged needsRealInfra=true, but the test-author declares that classification WRONG for this specific defect and never bound a real container. Judge on the merits, using the actual finding description and the test code in the worktree (' + wtPath + '): is the underlying defect genuinely independent of real Postgres/Redis behavior (pure in-process logic, exception handling, serialization, validation — an EF in-memory / Moq test proves it just as well), or does it plausibly depend on real database/cache semantics (transactions, locking, concurrency, connection pooling, provider-specific SQL) that an in-memory substitute cannot exercise? Default to UPHELD when genuinely uncertain — a wrongly-accepted override means a defect class this pipeline exists to catch (the green-build illusion) ships unverified.\nTEST-AUTHOR\'S DECLARED OVERRIDE: ' + JSON.stringify(overrideReason), 'Verify')
+        res.gates['adjudicator:realinfra-override'] = adj ? adj.verdict : 'NULL'
+        res.gateDetails = res.gateDetails || {}
+        res.gateDetails['adjudicator:realinfra-override'] = adj ? { verdict: adj.verdict, headline: adj.headline, reasons: adj.reasons } : null
+        if (adj && adj.verdict === 'OVERRULED') {
+          res.note = 'realInfra classification overridden (KI-E143C): ' + overrideReason.slice(0, 200) + ' — adjudicated legitimate, proceeding on the in-memory/Moq proof'
+        } else {
+          return finish('FAILED', 'realInfra marker probe (KI-E10): verify-raw.txt has NO FACTORY::REALINFRA:: marker on disk. The test-author declared an override ("' + overrideReason.slice(0, 150) + '"), but adjudicator ' + (adj ? adj.verdict : 'NULL') + ' — the graph\'s needsRealInfra classification stands. Failing BEFORE the gate band; write/fix the Testcontainers test.')
+        }
+      } else {
+        return finish('FAILED', 'realInfra marker probe (KI-E10): verify-raw.txt has NO FACTORY::REALINFRA:: marker on disk — the regression test never bound a real container (in-memory green). Failing BEFORE the gate band; write/fix the Testcontainers test (the fold-time grep remains the close authority).')
+      }
+    }
     res.note = (probe && probe.markerFound === true)
       ? 'realInfra marker probed PRESENT on disk (runner self-report lagged its own artifact — KI-L44 class); fold grep remains the authority'
       : 'realInfra self-report not true — close/fail deferred to the driver fold-time FACTORY::REALINFRA:: marker grep'
@@ -813,6 +1131,74 @@ async function runItem(item) {
     ? test.baselineFailures
     : (Array.isArray(verify.baselineFailures) ? verify.baselineFailures : [])
   res.transitions.push('GREEN', 'BUILT', 'TESTED')
+
+  // KI-E152 (ported from a host-mount session) — deterministic verify evidence, surfaced directly in
+  // every review-role prompt (edge-scan, the technical gates, method-flow reviews, PO, refuter,
+  // re-auditor). Origin incident: a diff collected unanimous APPROVED verdicts across the whole gate
+  // band on a runner's confident summary, then failed the deterministic integrate step with hundreds
+  // of new test regressions — neither the shared REVIEW PACK hint (diff snapshot only) nor any gate
+  // brief ever quoted the runner's own verify.json fields, so a reviewer judging code quality had zero
+  // visibility into whether the fix even builds, unless they independently re-ran the build themselves
+  // (never instructed anywhere). This makes that evidence unmissable instead of relying on the diff
+  // alone to imply it — a second, independent, disk-derived signal placed directly in front of every
+  // verdict, on top of (not instead of) the worktree spot-check the REVIEW PACK hint already requires.
+  const verifyEvidenceHint = ' DETERMINISTIC VERIFY EVIDENCE (machine-run, not the runner\'s prose — cross-check your own read of the diff against this): build=' + (verify.build || '?') + ', targetedTest=' + (verify.targetedTest || '?') + ', suite={passed:' + ((verify.suite && verify.suite.passed) || 0) + ',failed:' + ((verify.suite && verify.suite.failed) || 0) + ',skipped:' + ((verify.suite && verify.suite.skipped) || 0) + '}' + (verify.realInfraExercised ? ', realInfraExercised=true' : '') + '. A `build=fail` or `targetedTest=fail` or any nonzero `suite.failed` means the change does NOT work at a mechanical level RIGHT NOW, regardless of how clean the diff reads — verdict CHANGES_REQUIRED unless the failure is a known, already-ledgered baseline (see baselineFailures) and not caused by this diff.'
+
+  // KI-E180 (ported from a host-mount session) — CROSS-SERVICE VERIFY-SCOPE GAP. A fix whose touch-set
+  // spans MULTIPLE services (each its own .sln) can have ONLY the item's single primary solution ever
+  // built+tested: the runner is deliberately kept blind to fix.filesChanged (KI-L56's tiny context
+  // budget), and item.solution/CFG.solution names exactly ONE solution (the `sln` constant above), so a
+  // genuinely cross-service diff's OTHER touched service(s) never get an independent build+suite run at
+  // all. Origin-host incident (24947b360): an item's touch-set already spanned five real services from
+  // the moment it entered the graph, but verify.json built+tested only ONE of them, and the resulting
+  // verifyEvidenceHint (KI-E152 above) truthfully told every reviewer "build=pass, targetedTest=pass,
+  // suite={failed:0}" — correct, but silently scoped to 1 of 5 touched services. Most reviewers trusted
+  // that hint at face value and never independently re-ran the other services' own suites; only the
+  // ones who happened to re-run one by hand caught a genuinely red test there. Same theme as KI-E152 one
+  // layer deeper: making the deterministic verify result unmissable to reviewers is not enough if that
+  // result can be silently incomplete — an unmissable-but-incomplete number is MORE misleading than
+  // none, because the reviewer has been told to trust it. Fix: a zero-cost, zero-agent-call mechanical
+  // check — derive the SET of distinct top-level service directories the fix actually touched with a
+  // real .cs change (from res.filesChanged, captured just above in the fixer block per this repo's own
+  // KI-E180 adaptation note there, since this repo has no KI-E141 accumulator to reuse), denylist
+  // generic tooling roots so a shared-library path never fabricates a false "service", and cross-check
+  // each against the runner's own `evidence` string (which already names every command it ran) for a
+  // build/suite mention. Gated on svcDirs.size > 1, not uncovered.length alone — an ordinary
+  // single-service item is never a false positive (this repo's own default exec-smoke fixture, whose
+  // stub evidence never names its one service literally, is the regression guard for exactly this). On
+  // a genuine gap: fails the item pre-band, forcing a re-verify before the incomplete-but-confident
+  // evidence ever reaches a reviewer. Deliberately does NOT retrofit a second FACTORY::SUMMARY::suite /
+  // FACTORY::BUILD::RESULT marker into the same verify-raw.txt — this repo's own `lib/verify.mjs`
+  // `parseVerifyRaw`/`lastMatch` (KI-D3) parses both markers LAST-MATCH-WINS, so a second solution's
+  // suite teed into the same transcript would silently make the fold's own machine-authoritative check
+  // see ONLY the last service's numbers, discarding the first. Failing cheaply and re-verifying (the
+  // existing resume/group/recover path) is the safe shape; teeing multiple markers into a parser built
+  // for exactly one is not.
+  if (codeChange && !verificationOnly && (res.filesChanged || []).length) {
+    // GENERIC_ROOTS: top-level folders that are build/doc/deploy tooling, not a distinct service with
+    // its own .sln — without this denylist a shared-library path like `src/Shared/Azathoth.Authorization/
+    // X.cs` would extract the literal segment "src" as a fabricated "service", a false positive on
+    // every fix that touches ANY shared library alongside its owning service.
+    const GENERIC_ROOTS = new Set(['src', 'doc', 'docs', 'k8s', 'scripts', 'tests', 'test', 'tools', 'deploy', 'templates', 'config', '_bmad-output', '.github'])
+    const svcOf = function (f) {
+      const rel = String(f || '').replace(/^.*\/state\/worktrees\/[^/]+\//, '') // strip an absolute worktree-rooted prefix (KI-E149/E170/172 isolation paths) down to the repo-relative form
+      const m = /^([A-Za-z][A-Za-z0-9_.]*)\//.exec(rel)
+      return (m && !GENERIC_ROOTS.has(m[1].toLowerCase())) ? m[1] : null
+    }
+    const svcDirs = new Set()
+    for (const f of res.filesChanged) { if (/\.cs$/i.test(f)) { const s = svcOf(f); if (s) svcDirs.add(s) } }
+    const ev = String(verify.evidence || '')
+    const uncovered = [...svcDirs].filter(function (svc) { return !new RegExp('\\b' + svc.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\b').test(ev) })
+    // Gated on svcDirs.size > 1 (a GENUINELY cross-service touch-set), not on uncovered.length alone — a
+    // single-service item whose one service happens not to be named verbatim in evidence prose (a stub
+    // in a test harness; a runner that describes its build a different way) is NOT this failure class,
+    // and firing on it would be a false positive on the overwhelmingly common single-service item.
+    if (svcDirs.size > 1 && uncovered.length) {
+      return finish('FAILED', 'cross-service verify-scope gap (KI-E180): this fix touches .cs files in ' + [...svcDirs].join(', ') + ', but the runner\'s verify evidence never mentions building/testing ' + uncovered.join(', ') + ' — re-run verify (or the item) so every touched service with a real code change gets its own independent build+suite, not just the item\'s primary solution.')
+    }
+  }
+
+  await checkpointProgress(res, 'post-verify') // KI-E137 — kill-resilience: fix+verify survive a kill during the 8-scan pre-band chain
 
   // TESTED-pre. RED-PROOF MARKER PROBE (KI-E83) — the KI-E10 realInfra-marker-probe pattern applied
   //     to the sibling FACTORY::RED:: marker. The self-reported `test.red` check a few lines above
@@ -847,6 +1233,25 @@ async function runItem(item) {
     // P1 check is the backstop either way, same fail-open posture as every sibling pre-band probe.
   }
 
+  // TESTED-pre2. RED-PROOF COVERAGE PROBE (KI-E175, ported from a host-mount session) — KI-E83
+  //     proves A marker exists; this proves it belongs to the test class that actually shipped.
+  //     Only meaningful when test-author recorded a real testFiles/runCmd target to compare
+  //     against (skip silently otherwise — fail-open, same posture as every sibling pre-band probe
+  //     when its own precondition data is missing).
+  if (codeChange && test && test.runCmd) {
+    const coverageProbe = await call('red-coverage-probe', { model: 'claude-haiku-4-5', effort: 'low' }, RED_COVERAGE_SCHEMA,
+      'READ-ONLY EVIDENCE PROBE (KI-E175). Read ' + itemsDir(id) + '/test.json — note its `runCmd` (the exact test-author red-proof command, ending in a dotnet --filter test CLASS name) and `testFiles`. Then read ' + itemsDir(id) + '/verify.json — note its `evidence` text and any other field describing which test class the FINAL verify run actually targeted (do not assume a fixed field name; read the prose). '
+      + 'Compare the test CLASS name(s): does verify.json\'s final targeted test class match (or is it a strict superset run of) the SAME class(es) test.json\'s runCmd red-proved? If verify targeted a DIFFERENT class not covered by test.json\'s red-proof, that class was never proven to FAIL on unfixed code — only proven to pass now, which is not the same thing. '
+      + 'If they match (or verify.json is missing/empty, or test.json shows verificationOnly with no new class needed), return covered=true. '
+      + 'If they diverge, independently Read the ACTUAL test source file verify.json named (do not trust its evidence prose — that text can be wrong) and check whether its own request/setup genuinely depends on the exact code path the fix changed (read ' + (item.files || []).join(', ') + ') — if it plainly does not (e.g. a claimed header/precondition is simply absent from the test\'s own request setup), return covered=false with `gap` naming the exact missing precondition and file:line.',
+      'Verify')
+    if (coverageProbe && coverageProbe.covered === false) {
+      return finish('FAILED', 'RED-proof coverage probe (KI-E175): the test class verify.json actually targeted was never red-proved by test.json\'s own runCmd, and its setup does not appear to reach the fix\'s code path — ' + (coverageProbe.gap || 'no discriminating precondition found') + '. Failing BEFORE the gate band (cheap); a vacuous test that passes identically on reverted code is not evidence the fix works.')
+    }
+    // coverageProbe null (infra failure) or covered:true -> proceed; the gate band's own reviewers
+    // remain the backstop either way, same fail-open posture as every sibling pre-band probe.
+  }
+
   // 4a4. ROOT-CAUSE TOUCH PROBE (KI-E104) — the PRE-BAND half of the fold's deterministic P9
   //     ("a diff that touched ONLY tests greened the test, it did not fix the bug"). P9 ran ONLY at
   //     fold, i.e. AFTER the whole gate band was spent — the identical economics KI-E83 fixed for
@@ -879,6 +1284,54 @@ async function runItem(item) {
     }
   }
 
+  // PRIOR-FINDING SCAN (KI-E168, ported from a host-mount session) — pre-band feedback-vs-diff
+  //     coverage probe, RE-FIX ONLY. A reFix round is TOLD (reFixNote/staleGuard, prose only) to read
+  //     feedback.md and address every prior CHANGES_REQUIRED finding — but nothing MACHINE-VERIFIES
+  //     it actually did, on a THIRD axis distinct from acceptance-scan (KI-E18 — the item's own
+  //     acceptance criteria) and plan-commitment-scan (KI-E87/E101 — the planner's OWN stated intent):
+  //     the SPECIFIC review findings that caused the PRIOR attempt to be rejected. Without this, that
+  //     gap is closed only by the full opus gate band independently re-discovering an unaddressed
+  //     finding from scratch — the most expensive possible point to learn "you didn't fix what broke
+  //     last time". Live incident on the origin host: three separate reFix items each burned a FULL
+  //     gate band before failing on essentially the same unresolved finding again. Mirrors
+  //     acceptance-scan/plan-commitment-scan's exact probe -> ONE bounded amend -> re-probe ->
+  //     pre-band-fail-or-continue shape, and (per KI-E128's lesson for plan-commitment-scan) runs for
+  //     verificationOnly reFix rounds TOO — a claim that a finding is "already fixed in the standing
+  //     tree" is exactly the claim most worth a cheap, independent check before it reaches the gate
+  //     band unverified. Reuses KI-E166's "PRIOR CYCLE(S)' FEEDBACK" divider (present in this repo
+  //     since that port landed) to skip findings this SAME check already covered on an earlier round.
+  if (item.reFix) {
+    phase('EdgeScan')
+    const fbPrompt = (verificationOnly
+      ? 'VERIFICATION-ONLY LANE (mirrors KI-E128): no fixer ran this round — the claim is that every prior finding is ALREADY resolved in the standing worktree. Grade against the diff that is ALREADY THERE (`git -C ' + wtPath + ' diff HEAD`), not new work. A finding whose fix is absent from that diff is UNEVIDENCED — say so; do not credit an intention. '
+      : '') +
+      'PRIOR-FINDING SCAN (KI-E168 — pre-band feedback-vs-diff coverage probe). This item is a RE-FIX: a PRIOR attempt was REJECTED. STEP 1: run `cat ' + itemsDir(id) + '/feedback.md 2>/dev/null || echo NO-FEEDBACK-FILE` — if it prints NO-FEEDBACK-FILE, return honored=true and gaps=[] immediately (nothing to check). STEP 2: otherwise, list EVERY bullet under a "### Findings" heading found ABOVE any "## PRIOR CYCLE(S)\' FEEDBACK" divider (a divider marks OLDER content this SAME check already covered on an earlier round) as one finding each. If there is NO "### Findings" heading at all, return honored=true and gaps=[]. STEP 3: read ' + itemsDir(id) + '/review-pack.md (the machine snapshot of THIS diff). STEP 4: for EACH finding from step 2, decide whether the diff contains CONCRETE evidence it was actually addressed — a specific hunk, file, or test; a prose claim with no matching change is NOT evidence. Return honored=true ONLY if EVERY finding is evidenced; otherwise honored=false with each unaddressed finding in gaps (commitment: quote the finding, why: what is still missing). Do NOT edit anything.'
+    let pf = await call('prior-finding-probe', { model: 'claude-haiku-4-5', effort: 'low' }, PLAN_COMMITMENT_SCHEMA, fbPrompt, 'EdgeScan')
+    if (pf && pf.honored === false && Array.isArray(pf.gaps) && pf.gaps.length) {
+      res.amended = true // KI-E125 — an amend is about to edit the worktree AFTER verify
+      const amend = await call('fixer', R.fixer, FIX_SCHEMA, 'PRIOR-FINDING AMEND (KI-E168): a pre-band probe found PRIOR REVIEW FINDING(S) (from the last rejected attempt) with NO evidence they were addressed in this diff — the gate band would independently re-discover this at full price. Address EVERY finding below with the minimal correct change (or state in note precisely why a finding no longer applies). Then re-verify the touched surface (code: `' + BT + ' build <touched .csproj> 2>&1 | tee -a ' + RAW + '` + `' + BT + ' filter <test .csproj> "<TestClassName>" 2>&1 | tee -a ' + RAW + '`; doc/config: the spec\'s grep) and REGENERATE the review pack: `' + PACKCMD + '`. FINDINGS: ' + JSON.stringify(pf.gaps.slice(0, 8)) + claimsHint + countClaimsHint, 'EdgeScan')
+      if (amend && amend.scopeStop) return await frameAndBlock('fixer scope-stop during prior-finding amend — ' + (amend.summary || ''))
+      if (amend && (amend.applied || (amend.note && String(amend.note).trim()))) {
+        const noteHint = amend.applied ? '' : ('\nFIXER\'S EXPLANATION (no code change was applied — the diff is UNCHANGED from the first scan; judge whether this explanation genuinely justifies every finding as already-addressed or legitimately no-longer-applicable, do NOT rubber-stamp a bare assertion with no evidence): ' + amend.note)
+        const re = await call('prior-finding-probe', { model: 'claude-haiku-4-5', effort: 'low' }, PLAN_COMMITMENT_SCHEMA, fbPrompt + '\nRE-SCAN: an amend just addressed the prior gaps — judge the AMENDED diff fresh; prior gaps are hypotheses to re-verify, never conclusions to copy forward.' + noteHint, 'EdgeScan')
+        if (re && typeof re.honored === 'boolean') pf = re
+      }
+    }
+    if (pf && typeof pf.honored === 'boolean') {
+      res.gates['probe:prior-finding-scan'] = pf.honored ? 'APPROVED' : 'CHANGES_REQUIRED'
+      res.gateDetails = res.gateDetails || {}
+      res.gateDetails['probe:prior-finding-scan'] = {
+        verdict: pf.honored ? 'APPROVED' : 'CHANGES_REQUIRED',
+        headline: pf.honored ? 'every prior review finding evidenced in the diff' : ((pf.gaps || []).length + ' prior review finding(s) with NO evidence they were addressed'),
+        findings: (pf.gaps || []).slice(0, 12).map(function (g) { return { severity: 'HIGH', title: 'unaddressed prior finding: ' + String(g.commitment || '').slice(0, 140), fix: String(g.why || '') } }),
+      }
+      if (!pf.honored) {
+        const gapNote = (pf.gaps || []).slice(0, 6).map(function (g) { return String(g.commitment || '').slice(0, 90) }).join(' | ')
+        return finish('FAILED', 'prior-finding-scan (KI-E168): prior review finding(s) with NO evidence they were addressed after one bounded amend — ' + (gapNote || 'see gateDetails') + '. Pre-band fail (cheap — no gate band was spent); the fix must address every finding from the last rejected attempt.')
+      }
+    }
+  }
+
   // Editorial (Band C) — advisory, doc items only; applies doc fixes in the worktree, NEVER blocks.
   // KI-L34: runs BEFORE the gate band (it used to run after) so the gates review the editorial
   // output as part of the diff. Invariant: NOTHING mutates the worktree after the gate band — the
@@ -900,6 +1353,96 @@ async function runItem(item) {
     res.gates[ek] = er ? er.verdict : 'NULL'
     res.gateDetails = res.gateDetails || {}
     res.gateDetails[ek] = er ? { verdict: er.verdict, headline: er.headline, findings: (er.findings || []).slice(0, 6), advisory: true } : null
+  }
+
+  // EF-MIGRATION PROBE (KI-E185, ported from a host-mount session) — the pre-band catch for a class
+  //     of defect that survives build+test looking green: an EF-mapped entity's PERSISTED SHAPE
+  //     changed with no corresponding migration and a stale ModelSnapshot. The in-memory test
+  //     provider (used by every mocked/unit test this pipeline runs) has no schema at all, so it is
+  //     structurally blind to this — the only way to know is to ask the real EF tooling. Unlike
+  //     every sibling probe in this file, "is the diff internally consistent" isn't the question
+  //     here; "does the migration history account for the CURRENT model" is, and only `dotnet ef
+  //     migrations has-pending-model-changes` can answer it — the FIRST pre-band probe here to shell
+  //     out to a real dotnet invocation rather than a text/AST-shape diff (mirrors build-test.sh's
+  //     own build/red/filter/suite shape, not rootcause/leftover/comment/ledger-anchor's pure-lint
+  //     shape). Live incident on the origin host: a persisted entity schema rewrite (Guid id ->
+  //     string + 5 new columns + 1 index) shipped with no migration; 5 independent gate/review roles
+  //     each spent a full dispatch re-discovering the SAME thing by hand before this existed. Gated
+  //     broadly on item.files naming a path under a recognizable {Service}/src/{Service}.{Layer}/
+  //     layout (Core/Persistence/Infrastructure) — deliberately wider than "only Persistence
+  //     changed", since the origin incident's own entity edit lived under .Core/Domain/ and never
+  //     touched a path containing the word "Persistence" at all — an entity's shape can change
+  //     without its EF configuration file ever being touched. A service this reaches that never
+  //     actually changed its model costs one clean, fast dotnet-ef invocation — never a false
+  //     CRITICAL.
+  const efMigrationServices = Array.from(new Set((item.files || [])
+    .map(function (f) { const m = /^([A-Za-z0-9.]+)\/src\/\1\.(?:Core|Persistence|Infrastructure)\//.exec(f); return m ? m[1] : null })
+    .filter(Boolean)))
+  if (codeChange && !verificationOnly && efMigrationServices.length) {
+    const svcList = efMigrationServices.map(function (s) { return '  - service=' + s + ': run `' + BT + ' efmigration ' + wtPath + '/' + s + '/src/' + s + '.Api ../' + s + '.Persistence`' }).join('\n')
+    const emProbe = await call('efmigration-probe', { model: 'claude-haiku-4-5', effort: 'low' }, EFMIGRATION_SCHEMA,
+      'EF-MIGRATION PROBE (KI-E185). Run EACH of the following commands via Bash, exactly as written, one per service — do NOT edit anything, do NOT interpret, just run and read the result line:\n' + svcList + '\nEach prints a line `FACTORY::EFMIGRATION::RESULT verdict=<clean|dirty|inconclusive> exit=<n>` — report ONE entry per service actually run: {service, verdict} taking verdict VERBATIM from that line (if a command errors before printing that line at all — e.g. no such project on disk — omit that service from results entirely rather than guessing a verdict).', 'EdgeScan')
+    const emResults = (emProbe && Array.isArray(emProbe.results)) ? emProbe.results : []
+    const emDirty = emResults.filter(function (r) { return r.verdict === 'dirty' })
+    if (emDirty.length) {
+      res.gates['probe:efmigration'] = 'CHANGES_REQUIRED'
+      res.gateDetails = res.gateDetails || {}
+      res.gateDetails['probe:efmigration'] = {
+        verdict: 'CHANGES_REQUIRED',
+        headline: emDirty.length + ' service(s) have an EF-mapped entity change with no migration: ' + emDirty.map(function (r) { return r.service }).join(', '),
+        findings: emDirty.map(function (r) { return { severity: 'CRITICAL', title: r.service + ': pending model changes with no migration', fix: 'from ' + r.service + '/src/' + r.service + '.Api, run `dotnet ef migrations add <Name> --project ../' + r.service + '.Persistence`, then confirm `dotnet ef migrations has-pending-model-changes` is clean' } }),
+      }
+      return finish('FAILED', 'efmigration probe (KI-E185): ' + emDirty.map(function (r) { return r.service }).join(', ') + ' — a persisted EF entity changed shape with no migration and a stale ModelSnapshot; a real (non-in-memory) deployment would crash-loop on this while every mocked test stays green. Pre-band fail (cheap — no gate band was spent).')
+    }
+    // A missing/empty results array (every service errored before the RESULT line, or the probe
+    // itself came back null) proceeds — announced as SKIPPED, never silently read as clean, same
+    // posture as every sibling pre-band probe. "inconclusive" (a real error unrelated to pending
+    // changes, e.g. a build failure the earlier verify step would already have caught) also proceeds
+    // without failing THIS probe — it is not evidence of a migration gap either way.
+    res.gates['probe:efmigration'] = emResults.length ? 'APPROVED' : 'SKIPPED'
+  }
+
+  // 4a6. EDITORIAL HIGH-FINDING AMEND (KI-E164, ported from a host-mount session) — editorial
+  //      (KI-L34) deliberately never self-edits FACTUAL content ("content-is-sacrosanct" — a prose
+  //      pass correcting a fact it cannot independently verify against code is exactly the overreach
+  //      that separation avoids) — it only REPORTS. Until now that report went nowhere within the
+  //      SAME attempt: a HIGH-severity, grep-verified factual finding with an exact replacement
+  //      already written sat as advisory prose while the diff proceeded to the hard gate band
+  //      UNCHANGED, so the identical defect had to be independently rediscovered by a later, far more
+  //      expensive reviewer before it blocked anything. Live incident on the origin host: two HIGH
+  //      editorial:prose findings (fabricated event/field names in a planning doc, a false "already
+  //      covered" decrypt claim) shipped completely unapplied all the way to the gate band, which
+  //      independently rediscovered the identical defects at full opus-gate-band price. Mirrors the
+  //      edge-scan/acceptance-scan/plan-commitment-scan "one bounded amend" idiom exactly: the FIXER
+  //      (never editorial itself) applies the correction, preserving the existing discovery/
+  //      application separation of roles. Scoped to HIGH only — MEDIUM/LOW editorial findings stay
+  //      purely advisory (a style opinion forced into every diff via an expensive amend would be
+  //      exactly the over-triggering this fix must not introduce).
+  const editorialHighFindings = []
+  for (const ek of Object.keys(res.gateDetails || {})) {
+    if (!ek.startsWith('editorial:')) continue
+    for (const f of ((res.gateDetails[ek] && res.gateDetails[ek].findings) || [])) {
+      if (String(f.severity || '').toUpperCase() === 'HIGH') editorialHighFindings.push(Object.assign({ gate: ek }, f))
+    }
+  }
+  if (editorialHighFindings.length && !verificationOnly) {
+    res.amended = true // KI-E125 — an amend is about to edit the worktree after verify
+    const edAmend = await call('fixer', R.fixer, FIX_SCHEMA, 'EDITORIAL HIGH-FINDING AMEND (KI-E164): an advisory editorial pass found HIGH-severity, grep-verified factual defect(s) it deliberately did NOT self-correct (editorial never edits facts, only prose/structure). Apply EACH exact fix below now, re-run the targeted build+test via `' + BT + ' build <touched .csproj> 2>&1 | tee -a ' + RAW + '` and `' + BT + ' filter <test .csproj> "<TestClassName>" 2>&1 | tee -a ' + RAW + '` if you touched code, and REGENERATE the review pack as your LAST action: `' + PACKCMD + '`. FINDINGS: ' + JSON.stringify(editorialHighFindings.slice(0, 12)) + claimsHint + countClaimsHint, 'Verify')
+    if (edAmend && edAmend.scopeStop) return await frameAndBlock('fixer scope-stop during editorial-finding amend — ' + (edAmend.summary || ''))
+    if (edAmend && edAmend.applied) {
+      // Re-run exactly the editorial flows that HAD a HIGH finding, so the recorded verdict reflects
+      // the corrected diff instead of the stale pre-amend finding (same KI-L35 re-verify posture).
+      for (const f of flowsFor(item).filter(function (x) { return x.band === 'editorial' })) {
+        const ek = 'editorial:' + f.skill.replace('bmad-editorial-review-', '')
+        const hadHigh = (res.gateDetails[ek] && res.gateDetails[ek].findings || []).some(function (x) { return String(x.severity || '').toUpperCase() === 'HIGH' })
+        if (!hadHigh) continue
+        const rescan = await call(SKILL_ROLE[f.skill], RF[f.routeKey], GATE_SCHEMA, 'RE-SCAN (KI-E164): a bounded fixer amend just applied the exact correction(s) your prior HIGH finding(s) specified — re-walk the AMENDED diff fresh; treat your own prior finding as a hypothesis to re-verify (KI-L35), not a conclusion to copy forward. Advisory pass; apply doc fixes in the worktree but NEVER block the item. Regenerate the review pack as your LAST action: `' + PACKCMD + '`.', 'Verify')
+        if (rescan) {
+          res.gates[ek] = rescan.verdict
+          res.gateDetails[ek] = { verdict: rescan.verdict, headline: rescan.headline, findings: (rescan.findings || []).slice(0, 6), advisory: true }
+        }
+      }
+    }
   }
 
   // KI-L35: on a reFix round a reviewer that anchors on the PRIOR round's findings (its own old
@@ -924,14 +1467,14 @@ async function runItem(item) {
   if (edgeFlow) {
     phase('EdgeScan')
     edgeRoute = band === 'LIGHT' ? SONNET : (RF[edgeFlow.routeKey] || RT.rEdge)
-    edgeExtra = 'Apply the ' + edgeFlow.skill + ' BMAD review methodology to the WORKTREE DIFF only (git -C <worktree> diff). Verdict CHANGES_REQUIRED on any CRITICAL/HIGH you find; APPROVED only if the diff is clean by your lens.' + staleGuard + voGuard + ' EARLY SCAN (pre-band, KI-E12): you run BEFORE the full gate band so unhandled boundaries get fixed cheaply now instead of failing the whole item after the band. Findings-only discipline as usual.'
+    edgeExtra = 'Apply the ' + edgeFlow.skill + ' BMAD review methodology to the WORKTREE DIFF only (git -C <worktree> diff). Verdict CHANGES_REQUIRED on any CRITICAL/HIGH you find; APPROVED only if the diff is clean by your lens.' + staleGuard + voGuard + ' EARLY SCAN (pre-band, KI-E12): you run BEFORE the full gate band so unhandled boundaries get fixed cheaply now instead of failing the whole item after the band. Findings-only discipline as usual.' + verifyEvidenceHint
     edgeFinal = await call('review-edgecase', edgeRoute, GATE_SCHEMA, edgeExtra, 'EdgeScan')
     res.artifacts['review:review-edge-case-hunter'] = 'state/items/' + id + '/review-edgecase.md'
     const edgeFindings = (edgeFinal && edgeFinal.findings) || []
     if (edgeFinal && edgeFinal.verdict === 'CHANGES_REQUIRED' && edgeFindings.length && !verificationOnly) {
       // ONE bounded amend: the fixer addresses the scan's findings, re-verifies the touched surface,
       // regenerates the pack; the re-scan's verdict is final (no second amend — the band adjudicates).
-      const amend = await call('fixer', R.fixer, FIX_SCHEMA, 'EARLY EDGE-SCAN AMEND (KI-E12): the edge-case hunter walked your fix\'s branching paths BEFORE the gate band and found unhandled boundaries. Address EVERY finding below with the minimal correct guard (or state in note precisely why a finding is out of this item\'s scope). Then re-run the targeted build+test via `' + BT + ' build <touched .csproj> 2>&1 | tee -a ' + RAW + '` and `' + BT + ' filter <test .csproj> "<TestClassName>" 2>&1 | tee -a ' + RAW + '`, and REGENERATE the review pack: `' + PACKCMD + '`. FINDINGS: ' + JSON.stringify(edgeFindings.slice(0, 12)) + claimsHint, 'EdgeScan')
+      const amend = await call('fixer', R.fixer, FIX_SCHEMA, 'EARLY EDGE-SCAN AMEND (KI-E12): the edge-case hunter walked your fix\'s branching paths BEFORE the gate band and found unhandled boundaries. Address EVERY finding below with the minimal correct guard (or state in note precisely why a finding is out of this item\'s scope). Then re-run the targeted build+test via `' + BT + ' build <touched .csproj> 2>&1 | tee -a ' + RAW + '` and `' + BT + ' filter <test .csproj> "<TestClassName>" 2>&1 | tee -a ' + RAW + '`, and REGENERATE the review pack: `' + PACKCMD + '`. FINDINGS: ' + JSON.stringify(edgeFindings.slice(0, 12)) + claimsHint + countClaimsHint, 'EdgeScan')
       if (amend && amend.scopeStop) return await frameAndBlock('fixer scope-stop during edge-scan amend — ' + (amend.summary || ''))
       if (amend && amend.applied) {
         const rescan = await call('review-edgecase', edgeRoute, GATE_SCHEMA, edgeExtra + ' RE-SCAN: an amend just addressed your prior findings — re-walk the AMENDED diff fresh; prior findings are hypotheses to re-verify (KI-L35), never conclusions to copy forward.', 'EdgeScan')
@@ -962,7 +1505,7 @@ async function runItem(item) {
       let ac = await call('acceptance-probe', { model: 'claude-haiku-4-5', effort: 'low' }, ACCEPT_SCHEMA, acceptPrompt, 'EdgeScan')
       if (ac && ac.covered === false && Array.isArray(ac.gaps) && ac.gaps.length) {
         // ONE bounded amend (mirrors the edge-scan amend), then ONE re-probe; the re-probe's verdict is final.
-        const amend = await call('fixer', R.fixer, FIX_SCHEMA, 'ACCEPTANCE-GAP AMEND (KI-E18): a pre-band probe found acceptance clause(s) with NO evidence in your diff — the gate band would FAIL the item at full price for exactly this (the #1 recent FAIL cause). Address EVERY gap below with the minimal correct change (or state in note precisely why a clause is already satisfied or out of this item\'s scope). Then re-verify the touched surface (code: `' + BT + ' build <touched .csproj> 2>&1 | tee -a ' + RAW + '` + `' + BT + ' filter <test .csproj> "<TestClassName>" 2>&1 | tee -a ' + RAW + '`; doc/config: the spec\'s grep) and REGENERATE the review pack: `' + PACKCMD + '`. GAPS: ' + JSON.stringify(ac.gaps.slice(0, 8)) + claimsHint, 'EdgeScan')
+        const amend = await call('fixer', R.fixer, FIX_SCHEMA, 'ACCEPTANCE-GAP AMEND (KI-E18): a pre-band probe found acceptance clause(s) with NO evidence in your diff — the gate band would FAIL the item at full price for exactly this (the #1 recent FAIL cause). Address EVERY gap below with the minimal correct change (or state in note precisely why a clause is already satisfied or out of this item\'s scope). Then re-verify the touched surface (code: `' + BT + ' build <touched .csproj> 2>&1 | tee -a ' + RAW + '` + `' + BT + ' filter <test .csproj> "<TestClassName>" 2>&1 | tee -a ' + RAW + '`; doc/config: the spec\'s grep) and REGENERATE the review pack: `' + PACKCMD + '`. GAPS: ' + JSON.stringify(ac.gaps.slice(0, 8)) + claimsHint + countClaimsHint, 'EdgeScan')
         if (amend && amend.scopeStop) return await frameAndBlock('fixer scope-stop during acceptance amend — ' + (amend.summary || ''))
         // Fix (multi-lens review, 2026-08-25): the prompt above explicitly OFFERS the fixer a
         // note-only response ("or state in note precisely why a clause is already satisfied or out
@@ -991,6 +1534,50 @@ async function runItem(item) {
           const gapNote = (ac.gaps || []).slice(0, 6).map(function (g) { return String(g.clause || '').slice(0, 90) }).join(' | ')
           return finish('FAILED', 'acceptance-scan (KI-E18): acceptance clause(s) with NO evidence in the diff after one bounded amend — ' + (gapNote || 'see gateDetails') + '. Pre-band fail (cheap — no gate band was spent); the fix must address EVERY acceptance clause.')
         }
+      }
+    }
+  }
+
+  // 4c-ter. BREADTH-CLAIM VERIFICATION PROBE (KI-E179, ported from a host-mount session) —
+  //     acceptance-scan (KI-E18) proves each acceptance CLAUSE has evidence in the diff; it never
+  //     questions whether a clause making an ABSOLUTE, universal-quantifier claim ("no
+  //     consumer...", "every X...") is PROVEN AS WIDELY AS IT CLAIMS. Live incident on the origin
+  //     host: a breadth-scan regression test (written to prove "no participating consumer
+  //     re-persists a plaintext body") had a regex that matched one call-site shape but not a
+  //     dotted-member-access variant of the exact same call, and a scan root covering one
+  //     directory while a sibling directory (same interface, same service) held both the unswept
+  //     offender and several already-converted consumers — the sweep and its own proof test shared
+  //     the identical blind spot, so the test stayed green over a real, undocumented gap. Three
+  //     opus-class gate reviewers each independently rediscovered this, expensively, only after
+  //     the full band ran. Gated on the ACCEPTANCE TEXT itself naming a universal/breadth claim — a
+  //     cheap, zero-cost string check — so this never fires on the (large) majority of items making
+  //     ordinary, bounded claims.
+  if (!verificationOnly && BREADTH_CLAIM_RE.test(item.acceptance || '')) {
+    phase('EdgeScan')
+    let bc = await call('breadth-claim-probe', { model: 'claude-sonnet-4-6', effort: 'medium' }, ACCEPT_SCHEMA,
+      'BREADTH-CLAIM VERIFICATION (KI-E179 — pre-band completeness-sweep probe). This item\'s acceptance criteria makes an ABSOLUTE, universal-quantifier claim — the kind a narrow regression test can silently under-cover without anyone noticing (live incident this guards against: a breadth-scan test\'s regex matched one call-site shape but not a dotted-member-access variant of the exact same call, and its scan root covered one consumer directory while a sibling directory — same interface, same service — held both the unswept offender and several already-converted consumers; the sweep and its own proof test shared the identical blind spot). STEP 1: read the ACCEPTANCE CLAIM below and name exactly what universal set it claims to cover. STEP 2: read ' + itemsDir(id) + '/review-pack.md for the new/modified regression test(s) meant to PROVE this claim — find their actual scan boundary (directory roots, regex patterns, hardcoded lists). STEP 3: independently search the REAL worktree yourself (grep/glob under ' + wtPath + ') for anything that plausibly falls inside the claimed universal set but OUTSIDE the test\'s own scan boundary — do not trust the test\'s stated scope, verify it against the actual codebase structure. Return covered=true only if the test\'s real implementation genuinely reaches everything the claim implies; otherwise covered=false with each gap in gaps (clause = the specific site or boundary the test misses, why = the evidence). ACCEPTANCE CLAIM: ' + (item.acceptance || ''), 'EdgeScan')
+    if (bc && bc.covered === false && Array.isArray(bc.gaps) && bc.gaps.length) {
+      res.amended = true
+      const bcAmend = await call('fixer', R.fixer, FIX_SCHEMA, 'BREADTH-CLAIM GAP AMEND (KI-E179): a pre-band probe found that your breadth-claiming regression test\'s own scan boundary does NOT actually cover everything your acceptance criteria universally claims — the gate band would independently rediscover this at full price. Address EVERY gap below: either widen the test\'s scan boundary/regex to genuinely cover the missed site(s), or fix the missed site(s) themselves (whichever the gap actually calls for), or state in note precisely why a gap is already covered or legitimately out of scope. Then re-verify the touched surface and REGENERATE the review pack: `' + PACKCMD + '`. GAPS: ' + JSON.stringify(bc.gaps.slice(0, 8)) + claimsHint + countClaimsHint, 'EdgeScan')
+      if (bcAmend && bcAmend.scopeStop) return await frameAndBlock('fixer scope-stop during breadth-claim amend — ' + (bcAmend.summary || ''))
+      if (bcAmend && (bcAmend.applied || (bcAmend.note && String(bcAmend.note).trim()))) {
+        const bcNoteHint = bcAmend.applied ? '' : ('\nFIXER\'S EXPLANATION (no code change was applied — judge whether this genuinely justifies every gap as already-covered or out of scope, do NOT rubber-stamp a bare assertion): ' + bcAmend.note)
+        const bcRe = await call('breadth-claim-probe', { model: 'claude-sonnet-4-6', effort: 'medium' }, ACCEPT_SCHEMA,
+          'BREADTH-CLAIM VERIFICATION, RE-SCAN (KI-E179): an amend just addressed the prior gaps — independently re-verify the AMENDED diff and worktree fresh; prior gaps are hypotheses to re-check, never conclusions to copy forward.' + bcNoteHint, 'EdgeScan')
+        if (bcRe && typeof bcRe.covered === 'boolean') bc = bcRe
+      }
+    }
+    if (bc && typeof bc.covered === 'boolean') {
+      res.gates['probe:breadth-claim'] = bc.covered ? 'APPROVED' : 'CHANGES_REQUIRED'
+      res.gateDetails = res.gateDetails || {}
+      res.gateDetails['probe:breadth-claim'] = {
+        verdict: bc.covered ? 'APPROVED' : 'CHANGES_REQUIRED',
+        headline: bc.covered ? 'the breadth-claiming test\'s own scan genuinely covers the universal claim' : ((bc.gaps || []).length + ' site(s)/boundary gap(s) the breadth-claiming test does not actually reach'),
+        findings: (bc.gaps || []).slice(0, 12).map(function (g) { return { severity: 'HIGH', title: 'breadth-claim gap: ' + String(g.clause || '').slice(0, 140), fix: String(g.why || '') } }),
+      }
+      if (!bc.covered) {
+        const bcGapNote = (bc.gaps || []).slice(0, 6).map(function (g) { return String(g.clause || '').slice(0, 90) }).join(' | ')
+        return finish('FAILED', 'breadth-claim probe (KI-E179): the universal claim in this item\'s acceptance criteria is NOT actually proven as widely as claimed, even after one bounded amend — ' + (bcGapNote || 'see gateDetails') + '. Pre-band fail (cheap — no gate band was spent); a completeness sweep is only as good as its own scan boundary.')
       }
     }
   }
@@ -1044,11 +1631,12 @@ async function runItem(item) {
         ? 'PLAN-STEP SCAN (KI-E101 — pre-band plan-vs-diff step-coverage probe). Before implementing, this item\'s OWN plan decomposed the work into the numbered steps below. STEP 1: Read ' + itemsDir(id) + '/review-pack.md (the machine snapshot of this change). STEP 2: for EACH numbered step, decide whether the CHANGE (the diff / new files) carries CONCRETE evidence that step was actually carried out — a specific hunk, file, or test. Judge COVERAGE of the plan\'s own steps, not general quality (the review band judges that); a step the diff quietly skipped is precisely what this probe exists to catch. Return honored=true ONLY if EVERY step is evidenced; otherwise honored=false with each un-evidenced step in gaps (quote the step text in `commitment`, why no evidence in `why`). Do NOT edit anything.\nPLAN STEPS:\n' + stepList
         : 'PLAN-COMMITMENT SCAN (KI-E87 — pre-band plan-vs-diff self-consistency probe). Before implementing, this item\'s OWN plan stated the commitment language below (its approach/blast-radius fields). STEP 1: Read ' + itemsDir(id) + '/review-pack.md (the machine snapshot of this change). STEP 2: for each "MUST"/"must include/add/…"/"required to" commitment in the text below, decide whether the CHANGE (the diff / new files) contains CONCRETE evidence the commitment was honored. Judge whether the plan\'s own promise was kept — not general quality (the review band judges that). Return honored=true ONLY if EVERY commitment is evidenced; otherwise honored=false with each unhonored commitment in gaps (quote the commitment + why no evidence). Do NOT edit anything.\nPLAN TEXT:\n' + commitmentText
       let pc = await call('plan-commitment-probe', { model: 'claude-haiku-4-5', effort: 'low' }, PLAN_COMMITMENT_SCHEMA, planPrompt, 'EdgeScan')
+      let amend = null // KI-E142B (ported from a host-mount session): hoisted out of the gap-handling block below so the deviation-adjudication check further down (after the re-probe) can still read amend.deviations — a bounded-amend that never ran (no gaps found) leaves this null, which the deviation check already treats as "nothing declared".
       if (pc && pc.honored === false && Array.isArray(pc.gaps) && pc.gaps.length) {
         const amendHead = stepMode
           ? 'PLAN-STEP AMEND (KI-E101): a pre-band probe found step(s) your OWN plan laid out with NO evidence in your diff — the re-audit would FAIL the item at full band price for exactly this.'
           : 'PLAN-COMMITMENT AMEND (KI-E87): a pre-band probe found commitment(s) your OWN plan made with NO evidence in your diff — the re-audit would FAIL the item at full band price for exactly this.'
-        const amend = await call('fixer', R.fixer, FIX_SCHEMA, amendHead + ' Address EVERY gap below with the minimal correct change (or state in note precisely why that ' + axis + ' is already satisfied or no longer applicable). Then re-verify the touched surface (code: `' + BT + ' build <touched .csproj> 2>&1 | tee -a ' + RAW + '` + `' + BT + ' filter <test .csproj> "<TestClassName>" 2>&1 | tee -a ' + RAW + '`; doc/config: the spec\'s grep) and REGENERATE the review pack: `' + PACKCMD + '`. GAPS: ' + JSON.stringify(pc.gaps.slice(0, 8)) + claimsHint, 'EdgeScan')
+        amend = await call('fixer', R.fixer, FIX_SCHEMA, amendHead + ' Address EVERY gap below with the minimal correct change (or state in note precisely why that ' + axis + ' is already satisfied or no longer applicable). Then re-verify the touched surface (code: `' + BT + ' build <touched .csproj> 2>&1 | tee -a ' + RAW + '` + `' + BT + ' filter <test .csproj> "<TestClassName>" 2>&1 | tee -a ' + RAW + '`; doc/config: the spec\'s grep) and REGENERATE the review pack: `' + PACKCMD + '`. GAPS: ' + JSON.stringify(pc.gaps.slice(0, 8)) + claimsHint + countClaimsHint, 'EdgeScan')
         if (amend && amend.scopeStop) return await frameAndBlock('fixer scope-stop during plan-commitment amend — ' + (amend.summary || ''))
         // Fix (multi-lens review, 2026-08-25): the prompt above explicitly OFFERS the fixer a
         // note-only response ("or state in note precisely why the commitment is already satisfied
@@ -1078,9 +1666,90 @@ async function runItem(item) {
         }
         if (!pc.honored) {
           const gapNote = (pc.gaps || []).slice(0, 6).map(function (g) { return String(g.commitment || '').slice(0, 90) }).join(' | ')
-          return finish('FAILED', 'plan-commitment-scan (' + (stepMode ? 'KI-E101 STEP mode' : 'KI-E87 PROSE mode') + '): the plan\'s own ' + axis + '(s) have NO evidence in the diff after one bounded amend — ' + (gapNote || 'see gateDetails') + '. Pre-band fail (cheap — no gate band was spent); the fix must cover every ' + axis + ' the plan itself laid out.')
+          // KI-E142B (ported from a host-mount session): not every unhonored commitment is a genuine
+          // gap — a step can legitimately turn out unnecessary, already-satisfied elsewhere, or
+          // superseded by a better approach the fixer found mid-implementation. A SILENT gap (the fixer
+          // never said why) still fails exactly as before — explaining a deviation is required, never
+          // optional, and this never rewards silence. Only a DECLARED, explained deviation
+          // (fix.json.deviations, from the bounded amend above) earns an INDEPENDENT adjudicator
+          // judgment before the fail — deliberately NOT re-asked of the same cheap probe that just
+          // found the gap (grading its own homework), but of the SAME high-effort adjudicator role
+          // already trusted to break a gate-review tie on the merits of the diff.
+          const declared = (amend && Array.isArray(amend.deviations))
+            ? amend.deviations.filter(function (d) { return d && String(d.reason || '').trim() })
+            : []
+          if (declared.length) {
+            const adj = await call('adjudicator', R.adjudicator, ADJUDICATE_SCHEMA,
+              'PLAN-DEVIATION ADJUDICATION (KI-E142B): a pre-band probe found ' + axis + '(s) with no evidence in the diff. The fixer declares these as DELIBERATE deviations, not oversights — judge on the merits whether EVERY declared deviation is legitimate (the ' + axis + ' no longer applies, is satisfied a different way, or the plan\'s own premise was wrong) or is a rationalization for a genuine gap. Read the actual worktree diff (`git -C ' + wtPath + ' diff`) and the original plan\'s ' + axis + '(s) before ruling — do not take either side\'s word for it. Default to UPHELD when genuinely uncertain (fail-safe: back to the fixer, not a coin-flip pass). OVERRULED means EVERY remaining gap below is legitimately explained; if even one is not, this is UPHELD.\nREMAINING GAPS: ' + JSON.stringify((pc.gaps || []).slice(0, 8)) + '\nFIXER\'S DECLARED DEVIATIONS: ' + JSON.stringify(declared.slice(0, 8)), 'EdgeScan')
+            res.gates['adjudicator:plan-deviation'] = adj ? adj.verdict : 'NULL'
+            res.gateDetails['adjudicator:plan-deviation'] = adj ? { verdict: adj.verdict, headline: adj.headline, reasons: adj.reasons } : null
+            if (adj && adj.verdict === 'OVERRULED') {
+              res.gates['probe:plan-commitment-scan'] = 'APPROVED'
+              res.gateDetails['probe:plan-commitment-scan'].verdict = 'APPROVED'
+              res.gateDetails['probe:plan-commitment-scan'].headline += ' — deviation(s) adjudicated legitimate (KI-E142B)'
+              // fall through — the item proceeds; nothing fails the item on this path.
+            } else {
+              return finish('FAILED', 'plan-commitment-scan (' + (stepMode ? 'KI-E101 STEP mode' : 'KI-E87 PROSE mode') + '): ' + (pc.gaps || []).length + ' ' + axis + '(s) with a declared deviation, but adjudicator ' + (adj ? adj.verdict : 'NULL') + ' — ' + (gapNote || 'see gateDetails') + '. Pre-band fail (cheap — no gate band was spent).')
+            }
+          } else {
+            return finish('FAILED', 'plan-commitment-scan (' + (stepMode ? 'KI-E101 STEP mode' : 'KI-E87 PROSE mode') + '): the plan\'s own ' + axis + '(s) have NO evidence in the diff after one bounded amend — ' + (gapNote || 'see gateDetails') + '. Pre-band fail (cheap — no gate band was spent); the fix must cover every ' + axis + ' the plan itself laid out.')
+          }
         }
       }
+    }
+  }
+
+  // SHADOW-MODE CONSOLIDATED SCAN (KI-E169, ported from a host-mount session) — HOST-POLICY-GATED,
+  //     purely observational. Three independent opus evaluators on the origin host audited whether
+  //     acceptance-scan (KI-E18), plan-commitment-scan (KI-E87/E101), and prior-finding-scan (KI-E168)
+  //     could be merged into ONE haiku call instead of three separate ones, to cut per-call overhead.
+  //     Result: no evidence of cross-axis dilution for a SMALL shape (<=3 axes, one shared diff) — but
+  //     explicitly n=1, and the evaluators named two conditions before trusting it with a real verdict:
+  //     (a) validate the merged response always carries every axis, never silently treating a missing
+  //     one as a pass, and (b) shadow-run it against real data with verdicts diffed, so a regression
+  //     shows up as data, not a missed finding downstream. This block is EXACTLY (b): it changes
+  //     NOTHING about what closes or fails an item — acceptance-scan/plan-commitment-scan/
+  //     prior-finding-scan above remain the sole source of truth, completely unmodified — it only ALSO
+  //     fires one additional, non-blocking consolidated call, and ONLY when all three axes were
+  //     independently active and APPROVED this round (the only shape reachable here: any of the three
+  //     CHANGES_REQUIRED already returned FAILED via the fail-open path above, before this line ever runs).
+  //     Condition (a) is enforced by SHADOW_SCAN_SCHEMA's three independently `required` booleans — a
+  //     malformed/truncated response fails JSON-schema validation before ever reaching this code, never
+  //     silently reads as three passes.
+  //     Off by default (a host opts in only when it wants this dataset collected, KI-E171); never
+  //     amends, never touches the worktree, never blocks. Read `probe:consolidated-scan-shadow` in
+  //     gateDetails across enough real runs before ever considering promoting the merged call to a
+  //     real verdict.
+  if (A.policies && A.policies.shadowConsolidatedScan && !verificationOnly
+      && res.gates['probe:acceptance-scan'] === 'APPROVED'
+      && res.gates['probe:plan-commitment-scan'] === 'APPROVED'
+      && res.gates['probe:prior-finding-scan'] === 'APPROVED') {
+    phase('EdgeScan')
+    const shadowPrompt = 'SHADOW CONSOLIDATED SCAN (KI-E169 — purely observational; nothing you find here affects this item\'s outcome). Check THREE independent things against the SAME diff. STEP 1: read ' + itemsDir(id) + '/review-pack.md (the machine snapshot of this change). STEP 2: run `cat ' + itemsDir(id) + '/feedback.md 2>/dev/null || echo NO-FEEDBACK-FILE` for item (c) below. STEP 3: judge each of the three independently, using ONLY concrete diff evidence (a specific hunk, file, or test) — a prose claim with no matching change is NOT evidence:\n'
+      + '(a) ACCEPTANCE — does the diff evidence every clause of: ' + JSON.stringify(item.acceptance || '') + '\n'
+      + '(b) PLAN — does the diff evidence every commitment/step of: ' + JSON.stringify({ approach: plan && plan.approach, steps: plan && plan.steps }) + '\n'
+      + '(c) PRIOR FINDINGS — does the diff evidence every finding under a "### Findings" heading in the STEP 2 output (ABOVE any "## PRIOR CYCLE(S)\' FEEDBACK" divider); true if the file is absent or has no such section.\n'
+      + 'Return acceptanceCovered, planHonored, findingHonored as three independent booleans. Do NOT edit anything.'
+    const shadow = await call('consolidated-scan-shadow', { model: 'claude-haiku-4-5', effort: 'low' }, SHADOW_SCAN_SCHEMA, shadowPrompt, 'EdgeScan')
+    res.gateDetails = res.gateDetails || {}
+    if (shadow) {
+      // Reachable only when all three real gates are 'APPROVED' (see the guard above) — computed
+      // dynamically rather than assumed, so this stays correct if a future change ever makes one of
+      // the three scans non-fatal.
+      const realAcc = res.gates['probe:acceptance-scan'] === 'APPROVED'
+      const realPlan = res.gates['probe:plan-commitment-scan'] === 'APPROVED'
+      const realFind = res.gates['probe:prior-finding-scan'] === 'APPROVED'
+      const agree = shadow.acceptanceCovered === realAcc && shadow.planHonored === realPlan && shadow.findingHonored === realFind
+      res.gates['probe:consolidated-scan-shadow'] = agree ? 'AGREE' : 'DISAGREE'
+      res.gateDetails['probe:consolidated-scan-shadow'] = {
+        verdict: agree ? 'APPROVED' : 'CHANGES_REQUIRED', // reused vocabulary for reporting only — NEVER read by finish()/fold; this gate is never in any blocking set
+        headline: agree ? 'consolidated shadow call agreed with all 3 separate real verdicts' : 'consolidated shadow call DISAGREED with at least one separate real verdict — data point for KI-E169',
+        findings: agree ? [] : [{ severity: 'INFO', title: 'shadow vs real: acceptance ' + shadow.acceptanceCovered + '/' + realAcc + ', plan ' + shadow.planHonored + '/' + realPlan + ', finding ' + shadow.findingHonored + '/' + realFind, fix: 'observational only — does not affect this item; feeds the KI-E169 consolidation-safety dataset before any promotion decision' }],
+      }
+    } else {
+      // KI-L53 fail-open posture: an unavailable shadow probe is infra noise, never itself a
+      // disagreement signal — announced rather than silently absent (KI-E20/KI-E41 posture).
+      res.gates['probe:consolidated-scan-shadow'] = 'SKIPPED'
     }
   }
 
@@ -1182,98 +1851,143 @@ async function runItem(item) {
     }
   }
 
-  // 5. REVIEW band — role gates (Band A) + method review-flows (Band B), EACH a separate adversarial
-  //    subagent (never nested in the doing agent). 4 technical role gates + applicable method flows run
-  //    pooled; the PO role gate runs LAST (functional acceptance after the technical band).
-  phase('Gates')
-  const gateRoles = band === 'LIGHT' ? ['developer', 'qa'] // LIGHT: skip the opus architect/security/po panel
-    : (item.gateSet && item.gateSet.length ? item.gateSet : (CFG.gateSet || ['architect', 'developer', 'qa', 'security', 'po']))
-  const techGates = gateRoles.filter(function (g) { return g !== 'po' })
+  // KI-E139 (ported from a host-mount session) — GATE-BAND REUSE (content-hash-fenced), building on
+  // KI-E137's checkpoints. Everything above (fix, verify, all pre-band scans) ALWAYS re-runs fresh on
+  // a relaunch, unchanged — this freshly-regenerated review-pack.md IS the trustworthy "current" input
+  // the hash below compares against, not a shortcut around producing it. What this skips is ONLY the
+  // expensive part: if a PRIOR attempt's progress.json proves the gate band already reached a
+  // fully-resolved GATED state (its `stage` is 'post-gates' or 'post-reaudit' — a stage the pipeline
+  // only reaches after every dissent/adjudication/re-gate has settled) AND a FRESH hash of the pack
+  // JUST regenerated above matches the hash recorded at THAT prior post-preband checkpoint, the
+  // reviewable diff is byte-identical to what a full gate band already vetted — re-running the SAME
+  // reviewers against the SAME snapshot cannot teach anything a cache can't. The hash is NEVER trusted
+  // from item.priorProgress alone — it is recomputed BY A FRESH PROBE, right now, against the live
+  // worktree; a stale, missing, or mismatched hash always falls through to a full, independent
+  // re-gate, byte-identical to pre-KI-E139 behaviour. Never applies to the pre-band scans themselves
+  // or to refute/re-audit/integrate, which ALWAYS still run fresh regardless (unchanged KI-E69
+  // posture: "gates re-adjudicate the worktree on every relaunch" stays true — this only makes the
+  // RE-adjudication mechanical and cheap instead of an unconditional re-pay, and ONLY on a proof, not
+  // an assumption).
+  let prebandHash = null
+  {
+    const PHRAW = itemsDir(id) + '/review-pack.md'
+    const hp = await call('pack-hash-probe', { model: 'claude-haiku-4-5', effort: 'low' }, PACK_HASH_SCHEMA,
+      'Run EXACTLY this ONE command via Bash: `shasum -a 256 ' + PHRAW + ' | cut -d\' \' -f1` (or `sha256sum` if `shasum` is unavailable) and return its trimmed 64-character lowercase hex output as hash. Do NOTHING else: no edits, no other commands, no interpretation.', 'Gates')
+    if (hp && typeof hp.hash === 'string' && /^[0-9a-f]{64}$/.test(hp.hash)) prebandHash = hp.hash
+  }
+  await checkpointProgress(res, 'post-preband', prebandHash ? { reviewPackHash: prebandHash } : null) // KI-E137/E139 — kill-resilience + the fencing token gate-band reuse compares against. Placed here rather than immediately before phase('Gates') in the origin diff's exact spot because this repo's pre-band scan chain ends one scan earlier (ledger-anchor-scan, KI-E91) — no root-cause-touch-probe (KI-E104's probe form) exists here yet to checkpoint after; this is still the correct "last thing before the gate band" position for THIS repo's actual pipeline.
+
+  // Hoisted OUT of the `if (!gatesReused)` block below (KI-E139): flowsFor(item)'s method-flow set
+  // does not depend on whether the gate band actually runs, and the LATER Refute+Re-audit section's
+  // `refuteCovered` reads it too — scoping it to the gate band alone would leave it undefined on the
+  // reuse path.
   // KI-E12: the edge-case hunter left the late band ONLY when the early scan produced a verdict
   // (edgeFinal); a null early scan (agent unavailable) falls back to the late-band slot so verdict
   // coverage is never lost.
   const methodFlows = flowsFor(item).filter(function (f) { return f.band === 'method' && f.blocking && !(edgeFinal && f.routeKey === 'review.edgecase') })
-  const blocking = techGates.map(function (g) { return { key: 'gate:' + g, role: 'gate-' + g, route: band === 'LIGHT' ? SONNET : R.gates[g], extra: (staleGuard + voGuard) || null } })
-    .concat(methodFlows.map(function (f) {
-      return { key: 'review:' + f.skill.replace('bmad-', ''), role: SKILL_ROLE[f.skill], route: band === 'LIGHT' ? SONNET : RF[f.routeKey],
-        extra: 'Apply the ' + f.skill + ' BMAD review methodology to the WORKTREE DIFF only (git -C <worktree> diff). Verdict CHANGES_REQUIRED on any CRITICAL/HIGH you find; APPROVED only if the diff is clean by your lens.' + staleGuard + voGuard }
-    }))
-  const brRes = await Promise.all(blocking.map(function (x) { return call(x.role, x.route, GATE_SCHEMA, x.extra, 'Gates') }))  // each agent() routes through the global limiter (caps total concurrency)
-  // KI-E12: the early scan's FINAL verdict joins the band's verdict set — recording, failedBlk,
-  // adjudication membership, and the P8 re-gate loop treat it exactly like an in-band reviewer.
-  if (edgeFinal) { blocking.push({ key: 'review:review-edge-case-hunter', role: 'review-edgecase', route: edgeRoute, extra: edgeExtra }); brRes.push(edgeFinal) }
-  // KI-L31: capture the FULL structured verdict (headline + findings), not just the verdict string —
-  // the driver projects these into state/items/<id>/feedback.md at fold, so the reFix loop never
-  // depends on a reviewer remembering to write its artifact file (a returned-but-unwritten review
-  // otherwise leaves the PRIOR attempt's file as poisoned feedback).
-  res.gateDetails = res.gateDetails || {}
-  const detail = function (gr) { return gr ? { verdict: gr.verdict, headline: gr.headline, acceptanceMet: gr.acceptanceMet, redGreenConfirmed: gr.redGreenConfirmed, findings: (gr.findings || []).slice(0, 12), reasons: gr.reasons } : null }
-  for (let i = 0; i < blocking.length; i++) {
-    const b = blocking[i], gr = brRes[i]
-    res.artifacts[b.key] = 'state/items/' + id + '/' + b.role + '.md'
-    res.gates[b.key] = gr ? gr.verdict : 'NULL'
-    res.gateDetails[b.key] = detail(gr)
-    // KI-L57: honour a gate's scopeViolation flag ONLY when the same gate did NOT approve — a
-    // genuine red-line crossing is never approvable, so {verdict:'APPROVED', scopeViolation:true}
-    // is a self-contradictory agent result (live: ITEM-H9 cycle 33 — the developer gate's
-    // prose said "product-scope: CLEAR", verdict APPROVED, yet the stray boolean hard-stopped the
-    // item into the owner queue on a false premise). The inconsistent flag is preserved on
-    // gateDetails for the audit trail instead of blocking.
-    if (gr && gr.scopeViolation) {
-      if (gr.verdict !== 'APPROVED') return await frameAndBlock(b.key + ': product-scope violation (hard stop)' + (gr.headline ? ' — gate headline: ' + String(gr.headline).slice(0, 200) : ''))
-      if (res.gateDetails[b.key]) res.gateDetails[b.key].scopeViolationIgnored = true
+
+  let gatesReused = false
+  if (item.priorProgress && ['post-gates', 'post-reaudit'].includes(item.priorProgress.progressStage)
+      && typeof item.priorProgress.reviewPackHash === 'string' && prebandHash && prebandHash === item.priorProgress.reviewPackHash) {
+    // Merge so THIS attempt's own freshly-run pre-band probe verdicts (already on res.gates) are never
+    // clobbered by the prior attempt's — only the gate:*/review:*/adjudicator/gate:po keys are new here.
+    res.gates = Object.assign({}, item.priorProgress.gates, res.gates)
+    res.gateDetails = Object.assign({}, item.priorProgress.gateDetails || {}, res.gateDetails)
+    res.gateBandReused = true // telemetry: this relaunch skipped the opus gate band on a content-hash proof, not an assumption
+    res.transitions.push('GATED')
+    gatesReused = true
+  }
+  if (!gatesReused) {
+    // 5. REVIEW band — role gates (Band A) + method review-flows (Band B), EACH a separate adversarial
+    //    subagent (never nested in the doing agent). 4 technical role gates + applicable method flows run
+    //    pooled; the PO role gate runs LAST (functional acceptance after the technical band).
+    phase('Gates')
+    const gateRoles = band === 'LIGHT' ? ['developer', 'qa'] // LIGHT: skip the opus architect/security/po panel
+      : (item.gateSet && item.gateSet.length ? item.gateSet : (CFG.gateSet || ['architect', 'developer', 'qa', 'security', 'po']))
+    const techGates = gateRoles.filter(function (g) { return g !== 'po' })
+    const blocking = techGates.map(function (g) { return { key: 'gate:' + g, role: 'gate-' + g, route: band === 'LIGHT' ? SONNET : R.gates[g], extra: staleGuard + voGuard + verifyEvidenceHint } })
+      .concat(methodFlows.map(function (f) {
+        return { key: 'review:' + f.skill.replace('bmad-', ''), role: SKILL_ROLE[f.skill], route: band === 'LIGHT' ? SONNET : RF[f.routeKey],
+          extra: 'Apply the ' + f.skill + ' BMAD review methodology to the WORKTREE DIFF only (git -C <worktree> diff). Verdict CHANGES_REQUIRED on any CRITICAL/HIGH you find; APPROVED only if the diff is clean by your lens.' + staleGuard + voGuard + verifyEvidenceHint }
+      }))
+    const brRes = await Promise.all(blocking.map(function (x) { return call(x.role, x.route, GATE_SCHEMA, x.extra, 'Gates') }))  // each agent() routes through the global limiter (caps total concurrency)
+    // KI-E12: the early scan's FINAL verdict joins the band's verdict set — recording, failedBlk,
+    // adjudication membership, and the P8 re-gate loop treat it exactly like an in-band reviewer.
+    if (edgeFinal) { blocking.push({ key: 'review:review-edge-case-hunter', role: 'review-edgecase', route: edgeRoute, extra: edgeExtra }); brRes.push(edgeFinal) }
+    // KI-L31: capture the FULL structured verdict (headline + findings), not just the verdict string —
+    // the driver projects these into state/items/<id>/feedback.md at fold, so the reFix loop never
+    // depends on a reviewer remembering to write its artifact file (a returned-but-unwritten review
+    // otherwise leaves the PRIOR attempt's file as poisoned feedback).
+    res.gateDetails = res.gateDetails || {}
+    const detail = function (gr) { return gr ? { verdict: gr.verdict, headline: gr.headline, acceptanceMet: gr.acceptanceMet, redGreenConfirmed: gr.redGreenConfirmed, findings: (gr.findings || []).slice(0, 12), reasons: gr.reasons } : null }
+    for (let i = 0; i < blocking.length; i++) {
+      const b = blocking[i], gr = brRes[i]
+      res.artifacts[b.key] = 'state/items/' + id + '/' + b.role + '.md'
+      res.gates[b.key] = gr ? gr.verdict : 'NULL'
+      res.gateDetails[b.key] = detail(gr)
+      // KI-L57: honour a gate's scopeViolation flag ONLY when the same gate did NOT approve — a
+      // genuine red-line crossing is never approvable, so {verdict:'APPROVED', scopeViolation:true}
+      // is a self-contradictory agent result (live: ITEM-H9 cycle 33 — the developer gate's
+      // prose said "product-scope: CLEAR", verdict APPROVED, yet the stray boolean hard-stopped the
+      // item into the owner queue on a false premise). The inconsistent flag is preserved on
+      // gateDetails for the audit trail instead of blocking.
+      if (gr && gr.scopeViolation) {
+        if (gr.verdict !== 'APPROVED') return await frameAndBlock(b.key + ': product-scope violation (hard stop)' + (gr.headline ? ' — gate headline: ' + String(gr.headline).slice(0, 200) : ''))
+        if (res.gateDetails[b.key]) res.gateDetails[b.key].scopeViolationIgnored = true
+      }
     }
-  }
-  const failedBlk = blocking.filter(function (b, i) { return (brRes[i] ? brRes[i].verdict : 'NULL') !== 'APPROVED' })
-  // KI-L53: a NULL gate (agent unavailable after retries) is an INFRA failure, not a dissent — name it
-  // separately in the note (so the fold's auto-infra-retry can spare the attempt) and never send a
-  // null-only "dispute" to the adjudicator (there are no findings to adjudicate; fail-closed stands).
-  const nullBlk = blocking.filter(function (b, i) { return !brRes[i] })
-  if (nullBlk.length) res.infraSuspect = true
-  const unavailNote = function () { return nullBlk.length ? '; stage agent UNAVAILABLE (null after retries — possible infra/credit failure, NOT a quality verdict): ' + nullBlk.map(function (b) { return b.key }).join(', ') : '' }
-  if (failedBlk.length) {
-    // KI-C8 — a SPLIT verdict on a CRITICAL/HIGH item is contestable: adjudicate (fable-5) rather than an
-    // unconditional bounce. Unanimous CHANGES_REQUIRED, or any MEDIUM/LOW item, fails straight to the fixer.
-    // KI-E15 (2026-07-20): the `band === 'FULL'` guard is DROPPED — a split on ANY CRITICAL/HIGH item
-    // adjudicates, LIGHT band included. Cycle 46 ran two genuine LIGHT-band HIGH splits (ITEM-H17 5-vs-1,
-    // ITEM-H-A6 6-vs-1) that failed straight to the operator, who had to convene the adjudicator
-    // MANUALLY — both dissents were UPHELD with exact bounded remedies that direct-recovered same-session.
-    // In-band adjudication turns "FAILED, unexplained dispute" into "FAILED + authoritative §5 remedy"
-    // (or OVERRULED → proceeds), at a cost bounded to genuine splits only (unanimous fails and MEDIUM/LOW
-    // items still skip it; the KI-L53 null-only outage guard is unchanged).
-    const heavy = item.severity === 'CRITICAL' || item.severity === 'HIGH'
-    const disputed = heavy && failedBlk.length < blocking.length && failedBlk.length > nullBlk.length // a null-only "dispute" is an outage, not a dissent
-    if (disputed) {
-      // P8: an adjudicator can never wave through the SECURITY gate on a security/crypto CRITICAL — that dissent
-      // is non-adjudicable; the fix must SATISFY the gate, not be overruled past it.
-      const securityDissent = failedBlk.some(function (b) { return b.key === 'gate:security' || b.key === 'review:review-security' })
-      const securityCrit = item.severity === 'CRITICAL' && (item.theme === 'security-multitenancy' || /crypto|secret|token|auth|tls|pii/i.test(item.theme + ' ' + (item.title || '')))
-      if (securityDissent && securityCrit) return finish('FAILED', 'security gate dissented on a security/crypto CRITICAL — non-adjudicable; the fix must satisfy the security gate (P8), it cannot be overruled')
-      const adj = await call('adjudicator', R.adjudicator, ADJUDICATE_SCHEMA, 'DISPUTED ' + item.severity + ': review(s) [' + failedBlk.map(function (b) { return b.key }).join(', ') + '] returned CHANGES_REQUIRED while ' + (blocking.length - failedBlk.length) + ' other(s) APPROVED the SAME diff. Adjudicate on the merits of the worktree diff: is the fix genuinely defective (UPHELD -> back to the fixer) or were the dissenting review(s) wrong (OVERRULED -> the fix proceeds)? WRITE state/items/' + id + '/adjudication.md.', 'Gates')
-      res.artifacts.adjudication = 'state/items/' + id + '/adjudication.md'
-      res.gates['adjudicator'] = adj ? adj.verdict : 'NULL'
-      res.gateDetails['adjudicator'] = detail(adj)
-      if (!adj || adj.verdict !== 'OVERRULED') return finish('FAILED', 'review(s) not APPROVED + adjudicator ' + (adj ? adj.verdict : 'NULL') + ': ' + failedBlk.map(function (b) { return b.key }).join(', '))
-      // P8: OVERRULE is not a free pass — RE-RUN the dissenting gate(s) once against the (unchanged) diff and
-      // proceed ONLY if they now APPROVE. The adjudicator breaks a genuine tie; it does not silence a gate.
-      const reRes = await Promise.all(failedBlk.map(function (b) { return call(b.role, b.route, GATE_SCHEMA, (b.extra || 'Re-gate this worktree diff.') + ' RE-GATE: adjudication OVERRULED the prior dissent as wrong-on-the-merits; judge the SAME diff strictly and independently. APPROVED only if it is genuinely clean by your lens.', 'Gates') }))
-      for (let i = 0; i < failedBlk.length; i++) res.gateDetails[failedBlk[i].key + ':re-gate'] = detail(reRes[i])
-      const stillFailed = failedBlk.filter(function (b, i) { return (reRes[i] ? reRes[i].verdict : 'NULL') !== 'APPROVED' })
-      if (stillFailed.length) return finish('FAILED', 'adjudicator OVERRULED but the re-gate still not APPROVED (P8): ' + stillFailed.map(function (b) { return b.key }).join(', '))
-      // re-gate APPROVED: proceed past the gate band.
-    } else {
-      return finish('FAILED', 'review(s) not APPROVED: ' + failedBlk.map(function (b) { return b.key }).join(', ') + unavailNote())
+    const failedBlk = blocking.filter(function (b, i) { return (brRes[i] ? brRes[i].verdict : 'NULL') !== 'APPROVED' })
+    // KI-L53: a NULL gate (agent unavailable after retries) is an INFRA failure, not a dissent — name it
+    // separately in the note (so the fold's auto-infra-retry can spare the attempt) and never send a
+    // null-only "dispute" to the adjudicator (there are no findings to adjudicate; fail-closed stands).
+    const nullBlk = blocking.filter(function (b, i) { return !brRes[i] })
+    if (nullBlk.length) res.infraSuspect = true
+    const unavailNote = function () { return nullBlk.length ? '; stage agent UNAVAILABLE (null after retries — possible infra/credit failure, NOT a quality verdict): ' + nullBlk.map(function (b) { return b.key }).join(', ') : '' }
+    if (failedBlk.length) {
+      // KI-C8 — a SPLIT verdict on a CRITICAL/HIGH item is contestable: adjudicate (fable-5) rather than an
+      // unconditional bounce. Unanimous CHANGES_REQUIRED, or any MEDIUM/LOW item, fails straight to the fixer.
+      // KI-E15 (2026-07-20): the `band === 'FULL'` guard is DROPPED — a split on ANY CRITICAL/HIGH item
+      // adjudicates, LIGHT band included. Cycle 46 ran two genuine LIGHT-band HIGH splits (ITEM-H17 5-vs-1,
+      // ITEM-H-A6 6-vs-1) that failed straight to the operator, who had to convene the adjudicator
+      // MANUALLY — both dissents were UPHELD with exact bounded remedies that direct-recovered same-session.
+      // In-band adjudication turns "FAILED, unexplained dispute" into "FAILED + authoritative §5 remedy"
+      // (or OVERRULED → proceeds), at a cost bounded to genuine splits only (unanimous fails and MEDIUM/LOW
+      // items still skip it; the KI-L53 null-only outage guard is unchanged).
+      const heavy = item.severity === 'CRITICAL' || item.severity === 'HIGH'
+      const disputed = heavy && failedBlk.length < blocking.length && failedBlk.length > nullBlk.length // a null-only "dispute" is an outage, not a dissent
+      if (disputed) {
+        // P8: an adjudicator can never wave through the SECURITY gate on a security/crypto CRITICAL — that dissent
+        // is non-adjudicable; the fix must SATISFY the gate, not be overruled past it.
+        const securityDissent = failedBlk.some(function (b) { return b.key === 'gate:security' || b.key === 'review:review-security' })
+        const securityCrit = item.severity === 'CRITICAL' && (item.theme === 'security-multitenancy' || /crypto|secret|token|auth|tls|pii/i.test(item.theme + ' ' + (item.title || '')))
+        if (securityDissent && securityCrit) return finish('FAILED', 'security gate dissented on a security/crypto CRITICAL — non-adjudicable; the fix must satisfy the security gate (P8), it cannot be overruled')
+        const adj = await call('adjudicator', R.adjudicator, ADJUDICATE_SCHEMA, 'DISPUTED ' + item.severity + ': review(s) [' + failedBlk.map(function (b) { return b.key }).join(', ') + '] returned CHANGES_REQUIRED while ' + (blocking.length - failedBlk.length) + ' other(s) APPROVED the SAME diff. Adjudicate on the merits of the worktree diff: is the fix genuinely defective (UPHELD -> back to the fixer) or were the dissenting review(s) wrong (OVERRULED -> the fix proceeds)? WRITE state/items/' + id + '/adjudication.md.', 'Gates')
+        res.artifacts.adjudication = 'state/items/' + id + '/adjudication.md'
+        res.gates['adjudicator'] = adj ? adj.verdict : 'NULL'
+        res.gateDetails['adjudicator'] = detail(adj)
+        if (!adj || adj.verdict !== 'OVERRULED') return finish('FAILED', 'review(s) not APPROVED + adjudicator ' + (adj ? adj.verdict : 'NULL') + ': ' + failedBlk.map(function (b) { return b.key }).join(', '))
+        // P8: OVERRULE is not a free pass — RE-RUN the dissenting gate(s) once against the (unchanged) diff and
+        // proceed ONLY if they now APPROVE. The adjudicator breaks a genuine tie; it does not silence a gate.
+        const reRes = await Promise.all(failedBlk.map(function (b) { return call(b.role, b.route, GATE_SCHEMA, (b.extra || 'Re-gate this worktree diff.') + ' RE-GATE: adjudication OVERRULED the prior dissent as wrong-on-the-merits; judge the SAME diff strictly and independently. APPROVED only if it is genuinely clean by your lens.', 'Gates') }))
+        for (let i = 0; i < failedBlk.length; i++) res.gateDetails[failedBlk[i].key + ':re-gate'] = detail(reRes[i])
+        const stillFailed = failedBlk.filter(function (b, i) { return (reRes[i] ? reRes[i].verdict : 'NULL') !== 'APPROVED' })
+        if (stillFailed.length) return finish('FAILED', 'adjudicator OVERRULED but the re-gate still not APPROVED (P8): ' + stillFailed.map(function (b) { return b.key }).join(', '))
+        // re-gate APPROVED: proceed past the gate band.
+      } else {
+        return finish('FAILED', 'review(s) not APPROVED: ' + failedBlk.map(function (b) { return b.key }).join(', ') + unavailNote())
+      }
     }
+    if (gateRoles.includes('po')) {
+      const po = await call('gate-po', R.gates.po, GATE_SCHEMA, verifyEvidenceHint, 'Gates')
+      res.artifacts['gate:po'] = 'state/items/' + id + '/gate-po.md'
+      res.gates['gate:po'] = po ? po.verdict : 'NULL'
+      res.gateDetails['gate:po'] = detail(po)
+      if (!po) { res.infraSuspect = true; return finish('FAILED', 'PO gate agent UNAVAILABLE (null after retries — possible infra/credit failure, NOT a quality verdict)') } // KI-L53
+      if (res.gates['gate:po'] !== 'APPROVED') return finish('FAILED', 'PO gate not APPROVED')
+    }
+    res.transitions.push('GATED')
   }
-  if (gateRoles.includes('po')) {
-    const po = await call('gate-po', R.gates.po, GATE_SCHEMA, null, 'Gates')
-    res.artifacts['gate:po'] = 'state/items/' + id + '/gate-po.md'
-    res.gates['gate:po'] = po ? po.verdict : 'NULL'
-    res.gateDetails['gate:po'] = detail(po)
-    if (!po) { res.infraSuspect = true; return finish('FAILED', 'PO gate agent UNAVAILABLE (null after retries — possible infra/credit failure, NOT a quality verdict)') } // KI-L53
-    if (res.gates['gate:po'] !== 'APPROVED') return finish('FAILED', 'PO gate not APPROVED')
-  }
-  res.transitions.push('GATED')
+  await checkpointProgress(res, 'post-gates') // KI-E137 — kill-resilience: the whole (expensive) opus gate band survives a kill during refute+re-audit
 
   // 6+7. REFUTE + RE-AUDIT — two INDEPENDENT adversarial passes over the SAME verified+gated diff: the refuter
   //      ATTACKS the fix (the in-memory-illusion skeptic); the multi-lens re-audit CONFIRMS the original finding
@@ -1292,8 +2006,8 @@ async function runItem(item) {
   for (const lens of lenses) pv.push({ kind: 'lens', lens: lens })
   const pvRes = await Promise.all(pv.map(function (t) {
     return t.kind === 'refute'
-      ? call('refuter', R.refuter, REFUTE_SCHEMA, null, 'Refute+Re-audit')
-      : call('re-auditor', R.reauditor, REAUDIT_SCHEMA, 'Apply the ' + t.lens + ' audit lens ONLY, scoped to the worktree diff + its immediate blast radius. Confirm the ORIGINAL finding is gone (cite the now-correct file:line, not the test) AND that THIS lens finds no new CRITICAL/HIGH in the change.', 'Refute+Re-audit')
+      ? call('refuter', R.refuter, REFUTE_SCHEMA, verifyEvidenceHint, 'Refute+Re-audit')
+      : call('re-auditor', R.reauditor, REAUDIT_SCHEMA, 'Apply the ' + t.lens + ' audit lens ONLY, scoped to the worktree diff + its immediate blast radius. Confirm the ORIGINAL finding is gone (cite the now-correct file:line, not the test) AND that THIS lens finds no new CRITICAL/HIGH in the change.' + verifyEvidenceHint, 'Refute+Re-audit')
   }))
   // refuter verdict (slot 0 when present)
   if (!refuteCovered) {
@@ -1321,6 +2035,7 @@ async function runItem(item) {
     return finish('FAILED', parts.join('; '))
   }
   res.transitions.push('REAUDITED')
+  await checkpointProgress(res, 'post-reaudit') // KI-E137 — kill-resilience: gates + refute + re-audit survive a kill during integrate
 
   // 8. escalate-tier stops here for human sign-off (auth/money/crypto/cross-service)
   if (item.autonomyTier === 'escalate' || item._escalate) {
@@ -1488,6 +2203,36 @@ if (DRY || !items.length) {
 // call routes through the global `limit` (makeLimiter(CONC)), so total concurrent agents stay <= CONC
 // across all items + stages — an item never holds a slot while awaiting another, so there is no
 // nested-limiter deadlock. Isolated per-item worktrees => zero cross-item contamination (Phase-2 finding 4).
+// KI-E137 (ported from a host-mount session) — INCREMENTAL PROGRESS CHECKPOINTING. checkpointResult
+// (KI-L40) below persists only the TERMINAL outcome, so a kill anywhere between `fix` and `integrate`
+// (10-25+ agent calls: the whole pre-band scan chain, then the entire opus gate band, then
+// refute+re-audit) left a resumed item with NOTHING — discarding every already-paid-for stage no
+// matter how close to done it was. `checkpointProgress(res, stage, extra)`, a sibling of
+// checkpointResult (same KI-D8 provenance framing, same CHECKPOINT_SCHEMA write contract, a SEPARATE
+// state/items/<id>/progress.json file so the terminal-checkpoint contract reconstruct/fold depend on
+// is untouched), is called at 4 phase boundaries: post-verify (before the pre-band scan chain
+// begins), post-preband (after it, before the gate band), post-gates (after GATED, before
+// refute+re-audit), post-reaudit (after REAUDITED, before integrate). Deliberately does NOT (yet)
+// feed relaunch reuse — progress.json is advisory/forensic only in this change, same posture
+// lib/prior-attempt.mjs already documents for why `verify` onward stays unreused; teaching a relaunch
+// to actually SKIP a stage whose progress.json proves current against the live worktree is a
+// separate, larger change (KI-E139's content-hash-fenced gate-band reuse) that touches the "gates
+// re-adjudicate every relaunch" trust boundary and needs its own review.
+async function checkpointProgress(res, stage, extra) {
+  try {
+    const path = itemsDir(res.id) + '/progress.json'
+    // toState is meaningless mid-pipeline (finish() hasn't run yet) — stamp an explicit sentinel so
+    // nothing downstream can mistake this for a terminal verdict (res.toState defaults to 'FAILED'
+    // at construction, which would otherwise silently misread as a real failure on disk). `extra`
+    // (KI-E139) merges IN ADDITION — e.g. reviewPackHash, the fencing token gate-band reuse needs —
+    // without ever touching the real `res` object itself (this snapshot is a throwaway clone).
+    const snapshot = Object.assign({}, res, { toState: 'IN_PROGRESS', progressStage: stage }, extra || {})
+    const json = JSON.stringify(snapshot)
+    const ck = await tryAgent('You are a checkpoint writer performing kill-resilience PROGRESS persistence (KI-E137, sibling of KI-L40) — you are NOT authoring or judging a result. This is routine machine-state bookkeeping of an automated build pipeline about its OWN run, MID-FLIGHT: the JSON below is an INCOMPLETE snapshot (stage "' + stage + '" just reached, not a final verdict) of automated build/test/review state about CODE in a scratch worktree — it represents no human signature, no official record, and no communication to any person (KI-D8 provenance). Write the EXACT text between the CHECKPOINT-BEGIN and CHECKPOINT-END markers (exclusive) to the file ' + path + ' (absolute path; overwrite if it exists) using the Write tool — byte-for-byte, ONE line, no reformatting, no added/removed fields, no markdown fences.\nCHECKPOINT-BEGIN\n' + json + '\nCHECKPOINT-END\nThen VERIFY it parses: run `node -e "JSON.parse(require(\'fs\').readFileSync(\'' + path + '\',\'utf8\'));console.log(\'CHECKPOINT-OK\')"` via Bash and confirm the output is CHECKPOINT-OK. If the parse fails, rewrite the file and re-verify. Return written=true ONLY after seeing CHECKPOINT-OK.', { label: res.id + ':progress:' + stage, phase: 'Checkpoint', model: 'claude-haiku-4-5', effort: 'low', schema: CHECKPOINT_SCHEMA }, claimTokensSilently)
+    if (!ck || ck.written !== true) log('[progress-checkpoint] ' + res.id + ' (' + stage + ') NOT persisted — a reconstruct/resume after a kill past this point will not see it')
+  } catch (e) { log('[progress-checkpoint] ' + res.id + ' (' + stage + ') failed: ' + (e && e.message)) }
+}
+
 // KI-L40 — kill-resilience checkpoint: the batch's results previously existed ONLY in this workflow's
 // memory until the final return, so a session kill mid-run lost every COMPLETED item's lifecycle and
 // the whole band re-ran (cycle 25 was launched 3×, ~2 dead bands). The moment an item resolves, a
@@ -1508,7 +2253,7 @@ async function checkpointResult(r) {
     // automated safety review) to the on-disk stage artifacts + machine-evidence transcripts
     // that PRODUCED this JSON, so persistence is distinguishable from fabrication; the driver's
     // fold independently re-derives the verdict from those raw transcripts regardless.
-    const ck = await tryAgent('You are a checkpoint writer performing kill-resilience PERSISTENCE (KI-L40) — you are NOT authoring or judging a result. This is routine machine-state bookkeeping of an automated build pipeline about its OWN run: the JSON below contains automated build/test/review verdicts about CODE in a scratch worktree — it represents no human signature, no official record, and no communication to any person (KI-D8 provenance). The JSON was ALREADY COMPUTED by this workflow\'s ' + Object.keys(r.artifacts || {}).length + ' prior lifecycle stage(s); their artifacts and machine-evidence transcripts (verify-red-raw.txt / verify-raw.txt / integrate-raw.txt with FACTORY:: markers, gate/review prose) are on disk at ' + itemsDir(r.id) + ' — run `ls -la ' + itemsDir(r.id) + '` FIRST and confirm the stage artifacts exist; they are the provenance of every verdict in this JSON. The driver\'s fold re-derives the final verdict from those transcripts and NEVER trusts this file alone. Write the EXACT text between the CHECKPOINT-BEGIN and CHECKPOINT-END markers (exclusive) to the file ' + path + ' (absolute path; overwrite if it exists) using the Write tool — byte-for-byte, ONE line, no reformatting, no added/removed fields, no markdown fences.\nCHECKPOINT-BEGIN\n' + json + '\nCHECKPOINT-END\nThen VERIFY it parses: run `node -e "JSON.parse(require(\'fs\').readFileSync(\'' + path + '\',\'utf8\'));console.log(\'CHECKPOINT-OK\')"` via Bash and confirm the output is CHECKPOINT-OK. If the parse fails, rewrite the file and re-verify. Return written=true ONLY after seeing CHECKPOINT-OK.', { label: r.id + ':checkpoint', phase: 'Checkpoint', model: 'claude-haiku-4-5', effort: 'low', schema: CHECKPOINT_SCHEMA }) // KI-L48: was phase:'Integrate' — a FAILED item's checkpoint showed as Integrate activity, misreading as gates-skipped
+    const ck = await tryAgent('You are a checkpoint writer performing kill-resilience PERSISTENCE (KI-L40) — you are NOT authoring or judging a result. This is routine machine-state bookkeeping of an automated build pipeline about its OWN run: the JSON below contains automated build/test/review verdicts about CODE in a scratch worktree — it represents no human signature, no official record, and no communication to any person (KI-D8 provenance). The JSON was ALREADY COMPUTED by this workflow\'s ' + Object.keys(r.artifacts || {}).length + ' prior lifecycle stage(s); their artifacts and machine-evidence transcripts (verify-red-raw.txt / verify-raw.txt / integrate-raw.txt with FACTORY:: markers, gate/review prose) are on disk at ' + itemsDir(r.id) + ' — run `ls -la ' + itemsDir(r.id) + '` FIRST and confirm the stage artifacts exist; they are the provenance of every verdict in this JSON. The driver\'s fold re-derives the final verdict from those transcripts and NEVER trusts this file alone. Write the EXACT text between the CHECKPOINT-BEGIN and CHECKPOINT-END markers (exclusive) to the file ' + path + ' (absolute path; overwrite if it exists) using the Write tool — byte-for-byte, ONE line, no reformatting, no added/removed fields, no markdown fences.\nCHECKPOINT-BEGIN\n' + json + '\nCHECKPOINT-END\nThen VERIFY it parses: run `node -e "JSON.parse(require(\'fs\').readFileSync(\'' + path + '\',\'utf8\'));console.log(\'CHECKPOINT-OK\')"` via Bash and confirm the output is CHECKPOINT-OK. If the parse fails, rewrite the file and re-verify. Return written=true ONLY after seeing CHECKPOINT-OK.', { label: r.id + ':checkpoint', phase: 'Checkpoint', model: 'claude-haiku-4-5', effort: 'low', schema: CHECKPOINT_SCHEMA }, claimTokensSilently) // KI-L48: was phase:'Integrate' — a FAILED item's checkpoint showed as Integrate activity, misreading as gates-skipped
     if (!ck || ck.written !== true) log('[checkpoint] ' + r.id + ' NOT persisted — a reconstruct after a kill will not see this item')
   } catch (e) { log('[checkpoint] ' + r.id + ' failed: ' + (e && e.message)) }
   return r

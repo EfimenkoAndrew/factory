@@ -22,8 +22,15 @@ export const FINDING = { type: 'object', additionalProperties: false, required: 
 // the port "accepts and validates but never acts on". Optional by design: a planner that omits it,
 // and a plan authored before the field existed, both validate exactly as before.
 export const PLAN_SCHEMA = { type: 'object', additionalProperties: false, required: ['rootCause', 'approach', 'recommendScopeStop', 'recommendEscalate'], properties: { rootCause: { type: 'string' }, approach: { type: 'string' }, steps: { type: 'array', items: { type: 'string' } }, files: { type: 'array', items: { type: 'string' } }, testStrategy: { type: 'string' }, blastRadius: { type: 'string' }, ruleRisks: { type: 'string' }, recommendEscalate: { type: 'boolean' }, recommendScopeStop: { type: 'boolean' } } };
+// KI-E134 — the narrow follow-up ask fired when a plan's own approach/blastRadius carries commitment
+// language ("MUST"/"required to") but `steps` came back missing/under-decomposed: a SINGLE cheap
+// bounded call (never a second full plan). Byte-identical to factory.js's copy (schema-parity gate).
+export const PLAN_STEPS_NUDGE_SCHEMA = { type: 'object', additionalProperties: false, required: ['steps', 'note'], properties: { steps: { type: 'array', items: { type: 'string' } }, note: { type: 'string' } } };
 
-export const TEST_SCHEMA = { type: 'object', additionalProperties: false, required: ['red', 'note'], properties: { red: { type: 'boolean' }, verificationOnly: { type: 'boolean' }, testFiles: { type: 'array', items: { type: 'string' } }, runCmd: { type: 'string' }, baselineFailures: { type: 'array', items: { type: 'string' } }, evidence: { type: 'string' }, note: { type: 'string' } } };
+// KI-E143C (ported from a host-mount session): `realInfraOverride` added for schema-parity with
+// factory.js's TEST_SCHEMA — structurally inert here (this runtime has no adjudication routing for
+// it, see stage-parity.mjs), same posture as FIX_SCHEMA's `deviations` field above.
+export const TEST_SCHEMA = { type: 'object', additionalProperties: false, required: ['red', 'note'], properties: { red: { type: 'boolean' }, verificationOnly: { type: 'boolean' }, testFiles: { type: 'array', items: { type: 'string' } }, runCmd: { type: 'string' }, baselineFailures: { type: 'array', items: { type: 'string' } }, evidence: { type: 'string' }, note: { type: 'string' }, realInfraOverride: { type: ['string', 'null'] } } };
 
 // KI-O2: `divergence` is typed `['string','null','object']` — factory.js's FIX_SCHEMA in this PR
 // already carries the same widened type (the upstream fix landed; both copies are in sync, and the
@@ -32,11 +39,20 @@ export const TEST_SCHEMA = { type: 'object', additionalProperties: false, requir
 // `['string','null']` typing rejected on a real, brief-conforming fixer response (live 2026-07-28).
 // Nothing downstream (driver.mjs, lib/*.mjs, factory.js itself) reads `.divergence`
 // programmatically — it is purely informational for human fold review.
-export const FIX_SCHEMA = { type: 'object', additionalProperties: false, required: ['applied', 'scopeStop', 'summary'], properties: { applied: { type: 'boolean' }, filesChanged: { type: 'array', items: { type: 'string' } }, summary: { type: 'string' }, scopeStop: { type: 'boolean' }, divergence: { type: ['string', 'null', 'object'] }, note: { type: 'string' } } };
+// KI-E142B (ported from a host-mount session): `deviations` added for schema-parity with factory.js's
+// FIX_SCHEMA — a plan-commitment deviation declared by a fixer here would have nowhere to be
+// adjudicated (plan-feasibility-probe/plan-quality-probe and the KI-E142B adjudication routing are
+// UNPORTED, see stage-parity.mjs), so this field is structurally inert in this runtime today.
+// KI-E181 (ported from a host-mount session): `filesChanged.description` kept byte-identical to
+// factory.js's copy (the schema-parity selftest deep-equals them) — canon's `svcDirs` KI-E180 check
+// is likewise `afterVerify`/`planNext`-unported here (a pure-mechanical check, not an agent role, so
+// there is nothing for stage-parity.mjs to declare UNPORTED), so the description is structurally
+// inert in THIS runtime the same way `deviations` above is — present for parity, not consulted here.
+export const FIX_SCHEMA = { type: 'object', additionalProperties: false, required: ['applied', 'scopeStop', 'summary'], properties: { applied: { type: 'boolean' }, filesChanged: { type: 'array', items: { type: 'string' }, description: "ONLY files this fix itself created or modified via a tool call. Never include a file you merely read, referenced, relied on, or re-verified — including one the test-author's own red test already wrote correctly. A file you consulted but did not change stays OUT of this list; it feeds the KI-E180 cross-service verify-scope check (above), so an inflated or incomplete claim can misfire that check in either direction (KI-E181)." }, summary: { type: 'string' }, scopeStop: { type: 'boolean' }, divergence: { type: ['string', 'null', 'object'] }, note: { type: 'string' }, deviations: { type: 'array', items: { type: 'object', additionalProperties: false, required: ['commitment', 'reason'], properties: { commitment: { type: 'string' }, reason: { type: 'string' } } } } } };
 
 const STRARR = { type: 'array', items: { type: 'string' } };
 
-export const VERIFY_SCHEMA = { type: 'object', additionalProperties: false, required: ['build', 'targetedTest', 'suite'], properties: { build: { type: 'string', pattern: '^(pass|fail)' }, targetedTest: { type: 'string', pattern: '^(pass|fail)' }, suite: { type: 'object', additionalProperties: true }, realInfraExercised: {}, realInfraKind: { type: 'string' }, dockerAbsent: { type: 'boolean' }, failingTests: STRARR, newFailures: STRARR, baselineFailures: STRARR, debris: STRARR, evidence: { type: 'string' }, note: { type: 'string' } } };
+export const VERIFY_SCHEMA = { type: 'object', additionalProperties: false, required: ['build', 'targetedTest', 'suite'], properties: { build: { type: 'string', pattern: '^(pass|fail)' }, targetedTest: { type: 'string', pattern: '^(pass|fail)' }, suite: { type: 'object', additionalProperties: true }, realInfraExercised: {}, realInfraKind: { type: 'string' }, dockerAbsent: { type: 'boolean' }, failingTests: STRARR, newFailures: STRARR, baselineFailures: STRARR, debris: STRARR, evidence: { type: 'string' }, note: { type: 'string' } } }; // KI-E145 (ported from a host-mount session): kept byte-identical to canon's VERIFY_SCHEMA. `mainDriftOwnFiles` briefly lived here (KI-E144B) as the runner's own closed boolean answer — an improvement on free-text regex-matching, but still a self-report. Now superseded there: an INDEPENDENT probe (main-drift-probe, PROBE_SCHEMA) re-derives the fact directly from the teed evidence file, matching this pipeline's own established posture (KI-E10/E83/E104) of never trusting an agent's claim about its own evidence. Removed from here rather than left as a dead field nothing reads.
 
 export const GATE_SCHEMA = { type: 'object', additionalProperties: false, required: ['gate', 'verdict', 'headline'], properties: { gate: { type: 'string' }, verdict: { type: 'string', enum: ['APPROVED', 'CHANGES_REQUIRED'] }, findings: { type: 'array', items: FINDING }, scopeViolation: { type: 'boolean' }, acceptanceMet: { type: 'boolean' }, redGreenConfirmed: { type: 'boolean' }, headline: { type: 'string' } } };
 
@@ -64,6 +80,9 @@ export const PROBE_SCHEMA = { type: 'object', additionalProperties: false, requi
 // polarity), so this schema is kept for parity with canon's agent-relay shape rather than because the
 // check is missing. See opencode/stage-parity.mjs, which the selftest enforces against both files.
 export const RED_PROOF_SCHEMA = { type: 'object', additionalProperties: false, required: ['markerFound', 'exitCode'], properties: { markerFound: { type: 'boolean' }, exitCode: { type: 'number' }, line: { type: 'string' } } };
+// KI-E175 (ported from a host-mount session) — schema-parity only; the stage itself stays UNPORTED
+// (see opencode/stage-parity.mjs).
+export const RED_COVERAGE_SCHEMA = { type: 'object', additionalProperties: false, required: ['covered'], properties: { covered: { type: 'boolean' }, gap: { type: ['string', 'null'] } } };
 
 // KI-E87 + KI-E101 — the plan-commitment/plan-step contract. KI-E112: this stage IS dispatched by the
 // port (the plancommit/plancommit_amend/plancommit_reprobe trio in planNext), so this schema is live,
@@ -81,13 +100,41 @@ export const LEDGER_ANCHOR_SCHEMA = { type: 'object', additionalProperties: fals
 // because zero here means FAILURE while COMMENT_SCHEMA's `count` zero means success.
 export const ROOTCAUSE_SCHEMA = { type: 'object', additionalProperties: false, required: ['nonTestCount'], properties: { nonTestCount: { type: 'number' }, files: { type: 'array', items: { type: 'string' } }, skipped: { type: 'boolean' } } };
 
+// KI-E185 (ported from a host-mount session) — EF-migration pending-model-change probe (schema-parity
+// ONLY, same disclosed-gap shape as PACK_HASH_SCHEMA/SHADOW_SCAN_SCHEMA below): unlike ROOTCAUSE_SCHEMA
+// above (which this port enforces MECHANICALLY via afterVerify's nonTestChanged check over the
+// worktree diff), "does the persisted EF model match the migration history" cannot be answered by
+// reading the worktree's git diff at all — canon's probe shells out to a REAL `dotnet ef migrations
+// has-pending-model-changes` invocation, and this runtime has no equivalent real-command-relay
+// capability to dispatch that onto (see stage-parity.mjs's UNPORTED['efmigration-probe'] for the full
+// reason). Kept here for byte/structure schema-parity with factory.js only; intentionally absent from
+// the SCHEMAS registry below since nothing in this runtime ever needs to validate against it.
+export const EFMIGRATION_SCHEMA = { type: 'object', additionalProperties: false, required: ['results'], properties: { results: { type: 'array', items: { type: 'object', additionalProperties: false, required: ['service', 'verdict'], properties: { service: { type: 'string' }, verdict: { type: 'string' } } } } } };
+
 export const SWEEP_DESIGN_SCHEMA = { type: 'object', additionalProperties: false, required: ['pattern', 'headline'], properties: { pattern: { type: 'string' }, applicationNotes: { type: 'string' }, conformanceCheck: { type: 'string' }, headline: { type: 'string' } } };
 
 export const CHECKPOINT_SCHEMA = { type: 'object', additionalProperties: false, required: ['written'], properties: { written: { type: 'boolean' }, note: { type: 'string' } } };
 
+// KI-E139 (ported from a host-mount session) — pack-hash probe (schema-parity ONLY, same
+// disclosed-gap shape as other UNPORTED-with-a-reason schemas): the content-hash fencing token
+// gate-band reuse compares against a prior attempt's progress.json is a genuinely UNPORTED
+// mechanism in this runtime (see stage-parity.mjs's UNPORTED['pack-hash-probe'] for the reason) —
+// no mechanical or agent-dispatched equivalent exists here, so it is intentionally absent from the
+// SCHEMAS registry below (nothing in this runtime ever needs to validate against it) while still
+// satisfying byte/structure parity with factory.js.
+export const PACK_HASH_SCHEMA = { type: 'object', additionalProperties: false, required: ['hash'], properties: { hash: { type: 'string' } } };
+
+// KI-E169 (ported from a host-mount session) — shadow-mode consolidated-scan probe (schema-parity
+// ONLY, same disclosed-gap shape as PACK_HASH_SCHEMA immediately above): a genuinely UNPORTED, purely
+// observational data-collection mechanism in this runtime (see stage-parity.mjs's
+// UNPORTED['consolidated-scan-shadow'] for the reason) — no mechanical or agent-dispatched equivalent
+// exists here, so it is intentionally absent from the SCHEMAS registry below while still satisfying
+// byte/structure parity with factory.js.
+export const SHADOW_SCAN_SCHEMA = { type: 'object', additionalProperties: false, required: ['acceptanceCovered', 'planHonored', 'findingHonored'], properties: { acceptanceCovered: { type: 'boolean' }, planHonored: { type: 'boolean' }, findingHonored: { type: 'boolean' } } };
+
 // Registry keyed by the same schema-name string the runtime.mjs CLI accepts on `submit --schema <name>`.
 export const SCHEMAS = {
-  PLAN_SCHEMA, TEST_SCHEMA, FIX_SCHEMA, VERIFY_SCHEMA, GATE_SCHEMA, REFUTE_SCHEMA, REAUDIT_SCHEMA,
+  PLAN_SCHEMA, PLAN_STEPS_NUDGE_SCHEMA, TEST_SCHEMA, FIX_SCHEMA, VERIFY_SCHEMA, GATE_SCHEMA, REFUTE_SCHEMA, REAUDIT_SCHEMA,
   INTEG_SCHEMA, ADJUDICATE_SCHEMA, DECISION_SCHEMA, ACCEPT_SCHEMA, LEFTOVER_SCHEMA, PROBE_SCHEMA,
   SWEEP_DESIGN_SCHEMA, CHECKPOINT_SCHEMA,
 };

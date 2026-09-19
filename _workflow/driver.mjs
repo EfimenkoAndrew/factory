@@ -34,24 +34,25 @@ import { projectBatch, renderProjection } from './lib/band-cost.mjs';
 import { loadRouting, resolve as routeResolve, concurrencyFor } from './lib/router.mjs';
 import { addWorktree, removeWorktree, pruneStaleBranch, listWorktrees, changedFiles, pruneWorktrees, isFactoryWorktreePath, parseComposeLs, strayComposeProjects } from './lib/worktree.mjs';
 import { acquireLock, releaseLock } from './lib/lock.mjs';
-import { parseVerifyRaw, verdictFromParse, debrisFiles, parseRedRaw, hasRealInfraMarker, touchedRootCause, effectiveBaseline, decodeTranscript, flakeSuspects } from './lib/verify.mjs';
+import { parseVerifyRaw, verdictFromParse, debrisFiles, parseRedRaw, hasRealInfraMarker, touchedRootCause, effectiveBaseline, decodeTranscript, flakeSuspects, isPhantomBaseline, annotateBaselineReason } from './lib/verify.mjs';
 import { preflight, dockerAvailable } from './lib/preflight.mjs';
 import { classifyFilesEntry, buildBasenameIndex, acceptanceSurfaceGaps } from './lib/graphaudit.mjs';
-import { renderFeedback } from './lib/feedback.mjs';
+import { renderFeedback, mergeFeedbackHistory } from './lib/feedback.mjs';
 import { dissentersFrom, roleForGateKey, recoveryFoldSkeleton, priorCycleOf, missingStageFrom } from './lib/recover.mjs'; // KI-E20 — the direct-recovery scaffold; KI-E81 — missing-stage auto-detection
 import { applyConvergenceBonus, effectiveRetryBound, applyStallDetection, isStalled } from './lib/convergence.mjs';
 import { clusterBySimilarity, sharedLabel, perCliqueBatchPatterns, bestClosedPrecedent, sig as simSig, similarSigs } from './lib/similarity.mjs';
 import { loadController, isStale as controllerStale, claimController, verifyController, releaseController, DEFAULT_TTL_MINUTES } from './lib/controller.mjs';
 import { buildFactoryRouting } from './lib/routing-drift.mjs';
 import { githubIssueToItem, markdownChecklistToItems, ingestReport, enforceIngestTier, countCheckedBoxes } from './lib/ingest.mjs'; // KI-E27 — multi-source issue ingestion
-import { snapshotMainFiles, driftAgainstSnapshot, dirtyMainPaths, filesOverlapDirty, splitDriftByStatus, repairDirtyDrift, unclaimedMainDrift } from './lib/mainguard.mjs';
+import { snapshotMainFiles, driftAgainstSnapshot, dirtyMainPaths, filesOverlapDirty, splitDriftByStatus, repairDirtyDrift, unclaimedMainDrift, matchWorktreeDebris } from './lib/mainguard.mjs';
 import { buildDocMap, readRoleBriefs, readRepoProfiles } from './lib/promptpack.mjs';
 import { loadPolicies, renderPolicies, POLICY_TEXT } from './lib/policy.mjs'; // PR#9 review — host-policy gating (no-comments / no-schema-changes are per-host, never universal)
 // KI-E7 — telemetry is OBSERVATIONAL ONLY (ai-factory-observability spine AD-1..3/AD-11): emit()
 // never throws, never blocks a command, and never feeds a fold verdict. FACTORY_TELEMETRY=0 disables.
-import { emit as temit, deriveStageTimeline, readEvents, aggregateEvents, renderTelemetryReport, telemetryFile, GAP_FENCE_MS, nonCanonicalArtifacts, isRecoveryResultId, isDirectRecoveryFold } from './lib/telemetry.mjs';
+import { emit as temit, deriveStageTimeline, readEvents, aggregateEvents, renderTelemetryReport, continuedRunsMd, telemetryFile, GAP_FENCE_MS, nonCanonicalArtifacts, isRecoveryResultId, isDirectRecoveryFold } from './lib/telemetry.mjs';
 import { parseTokenUsageVector, buildTokenUsageQuery, tokenUsageSummary } from './lib/token-usage.mjs'; // KI-E66 — cache-hit-rate bridge
 import { loadPriorAttempt, priorAttemptStages } from './lib/prior-attempt.mjs'; // KI-E69 — cross-session plan/test/fix reuse on relaunch
+import { readProgressCheckpoint, summarizeProgress } from './lib/progress-checkpoint.mjs'; // KI-E137 — incremental mid-pipeline checkpoint read/summarize (resume/reconstruct diagnostics)
 import { lintWorktreeDocClaims } from './lib/doclint.mjs'; // F2 — phantom doc-path detection aid at fold (WARN-only)
 import { findLeftovers } from './lib/leftover-scan.mjs'; // KI-D12 — deferral/tech-debt lexicon detection aid at fold (WARN-only)
 import { findComments } from './lib/comment-scan.mjs'; // KI-E59 — no-new-comments detection aid at fold (WARN-only)
@@ -185,7 +186,26 @@ function costSnapshot(ledger) {
   const total = Object.values(byModel).reduce((a, b) => a + b, 0);
   const closed = Object.values(ledger.items).filter((r) => r.state === 'CLOSED').length;
   const opus = Object.entries(byModel).filter(([m]) => /opus/i.test(m)).reduce((a, [, t]) => a + t, 0);
-  return { cycle: ledger.cycle, byModel, total, closed, callsPerClosed: closed ? Math.round(total / closed * 10) / 10 : null, opusShare: total ? Math.round(opus / total * 100) / 100 : 0 };
+  // KI-E150 (ported from a host-mount session) — real per-item token totals (factory.js's
+  // concurrency-safe budget.spent() attribution), distinct from byModel/total above which only ever
+  // counted agent CALLS, never tokens. Summed only over CLOSED items with a real tokensUsed figure —
+  // an item folded before this change, or one whose only work was sweep-mode/pre-band-only, may have
+  // no tokensUsed at all; excluded rather than silently counted as 0, so totalTokens/tokensPerClosed
+  // don't understate the true average.
+  const closedWithTokens = Object.values(ledger.items).filter((r) => r.state === 'CLOSED' && typeof r.tokensUsed === 'number' && r.tokensUsed > 0);
+  const totalTokens = closedWithTokens.reduce((a, r) => a + r.tokensUsed, 0);
+  return { cycle: ledger.cycle, byModel, total, closed, callsPerClosed: closed ? Math.round(total / closed * 10) / 10 : null, opusShare: total ? Math.round(opus / total * 100) / 100 : 0, totalTokens, closedWithTokens: closedWithTokens.length, tokensPerClosed: closedWithTokens.length ? Math.round(totalTokens / closedWithTokens.length) : null };
+}
+
+// KI-E150 — the N most token-expensive CLOSED items (real per-item totals, not call counts). Bounded
+// so this stays a report, not a full ledger dump; sorted desc so the costliest work is always visible
+// first regardless of how many items have a recorded tokensUsed.
+function topTokenItems(ledger, n) {
+  return Object.entries(ledger.items)
+    .filter(([, r]) => r.state === 'CLOSED' && typeof r.tokensUsed === 'number' && r.tokensUsed > 0)
+    .sort((a, b) => b[1].tokensUsed - a[1].tokensUsed)
+    .slice(0, n)
+    .map(([id, r]) => ({ id, tokensUsed: r.tokensUsed }));
 }
 
 function readCostHistory(cfg) {
@@ -224,14 +244,25 @@ function costMd(ledger, history) {
     return dCalls > 0 ? `${dCalls}/+0` : '—';
   };
   const trend = hs.slice(-10).map((h) => `| ${h.cycle} | ${h.total} | ${h.closed} | ${h.callsPerClosed ?? '—'} | ${marginalOf(h)} | ${Math.round((h.opusShare || 0) * 100)}% |`).join('\n');
+  // KI-E150 (ported from a host-mount session) — real per-item token totals now exist (factory.js's
+  // concurrency-safe budget.spent() attribution, ledger.mjs's foldResults accumulation). Rendered
+  // alongside the pre-existing call-count table rather than replacing it — call counts are still the
+  // "who did the work" model-routing signal; tokens answer "how expensive was it", a genuinely
+  // different question this report couldn't answer at all before. closedWithTokens can be less than
+  // closed: an item folded before this change, or whose only work was sweep-mode/pre-band-only
+  // (checkpoint-writer bookkeeping calls are deliberately NOT attributed — see the KI-E150
+  // KNOWN-ISSUES.md entry), has no tokensUsed to include.
+  const top = topTokenItems(ledger, 10);
+  const topRows = top.map((t) => `| ${t.id} | ${t.tokensUsed.toLocaleString()} |`).join('\n');
   return [
     '# Cost report — agent calls by model (routing evidence)',
     '',
     `_Generated ${now()} · cycle ${ledger.cycle}_`,
     '',
-    '_Counts are routed agent-calls per model (the faithful "who did the work" signal). Exact token totals',
-    'come from each Workflow run summary (subagent_tokens), recorded per cycle in the cycle report. This',
-    'report is OBSERVABILITY, not a governor — there is no budget gate (owner direction 2026-06-27)._',
+    '_Counts are routed agent-calls per model (the faithful "who did the work" signal) — model routing',
+    'evidence, not a spend total. Real per-item TOKEN totals (KI-E150) are tracked separately below; a',
+    'per-cycle whole-run token total (KI-E23) is still recorded in the cycle report. This report is',
+    'OBSERVABILITY, not a governor — there is no budget gate (owner direction 2026-06-27)._',
     '',
     '| Model | Agent calls | Share |',
     '|---|---|---|',
@@ -243,6 +274,13 @@ function costMd(ledger, history) {
     `- **Closed findings:** ${s.closed}`,
     `- **Agent-calls / closed finding:** ${s.callsPerClosed ?? '— (none closed yet)'}`,
     `- **Opus share of calls:** ${Math.round(s.opusShare * 100)}% _(PLAN §4 goal: opus reserved for hard reasoning + the 3 hard gates + refute)_`,
+    `- **Tokens / closed finding:** ${s.tokensPerClosed ? s.tokensPerClosed.toLocaleString() : '— (no per-item token data yet)'} _(KI-E150 — real total ${s.totalTokens.toLocaleString()} across ${s.closedWithTokens} of ${s.closed} closed item(s) with recorded tokensUsed)_`,
+    '',
+    '## Top 10 closed items by tokens (KI-E150)',
+    '',
+    '| Item | Tokens |',
+    '|---|---|',
+    topRows || '| _(no per-item token data yet)_ |  |',
     '',
     '## Per-cycle trend',
     '',
@@ -472,6 +510,19 @@ function deterministicVerifyOverride(cfg, ledger, wi, r) {
     return parseVerifyRaw(decodeTranscript(readFileSync(p))); // KI-E54: BOM-aware decode
   })();
   const baseline = effectiveBaseline(r.baselineFailures, baselineParse);
+  // KI-E163 (ported from a host-mount session) — defense-in-depth for KI-E162's upstream fix.
+  // `baseline` reads as 0 for two very different reasons that are indistinguishable in the number
+  // alone: a REAL measurement (a baseline run genuinely found zero pre-existing failures) or a
+  // PHANTOM default (nothing was EVER captured or reported, so effectiveBaseline's Math.max(0,0)
+  // silently reads identically to "measured clean"). A phantom 0 is exactly what let a deterministic
+  // override deterministically FAIL an item repeatedly on failures independently reproduced on a
+  // completely clean checkout with zero relation to the item's own diff, on the origin host. KI-E162
+  // closes the upstream gap (a reFix round now captures a baseline when none exists) — but a prompt
+  // instruction is not a guarantee an agent follows it every time, on every item shape. This is the
+  // downstream half: even when the prompt-side fix does not take, the override's own message stops
+  // presenting a phantom 0 with the same unqualified confidence as a real measurement.
+  const baselineIsPhantom = isPhantomBaseline(baseline, r.baselineFailures, baselineParse);
+  const annotateBaseline = (reason) => annotateBaselineReason(reason, baselineIsPhantom);
   const fail = (reason) => {
     r.transitions = ['FAILED']; r.toState = 'FAILED';
     r.note = 'deterministic fold-time override: ' + reason + (r.note ? ' [agent claimed: ' + r.note + ']' : '');
@@ -489,8 +540,8 @@ function deterministicVerifyOverride(cfg, ledger, wi, r) {
   const intText = readIf('integrate-raw.txt');
   const vVerdict = rawText ? verdictFromParse(parseVerifyRaw(rawText), baseline) : { pass: true, reason: 'no-machine-evidence' };
   const iVerdict = intText ? verdictFromParse(parseVerifyRaw(intText), baseline) : { pass: true, reason: 'no-machine-evidence' };
-  if (!vVerdict.pass) return fail('verify transcript: ' + vVerdict.reason);
-  if (!iVerdict.pass) return fail('integrate transcript: ' + iVerdict.reason);
+  if (!vVerdict.pass) return fail('verify transcript: ' + annotateBaseline(vVerdict.reason));
+  if (!iVerdict.pass) return fail('integrate transcript: ' + annotateBaseline(iVerdict.reason));
   // P3 — a CODE item MUST carry machine green in EITHER transcript; absence in BOTH is agent-trust → FAIL.
   const hasMachineGreen = (rawText && vVerdict.reason !== 'no-machine-evidence') || (intText && iVerdict.reason !== 'no-machine-evidence');
   if (codeChange && !hasMachineGreen) {
@@ -522,7 +573,29 @@ function deterministicVerifyOverride(cfg, ledger, wi, r) {
   // (FACTORY::RED::0) — machine proof the acceptance already holds. A missing transcript still fails.
   if (codeChange) {
     const red = parseRedRaw(readIf('verify-red-raw.txt'));
-    if (r.verificationOnly === true) {
+    // KI-E132: r.verificationOnly is a copy captured when this checkpoint was produced — it goes STALE
+    // when an item is re-claimed for a later re-verification round whose fresh test.json/verify-red-raw.txt
+    // overwrite the very files this check reads, without ever updating the embedded r object (itself often
+    // reconstructed from an EARLIER, now-superseded checkpoint — live: PAYMENTS-M4/MARKETING-M3/RISK-M3,
+    // cycle 82, each a fully-13-gates-APPROVED item re-claimed for a redundant "is this still fixed?" pass
+    // whose legitimate exit=0 confirmation then read as "vacuous test" against the stale embedded flag).
+    // Re-derive from the on-disk test.json — the SAME freshness tier as verify-red-raw.txt below — and
+    // prefer it on disagreement: it is the test-author's own live attestation for THIS transcript, not a
+    // possibly-older copy. Falls back to r.verificationOnly when test.json is absent/unparseable (pre-KI-E132
+    // results, or a hand-authored recovery fold with no test.json on disk).
+    let effectiveVO = r.verificationOnly === true;
+    try {
+      const tjRaw = readIf('test.json');
+      const tj = tjRaw ? JSON.parse(tjRaw) : null;
+      if (tj) {
+        const diskVO = !!(tj.verificationOnly === true && !tj.red);
+        if (diskVO !== effectiveVO) {
+          console.log(`  KI-E132 ${r.id}: verificationOnly mismatch — embedded result said ${effectiveVO}, on-disk test.json says ${diskVO} (test.json wins: it is the live test-author attestation, not a possibly-stale checkpoint copy)`);
+          effectiveVO = diskVO;
+        }
+      }
+    } catch { /* unparseable test.json — trust the embedded flag, same as pre-KI-E132 behavior */ }
+    if (effectiveVO) {
       if (!red.hasData) return fail('verificationOnly item has no verify-red-raw.txt transcript (FACTORY::RED:: marker) — cannot machine-prove the acceptance already holds on the current tree');
       if (red.red) {
         // KI-E61 — the flag was an in-run MISCLASSIFICATION, but the transcript satisfies the
@@ -533,12 +606,13 @@ function deterministicVerifyOverride(cfg, ledger, wi, r) {
         // the KI-L37 reFix heuristic stamps verificationOnly even when the test-author went on
         // to produce a real red). Clearing the flag also re-arms the P9 root-cause check below.
         console.log(`  KI-E61 ${r.id}: verificationOnly flag contradicted by a GENUINE red (exit=${red.exit}) + machine green — auto-corrected to the normal red-green contract (result closes on the STRONGER evidence)`);
-        r.verificationOnly = false;
+        effectiveVO = false;
       }
     } else {
       if (!red.hasData) return fail('no RED proof (verify-red-raw.txt absent / no FACTORY::RED:: marker) — cannot prove the regression test fails on old code (vacuous-test risk)');
       if (!red.red) return fail('RED proof shows the test PASSED on old code (exit=' + red.exit + ') — vacuous test (passes on both old and new code)');
     }
+    r.verificationOnly = effectiveVO; // keep it consistent for the P9/filesChanged checks below and every downstream consumer of this result object
   }
 
   // P2 — real-infra: a needsRealInfra item must carry a real container marker (not an EF in-memory green).
@@ -597,10 +671,19 @@ function escalateExhausted(ledger, cfg) {
     // never disagree: the retry budget is spent, OR the trajectory has stalled (consecutive rounds
     // with no reduction in blocking findings — spending the remaining band is near-certain waste).
     const stalled = isStalled(cfg, row);
+    // KI-E167 (ported from a host-mount session) — the stall may have been detected via the original
+    // gate-band finding-count trend OR the pre-band failure-signature fallback (row.stallReason,
+    // persisted by applyStallDetection since neither this function nor its caller sees that
+    // function's per-call return value) — phrase the escalation note to match the evidence that
+    // actually fired, instead of always claiming "blocking findings did not shrink" for a trajectory
+    // that may never have reached the gate band at all.
+    const stallNote = stalled
+      ? (row.stallReason === 'signature'
+        ? `auto-escalated: NO-PROGRESS on ${row.stallRounds} consecutive round(s) — the SAME pre-band failure ("${row.lastFailSignature}") repeated verbatim with no gate-band data to compare — after ${row.attempts} attempt(s); another band is near-certain waste — needs a human`
+        : `auto-escalated: NO-PROGRESS on ${row.stallRounds} consecutive round(s) (blocking findings did not shrink) after ${row.attempts} attempt(s); another band is near-certain waste — needs a human`)
+      : `auto-escalated: exhausted ${row.attempts} fix attempt(s) (bound ${bound}${row.retryBonus ? ` incl. +${row.retryBonus} convergence bonus` : ''}); needs a human`;
     if (row.state === 'FAILED' && (row.attempts > bound || stalled) &&
-        transition(ledger, id, 'ESCALATED', stalled
-          ? `auto-escalated: NO-PROGRESS on ${row.stallRounds} consecutive round(s) (blocking findings did not shrink) after ${row.attempts} attempt(s); another band is near-certain waste — needs a human`
-          : `auto-escalated: exhausted ${row.attempts} fix attempt(s) (bound ${bound}${row.retryBonus ? ` incl. +${row.retryBonus} convergence bonus` : ''}); needs a human`)) {
+        transition(ledger, id, 'ESCALATED', stallNote)) {
       out.push(id);
       temit({ source: 'driver', event: 'transition', item: id, cycle: ledger.cycle, outcome: 'ESCALATED' }); // KI-E7 finding #12
     }
@@ -699,7 +782,13 @@ function cmdFold(file, flags) {
       if (!fb) continue;
       const dir = abs(join(cfg.paths.items, r.id));
       if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
-      writeFileSync(join(dir, 'feedback.md'), fb);
+      const fbPath = join(dir, 'feedback.md');
+      // KI-E166 (ported from a host-mount session) — preserve prior-cycle feedback instead of
+      // silently discarding a still-open finding the instant a LATER cycle fails for a different
+      // reason — see lib/feedback.mjs's own comment for the incident this closes.
+      let priorFb = null;
+      try { if (existsSync(fbPath)) priorFb = readFileSync(fbPath, 'utf8'); } catch { /* best-effort — no prior file readable is the same as none existing */ }
+      writeFileSync(fbPath, mergeFeedbackHistory(fb, priorFb));
     } catch { /* best-effort feedback artifact — never block the fold on it */ }
   }
   // P11 — persist every FAILED reason so a re-fix is not blind. A verify/fold-stage FAIL runs NO gates, so
@@ -859,6 +948,44 @@ function cmdFold(file, flags) {
       if (committedDrift.length) console.log(`  ℹ COMMITTED DELIVERY ${r.id} (KI-E35): item files changed in main via HUMAN commits during the run window (clean per git status) — likely the operator committed this item's output; verify intent, no repair needed:\n` + committedDrift.map((d) => `      ${d.file} (${d.was} -> ${d.now})`).join('\n'));
     } catch { /* detection aid only */ }
   }
+  // KI-E146 (ported from a host-mount session) — the KI-E89 unclaimed-drift sweep, run here for the
+  // first time. Every prior invocation site was `cmdMainCheck`, a command an operator has to remember
+  // to run manually; `fold` runs automatically every single cycle and, until now, never looked for
+  // this class at all — the per-item loop just above can only ever check a path some item's OWN
+  // snapshot declared, so a stray NEW file an agent creates ad-hoc (never in any files[]) is invisible
+  // to it by construction. Live cost of the gap on the origin host: a stray file left by one item sat
+  // unreported through that cycle's own fold, then poisoned an entire SEPARATE, unrelated batch's
+  // main-check sweep the NEXT cycle (KI-E144) — a whole cycle of silence in between during which
+  // nobody had reason to run `main-check` by hand. This closes the "just happened not to look" window
+  // by surfacing it at the ONE checkpoint that always runs, not the one that sometimes does.
+  // Deliberately still NEVER auto-repaired, same as `cmdMainCheck`'s own posture (KI-E89's header
+  // comment is explicit about why: an unclaimed path could be agent contamination OR an operator's
+  // own unrelated work-in-progress sitting in the same tree, and there is no snapshot to prove which
+  // — auto-deleting the wrong guess would destroy real, uncommitted human work). Read-only, WARN-only,
+  // same posture as every other detection aid in this function.
+  try {
+    const itemsRoot = abs(cfg.paths.items);
+    const claimedPaths = new Set();
+    for (const d of readdirSync(itemsRoot, { withFileTypes: true })) {
+      if (!d.isDirectory()) continue;
+      try {
+        const snapFiles = (readJson(join(itemsRoot, d.name, 'main-snapshot.json')) || {}).files || {};
+        for (const f of Object.keys(snapFiles)) claimedPaths.add(f);
+      } catch { /* no snapshot for this item, or unreadable — contributes nothing, matches cmdMainCheck */ }
+    }
+    const unclaimed = unclaimedMainDrift(dirtyMainPaths(REPO_ROOT), MOUNT_REL, claimedPaths);
+    if (unclaimed.length) {
+      // KI-E177 (ported from a host-mount session) — an unclaimed path that byte-matches this
+      // fold's OWN item worktrees is overwhelming evidence of leaked contamination, not operator
+      // WIP. Still never auto-repaired (KI-E89's posture is unchanged) — this only upgrades the
+      // signal so a human is not left to manually re-derive the diff-check by hand.
+      const debris = matchWorktreeDebris(REPO_ROOT, unclaimed, arr.map((r) => r.id), abs(cfg.paths.worktreesState));
+      const matched = debris.filter((d) => d.matchedItem);
+      const truly = debris.filter((d) => !d.matchedItem).map((d) => d.path);
+      if (matched.length) console.log(`  ⚠ MAIN-TREE CONTAMINATION unclaimed, HIGH CONFIDENCE (KI-E177): byte-identical to a file already in the SAME item's OWN worktree — this can only be leaked write-isolation contamination, never operator work-in-progress. Not auto-repaired (still a human call to delete from the shared main tree), but safe to remove once eyeballed:\n` + matched.map((d) => `      ${d.path} == ${d.matchedItem}'s worktree copy of ${d.matchedFile}`).join('\n'));
+      if (truly.length) console.log(`  ⚠ MAIN-DRIFT unclaimed (KI-E89/E146): main-tree path(s) dirty outside the factory mount with NO item snapshot to check against, found during fold — could be leaked factory-worktree contamination (no item has ever claimed this path) OR the operator's own unrelated work-in-progress; this fold cannot tell which, so it surfaces it rather than silently missing the contamination case AGAIN. Eyeball each (never auto-repaired — see KI-E89):\n` + truly.map((p) => `      ${p}`).join('\n'));
+    }
+  } catch { /* detection aid only */ }
   const { applied, rejected, skipped } = foldResults(ledger, arr);
   // KI-L41 — convergence bonus BEFORE the exhaustion sweep: a FAILED round whose blocking-finding
   // set is strictly narrower than the prior round's (fewer findings, max severity not worse — both
@@ -874,7 +1001,14 @@ function cmdFold(file, flags) {
   // means the trajectory is not converging, so the remaining band(s) are near-certain waste. Park it
   // for a human instead (escalateExhausted below applies the transition).
   const stalls = applyStallDetection(ledger, cfg, arr, priorConvergence);
-  for (const s of stalls) console.log(`  KI-E105 ${s.id}: NO-PROGRESS streak ${s.stallRounds} (findings ${s.from ? s.from.findings : '?'} -> ${s.to.findings}) — parking for a human instead of spending another band`);
+  // KI-E167 (ported from a host-mount session) — a stall can now be REPORTED via two distinct
+  // evidence shapes — the original gate-band finding-count trend (`from`/`to`), or a pre-band failure
+  // whose `note` signature repeated verbatim across consecutive rounds with no gate-band data to
+  // compare at all. Log each in its own terms rather than forcing the signature case through a
+  // "findings ? -> ?" template it never populates.
+  for (const s of stalls) console.log(s.reason === 'signature'
+    ? `  KI-E167 ${s.id}: NO-PROGRESS streak ${s.stallRounds} — the SAME pre-band failure ("${s.signature}") repeated verbatim with no gate-band data to compare — parking for a human instead of spending another band`
+    : `  KI-E105 ${s.id}: NO-PROGRESS streak ${s.stallRounds} (findings ${s.from ? s.from.findings : '?'} -> ${s.to.findings}) — parking for a human instead of spending another band`);
   const escalated = escalateExhausted(ledger, cfg);
   writeJsonAtomic(abs(cfg.paths.ledger), ledger);
   recordCostSnapshot(cfg, ledger); // per-cycle cost snapshot for the trend (observability, not a gate)
@@ -924,7 +1058,7 @@ function cmdFold(file, flags) {
           prevMs = s.mtimeMs;
         }
       }
-      temit({ source: 'driver', event: 'item_folded', item: r.id, cycle: cyc, lane: row.runLabel || undefined, outcome: row.state || r.toState, attempts: row.attempts, attrs: { toState: r.toState, band: r.band || undefined, resultId: r.resultId || undefined, direct: isRec || undefined, transitions: (r.transitions || []).slice(0, 12), gates: r.gates || {}, cost: r.cost || {}, infraSuspect: !!r.infraSuspect, verificationOnly: !!r.verificationOnly, priorAttemptReuse: (r.priorAttemptReuse && r.priorAttemptReuse.length) ? r.priorAttemptReuse : undefined, note: String(r.note || '').slice(0, 240) } }); // KI-E23: band stamped so gate-value/cost split LIGHT vs FULL; KI-E46: direct/resultId stamped so recovery closes classify without prose sniffing; KI-E69: priorAttemptReuse visible whenever a relaunch reused a killed run's artifacts
+      temit({ source: 'driver', event: 'item_folded', item: r.id, cycle: cyc, lane: row.runLabel || undefined, outcome: row.state || r.toState, attempts: row.attempts, attrs: { toState: r.toState, band: r.band || undefined, resultId: r.resultId || undefined, direct: isRec || undefined, transitions: (r.transitions || []).slice(0, 12), gates: r.gates || {}, cost: r.cost || {}, tokensUsed: r.tokensUsed || undefined, infraSuspect: !!r.infraSuspect, verificationOnly: !!r.verificationOnly, priorAttemptReuse: (r.priorAttemptReuse && r.priorAttemptReuse.length) ? r.priorAttemptReuse : undefined, note: String(r.note || '').slice(0, 240) } }); // KI-E23: band stamped so gate-value/cost split LIGHT vs FULL; KI-E46: direct/resultId stamped so recovery closes classify without prose sniffing; KI-E69: priorAttemptReuse visible whenever a relaunch reused a killed run's artifacts; KI-E150: tokensUsed is this item's OWN precise total (concurrency-safe attribution), distinct from KI-E23's whole-run usage event
     }
     temit({ source: 'driver', event: 'fold_summary', cycle: cyc, attrs: { file: basename(foldPath), applied: applied.length, rejected: rejected.length, skipped: skipped.length, overrides: overrides.length, infraRetries: infraApplied.length, escalated: escalated.length } });
     // KI-E23 (P6c): the run's token usage, returned by factory.js from the runtime budget counter —
@@ -942,6 +1076,91 @@ function cmdFold(file, flags) {
   if (escalated.length) console.log('  auto-escalated (retry-bound exhausted -> queue):', escalated.join(', '));
   if (skipped.length) console.log('  skipped (already folded, idempotent):', skipped.map((s) => s.resultId).join(', '));
   if (rejected.length) console.log('  rejected:', JSON.stringify(rejected));
+}
+
+// KI-E140 (ported from a host-mount session) — record what launched, for the ONE thing the driver
+// structurally cannot check itself: whether a PRIOR attempt's Workflow task is actually dead before a
+// NEW one relaunches into the SAME worktree path. Only the controller session holds a
+// TaskOutput/TaskStop handle on its own launches — the driver is a separate Node process with no
+// visibility into the harness's task registry — so this command exists purely so the controller can
+// hand the driver something to remember and SURFACE later (cmdResume's KI-E140 reminder), instead of
+// relying on the controller's own memory across a session boundary. Best-effort, read-nothing,
+// writes-only: a bad flag combination logs and no-ops rather than throwing, since this command sits
+// on the hot path right after a real Workflow launch and must never be the reason a controller loses
+// track of what it just started.
+// KI-E176 (ported from a host-mount session) — durable log of every CONTINUED run: a Workflow
+// stopped mid-flight (a deliberate operator pause, a crash, a laptop sleep) and relaunched into
+// the SAME claim/worktree (KI-E140's own relaunch line), as opposed to an independent fresh
+// attempt from a new `group`. The controller declares this explicitly via `--continued` at
+// mark-launched time — only the controller session actually knows it chose to relaunch rather
+// than re-claim, so this is not something the driver can infer from ledger state alone (a
+// stranded CLAIMED row looks identical either way). Renders the accumulated history
+// (continuedRunsMd, lib/telemetry.mjs) to reports/continued-runs.md on every logged continuation
+// so the operator always has an up-to-date record with no separate report command needed.
+function cmdMarkLaunched(flags) {
+  const cfg = loadConfig();
+  const ids = (flags.ids || '').split(',').map((s) => s.trim()).filter(Boolean);
+  const taskId = flags.taskId || flags.task || '';
+  const runId = flags.runId || flags.run || '';
+  if (!ids.length || !taskId) { console.log('mark-launched: need --ids a,b,c --taskId <id> (--runId <id> optional; --continued to log a pause+relaunch, KI-E176) — no-op'); return; }
+  const continued = !!flags.continued;
+  const ledger = continued ? loadLedger(abs(cfg.paths.ledger)) : null; // only loaded when needed, for cycle attribution on the logged event
+  const meta = { taskId, runId: runId || undefined, launchedAt: now() };
+  let n = 0, logged = 0;
+  for (const id of ids) {
+    try {
+      const dir = abs(join(cfg.paths.items, id));
+      if (!existsSync(dir)) { console.log(`  mark-launched ${id} SKIPPED — no state/items/${id}/ dir (not a claimed item)`); continue; }
+      if (continued) {
+        let prior = null;
+        try { prior = readJson(join(dir, 'launch-meta.json')); } catch { /* no prior launch recorded — nothing to log */ }
+        if (prior && prior.taskId && prior.taskId !== taskId) {
+          temit({ source: 'driver', event: 'run_continued', item: id, cycle: ledger ? ledger.cycle : undefined, attrs: { previousTaskId: prior.taskId, previousRunId: prior.runId, previousLaunchedAt: prior.launchedAt, newTaskId: taskId, newRunId: runId || undefined } });
+          logged++;
+        }
+      }
+      writeJsonAtomic(join(dir, 'launch-meta.json'), meta);
+      n++;
+    } catch (e) { console.log(`  mark-launched ${id} SKIPPED (${e && e.message})`); }
+  }
+  if (logged) {
+    try { mkdirSync(abs(cfg.paths.reports), { recursive: true }); writeFileSync(join(abs(cfg.paths.reports), 'continued-runs.md'), continuedRunsMd(readEvents())); }
+    catch (e) { console.log('  (continued-runs.md render skipped: ' + (e && e.message) + ')'); }
+  }
+  console.log(`mark-launched: recorded taskId=${taskId}${runId ? ` runId=${runId}` : ''} for ${n}/${ids.length} item(s)${continued ? `; ${logged} logged as CONTINUED (reports/continued-runs.md)` : ''} — cmdResume will surface this before a relaunch (KI-E140)`);
+}
+
+// KI-E154 (ported from a host-mount session) — mtime-based stall detection, the counterpart the
+// driver COULD always compute itself without a TaskOutput handle (which only the controller session
+// has, per KI-E140's own admission it "cannot check this itself"). Live incident on the origin host:
+// a Workflow survived a laptop sleep in the harness's own task tracker (TaskOutput kept reporting
+// status:"running" for 12+ hours) while the item's own directory sat frozen at its pre-launch mtime
+// the entire time. KI-E140's reminder alone left the controller to manually diff `ls -laT` against
+// launch-meta.json's timestamp by hand to reach that conclusion; this makes the SAME disk-only
+// evidence a first-class, computed signal instead of something re-derived from memory each time.
+// Deliberately NOT a liveness proof (a TaskOutput check remains the only real answer, and KI-E140's
+// own reminder to run one stays alongside this, unchanged) — a run legitimately can go quiet for a
+// while mid-call (a long opus gate, a slow build) without being dead, which is exactly why this only
+// fires past a grace period, not "no activity at all yet".
+function stallSuspected(itemDir, launchedAtIso, graceMinutes) {
+  if (!launchedAtIso) return null; // nothing recorded — cannot judge, never a false positive
+  const launchedAtMs = Date.parse(launchedAtIso);
+  if (!Number.isFinite(launchedAtMs)) return null;
+  const grace = typeof graceMinutes === 'number' ? graceMinutes : 30;
+  const ageMinutes = Math.round((Date.now() - launchedAtMs) / 60000);
+  if (ageMinutes < grace) return { suspected: false, ageMinutes, grace };
+  let newestMtime = 0;
+  try {
+    for (const f of readdirSync(itemDir)) {
+      if (f === 'launch-meta.json') continue; // the controller's OWN bookkeeping write, not run activity — would always be ~launchedAt and mask a genuinely stalled run
+      try {
+        const st = statSync(join(itemDir, f));
+        if (st.isFile() && st.mtimeMs > newestMtime) newestMtime = st.mtimeMs;
+      } catch { /* unreadable entry — skip, do not let one bad file hide real evidence in the rest */ }
+    }
+  } catch { return null; } // item dir unreadable — cannot judge, never a false positive
+  const activitySinceLaunch = newestMtime > launchedAtMs;
+  return { suspected: !activitySinceLaunch, ageMinutes, grace, newestActivityAgeMinutes: newestMtime ? Math.round((Date.now() - newestMtime) / 60000) : null };
 }
 
 function cmdResume(flags) {
@@ -969,6 +1188,13 @@ function cmdResume(flags) {
     }
     const ck = hasCheckpoint(r.id);
     console.log(`  ${r.id}: ${r.state}${wtState}${r.runLabel ? ` [label=${r.runLabel}]` : ''}${ck ? ' [checkpointed #' + cyc + ' — reconstruct+fold will pick it up]' : ''}`);
+    // KI-E137 (ported from a host-mount session): no FINAL checkpoint, but a mid-pipeline
+    // progress.json may still show how far this attempt got before dying — surfaced here so "must
+    // re-run" is never mistaken for "nothing happened".
+    if (!ck) {
+      const pr = readProgressCheckpoint(abs(join(cfg.paths.items, r.id)), r.id, cyc);
+      if (pr) console.log(`    ${summarizeProgress(pr)}`);
+    }
     if (!ck && r.runScript && existsSync(presolve(REPO_ROOT, r.runScript))) {
       const k = r.runScript; if (!relaunch.has(k)) relaunch.set(k, []); relaunch.get(k).push(r.id);
     }
@@ -1012,6 +1238,34 @@ function cmdResume(flags) {
         }
         if (committed.length) console.log(`    ℹ MAIN-GUARD ${id} (KI-E41/KI-E35): item files changed in main via HUMAN commits since claim (clean per git status) — verify the relaunch is still meaningful against the new main:\n` + committed.map((d) => `        ${d.file}`).join('\n'));
       } catch (e) { console.log(`    MAIN-GUARD ${id} SKIPPED (${e && e.message}) — treat as UNCHECKED, not clean (KI-E41; never blocks the relaunch listing)`); }
+    }
+    // KI-E140 (ported from a host-mount session) — TASK-LIVENESS REMINDER. A relaunch issued before a
+    // JUST-killed attempt's task is confirmed torn down risks two live attempts racing the SAME
+    // worktree path. The driver cannot check this itself — only the controller session holds a
+    // TaskOutput/TaskStop handle — so this is a REMINDER, mechanically surfaced instead of left to
+    // memory: if the controller recorded {runId, taskId} to state/items/<id>/launch-meta.json right
+    // after ITS OWN prior launch, print it here so the relaunch line is never copied without a
+    // liveness check. Read-only; a missing file (nothing recorded, or an old session that predates
+    // this convention) is silent, never a warning — this is a best-effort aid for controller
+    // behaviour this file cannot enforce, not a detector with a false-negative to worry about.
+    for (const id of relaunchIds) {
+      try {
+        const metaPath = abs(join(cfg.paths.items, id, 'launch-meta.json'));
+        if (!existsSync(metaPath)) continue;
+        const meta = readJson(metaPath);
+        if (meta && meta.taskId) {
+          // KI-E154 (ported from a host-mount session): disk-only evidence the driver CAN compute
+          // itself, alongside (never instead of) the TaskOutput check below — a stale "running" status
+          // in the harness's own tracker (the live incident this was built for: 12+ hours reported
+          // running, zero file activity in the item dir the entire time) is exactly the case this
+          // catches that TaskOutput alone would miss.
+          const stall = stallSuspected(abs(join(cfg.paths.items, id)), meta.launchedAt, 30);
+          const stallNote = stall && stall.suspected
+            ? ` STALL SUSPECTED (KI-E154): launched ${stall.ageMinutes}min ago with ${stall.newestActivityAgeMinutes === null ? 'zero file activity since' : `nothing newer than ${stall.newestActivityAgeMinutes}min ago`} in state/items/${id}/ — past the ${stall.grace}min grace period a real run almost always has written SOMETHING by now (this is disk evidence, not a liveness proof; still confirm with TaskOutput before relaunching).`
+            : (stall && !stall.suspected && stall.ageMinutes < stall.grace ? ` (launched ${stall.ageMinutes}min ago, within the ${stall.grace}min grace period — too soon to judge from disk activity alone)` : '');
+          console.log(`    ⚠ TASK-LIVENESS (KI-E140) ${id}: a prior launch recorded taskId=${meta.taskId}${meta.runId ? ` runId=${meta.runId}` : ''}${meta.launchedAt ? ` (launched ${meta.launchedAt})` : ''} — verify it is NOT still running (TaskOutput ${meta.taskId} block:false) BEFORE relaunching into the same worktree.${stallNote}`);
+        }
+      } catch (e) { console.log(`    TASK-LIVENESS ${id} SKIPPED (${e && e.message}) — treat as UNCHECKED (KI-E140; never blocks the relaunch listing)`); }
     }
     // KI-E42 — killed-run artifact quarantine. A dead attempt's improvised artifacts (cycle 47: a stray
     // RESULT.md claiming "false positive — already fixed, no action taken") survive into the relaunch's
@@ -1069,9 +1323,20 @@ function cmdResume(flags) {
             const claimHist = ((row && row.history) || []).filter((h) => h.to === 'CLAIMED');
             const claimMs = claimHist.length ? Date.parse(claimHist[claimHist.length - 1].at) : 0;
             const itemDir = abs(join(cfg.paths.items, id));
-            const pa = loadPriorAttempt(itemDir, claimMs || undefined);
+            // KI-E158(i) (ported from a host-mount session) — a rejected attempt never reuses
+            // test/fix; see lib/prior-attempt.mjs's own comment for the incident this fixes.
+            const pa = loadPriorAttempt(itemDir, claimMs || undefined, it.reFix);
             const stages = priorAttemptStages(pa);
             if (stages.length) { it.priorAttempt = pa; reusedAny = true; console.log(`    KI-E69: ${id} will REUSE {${stages.join(', ')}} from its already-on-disk attempt — verify onward still runs fresh`); }
+            // KI-E139 (ported from a host-mount session): attach a mid-pipeline progress.json
+            // (KI-E137), UNGATED by claimMs/clock — unlike plan/test/fix reuse above, this carries NO
+            // trust on its own; factory.js re-derives a FRESH content hash of the CURRENT worktree and
+            // only ever adopts the gate-band verdict on a proven match (see runItem's KI-E139 block).
+            // Still cycle-fenced (readProgressCheckpoint requires resultId === id#cyc, the SAME
+            // fold-idempotency convention result.json uses) so a truly ancient checkpoint is never even
+            // offered up for the hash check to evaluate.
+            const priorProgress = readProgressCheckpoint(itemDir, id, cyc);
+            if (priorProgress) { it.priorProgress = priorProgress; reusedAny = true; console.log(`    KI-E139: ${id} carries a progress.json at stage '${priorProgress.progressStage}' — factory.js hash-verifies the CURRENT worktree before trusting any of it (gate-band reuse only, never assumed)`); }
           }
           if (reusedAny) {
             const labelSlug = ((ledger.items[ids[0]] || {}).runLabel) || null;
@@ -1082,7 +1347,35 @@ function cmdResume(flags) {
         } catch (e) { console.log(`    KI-E69: reuse SKIPPED for script ${script} (${e && e.message}) — relaunching cold`); }
       }
     }
-    for (const [script, ids] of relaunch) console.log(`    Workflow({ scriptPath: "${abs(script)}" })   # ${ids.join(', ')}`);
+    // KI-E160 (ported from a host-mount session, live incident) — `script` is recorded ONCE, at claim
+    // time — the shared, UNLABELED default path (state/run-script.js/run-args.json) can be, and was,
+    // overwritten by a LATER, completely unrelated `group` call before this item was ever relaunched.
+    // The relaunch line below used to be printed unconditionally, trusting the recorded PATH with no
+    // check that its CURRENT on-disk content still corresponds to `ids` — so a stale recommendation
+    // looked identical to a fresh one, and a copied-and-launched stale line silently re-ran WHATEVER
+    // items the script currently held instead of the intended one. Fix: before printing each relaunch
+    // line, read the script's sibling run-args.json (same derivation --reuse above already uses) and
+    // verify every id in `ids` is still actually present in its items[]. A mismatch prints a loud STALE
+    // LAUNCHER warning naming exactly which ids are missing and the resume --reset-stale + group
+    // --label recovery, instead of a relaunch line that looks identical to a trustworthy one. Fail-open
+    // on an unreadable run-args (UNVERIFIED, never silently "clean") — this is a warning layer, never a
+    // hard block, since resume must never refuse to print anything.
+    for (const [script, ids] of relaunch) {
+      let staleIds = [];
+      try {
+        const runArgsPath = abs(script).replace(/run-script/, 'run-args').replace(/\.js$/, '.json');
+        if (existsSync(runArgsPath)) {
+          const raIds = new Set(((readJson(runArgsPath) || {}).items || []).map((x) => x.id));
+          staleIds = ids.filter((id) => !raIds.has(id));
+        } else {
+          console.log(`    STALE-LAUNCHER-CHECK (KI-E160) SKIPPED for ${script} — no sibling run-args.json found; treat as UNVERIFIED, not confirmed fresh`);
+        }
+      } catch (e) { console.log(`    STALE-LAUNCHER-CHECK (KI-E160) SKIPPED for ${script} (${e && e.message}) — treat as UNVERIFIED, not confirmed fresh`); }
+      if (staleIds.length) {
+        console.log(`    ⚠ STALE LAUNCHER (KI-E160): ${abs(script)}'s run-args.json no longer contains ${staleIds.join(', ')} — it was overwritten by a LATER, unrelated group() call sharing this same path. The line below would silently relaunch WHATEVER items this script currently holds instead. Do NOT use it for ${staleIds.join(', ')} — recover with: \`resume --reset-stale\` then \`group --ids ${staleIds.join(',')} --label <name>\` for a dedicated, collision-proof launcher.`);
+      }
+      console.log(`    Workflow({ scriptPath: "${abs(script)}" })   # ${ids.join(', ')}${staleIds.length ? '  <- STALE for ' + staleIds.join(', ') + ', see warning above' : ''}`);
+    }
     console.log('    (relaunch preserves claims/worktrees/reFix stamps; use --reset-stale ONLY when abandoning these runs instead.)');
     if (!flags.reuse) console.log('    (pass --reuse to skip regenerating plan/test/fix for items whose artifacts already exist from THIS claim, KI-E69 — verify onward always re-runs fresh regardless.)');
   }
@@ -1121,7 +1414,16 @@ function cmdReconstruct(flags) {
   const out = abs(join(String(cfg.root || '_bmad-output/ai-factory'), 'state', `results-cycle-${cyc}.json`));
   if (!results.length) {
     console.log(`reconstruct: NO cycle-${cyc} checkpoints found under ${cfg.paths.items} — nothing to fold`);
-    if (missing.length) console.log(`  in-flight with no checkpoint (must re-run): ${missing.join(', ')}`);
+    if (missing.length) {
+      console.log(`  in-flight with no FINAL checkpoint (must re-run): ${missing.join(', ')}`);
+      // KI-E137 (ported from a host-mount session): a missing result.json no longer means "nothing
+      // recoverable" — print each item's latest mid-pipeline progress.json (if any) so the operator
+      // can see how far a dead attempt got.
+      for (const id of missing) {
+        const pr = readProgressCheckpoint(join(itemsRoot, id), id, cyc);
+        if (pr) console.log(`    ${id}: ${summarizeProgress(pr)}`);
+      }
+    }
     return;
   }
   // KI-E44 — usage passthrough: checkpoints carry NO usage (factory.js reports the run total only at
@@ -1141,7 +1443,14 @@ function cmdReconstruct(flags) {
   for (const r of results) console.log(`  ${r.id}: ${r.toState} — ${String(r.note || '').slice(0, 110)}`);
   if (already.length) console.log(`  already folded (skipped): ${already.join(', ')}`);
   if (stale.length) console.log(`  stale checkpoints from other cycles (ignored): ${stale.join(', ')}`);
-  if (missing.length) console.log(`  in-flight with NO checkpoint — re-run only these after \`resume --reset-stale\`: ${missing.join(', ')}`);
+  if (missing.length) {
+    console.log(`  in-flight with NO FINAL checkpoint — re-run only these after \`resume --reset-stale\`: ${missing.join(', ')}`);
+    // KI-E137 (ported from a host-mount session): same mid-pipeline visibility as the zero-results branch above.
+    for (const id of missing) {
+      const pr = readProgressCheckpoint(join(itemsRoot, id), id, cyc);
+      if (pr) console.log(`    ${id}: ${summarizeProgress(pr)}`);
+    }
+  }
   console.log(`  next: node _bmad-output/ai-factory/_workflow/driver.mjs fold ${join(String(cfg.root || '_bmad-output/ai-factory'), 'state', `results-cycle-${cyc}.json`)}`);
 }
 
@@ -1201,6 +1510,27 @@ function deliveredInHeadHint(graphItems, id, r) {
   } catch { return ''; }
 }
 
+// KI-E159 (ported from a host-mount session) — a BLOCKED/ESCALATED item's decision.md is generated
+// ONCE, from whatever probe/gate flagged it at that moment — but a LATER pass in the same pipeline
+// run can independently REVERSE the finding decision.md was built from, and nothing regenerates
+// decision.md or un-blocks the item when that happens. A stale decision.md steers a human toward
+// ruling on a finding a later review/gate file already reversed on disk. Deliberately a SURFACING fix
+// only, never auto-unblocking: a false positive on an auto-unblock would be worse than the staleness
+// itself, so this only tells the human reading the queue to re-check the newer file before ruling.
+function staleDecisionHint(itemDir) {
+  try {
+    const decPath = join(itemDir, 'decision.md');
+    if (!existsSync(decPath)) return '';
+    const decMs = statSync(decPath).mtimeMs;
+    const newer = readdirSync(itemDir)
+      .filter((f) => /^(review|gate)-.*\.md$/.test(f))
+      .filter((f) => { try { return statSync(join(itemDir, f)).mtimeMs > decMs; } catch { return false; } })
+      .sort();
+    if (!newer.length) return '';
+    return `⚠ POSSIBLY STALE (KI-E159): ${newer.join(', ')} ${newer.length > 1 ? 'were' : 'was'} written AFTER this decision.md — re-read ${newer.length > 1 ? 'them' : 'it'} before ruling; the block may rest on a finding a later pass already reversed.`;
+  } catch { return ''; }
+}
+
 function cmdEscalationsSync(cfg, ledger, silent) {
   const queuePath = abs(cfg.paths.queue);
   const esc = Object.entries(ledger.items).filter(([, r]) => ['ESCALATED', 'BLOCKED'].includes(r.state));
@@ -1227,11 +1557,12 @@ function cmdEscalationsSync(cfg, ledger, silent) {
       const decPath = abs(join(cfg.paths.items, id, 'decision.md'));
       const framed = existsSync(decPath) ? ('\n\n' + readFileSync(decPath, 'utf8').trim() + '\n') : '';
       const hint = deliveredInHeadHint(graphItems, id, r);
+      const staleHint = staleDecisionHint(abs(join(cfg.paths.items, id)));
       // KI-E53: `r.note` (the ledger row's static field) is never assigned anywhere in this file —
       // only per-transition `history[].note` entries carry real reasons. Use the same lastNote()
       // walk the "retry-exhausted" section below already relies on, instead of a field that is
       // structurally always null (every escalated/blocked item rendered "(no note)").
-      return `## ${id} — ${r.state}\n\n- ${lastNote(r)}${hint ? '\n- ' + hint : ''}${framed}\n`;
+      return `## ${id} — ${r.state}\n\n- ${lastNote(r)}${hint ? '\n- ' + hint : ''}${staleHint ? '\n- ' + staleHint : ''}${framed}\n`;
     }).join('\n') : '_No items awaiting a human decision._',
     '',
     ...(exhausted.length ? [
@@ -2277,14 +2608,20 @@ function cmdDecisionsDigest() {
     const ageDays = enteredAt ? Math.max(0, Math.round((nowMs - Date.parse(enteredAt)) / 86400000)) : 0;
     const decPath = abs(join(cfg.paths.items, id, 'decision.md'));
     let options = [];
-    let question = wi.ownerDecision || '';
+    // KI-E151 (ported from a host-mount session) — wi.ownerDecision is a plain string for most
+    // items, but a synthetic owner-batch-ruling item can store it as a structured
+    // {date, ruling, rationale, source} object instead. Stringifying that unguarded downstream
+    // produced the literal text "[object Object]" for exactly those rows — extract the actual ruling
+    // text here so both shapes render as real, readable prose.
+    let question = typeof wi.ownerDecision === 'string' ? wi.ownerDecision
+      : (wi.ownerDecision && typeof wi.ownerDecision === 'object' ? (wi.ownerDecision.ruling || wi.ownerDecision.decision || '') : '');
     if (existsSync(decPath)) {
       const txt = readFileSync(decPath, 'utf8');
       options = [...new Set([...txt.matchAll(/\bOption ([A-Z])\b/g)].map((m) => m[1]))];
       if (!question) { const line = txt.split('\n').map((l) => l.trim()).find((l) => l && !l.startsWith('#')); if (line) question = line; }
     }
     if (!question) question = (r.note || '').slice(0, 160);
-    rows.push({ id, state: r.state, severity: wi.severity || '?', target: wi.target || '?', ageDays, question: String(question).replace(/\|/g, '/').replace(/\s+/g, ' ').slice(0, 160), options, delivered: !!deliveredInHeadHint(items, id, r) });
+    rows.push({ id, state: r.state, severity: wi.severity || '?', target: wi.target || '?', ageDays, question: String(question).replace(/\|/g, '/').replace(/\s+/g, ' ').slice(0, 160), options, delivered: !!deliveredInHeadHint(items, id, r), stale: !!staleDecisionHint(abs(join(cfg.paths.items, id))) });
   }
   rows.sort((a, b) => (sevRank[b.severity] || 0) - (sevRank[a.severity] || 0) || b.ageDays - a.ageDays || a.id.localeCompare(b.id));
   const bySev = rows.reduce((acc, r) => { acc[r.severity] = (acc[r.severity] || 0) + 1; return acc; }, {});
@@ -2324,6 +2661,16 @@ function cmdDecisionsDigest() {
       '## Possibly already DELIVERED in HEAD (KI-E36) — verify, then `driver recover <id>`',
       '',
       ...rows.filter((row) => row.delivered).map((row) => `- \`${row.id}\` — every touch-set file has a commit newer than the park`),
+      '',
+    ] : []),
+    // KI-E159 (ported from a host-mount session) — the same "surface, never auto-resolve" posture as
+    // KI-E36 above — a later review/gate pass in this item's OWN directory postdates decision.md, so
+    // the block may rest on a finding that pass already reversed. Re-read the newer file before
+    // ruling; this digest never assumes it.
+    ...(rows.some((row) => row.stale) ? [
+      '## Possibly stale decisions (KI-E159) — a later review/gate file postdates decision.md',
+      '',
+      ...rows.filter((row) => row.stale).map((row) => `- \`${row.id}\` — re-read the newer file(s) in state/items/${row.id}/ before ruling`),
       '',
     ] : []),
     '## Candidate cross-service question bundles (KI-E74) — VERIFY before ruling, do not assume',
@@ -2701,7 +3048,15 @@ function cmdMainCheck(rest, flags) {
   // REPO_ROOT/MOUNT_REL/claimedPaths.
   const unclaimed = unclaimedMainDrift(dirtyMainPaths(REPO_ROOT), MOUNT_REL, claimedPaths);
   if (unclaimed.length) {
-    console.log(`⚠ MAIN-DRIFT unclaimed (KI-E89): main-tree path(s) dirty outside the factory mount with NO item snapshot to check against — could be leaked factory-worktree contamination (no item has ever claimed this path) OR your own unrelated work-in-progress; main-check cannot tell which, so it surfaces it rather than silently missing the contamination case. Eyeball each:\n` + unclaimed.map((p) => `    ${p}`).join('\n'));
+    // KI-E177 (ported from a host-mount session) — same upgrade as the fold-time sweep: a
+    // byte-identical match against a claimed item's own worktree is overwhelming evidence of
+    // leaked contamination, not operator WIP. Checked against EVERY item the factory has ever
+    // claimed (allClaimedIds), matching this command's own --all scope.
+    const debris = matchWorktreeDebris(REPO_ROOT, unclaimed, allClaimedIds, abs(cfg.paths.worktreesState));
+    const matched = debris.filter((d) => d.matchedItem);
+    const truly = debris.filter((d) => !d.matchedItem).map((d) => d.path);
+    if (matched.length) console.log(`⚠ MAIN-TREE CONTAMINATION unclaimed, HIGH CONFIDENCE (KI-E177): byte-identical to a file already in the SAME item's OWN worktree — this can only be leaked write-isolation contamination, never operator work-in-progress. Not auto-repaired, but safe to remove once eyeballed:\n` + matched.map((d) => `    ${d.path} == ${d.matchedItem}'s worktree copy of ${d.matchedFile}`).join('\n'));
+    if (truly.length) console.log(`⚠ MAIN-DRIFT unclaimed (KI-E89): main-tree path(s) dirty outside the factory mount with NO item snapshot to check against — could be leaked factory-worktree contamination (no item has ever claimed this path) OR your own unrelated work-in-progress; main-check cannot tell which, so it surfaces it rather than silently missing the contamination case. Eyeball each:\n` + truly.map((p) => `    ${p}`).join('\n'));
   }
 }
 
@@ -2789,6 +3144,7 @@ function dispatch(cmd, flags, rest) {
     case 'decisions-digest': return cmdDecisionsDigest(); // KI-E24 — ranked owner-decision digest (severity x age + one-line reply format)
     case 'realinfra-lint': return cmdRealinfraLint(); // KI-L42 — report realInfra=true items with no .cs (KI-L38 false-fail shape)
     case 'resume': return cmdResume(flags);
+    case 'mark-launched': return cmdMarkLaunched(flags); // KI-E140 — record {taskId, runId} for a just-launched Workflow, surfaced later by resume's task-liveness reminder
     case 'progress': return cmdReport('progress');
     case 'burndown': return cmdReport('burndown');
     case 'cost': return cmdReport('cost');
@@ -2809,7 +3165,7 @@ function dispatch(cmd, flags, rest) {
     case 'telemetry-report': return cmdTelemetryReport(flags); // KI-E7 / spine AD-9 — evaluation report from events.jsonl
     case 'main-check': return cmdMainCheck(rest, flags); // KI-E50 — mid-band main-drift check (read-only, warn-only); KI-E82 — --all sweep
     default:
-      console.log('commands: init | status | select | claim | reset | fold | reconstruct | recover | resume | progress | burndown | cost | escalations | decisions-digest | group | suggest | cycle | sweep | sweep-fold | gc | preflight | graph-audit | realinfra-lint | report-cycle | ingest | merge-graph | controller | telemetry-report | main-check | worktree-add|remove|list');
+      console.log('commands: init | status | select | claim | reset | fold | reconstruct | recover | resume | mark-launched | progress | burndown | cost | escalations | decisions-digest | group | suggest | cycle | sweep | sweep-fold | gc | preflight | graph-audit | realinfra-lint | report-cycle | ingest | merge-graph | controller | telemetry-report | main-check | worktree-add|remove|list');
   }
 }
 

@@ -18,7 +18,14 @@
 import { readFileSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 
-const DEFAULTS = Object.freeze({ noNewComments: false, noSchemaChanges: false, failLaneOnMainDrift: false });
+// KI-E171 (ported from a host-mount session): shadowConsolidatedScan (KI-E169) shipped as a
+// config.json key WITHOUT being added here — this loader's merge only ever copies keys already
+// present in DEFAULTS (line below), so a flag can be set in every config file and still be silently
+// dropped on every real group/sweep launch, with exec-smoke coverage (which injects batch.policies
+// directly, bypassing this loader) structurally unable to catch the gap. Any future policy addition
+// MUST be added here in the SAME change, with a round-trip loadPolicies() assertion, not just
+// factory.js-side exec-smoke coverage of the flag's in-factory effect.
+const DEFAULTS = Object.freeze({ noNewComments: false, noSchemaChanges: false, failLaneOnMainDrift: false, shadowConsolidatedScan: false });
 
 function readJsonSafe(p) {
   try { return JSON.parse(readFileSync(p, 'utf8')); } catch { return null; }

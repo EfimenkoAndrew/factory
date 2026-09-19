@@ -123,6 +123,29 @@ export function effectiveBaseline(baselineArr, baselineParse) {
   return Math.max(reported, fromDisk)
 }
 
+// KI-E163 (ported from a host-mount session) — is an effective baseline of 0 a REAL measurement or a
+// PHANTOM default? effectiveBaseline's Math.max(0, 0) cannot tell the two apart: a baseline run that
+// genuinely found zero pre-existing failures and a baseline that was simply NEVER captured or reported
+// both read as the same "0". A phantom 0 is exactly what let a deterministic override deterministically
+// FAIL an item repeatedly on failures independently reproduced on a completely clean checkout with zero
+// relation to the item's own diff, on the origin host — the override's own message presented "beyond
+// baseline 0" with the same unqualified confidence whether the 0 was measured or defaulted. KI-E162
+// closes the upstream gap (a reFix round now captures a baseline when none exists); this is the
+// downstream, defense-in-depth half for when that prompt instruction doesn't take on some item shape.
+export function isPhantomBaseline(baseline, baselineArr, baselineParse) {
+  return baseline === 0 && !(Array.isArray(baselineArr) && baselineArr.length) && !baselineParse;
+}
+
+// Appends the KI-E163 caveat to a verdictFromParse `reason` string ONLY when it names an actual
+// "beyond baseline 0" comparison AND that 0 is phantom (per isPhantomBaseline) — a real, unrelated
+// failure reason (build failed, targeted test didn't pass, a genuinely non-zero baseline) is returned
+// byte-identical, never touched.
+export function annotateBaselineReason(reason, isPhantom) {
+  return (isPhantom && /beyond baseline 0\b/.test(String(reason || '')))
+    ? reason + ' (⚠ KI-E163: baseline=0 here is a DEFAULT, not a measurement — no baseline-raw.txt exists and no baselineFailures were ever reported for this item; if these failures are genuinely pre-existing, capturing a real baseline resolves this, not the diff)'
+    : reason;
+}
+
 // P1 — the RED proof marker. The test-author tees the PRE-FIX run; `FACTORY::RED::<exit>` with a NON-ZERO
 // exit proves the regression test genuinely fails on old code (non-vacuous). hasData=false => no red
 // transcript at all (the driver FAILs a code item that produced none — a vacuous test is the silent way a
