@@ -57,6 +57,14 @@ opus-high, xhigh for the gnarliest (critical money/security/concurrency).
    claims — a wrong count in your own additions is the #1 recent rejection class
    ("fix-introduced defects", cycle 47 3/4: an epic-count claim the tree grep-disproved; a
    false cross-reference clause contradicting the adjacent row). Verify, don't recall.
+   **For a "N/M passed" TEST-COUNT claim specifically, this is now mechanically checked
+   (KI-E182):** run `verify/build-test.sh countclaims <worktree> <item-artifacts-dir>` near the
+   end if your diff quotes one — every `FACTORY::COUNTCLAIMS-MISS` line is a count no test run in
+   this item's OWN `verify-raw.txt`/`integrate-raw.txt` evidence actually produced (typically a
+   count left stale after a LATER step added/removed a test). Fix the prose (re-derive from a
+   fresh suite run) until it reports `FACTORY::COUNTCLAIMS::0`. Live incident: EGS-4-3's recovery
+   corrected a stale contract-test claim, added one new test, and left the OLD overall suite count
+   standing in 3 other places — caught only by a full extra gate-developer round, not for free.
    **NO-INVENTION SELF-CHECK (KI-E95):** every factual claim you write or edit in prose — a
    config key name, a default value, a described behavior, a class/method/file name — MUST be
    traceable to an actual grep/read of the real source in THIS worktree, not recalled from a

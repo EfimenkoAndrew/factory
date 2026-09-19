@@ -9,6 +9,7 @@
 #   build-test.sh filter  <test.csproj-or-sln> "<FullyQualified~or~Name>"   # POST-FIX: proves the test is GREEN
 #   build-test.sh suite   <test.csproj-or-sln>
 #   build-test.sh claims    <worktree-path>       # KI-E11: phantom doc-path lint (FACTORY::CLAIMS::<n>)
+#   build-test.sh countclaims <worktree-path> <item-dir> # KI-E182: stale/invented test-count-claim lint (FACTORY::COUNTCLAIMS::<n>)
 #   build-test.sh leftovers <worktree-path>       # KI-D12: deferral/tech-debt lexicon lint (FACTORY::LEFTOVER::<n>) — engine-owned, runs BEFORE the local-override seam
 #   build-test.sh comments  <worktree-path>       # KI-E59: no-new-comments lint (FACTORY::COMMENT::<n>) — engine-owned, runs BEFORE the local-override seam
 #   build-test.sh ledger-anchor <worktree-path>   # KI-E91: STANDARDS-DIVERGENCE-LEDGER.md duplicate-anchor/false-tag-claim lint (FACTORY::LEDGER-ANCHOR::<n>) — engine-owned, runs BEFORE the local-override seam
@@ -184,6 +185,18 @@ case "$cmd" in
     node "$SCRIPT_DIR/../_workflow/claims-lint.mjs" "$wt"
     exit $?
     ;;
+  countclaims)
+    # KI-E182 (2026-09-18): deterministic stale/invented test-count-claim linter, run EARLY (fix/
+    # editorial/verify time) or during a manual recovery — same lib a future fold-time check would
+    # use (single source of truth). Emits FACTORY::COUNTCLAIMS-MISS::<claim> per unevidenced "N/M
+    # passed" claim + FACTORY::COUNTCLAIMS::<count>; exit 1 when count>0.
+    #   usage: build-test.sh countclaims <worktree-path> <item-artifacts-dir>
+    wt="$target"; itemdir="$filter"
+    if [ -z "$wt" ]; then echo "usage: build-test.sh countclaims <worktree> <item-artifacts-dir>" >&2; exit 64; fi
+    SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
+    node "$SCRIPT_DIR/../_workflow/countclaims-lint.mjs" "$wt" "$itemdir"
+    exit $?
+    ;;
   pack)
     # REVIEW PACK (cache-strategic reviewer input, 2026-07-18): ONE machine-generated snapshot of the
     # worktree change (git status + full diff vs HEAD + untracked-file contents) that every
@@ -218,7 +231,7 @@ case "$cmd" in
     exit 0
     ;;
   *)
-    echo "usage: build-test.sh build|red|filter|suite|claims|leftovers|comments|ledger-anchor|rootcause|pack <target> [filter|outfile]" >&2
+    echo "usage: build-test.sh build|red|filter|suite|claims|countclaims|leftovers|comments|ledger-anchor|rootcause|pack <target> [filter|outfile]" >&2
     exit 64
     ;;
 esac

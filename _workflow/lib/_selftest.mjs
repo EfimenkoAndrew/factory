@@ -2431,6 +2431,34 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
   eq(D99.findMissingClaims(['`Infra/dr-failover.yaml` is not yet built; tracked for Wave 3.'], entries99), [], 'KI-E99: "not yet built" phrasing is recognized');
 }
 
+// KI-E182 (2026-09-18, EGS-4-3 recovery incident) — sibling linter to doclint's phantom-path
+// check, for "N/M passed" test-count claims instead of file-path claims. Live incident: a fixer
+// round added a test (changing a real count from 2257/2282 to 2258/2283) but left the OLD count
+// standing in 3 prose locations, caught only by a fresh, expensive gate-developer re-dispatch.
+{
+  const C = await import('./countclaims.mjs');
+  eq(C.extractCountClaims('- IntegrationEventEncryptorTests: 23/23 passed'), [{ passed: 23, total: 23, text: '23/23' }], 'countclaims: extracts a plain N/M-passed claim');
+  eq(C.extractCountClaims('Released on 9/18 for the sprint.'), [], 'countclaims: an N/M shape with no "passed" nearby is not a count claim (date-like false positive)');
+  eq(C.extractCountClaims('Full ProductsService suite: 2258/2283 passed (was 2257/2282; +1 from the new test added during recovery)'), [], 'countclaims: a line honestly narrating a SUPERSEDED count is exempt entirely (line-granular, same tradeoff as doclint\'s NOT_YET_EXISTS_RE — the CURRENT-looking claim on this line is re-verifiable from the very next unremarkable line elsewhere in the same doc, so skipping the whole line costs nothing real)');
+  eq(C.extractCountClaims('previously 22/22 passed, now 23/23 passed after the fix'), [], 'countclaims: "previously" framing exempts the whole line, including its current-sounding second claim (line-granular, same tradeoff as doclint)');
+  eq(C.extractCountClaims('Backwards ratio 25/10 passed makes no sense as a pass-count'), [], 'countclaims: passed > total is never a real pass-count ratio (skipped as a probable coincidental match)');
+  eq(C.extractCountClaims('11/11 passed and 23/23 passed on the same line'), [{ passed: 11, total: 11, text: '11/11' }, { passed: 23, total: 23, text: '23/23' }], 'countclaims: multiple genuine claims on one line are all extracted');
+
+  eq([...C.extractEvidencePairs('Passed!  - Failed:     0, Passed:  2258, Skipped:     0, Total:  2283, Duration: 15 s')], ['2258/2283'], 'countclaims: extracts a pair from a real dotnet suite-summary line');
+  eq([...C.extractEvidencePairs('Failed!  - Failed:     1, Passed:   685, Skipped:     0, Total:   686, Duration: 9 s')], ['685/686'], 'countclaims: extracts a pair from a FAILING dotnet summary line too (passed count is still real evidence)');
+  eq([...C.extractEvidencePairs('FACTORY::SUMMARY::suite exit=0 failed=0 passed=413 skipped=0 dockerfail=0')], ['413/413'], 'countclaims: extracts a pair from the keyed FACTORY::SUMMARY::suite marker (failed=0 -> total=passed)');
+  eq([...C.extractEvidencePairs('FACTORY::SUMMARY::suite exit=1 failed=25 passed=2257 skipped=0 dockerfail=25')].sort(), ['2257/2282'], 'countclaims: keyed marker total = passed+failed+skipped even when failed>0');
+  const multi = 'Passed!  - Failed: 0, Passed: 11, Skipped: 0, Total: 11\nsome other line\nPassed!  - Failed: 0, Passed: 23, Skipped: 0, Total: 23';
+  eq([...C.extractEvidencePairs(multi)].sort(), ['11/11', '23/23'], 'countclaims: a transcript with multiple dotnet invocations yields multiple distinct pairs');
+
+  const evidence = new Set(['2258/2283', '11/11']);
+  eq(C.findUnevidencedCountClaims(['- Full ProductsService suite: check 2257/2282 passed'], evidence), ['2257/2282'], 'countclaims: a stale claim not matching any evidenced pair is flagged (the EGS-4-3 witness)');
+  eq(C.findUnevidencedCountClaims(['- Full ProductsService suite: 2258/2283 passed'], evidence), [], 'countclaims: a claim matching a real evidenced pair is NOT flagged');
+  eq(C.findUnevidencedCountClaims(['11/11 passed', '11/11 passed again'], evidence), [], 'countclaims: a repeated identical claim is deduped and, once evidenced, never flagged');
+  eq(C.findUnevidencedCountClaims([], evidence), [], 'countclaims: no added lines -> no findings');
+  eq(C.findUnevidencedCountClaims(['- 9/9 passed'], new Set()), ['9/9'], 'countclaims: an empty evidence set (no test run recorded yet) flags every claim — correct, an unverifiable claim is exactly as suspect as a stale one');
+}
+
 // Exporter pure core (telemetry/exporter/lib/aggregate.mjs — spine AD-5/AD-12/AD-13 + review
 // findings #3/#6/#11): ingest reducer, derived-only histograms, nested label maps (space-safe),
 // one-span-per-stage assembly with buffer consumption, valid Prometheus exposition.
@@ -2642,6 +2670,9 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
   ok(fsrc2.includes('GREP-ANCHORED SELF-REPORT (KI-E10)'), 'KI-E10: runner realInfra self-report is grep-anchored');
   ok(fsrc2.includes('DOC-CLAIM SELF-CHECK (KI-E11)'), 'KI-E11: fixer briefed with the claims self-check');
   ok(fsrc2.includes('DOC-CLAIM LINT (KI-E11)'), 'KI-E11: runner tees the claims lint for doc-touching items');
+  ok(fsrc2.includes('COUNT-CLAIM SELF-CHECK (KI-E182)'), 'KI-E182: fixer briefed with the count-claim self-check');
+  ok(fsrc2.includes('COUNT-CLAIM LINT (KI-E182)'), 'KI-E182: runner tees the count-claims lint for doc-touching items');
+  ok((fsrc2.match(/\+ claimsHint \+ countClaimsHint/g) || []).length === 7, 'KI-E182: the count-claims hint rides EVERY one of the 7 fixer/amend dispatch sites the doc-claims hint already reaches (initial fix + 6 amend rounds)');
   ok(fsrc2.includes('routine machine-state bookkeeping'), 'KI-D8: checkpoint preamble opens with the bookkeeping framing (4th mitigation)');
   // driver.mjs source contracts
   const dsrc = readFileSync(new URL('../driver.mjs', import.meta.url), 'utf8');
@@ -2654,10 +2685,14 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
   ok(bts2.includes('claims)') && bts2.includes('claims-lint.mjs'), 'KI-E11: build-test.sh claims subcommand wired to the CLI');
   const clisrc = readFileSync(new URL('../claims-lint.mjs', import.meta.url), 'utf8');
   ok(clisrc.includes('FACTORY::CLAIMS::') && clisrc.includes('lintWorktreeDocClaims'), 'KI-E11: claims CLI emits the machine marker from the SAME doclint lib the fold F2 uses');
+  ok(bts2.includes('countclaims)') && bts2.includes('countclaims-lint.mjs'), 'KI-E182: build-test.sh countclaims subcommand wired to the CLI');
+  const ccclisrc = readFileSync(new URL('../countclaims-lint.mjs', import.meta.url), 'utf8');
+  ok(ccclisrc.includes('FACTORY::COUNTCLAIMS::') && ccclisrc.includes('lintItemCountClaims'), 'KI-E182: countclaims CLI emits the machine marker from the SAME countclaims lib');
   // briefs
   ok(readFileSync(new URL('../../agents/review-edgecase.md', import.meta.url), 'utf8').includes('EARLY POSITION (KI-E12'), 'KI-E12: edge-case brief carries the early-position contract');
   ok(readFileSync(new URL('../../agents/marker-probe.md', import.meta.url), 'utf8').includes('marker-probe (KI-E10)'), 'KI-E10: marker-probe brief exists');
   ok(readFileSync(new URL('../../agents/fixer.md', import.meta.url), 'utf8').includes('DOC-CLAIM SELF-CHECK (KI-E11)'), 'KI-E11: fixer card carries the claims self-check');
+  ok(readFileSync(new URL('../../agents/fixer.md', import.meta.url), 'utf8').includes('mechanically checked\n   (KI-E182)'), 'KI-E182: fixer card\'s existing KI-E51 count-claim section now references the mechanical backstop');
   ok(readFileSync(new URL('../../agents/test-author.md', import.meta.url), 'utf8').includes('REAL-SHAPE SEEDING (KI-E38'), 'KI-E38: test-author brief carries the real-shape seeding rule');
   ok(readFileSync(new URL('../../agents/review-testreview.md', import.meta.url), 'utf8').includes('Seed-shape completeness (KI-E38'), 'KI-E38: test-review brief carries the seed-shape completeness lens');
   const ta38 = readFileSync(new URL('../../agents/test-author.md', import.meta.url), 'utf8');
