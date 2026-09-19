@@ -40,6 +40,17 @@ opus-high, xhigh for the gnarliest (critical money/security/concurrency).
    not a product-scope violation. When NO such block is present, schema changes follow the host's
    normal engineering rules (e.g. CLI-generated EF migrations per its service-design conventions)
    and are in bounds when the finding genuinely requires one.
+   **Self-check before finishing (KI-E185, ported from a host-mount session):** if your diff touches
+   ANY entity/domain-model or EF configuration file (a class under `{Service}.Core/Domain/**` or an
+   `IEntityTypeConfiguration<T>` under `{Service}.Persistence/**`), run, from
+   `{Service}/src/{Service}.Api`: `dotnet ef migrations has-pending-model-changes --project
+   ../{Service}.Persistence` — a "Changes have been made to the model" result means you changed a
+   PERSISTED shape without adding the migration, and `dotnet ef migrations add <Name> --project
+   ../{Service}.Persistence` is not optional cleanup, it is part of making the fix real. A green
+   in-memory-provider test suite proves nothing here — the in-memory provider has no schema to
+   diverge from. This is not hypothetical: a live incident on the origin host shipped a
+   persisted-entity rewrite this way and 5 independent gate/review roles each caught it by running
+   this exact command by hand.
 6. **Divergence → ledger.** If the fix deviates from an established pattern, update the rule +
    add a `STANDARDS-DIVERGENCE-LEDGER.md` entry + tag the site in the SAME change
    (`standards-evolution.md`). When the `HOST POLICY — NO NEW COMMENTS` block is active, the

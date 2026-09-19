@@ -1641,7 +1641,7 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
   // are both hours-old, separately-scoped pre-band scans on the origin host with no equivalent
   // planNext/applyPhaseResults phase in this runtime, so they are genuinely UNPORTED, not a silent
   // regression.
-  eq(Object.keys(STAGE_PARITY.unported).sort(), ['adjudicator:realinfra-override', 'breadth-claim-probe', 'consolidated-scan-shadow', 'main-drift-probe', 'pack-hash-probe', 'plan-feasibility-probe', 'plan-quality-probe', 'prior-finding-probe', 'red-coverage-probe'].sort(), 'KI-E112/KI-E139/KI-E142A/KI-E143C/KI-E145/KI-E168/KI-E169/KI-E175/KI-E179: the UNPORTED set contains EXACTLY the reviewed, dated entries — the four original KI-E103 disclosed gaps (red-proof KI-E83, plan-commitment/plan-step KI-E87+E101, ledger-anchor KI-E91, rootcause KI-E104) are still all closed; a name added here without ALSO updating this pinned list (in the same change) is precisely the silent-growth failure mode KI-E112 exists to catch');
+  eq(Object.keys(STAGE_PARITY.unported).sort(), ['adjudicator:realinfra-override', 'breadth-claim-probe', 'consolidated-scan-shadow', 'efmigration-probe', 'main-drift-probe', 'pack-hash-probe', 'plan-feasibility-probe', 'plan-quality-probe', 'prior-finding-probe', 'red-coverage-probe'].sort(), 'KI-E112/KI-E139/KI-E142A/KI-E143C/KI-E145/KI-E168/KI-E169/KI-E175/KI-E179/KI-E185: the UNPORTED set contains EXACTLY the reviewed, dated entries — the four original KI-E103 disclosed gaps (red-proof KI-E83, plan-commitment/plan-step KI-E87+E101, ledger-anchor KI-E91, rootcause KI-E104) are still all closed; a name added here without ALSO updating this pinned list (in the same change) is precisely the silent-growth failure mode KI-E112 exists to catch');
   ok(Object.keys(STAGE_PARITY.mechanical).length >= 5, 'KI-E112: the mechanical set carries the stages implemented deterministically instead of via an agent (runner, marker, comment, red-proof, rootcause)');
   // --- shared-constant byte parity (the KI-E97 drift class)
   for (const name of SHARED_CONSTANTS) {
@@ -4870,6 +4870,69 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
   ok(fixerMd183.includes('EGS-4-4'), 'KI-E183: cites the live incident that motivated the guidance');
   ok(fixerMd183.includes('add a `STANDARDS-DIVERGENCE-LEDGER.md` entry'), 'KI-E183 adaptation: item 6\'s own ledger-filename reference is corrected alongside the new guidance — the pre-existing text named a file that has never existed on disk (same defect class as KI-E64, which fixed only the driver.mjs constant)');
   ok(!fixerMd183.includes('`STANDARDS-LEDGER.md`'), 'KI-E183 adaptation: no surviving reference to the stale (missing-DIVERGENCE) ledger filename in fixer.md');
+}
+
+// KI-E185 (ported from a host-mount session, origin commits `29f91a505` + same-session
+// self-correction `a775ffdd4` + registry-entry follow-up `5993820e8`, folded together as one unit
+// per the origin's own note that the fixup and registry entry only make sense applied alongside the
+// feature they correct/document) — a NEW class of pre-band probe: unlike every sibling lint here
+// (leftover-lint/comment-lint/ledger-anchor-lint/rootcause-lint, all text/AST-shape diff scans),
+// "does the persisted model match the migration history" can only be answered by real `dotnet ef`
+// tooling — 5 independent gate/review roles on the origin host each ran the same command by hand to
+// catch a persisted entity schema change that shipped with no migration and a stale ModelSnapshot.
+// Real behavioral coverage of the pure service-extraction regex (run directly, not re-derived from a
+// string), source-text pins for the build-test.sh subcommand and the factory.js dispatch wiring
+// (already carrying the origin's own self-correction — this port never had the unanchored-grep bug
+// live), and a real behavioral regression guard exercising the ACTUAL grep invocation build-test.sh
+// runs against both literal EF Core CLI message strings (ported from the origin's own follow-up
+// fix's regression guard, `a775ffdd4`) — not just a source-text pin on which grep form is present.
+{
+  const deriveEfMigrationServices = (files) => Array.from(new Set((files || [])
+    .map((f) => { const m = /^([A-Za-z0-9.]+)\/src\/\1\.(?:Core|Persistence|Infrastructure)\//.exec(f); return m ? m[1] : null })
+    .filter(Boolean)))
+  eq(deriveEfMigrationServices([
+    'SearchService/src/SearchService.Infrastructure/Messaging/Consumers/',
+    'NotificationService/src/NotificationService.Infrastructure/Messaging/',
+    'ProductsService/src/ProductsService.Infrastructure/Messaging/Consumers/NewProductPreferenceMatchHandler.cs',
+    '_bmad-output/tech-debt/STANDARDS-DIVERGENCE-LEDGER.md',
+  ]), ['SearchService', 'NotificationService', 'ProductsService'], 'KI-E185: extracts every distinct service from Infrastructure-layer paths, in first-seen order, and ignores a non-service doc path');
+  eq(deriveEfMigrationServices(['ProductsService/src/ProductsService.Core/Domain/Preferences/Models/ProcessedPreferenceEvent.cs']), ['ProductsService'], 'KI-E185: an ENTITY edit under .Core/Domain/ triggers the check even though the path never contains the word "Persistence" at all — the exact origin-host incident shape (item.files never named the entity file itself, only a sibling Infrastructure consumer)');
+  eq(deriveEfMigrationServices(['saas/I2pMailService/src/I2pMailService.Adapters/Persistence/Npgsql/SqlMigrationRunner.cs']), [], 'KI-E185: the AOT-profile raw-SQL runner (no EF, "Persistence" is a sub-folder of .Adapters, not the project-name layer) correctly does NOT trigger — {Service}.Adapters != {Service}.Persistence');
+  eq(deriveEfMigrationServices([]), [], 'KI-E185: no files -> no services, never throws');
+  eq(deriveEfMigrationServices(null), [], 'KI-E185: a null files array never throws');
+
+  const fsrc185 = readFileSync(join(import.meta.dirname, '..', 'factory.js'), 'utf8');
+  ok(fsrc185.includes('const EFMIGRATION_SCHEMA'), 'KI-E185: the probe result schema is defined');
+  ok(fsrc185.includes('EF-MIGRATION PROBE (KI-E185)'), 'KI-E185: the dispatch prompt is present and marked');
+  ok(fsrc185.includes("emResults.filter(function (r) { return r.verdict === 'dirty' })"), 'KI-E185: the dirty-verdict filter reads the exact string the build-test.sh subcommand emits');
+  ok(fsrc185.includes("return finish('FAILED', 'efmigration probe (KI-E185):"), 'KI-E185: a dirty verdict actually fails the item pre-band, not just an advisory note');
+  ok(fsrc185.includes("res.gates['probe:efmigration'] = emResults.length ? 'APPROVED' : 'SKIPPED'"), 'KI-E185: an empty/unreadable result set is announced SKIPPED, never silently read as clean (KI-E20/E41 posture)');
+
+  const btsrc185 = readFileSync(join(import.meta.dirname, '..', '..', 'verify', 'build-test.sh'), 'utf8');
+  ok(btsrc185.includes('efmigration)'), 'KI-E185: build-test.sh has the new subcommand');
+  ok(btsrc185.includes('dotnet ef migrations has-pending-model-changes'), 'KI-E185: the subcommand invokes the real EF tool, not a text lint');
+  ok(btsrc185.includes('FACTORY::EFMIGRATION::RESULT verdict=') && btsrc185.includes('FACTORY::SUMMARY::efmigration'), 'KI-E185: emits both the probe-specific result marker and the KI-E19 evidence-manifest summary line');
+  ok(btsrc185.includes("grep -qi '^Changes have been made to the model'"), 'KI-E185: the dirty-detection grep is anchored to line-start from the start (folding in the origin\'s own same-session self-correction, `a775ffdd4`) — an unanchored grep for "Changes have been made to the model" also matches the CLEAN message ("No changes have been made...", which contains it as a literal substring), which on the origin host reported verdict=dirty unconditionally regardless of actual EF state until caught by a live gate re-check');
+  ok(!btsrc185.includes("grep -qi 'Changes have been made to the model'"), 'KI-E185: no surviving UNANCHORED form of the dirty-detection grep — this port never shipped the origin\'s own transient bug');
+  // Real behavioral proof of the anchor — not just a source-text pin. Exercises the ACTUAL grep
+  // invocation build-test.sh runs, against both real EF Core CLI message strings verbatim (ported
+  // from the origin's own regression guard for its same-session self-correction, `a775ffdd4`).
+  {
+    const dirtyMsg = 'Changes have been made to the model since the last migration. Add a new migration.';
+    const cleanMsg = 'No changes have been made to the model since the last migration.';
+    const matches = (line) => { try { execFileSync('bash', ['-c', 'grep -qi \'^Changes have been made to the model\''], { input: line + '\n' }); return true; } catch { return false; } };
+    ok(matches(dirtyMsg), 'KI-E185: the anchored grep matches the real dirty message verbatim');
+    ok(!matches(cleanMsg), 'KI-E185: the anchored grep does NOT false-match the real clean message (the exact bug the origin host\'s own unanchored version had: "No changes..." contains "changes..." as an unanchored substring)');
+  }
+
+  const fixerMd185 = readFileSync(new URL('../../agents/fixer.md', import.meta.url), 'utf8');
+  ok(fixerMd185.includes('Self-check before finishing (KI-E185'), 'KI-E185: the fixer brief tells the agent to self-check BEFORE finishing, not wait for a reviewer to catch it');
+  ok(fixerMd185.includes('dotnet ef migrations has-pending-model-changes'), 'KI-E185: the self-check names the exact command, not a vague "check for migrations"');
+
+  const { STAGE_PARITY: SP185 } = await import('../opencode/stage-parity.mjs');
+  ok(typeof SP185.unported['efmigration-probe'] === 'string' && SP185.unported['efmigration-probe'].length >= 40, 'KI-E185: opencode/stage-parity.mjs declares the new role UNPORTED with a substantive reason (this runtime has no real-command-relay capability to dispatch the check onto)');
+  const schemasSrc185 = readFileSync(new URL('../opencode/schemas.mjs', import.meta.url), 'utf8');
+  ok(schemasSrc185.includes('export const EFMIGRATION_SCHEMA'), 'KI-E185: opencode/schemas.mjs mirrors the new schema for byte/structure parity (Fix #20\'s deep-equal gate enforces the content matches factory.js exactly)');
 }
 
 console.log(`\nself-test: ${pass} passed, ${fail} failed`);

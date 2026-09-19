@@ -8,6 +8,7 @@
 #   build-test.sh red     <test.csproj-or-sln> "<FullyQualified~or~Name>"   # PRE-FIX: proves the test FAILS on old code
 #   build-test.sh filter  <test.csproj-or-sln> "<FullyQualified~or~Name>"   # POST-FIX: proves the test is GREEN
 #   build-test.sh suite   <test.csproj-or-sln>
+#   build-test.sh efmigration <api-project-dir> <persistence-project-relative-path> # KI-E185: EF Core pending-model-change lint (FACTORY::EFMIGRATION::<clean|dirty>) — real dotnet-ef invocation, not a text lint
 #   build-test.sh claims    <worktree-path>       # KI-E11: phantom doc-path lint (FACTORY::CLAIMS::<n>)
 #   build-test.sh countclaims <worktree-path> <item-dir> # KI-E182: stale/invented test-count-claim lint (FACTORY::COUNTCLAIMS::<n>)
 #   build-test.sh leftovers <worktree-path>       # KI-D12: deferral/tech-debt lexicon lint (FACTORY::LEFTOVER::<n>) — engine-owned, runs BEFORE the local-override seam
@@ -174,6 +175,44 @@ case "$cmd" in
     echo "FACTORY::SUMMARY::suite exit=$code failed=${sf:--1} passed=${sp:--1} skipped=${ss:--1}"
     exit $code
     ;;
+  efmigration)
+    # KI-E185 (ported from a host-mount session): EF Core pending-model-change detector. Unlike every
+    # sibling lint dispatched above (leftovers/comments/ledger-anchor/rootcause) or below
+    # (claims/countclaims), this is NOT a text/AST-shape diff scan — "does the persisted model match
+    # the migration history" is a question only the real EF tooling can answer, which is exactly why
+    # 5 independent gate/review roles on the origin host each had to run this SAME command by hand to
+    # catch a persisted-entity schema change shipping with no migration and a stale ModelSnapshot.
+    # $target = the API (startup) project's DIRECTORY (dotnet ef resolves the startup project from
+    # cwd); $filter = the --project path to the *.Persistence project, relative to $target.
+    #   usage: build-test.sh efmigration <worktree-path-to-Service.Api-dir> <../Service.Persistence>
+    _guard_worktree_path "$target" "target"
+    if [ -z "$filter" ]; then echo "usage: build-test.sh efmigration <api-project-dir> <persistence-project-relative-path>" >&2; exit 64; fi
+    echo "FACTORY::EFMIGRATION::START $target :: $filter"
+    out=$(cd "$target" 2>/dev/null && dotnet ef migrations has-pending-model-changes --project "$filter" 2>&1)
+    code=$?
+    printf '%s\n' "$out" | tail -20
+    # Exit 1 is ALSO what this command returns on an unrelated build failure (it builds the project
+    # first) — only the specific "pending changes" message is a genuine dirty verdict; any other
+    # non-zero exit is inconclusive (fail-open, same posture as every pre-band probe here), not a
+    # false CRITICAL. A clean run is exit 0 with no such message.
+    # KI-E185 (ported from a host-mount session, folding in a same-session self-correction there): the
+    # CLEAN message is "No changes have been made to the model since the last migration." — an
+    # UNANCHORED substring grep for "Changes have been made to the model" matches that too (it is a
+    # literal substring of the clean message), which on the origin host reported verdict=dirty
+    # unconditionally regardless of actual EF state until caught by a live gate re-check. Anchored to
+    # line-start here from the start: only the dirty message ("Changes have been made...") begins the
+    # line; the clean message begins with "No ".
+    if printf '%s\n' "$out" | grep -qi '^Changes have been made to the model'; then
+      verdict=dirty
+    elif [ "$code" -eq 0 ]; then
+      verdict=clean
+    else
+      verdict=inconclusive
+    fi
+    echo "FACTORY::EFMIGRATION::RESULT verdict=$verdict exit=$code"
+    echo "FACTORY::SUMMARY::efmigration exit=$code verdict=$verdict"  # KI-E19 evidence manifest
+    exit $code
+    ;;
   claims)
     # KI-E11 (2026-07-19): deterministic phantom-path linter for doc claims, run EARLY (fix/editorial/
     # verify time) — same lib the driver's fold-time F2 WARN uses (single source of truth). Emits
@@ -231,7 +270,7 @@ case "$cmd" in
     exit 0
     ;;
   *)
-    echo "usage: build-test.sh build|red|filter|suite|claims|countclaims|leftovers|comments|ledger-anchor|rootcause|pack <target> [filter|outfile]" >&2
+    echo "usage: build-test.sh build|red|filter|suite|efmigration|claims|countclaims|leftovers|comments|ledger-anchor|rootcause|pack <target> [filter|outfile]" >&2
     exit 64
     ;;
 esac

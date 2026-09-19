@@ -210,6 +210,11 @@ const SHADOW_SCAN_SCHEMA = { type: 'object', additionalProperties: false, requir
 // with inverted polarity is a genuine footgun for any consumer keying off shape (the exec-smoke
 // harness sniffs exactly that way and did in fact mis-stub this probe into failing every lane).
 const ROOTCAUSE_SCHEMA = { type: 'object', additionalProperties: false, required: ['nonTestCount'], properties: { nonTestCount: { type: 'number' }, files: { type: 'array', items: { type: 'string' } }, skipped: { type: 'boolean' } } }
+// KI-E185 (ported from a host-mount session) — EfMigration probe: one entry per service actually
+// checked (a service in efMigrationServices whose check errored before printing the RESULT line is
+// simply omitted, not force-fit into this array — the JS-side loop below treats a missing entry the
+// same as SKIPPED, fail-open, same posture as every sibling probe here).
+const EFMIGRATION_SCHEMA = { type: 'object', additionalProperties: false, required: ['results'], properties: { results: { type: 'array', items: { type: 'object', additionalProperties: false, required: ['service', 'verdict'], properties: { service: { type: 'string' }, verdict: { type: 'string' } } } } } }
 // Sweep-designer: the canonical fix pattern for a whole root-cause cluster (designed once, applied N times).
 const SWEEP_DESIGN_SCHEMA = { type: 'object', additionalProperties: false, required: ['pattern', 'headline'], properties: { pattern: { type: 'string' }, applicationNotes: { type: 'string' }, conformanceCheck: { type: 'string' }, headline: { type: 'string' } } }
 
@@ -1348,6 +1353,53 @@ async function runItem(item) {
     res.gates[ek] = er ? er.verdict : 'NULL'
     res.gateDetails = res.gateDetails || {}
     res.gateDetails[ek] = er ? { verdict: er.verdict, headline: er.headline, findings: (er.findings || []).slice(0, 6), advisory: true } : null
+  }
+
+  // EF-MIGRATION PROBE (KI-E185, ported from a host-mount session) — the pre-band catch for a class
+  //     of defect that survives build+test looking green: an EF-mapped entity's PERSISTED SHAPE
+  //     changed with no corresponding migration and a stale ModelSnapshot. The in-memory test
+  //     provider (used by every mocked/unit test this pipeline runs) has no schema at all, so it is
+  //     structurally blind to this — the only way to know is to ask the real EF tooling. Unlike
+  //     every sibling probe in this file, "is the diff internally consistent" isn't the question
+  //     here; "does the migration history account for the CURRENT model" is, and only `dotnet ef
+  //     migrations has-pending-model-changes` can answer it — the FIRST pre-band probe here to shell
+  //     out to a real dotnet invocation rather than a text/AST-shape diff (mirrors build-test.sh's
+  //     own build/red/filter/suite shape, not rootcause/leftover/comment/ledger-anchor's pure-lint
+  //     shape). Live incident on the origin host: a persisted entity schema rewrite (Guid id ->
+  //     string + 5 new columns + 1 index) shipped with no migration; 5 independent gate/review roles
+  //     each spent a full dispatch re-discovering the SAME thing by hand before this existed. Gated
+  //     broadly on item.files naming a path under a recognizable {Service}/src/{Service}.{Layer}/
+  //     layout (Core/Persistence/Infrastructure) — deliberately wider than "only Persistence
+  //     changed", since the origin incident's own entity edit lived under .Core/Domain/ and never
+  //     touched a path containing the word "Persistence" at all — an entity's shape can change
+  //     without its EF configuration file ever being touched. A service this reaches that never
+  //     actually changed its model costs one clean, fast dotnet-ef invocation — never a false
+  //     CRITICAL.
+  const efMigrationServices = Array.from(new Set((item.files || [])
+    .map(function (f) { const m = /^([A-Za-z0-9.]+)\/src\/\1\.(?:Core|Persistence|Infrastructure)\//.exec(f); return m ? m[1] : null })
+    .filter(Boolean)))
+  if (codeChange && !verificationOnly && efMigrationServices.length) {
+    const svcList = efMigrationServices.map(function (s) { return '  - service=' + s + ': run `' + BT + ' efmigration ' + wtPath + '/' + s + '/src/' + s + '.Api ../' + s + '.Persistence`' }).join('\n')
+    const emProbe = await call('efmigration-probe', { model: 'claude-haiku-4-5', effort: 'low' }, EFMIGRATION_SCHEMA,
+      'EF-MIGRATION PROBE (KI-E185). Run EACH of the following commands via Bash, exactly as written, one per service — do NOT edit anything, do NOT interpret, just run and read the result line:\n' + svcList + '\nEach prints a line `FACTORY::EFMIGRATION::RESULT verdict=<clean|dirty|inconclusive> exit=<n>` — report ONE entry per service actually run: {service, verdict} taking verdict VERBATIM from that line (if a command errors before printing that line at all — e.g. no such project on disk — omit that service from results entirely rather than guessing a verdict).', 'EdgeScan')
+    const emResults = (emProbe && Array.isArray(emProbe.results)) ? emProbe.results : []
+    const emDirty = emResults.filter(function (r) { return r.verdict === 'dirty' })
+    if (emDirty.length) {
+      res.gates['probe:efmigration'] = 'CHANGES_REQUIRED'
+      res.gateDetails = res.gateDetails || {}
+      res.gateDetails['probe:efmigration'] = {
+        verdict: 'CHANGES_REQUIRED',
+        headline: emDirty.length + ' service(s) have an EF-mapped entity change with no migration: ' + emDirty.map(function (r) { return r.service }).join(', '),
+        findings: emDirty.map(function (r) { return { severity: 'CRITICAL', title: r.service + ': pending model changes with no migration', fix: 'from ' + r.service + '/src/' + r.service + '.Api, run `dotnet ef migrations add <Name> --project ../' + r.service + '.Persistence`, then confirm `dotnet ef migrations has-pending-model-changes` is clean' } }),
+      }
+      return finish('FAILED', 'efmigration probe (KI-E185): ' + emDirty.map(function (r) { return r.service }).join(', ') + ' — a persisted EF entity changed shape with no migration and a stale ModelSnapshot; a real (non-in-memory) deployment would crash-loop on this while every mocked test stays green. Pre-band fail (cheap — no gate band was spent).')
+    }
+    // A missing/empty results array (every service errored before the RESULT line, or the probe
+    // itself came back null) proceeds — announced as SKIPPED, never silently read as clean, same
+    // posture as every sibling pre-band probe. "inconclusive" (a real error unrelated to pending
+    // changes, e.g. a build failure the earlier verify step would already have caught) also proceeds
+    // without failing THIS probe — it is not evidence of a migration gap either way.
+    res.gates['probe:efmigration'] = emResults.length ? 'APPROVED' : 'SKIPPED'
   }
 
   // 4a6. EDITORIAL HIGH-FINDING AMEND (KI-E164, ported from a host-mount session) — editorial

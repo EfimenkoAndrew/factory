@@ -100,6 +100,17 @@ export const LEDGER_ANCHOR_SCHEMA = { type: 'object', additionalProperties: fals
 // because zero here means FAILURE while COMMENT_SCHEMA's `count` zero means success.
 export const ROOTCAUSE_SCHEMA = { type: 'object', additionalProperties: false, required: ['nonTestCount'], properties: { nonTestCount: { type: 'number' }, files: { type: 'array', items: { type: 'string' } }, skipped: { type: 'boolean' } } };
 
+// KI-E185 (ported from a host-mount session) — EF-migration pending-model-change probe (schema-parity
+// ONLY, same disclosed-gap shape as PACK_HASH_SCHEMA/SHADOW_SCAN_SCHEMA below): unlike ROOTCAUSE_SCHEMA
+// above (which this port enforces MECHANICALLY via afterVerify's nonTestChanged check over the
+// worktree diff), "does the persisted EF model match the migration history" cannot be answered by
+// reading the worktree's git diff at all — canon's probe shells out to a REAL `dotnet ef migrations
+// has-pending-model-changes` invocation, and this runtime has no equivalent real-command-relay
+// capability to dispatch that onto (see stage-parity.mjs's UNPORTED['efmigration-probe'] for the full
+// reason). Kept here for byte/structure schema-parity with factory.js only; intentionally absent from
+// the SCHEMAS registry below since nothing in this runtime ever needs to validate against it.
+export const EFMIGRATION_SCHEMA = { type: 'object', additionalProperties: false, required: ['results'], properties: { results: { type: 'array', items: { type: 'object', additionalProperties: false, required: ['service', 'verdict'], properties: { service: { type: 'string' }, verdict: { type: 'string' } } } } } };
+
 export const SWEEP_DESIGN_SCHEMA = { type: 'object', additionalProperties: false, required: ['pattern', 'headline'], properties: { pattern: { type: 'string' }, applicationNotes: { type: 'string' }, conformanceCheck: { type: 'string' }, headline: { type: 'string' } } };
 
 export const CHECKPOINT_SCHEMA = { type: 'object', additionalProperties: false, required: ['written'], properties: { written: { type: 'boolean' }, note: { type: 'string' } } };
