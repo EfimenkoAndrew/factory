@@ -4714,5 +4714,87 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
   ok(drv160Src.includes('UNVERIFIED, never silently "clean"') || drv160Src.includes('UNVERIFIED, not confirmed fresh'), 'KI-E160: an unreadable run-args.json fails OPEN (a warning-layer check, never a hard block on the relaunch listing itself) — mirroring KI-E140\'s own posture for a read failure');
 }
 
+// KI-E180 (ported from a host-mount session) — CROSS-SERVICE VERIFY-SCOPE GAP. The runner's verify()
+// step is deliberately kept blind to fix.filesChanged (KI-L56's tiny context budget) and only ever
+// builds+tests the item's ONE primary solution — so a fix whose real touch-set spans MULTIPLE services
+// can have every service but the primary one go completely unverified, while the deterministic
+// verifyEvidenceHint (KI-E152) still reports a confident, correct-but-incomplete "build=pass,
+// targetedTest=pass, suite={failed:0}" that reviewers are told to trust. Adapted here: the origin's own
+// exec-smoke fixture intercepted a STEPWISE CONSOLIDATION step (KI-E117, confirmed absent in this repo
+// — see KI-E153/155/165/173/174/178) to inject the second service's touched file; this repo's fixer is
+// single-shot, so the same effect is produced by overriding the one SMOKE-CODE:fixer call directly to
+// return filesChanged spanning two real services.
+{
+  const src180 = readFileSync(join(import.meta.dirname, '..', 'factory.js'), 'utf8');
+
+  // (a) genuine gap: the fixer's filesChanged spans a second, real service (ProductsService) beyond
+  // the default smoke fixture's own target ("X") — but the runner's evidence only ever names the
+  // primary one. Item fails pre-band, before the gate band ever dispatches.
+  {
+    const gapOverride = (prompt, opts) => {
+      const label = (opts && opts.label) || '';
+      if (label === 'SMOKE-CODE:fixer') {
+        return { applied: true, filesChanged: ['X/src/Some.cs', 'ProductsService/src/ProductsService.Infrastructure/Consumers/SomeConsumer.cs'], summary: 'stub touching a second real service', scopeStop: false, divergence: null, note: 'stub' };
+      }
+      if (label === 'SMOKE-CODE:runner') {
+        return { build: 'pass', targetedTest: 'pass', suite: { passed: 2, failed: 0, skipped: 0 }, realInfraExercised: false, debris: [], evidence: 'FACTORY::BUILD::RESULT exit=0 (stub) — built X/X.sln, ran X.Tests', note: 'stub' };
+      }
+      return undefined;
+    };
+    const { result: r180a, calls: c180a } = await execSmoke(src180, smokeBatch(), { agentOverride: gapOverride });
+    const byId180a = {}; for (const r of r180a.results) byId180a[r.id] = r;
+    eq(byId180a['SMOKE-CODE'] && byId180a['SMOKE-CODE'].toState, 'FAILED', 'KI-E180 exec-smoke: a fix touching TWO real services, with verify evidence naming only one, fails pre-band');
+    const note180a = (byId180a['SMOKE-CODE'] || {}).note || '';
+    ok(/cross-service verify-scope gap \(KI-E180\)/.test(note180a) && /ProductsService/.test(note180a), 'KI-E180 exec-smoke: the failure note names the probe and the specific uncovered service, not a vague message');
+    ok(!c180a.some((c) => c.label.startsWith('SMOKE-CODE:gate')), 'KI-E180 exec-smoke: the gate band never dispatches when the verify-scope gap survives — caught cheap, mechanically, before the expensive band');
+  }
+
+  // (b) no gap: the SAME second-service touch, but this time the runner's evidence explicitly names
+  // BOTH services (a runner that genuinely built+tested each touched service) — the item proceeds to a
+  // normal close, exactly as if only one service had ever been touched.
+  {
+    const noGapOverride = (prompt, opts) => {
+      const label = (opts && opts.label) || '';
+      if (label === 'SMOKE-CODE:fixer') {
+        return { applied: true, filesChanged: ['X/src/Some.cs', 'ProductsService/src/ProductsService.Infrastructure/Consumers/SomeConsumer.cs'], summary: 'stub touching a second real service', scopeStop: false, divergence: null, note: 'stub' };
+      }
+      if (label === 'SMOKE-CODE:runner') {
+        return { build: 'pass', targetedTest: 'pass', suite: { passed: 4, failed: 0, skipped: 0 }, realInfraExercised: false, debris: [], evidence: 'FACTORY::BUILD::RESULT exit=0 (stub) — built X/X.sln AND ProductsService/ProductsService.sln, both suites green', note: 'stub' };
+      }
+      return undefined;
+    };
+    const { result: r180b } = await execSmoke(src180, smokeBatch(), { agentOverride: noGapOverride });
+    const byId180b = {}; for (const r of r180b.results) byId180b[r.id] = r;
+    eq(byId180b['SMOKE-CODE'] && byId180b['SMOKE-CODE'].toState, 'CLOSED', 'KI-E180 exec-smoke: when verify evidence names every touched service, the item proceeds to a normal close');
+  }
+
+  // (c) denylist regression guard: the second touched path is under a generic top-level tooling
+  // directory (src/Shared/...), not a real second service. svcDirs must stay size 1 (the denylist
+  // strips "src"), so the check never fires here regardless of what evidence does or doesn't mention —
+  // this is the exact false-positive class a naive first-path-segment heuristic would hit on every fix
+  // that touches a shared library alongside its owning service.
+  {
+    const sharedLibOverride = (prompt, opts) => {
+      const label = (opts && opts.label) || '';
+      if (label === 'SMOKE-CODE:fixer') {
+        return { applied: true, filesChanged: ['X/src/Some.cs', 'src/Shared/Azathoth.Authorization/PolicyHelper.cs'], summary: 'stub touching a shared library', scopeStop: false, divergence: null, note: 'stub' };
+      }
+      return undefined;
+    };
+    const { result: r180c } = await execSmoke(src180, smokeBatch(), { agentOverride: sharedLibOverride });
+    const byId180c = {}; for (const r of r180c.results) byId180c[r.id] = r;
+    eq(byId180c['SMOKE-CODE'] && byId180c['SMOKE-CODE'].toState, 'CLOSED', 'KI-E180 exec-smoke: a second touched path under a generic top-level dir (src/) is denylisted, never fabricating a false "second service"');
+  }
+
+  // (d) default fixture regression guard: the plain, unmodified smokeBatch() fixture (single service,
+  // stub evidence that never names it literally) must NEVER trip this check — this is the exact
+  // regression this threshold design (svcDirs.size > 1, not uncovered.length alone) exists to prevent.
+  {
+    const { result: r180d } = await execSmoke(src180, smokeBatch());
+    const byId180d = {}; for (const r of r180d.results) byId180d[r.id] = r;
+    eq(byId180d['SMOKE-CODE'] && byId180d['SMOKE-CODE'].toState, 'CLOSED', 'KI-E180 exec-smoke: the default single-service smoke fixture is unaffected — no false positive on the common case');
+  }
+}
+
 console.log(`\nself-test: ${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

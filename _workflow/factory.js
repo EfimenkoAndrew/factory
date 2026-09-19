@@ -932,6 +932,14 @@ async function runItem(item) {
     }
     if (fix.scopeStop) return await frameAndBlock('fixer scope-stop — ' + (fix.summary || ''))
     if (!fix.applied) return finish('FAILED', 'fixer did not apply: ' + (fix.note || fix.summary || ''))
+    // KI-E180 (ported from a host-mount session; adapted) — persist the fix's touch-set onto `res`
+    // (mirroring the origin's own `res.filesChanged` convention, there populated for KI-E141's
+    // phantom-manifest probe — confirmed absent in this repo, see KNOWN-ISSUES.md KI-E168) so the
+    // cross-service verify-scope check further below — which runs AFTER this block closes and the
+    // block-scoped `fix` goes out of scope — can still read it. This repo's fixer is single-shot (no
+    // KI-E117 stepwise/consolidation — see KNOWN-ISSUES.md KI-E153/155/165/173/174/178), so unlike the
+    // origin there is no multi-step accumulation: just this one call's own filesChanged, persisted.
+    if (Array.isArray(fix.filesChanged)) res.filesChanged = fix.filesChanged
   }
 
   // 4. runner (independent build + green + suite)
@@ -1119,6 +1127,60 @@ async function runItem(item) {
   // alone to imply it — a second, independent, disk-derived signal placed directly in front of every
   // verdict, on top of (not instead of) the worktree spot-check the REVIEW PACK hint already requires.
   const verifyEvidenceHint = ' DETERMINISTIC VERIFY EVIDENCE (machine-run, not the runner\'s prose — cross-check your own read of the diff against this): build=' + (verify.build || '?') + ', targetedTest=' + (verify.targetedTest || '?') + ', suite={passed:' + ((verify.suite && verify.suite.passed) || 0) + ',failed:' + ((verify.suite && verify.suite.failed) || 0) + ',skipped:' + ((verify.suite && verify.suite.skipped) || 0) + '}' + (verify.realInfraExercised ? ', realInfraExercised=true' : '') + '. A `build=fail` or `targetedTest=fail` or any nonzero `suite.failed` means the change does NOT work at a mechanical level RIGHT NOW, regardless of how clean the diff reads — verdict CHANGES_REQUIRED unless the failure is a known, already-ledgered baseline (see baselineFailures) and not caused by this diff.'
+
+  // KI-E180 (ported from a host-mount session) — CROSS-SERVICE VERIFY-SCOPE GAP. A fix whose touch-set
+  // spans MULTIPLE services (each its own .sln) can have ONLY the item's single primary solution ever
+  // built+tested: the runner is deliberately kept blind to fix.filesChanged (KI-L56's tiny context
+  // budget), and item.solution/CFG.solution names exactly ONE solution (the `sln` constant above), so a
+  // genuinely cross-service diff's OTHER touched service(s) never get an independent build+suite run at
+  // all. Origin-host incident (24947b360): an item's touch-set already spanned five real services from
+  // the moment it entered the graph, but verify.json built+tested only ONE of them, and the resulting
+  // verifyEvidenceHint (KI-E152 above) truthfully told every reviewer "build=pass, targetedTest=pass,
+  // suite={failed:0}" — correct, but silently scoped to 1 of 5 touched services. Most reviewers trusted
+  // that hint at face value and never independently re-ran the other services' own suites; only the
+  // ones who happened to re-run one by hand caught a genuinely red test there. Same theme as KI-E152 one
+  // layer deeper: making the deterministic verify result unmissable to reviewers is not enough if that
+  // result can be silently incomplete — an unmissable-but-incomplete number is MORE misleading than
+  // none, because the reviewer has been told to trust it. Fix: a zero-cost, zero-agent-call mechanical
+  // check — derive the SET of distinct top-level service directories the fix actually touched with a
+  // real .cs change (from res.filesChanged, captured just above in the fixer block per this repo's own
+  // KI-E180 adaptation note there, since this repo has no KI-E141 accumulator to reuse), denylist
+  // generic tooling roots so a shared-library path never fabricates a false "service", and cross-check
+  // each against the runner's own `evidence` string (which already names every command it ran) for a
+  // build/suite mention. Gated on svcDirs.size > 1, not uncovered.length alone — an ordinary
+  // single-service item is never a false positive (this repo's own default exec-smoke fixture, whose
+  // stub evidence never names its one service literally, is the regression guard for exactly this). On
+  // a genuine gap: fails the item pre-band, forcing a re-verify before the incomplete-but-confident
+  // evidence ever reaches a reviewer. Deliberately does NOT retrofit a second FACTORY::SUMMARY::suite /
+  // FACTORY::BUILD::RESULT marker into the same verify-raw.txt — this repo's own `lib/verify.mjs`
+  // `parseVerifyRaw`/`lastMatch` (KI-D3) parses both markers LAST-MATCH-WINS, so a second solution's
+  // suite teed into the same transcript would silently make the fold's own machine-authoritative check
+  // see ONLY the last service's numbers, discarding the first. Failing cheaply and re-verifying (the
+  // existing resume/group/recover path) is the safe shape; teeing multiple markers into a parser built
+  // for exactly one is not.
+  if (codeChange && !verificationOnly && (res.filesChanged || []).length) {
+    // GENERIC_ROOTS: top-level folders that are build/doc/deploy tooling, not a distinct service with
+    // its own .sln — without this denylist a shared-library path like `src/Shared/Azathoth.Authorization/
+    // X.cs` would extract the literal segment "src" as a fabricated "service", a false positive on
+    // every fix that touches ANY shared library alongside its owning service.
+    const GENERIC_ROOTS = new Set(['src', 'doc', 'docs', 'k8s', 'scripts', 'tests', 'test', 'tools', 'deploy', 'templates', 'config', '_bmad-output', '.github'])
+    const svcOf = function (f) {
+      const rel = String(f || '').replace(/^.*\/state\/worktrees\/[^/]+\//, '') // strip an absolute worktree-rooted prefix (KI-E149/E170/172 isolation paths) down to the repo-relative form
+      const m = /^([A-Za-z][A-Za-z0-9_.]*)\//.exec(rel)
+      return (m && !GENERIC_ROOTS.has(m[1].toLowerCase())) ? m[1] : null
+    }
+    const svcDirs = new Set()
+    for (const f of res.filesChanged) { if (/\.cs$/i.test(f)) { const s = svcOf(f); if (s) svcDirs.add(s) } }
+    const ev = String(verify.evidence || '')
+    const uncovered = [...svcDirs].filter(function (svc) { return !new RegExp('\\b' + svc.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\b').test(ev) })
+    // Gated on svcDirs.size > 1 (a GENUINELY cross-service touch-set), not on uncovered.length alone — a
+    // single-service item whose one service happens not to be named verbatim in evidence prose (a stub
+    // in a test harness; a runner that describes its build a different way) is NOT this failure class,
+    // and firing on it would be a false positive on the overwhelmingly common single-service item.
+    if (svcDirs.size > 1 && uncovered.length) {
+      return finish('FAILED', 'cross-service verify-scope gap (KI-E180): this fix touches .cs files in ' + [...svcDirs].join(', ') + ', but the runner\'s verify evidence never mentions building/testing ' + uncovered.join(', ') + ' — re-run verify (or the item) so every touched service with a real code change gets its own independent build+suite, not just the item\'s primary solution.')
+    }
+  }
 
   await checkpointProgress(res, 'post-verify') // KI-E137 — kill-resilience: fix+verify survive a kill during the 8-scan pre-band chain
 
