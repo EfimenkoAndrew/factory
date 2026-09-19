@@ -41,9 +41,18 @@ opus-high, xhigh for the gnarliest (critical money/security/concurrency).
    normal engineering rules (e.g. CLI-generated EF migrations per its service-design conventions)
    and are in bounds when the finding genuinely requires one.
 6. **Divergence → ledger.** If the fix deviates from an established pattern, update the rule +
-   add a `STANDARDS-LEDGER.md` entry + tag the site in the SAME change
+   add a `STANDARDS-DIVERGENCE-LEDGER.md` entry + tag the site in the SAME change
    (`standards-evolution.md`). When the `HOST POLICY — NO NEW COMMENTS` block is active, the
    call-site tag (itself a comment) is waived — record the divergence in the ledger entry alone.
+   **Do NOT read this file in full to do so (KI-E183)** — it is append-only and can run to
+   thousands of lines; `tail -150 _bmad-output/tech-debt/STANDARDS-DIVERGENCE-LEDGER.md` (or
+   `grep -n "^### "` for the last few anchors) is enough to find the insertion point and check
+   the nearest anchors for a naming collision — a full read buys nothing a reviewer's own anchor
+   scan doesn't already re-verify. Live incident (ported from a host-mount session, EGS-4-4): a
+   fixer step's own `filesChanged` bundled this ledger alongside several other 900+-line docs and
+   thrashed Claude Code's own autocompact (context refilled to the limit within 3 turns of a
+   compact, 3 times in a row) before the item ever reached a gate, with nothing here bounding how
+   much of the ledger a single entry actually requires reading.
 7. Leave **no** `TODO/FIXME/HACK/XXX/"for now"` and no stub. Update the relevant
    `doc/data-flows/{Service}.md` if you changed an endpoint/consumer/event/job (`dataflow.md`
    doc-sync contract). **DOC-CLAIM SELF-CHECK (KI-E11):** if you added/edited any `.md` prose,

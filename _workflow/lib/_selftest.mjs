@@ -4853,5 +4853,24 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
   ok(descMatch181 && portLit181.includes(descMatch181[1]), 'KI-E181: the filesChanged description is the exact same string in opencode/schemas.mjs as in factory.js — kept identical per the pre-existing Fix #20 schema-parity deepEqual gate (opencode/_selftest.mjs), verified directly here too rather than trusting that gate alone');
 }
 
+// KI-E183 (ported from a host-mount session, origin commit `057c83827`) — EGS-4-4's fixer role
+// itself errored ("Autocompact is thrashing: the context refilled to the limit within 3 turns of
+// the previous compact, 3 times in a row") after a fix step's filesChanged bundled the append-only
+// STANDARDS-DIVERGENCE-LEDGER.md alongside several other 900+-line docs, and agents/fixer.md's
+// ledger-entry instruction gave zero guidance on how much of that file needed reading to add one
+// entry safely — a natural invitation to read the whole thing, repeatedly. Ported near-verbatim
+// (prompt-guidance fix only, no factory.js change) — this repo's item 6 carried the identical
+// KI-E64-class stale filename (`STANDARDS-LEDGER.md`, missing "DIVERGENCE") that KI-E64 itself
+// fixed only in driver.mjs's graph-audit LEDGER_PATH constant, never in this prose; corrected in
+// the same edit so the new tail command actually names a file that exists.
+{
+  const fixerMd183 = readFileSync(new URL('../../agents/fixer.md', import.meta.url), 'utf8');
+  ok(fixerMd183.includes('Do NOT read this file in full to do so (KI-E183)'), 'KI-E183: the ledger-entry instruction now explicitly forbids a full read of the ledger file');
+  ok(fixerMd183.includes('tail -150 _bmad-output/tech-debt/STANDARDS-DIVERGENCE-LEDGER.md'), 'KI-E183: gives a concrete, cheap alternative (tail) to find the insertion point instead of reading the whole file, naming the REAL path (with "DIVERGENCE") rather than the stale KI-E64-class typo');
+  ok(fixerMd183.includes('EGS-4-4'), 'KI-E183: cites the live incident that motivated the guidance');
+  ok(fixerMd183.includes('add a `STANDARDS-DIVERGENCE-LEDGER.md` entry'), 'KI-E183 adaptation: item 6\'s own ledger-filename reference is corrected alongside the new guidance — the pre-existing text named a file that has never existed on disk (same defect class as KI-E64, which fixed only the driver.mjs constant)');
+  ok(!fixerMd183.includes('`STANDARDS-LEDGER.md`'), 'KI-E183 adaptation: no surviving reference to the stale (missing-DIVERGENCE) ledger filename in fixer.md');
+}
+
 console.log(`\nself-test: ${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);
