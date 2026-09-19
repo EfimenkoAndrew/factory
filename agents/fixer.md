@@ -139,6 +139,26 @@ opus-high, xhigh for the gnarliest (critical money/security/concurrency).
     ProjectReference edit was not needed because an existing shared dependency already gave
     transitive compile visibility; the shipped diff added exactly that unneeded reference anyway,
     breaking a pre-existing architecture-fitness test for a change the plan had already ruled out.
+13. **`filesChanged` MEANS "I EDITED THIS" — NOTHING ELSE (KI-E181, ported from a host-mount
+    session; adapted).** List a path ONLY if you created or modified it via a tool call as part of
+    THIS fix. Do NOT include a file merely because you read it, verified it still compiles, relied
+    on its content, or confirmed a test in it still passes — including the test-author's own red
+    test, which is already correct and does not need to be re-listed just because you looked at it.
+    A fix that made no edit to a file it merely consulted returns that file OUT of `filesChanged`,
+    never in it — the field records what you changed, not what you found relevant. This is not
+    cosmetic here: `filesChanged` feeds the KI-E180 cross-service verify-scope check above, which
+    derives which services your fix touched purely from this list — an inflated claim can fabricate
+    a false extra service and fail an otherwise-correct item, and an incomplete claim can hide a
+    real touched service from that same check. Live incident on the origin host (EGS-4-3,
+    2026-09-17): a STEPWISE fixer step there genuinely edited one file but also re-listed the
+    test-author's already-correct red-test file, untouched since long before that step ran, simply
+    because its own summary described that file's content; the origin's per-step phantom-manifest
+    check caught the false claim, but because its retry prompt at the time offered only "your edit
+    silently failed to persist" as an explanation, the retry reproduced the identical two-file claim
+    byte-for-byte and the item failed for nothing recoverable. **This repo has no per-step
+    phantom-manifest check to attach that retry-prompt fix to** (this fixer runs as one monolithic
+    call, not the origin's stepwise per-step loop — see the KI-E153/155/165/173/174/178 entry in
+    `KNOWN-ISSUES.md`), so only this PREVENTION half of the origin's two-part fix applies here.
 
 ### Constraints
 - All edits inside the WORKTREE. NEVER run git commit/add/checkout/restore/stash/reset/clean.

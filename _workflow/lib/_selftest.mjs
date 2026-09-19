@@ -4796,5 +4796,27 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
   }
 }
 
+// KI-E181 (ported from a host-mount session — PARTIAL PORT, see KNOWN-ISSUES.md) — the origin's
+// PREVENTION half (a filesChanged self-check in agents/fixer.md + a matching FIX_SCHEMA.description)
+// applies here because it feeds this repo's own real KI-E180 consumer of fix.filesChanged; the origin's
+// CURE half (a 3-branch KI-E178 retry-prompt rewrite) has no host here — this repo has zero per-step
+// phantom-manifest mechanism (confirmed by the pre-existing KI-E153/155/165/173/174/178 entry above) —
+// so there is no behavioral scenario to exercise. Source-text pins only, matching this file's own
+// established convention for a documentation/schema-only change (compare KI-O2, KI-E156's fixer.md pin).
+{
+  const fixerMd181 = readFileSync(join(import.meta.dirname, '..', '..', 'agents', 'fixer.md'), 'utf8');
+  ok(fixerMd181.includes('13. **`filesChanged` MEANS "I EDITED THIS" — NOTHING ELSE (KI-E181'), 'KI-E181: fixer.md gains item 13 documenting exactly what filesChanged means, for a human/agent reading the brief directly');
+  ok(fixerMd181.includes('KI-E180 cross-service verify-scope check'), 'KI-E181: item 13 names the REAL reason this matters in this repo (it feeds the KI-E180 check\'s svcDirs derivation), not just a restated origin rationale');
+
+  const facSrc181 = readFileSync(join(import.meta.dirname, '..', 'factory.js'), 'utf8');
+  const fixLit181 = facSrc181.slice(facSrc181.indexOf("const FIX_SCHEMA ="), facSrc181.indexOf("const FIX_SCHEMA =") + 2000);
+  ok(fixLit181.includes('description: "ONLY files this fix itself created or modified via a tool call.') && fixLit181.includes('KI-E181'), 'KI-E181: FIX_SCHEMA.filesChanged carries a description field naming what the field means and citing KI-E181, visible to the model at the structured-output level, not just in prose a model may skim');
+
+  const portSrc181 = readFileSync(join(import.meta.dirname, '..', 'opencode', 'schemas.mjs'), 'utf8');
+  const portLit181 = portSrc181.slice(portSrc181.indexOf('export const FIX_SCHEMA ='));
+  const descMatch181 = /description: (".*?")\s*}/s.exec(fixLit181);
+  ok(descMatch181 && portLit181.includes(descMatch181[1]), 'KI-E181: the filesChanged description is the exact same string in opencode/schemas.mjs as in factory.js — kept identical per the pre-existing Fix #20 schema-parity deepEqual gate (opencode/_selftest.mjs), verified directly here too rather than trusting that gate alone');
+}
+
 console.log(`\nself-test: ${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

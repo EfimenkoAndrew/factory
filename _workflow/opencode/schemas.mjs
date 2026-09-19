@@ -43,7 +43,12 @@ export const TEST_SCHEMA = { type: 'object', additionalProperties: false, requir
 // FIX_SCHEMA — a plan-commitment deviation declared by a fixer here would have nowhere to be
 // adjudicated (plan-feasibility-probe/plan-quality-probe and the KI-E142B adjudication routing are
 // UNPORTED, see stage-parity.mjs), so this field is structurally inert in this runtime today.
-export const FIX_SCHEMA = { type: 'object', additionalProperties: false, required: ['applied', 'scopeStop', 'summary'], properties: { applied: { type: 'boolean' }, filesChanged: { type: 'array', items: { type: 'string' } }, summary: { type: 'string' }, scopeStop: { type: 'boolean' }, divergence: { type: ['string', 'null', 'object'] }, note: { type: 'string' }, deviations: { type: 'array', items: { type: 'object', additionalProperties: false, required: ['commitment', 'reason'], properties: { commitment: { type: 'string' }, reason: { type: 'string' } } } } } };
+// KI-E181 (ported from a host-mount session): `filesChanged.description` kept byte-identical to
+// factory.js's copy (the schema-parity selftest deep-equals them) — canon's `svcDirs` KI-E180 check
+// is likewise `afterVerify`/`planNext`-unported here (a pure-mechanical check, not an agent role, so
+// there is nothing for stage-parity.mjs to declare UNPORTED), so the description is structurally
+// inert in THIS runtime the same way `deviations` above is — present for parity, not consulted here.
+export const FIX_SCHEMA = { type: 'object', additionalProperties: false, required: ['applied', 'scopeStop', 'summary'], properties: { applied: { type: 'boolean' }, filesChanged: { type: 'array', items: { type: 'string' }, description: "ONLY files this fix itself created or modified via a tool call. Never include a file you merely read, referenced, relied on, or re-verified — including one the test-author's own red test already wrote correctly. A file you consulted but did not change stays OUT of this list; it feeds the KI-E180 cross-service verify-scope check (above), so an inflated or incomplete claim can misfire that check in either direction (KI-E181)." }, summary: { type: 'string' }, scopeStop: { type: 'boolean' }, divergence: { type: ['string', 'null', 'object'] }, note: { type: 'string' }, deviations: { type: 'array', items: { type: 'object', additionalProperties: false, required: ['commitment', 'reason'], properties: { commitment: { type: 'string' }, reason: { type: 'string' } } } } } };
 
 const STRARR = { type: 'array', items: { type: 'string' } };
 
