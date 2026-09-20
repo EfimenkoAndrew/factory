@@ -9,6 +9,8 @@
 // corrected project path, so each marker can appear multiple times — the authoritative result is the FINAL
 // attempt, never the first (cycle-8 live bug: a wrong-path FILTER exit=1 preceded the correct exit=0, and
 // matching the first false-flagged a passing test). All markers below take the last occurrence.
+import { compareSuiteBaseline, suiteInvocations } from './baseline.mjs';
+
 function lastMatch(text, source) {
   const g = new RegExp(source, 'g');
   let m, last = null;
@@ -20,6 +22,7 @@ function lastMatch(text, source) {
 // build-test.sh transcript. hasData=false => nothing parseable (caller trusts the agent verdict).
 export function parseVerifyRaw(text) {
   const out = { hasData: false, build: null, suite: null, targetedFail: false, targetedFailClass: null, suiteExit: null };
+  Object.defineProperty(out, 'rawTranscript', { value: text });
   if (!text || typeof text !== 'string') return out;
   const bm = lastMatch(text, 'FACTORY::BUILD::RESULT\\s+exit=(-?\\d+)\\s+errors=(\\d+)');
   if (bm) { out.hasData = true; out.build = { exit: parseInt(bm[1], 10), errors: parseInt(bm[2], 10) }; }
@@ -96,27 +99,28 @@ export function flakeSuspects(text) {
   return out.sort();
 }
 
-// Decide PASS/FAIL from a deterministic parse + the agent-reported baseline failure count. A parse with
+// Decide PASS/FAIL from machine output and target/test baseline identities. A parse with
 // no machine evidence => pass:true reason 'no-machine-evidence' (the caller then trusts the agent verdict).
-export function verdictFromParse(p, baselineFailures) {
+export function verdictFromParse(p, baselineFailures, options = {}) {
   if (!p || !p.hasData) return { pass: true, reason: 'no-machine-evidence' };
   if (p.build && (p.build.exit !== 0 || p.build.errors > 0)) return { pass: false, reason: 'build failed (exit=' + p.build.exit + ', errors=' + p.build.errors + ')' };
   if (p.targetedFail) return { pass: false, reason: p.targetedFailClass ? ('targeted regression test did not pass (' + p.targetedFailClass + ')') : 'targeted regression test did not pass' };
-  const base = baselineFailures || 0;
-  if (p.suite && p.suite.failed - base > 0) return { pass: false, reason: (p.suite.failed - base) + ' new suite failure(s) beyond baseline ' + base };
+  const runs = suiteInvocations(p.rawTranscript);
+  for (const run of runs) {
+    const completions = [...run.text.matchAll(/^FACTORY::SUMMARY::suite exit=(-?\d+) failed=(\d+) passed=(\d+)[^\r\n]*\r?$/gm)];
+    if (completions.length !== 1) return { pass: false, reason: 'suite completion missing or duplicated' };
+    const [, code, failed, passed] = completions[0];
+    if (+failed + +passed <= 0 || +code !== (+failed ? 1 : 0)) return { pass: false, reason: 'suite completion inconsistent or vacuous' };
+    const comparison = compareSuiteBaseline(run.text, run.target, +failed, baselineFailures, options);
+    if (!comparison.pass) return comparison;
+  }
+  if (!runs.length && p.suite?.failed > 0) return { pass: false, reason: 'suite failures lack target/test baseline evidence; legacy count allowance refused' };
   if (typeof p.suiteExit === 'number' && p.suiteExit !== 0 && !p.suite) return { pass: false, reason: 'suite exited non-zero (exit=' + p.suiteExit + ')' };
   return { pass: true, reason: 'machine evidence: build clean, tests green' };
 }
 
-// KI-E43 — integrate/verify baseline parity. `r.baselineFailures` is the RUN-reported environmental
-// baseline (RED-stage capture preferred, verify-stage fallback); `baseline-raw.txt` is the DISK
-// transcript of the pre-fix full-suite run (build-test.sh suite teed at RED time — auditable, and it
-// survives a killed run). The effective baseline is the LARGER of the two counts: a runner that
-// under-reported (the cycle-47 ITEM-H15 false regression — the LIGHT-band verify skips the full
-// suite, so baselineFailures folded empty while integrate's full suite saw 6 pre-existing
-// Docker-unavailable Testcontainers failures) is corrected by its own transcript; a transcript-less
-// run keeps the reported array exactly as before. This is NOT a general weakening of the override:
-// the count still only OFFSETS pre-existing failures — any failure beyond it stays a regression.
+// Diagnostic compatibility only: this historical KI-E43 count never authorizes failures.
+// Evidence consumers must use captureBaseline from baseline.mjs and compare target/test identities.
 export function effectiveBaseline(baselineArr, baselineParse) {
   const reported = (Array.isArray(baselineArr) && baselineArr.length) || 0
   const fromDisk = (baselineParse && baselineParse.suite && typeof baselineParse.suite.failed === 'number' && baselineParse.suite.failed > 0) ? baselineParse.suite.failed : 0

@@ -21,11 +21,8 @@
 // principle that gates re-adjudicate the worktree on every relaunch (SKILL.md § Recovery); this
 // module never touches that.
 //
-// plan.md is prose, not JSON — there is no durable record of the planner's own structured fields.
-// But if test.json ALSO exists (proving the run proceeded past planning — either flag would have
-// short-circuited runItem() before ever reaching test-author), reusing recommendScopeStop/
-// recommendEscalate as {false, false} is provably correct, not a guess: a relaunch only reaches
-// this reuse path when neither flag fired the first time.
+// Planner control fields are reused only from structured progress checkpoints. Reaching test-author
+// does NOT prove recommendEscalate=false: the human-signoff stop happens after re-audit.
 //
 // Fix (multi-lens review, 2026-08-25, ported from the origin host-mount session): runItem() ALSO
 // reads plan.approach/plan.blastRadius (the PLAN-COMMITMENT SCAN's input text) — a fact this module
@@ -93,15 +90,15 @@ export function loadPriorAttempt(itemDir, sinceMs, isReFix) {
     const fix = fixPath ? readJsonSafe(fixPath) : null;
     if (fix && typeof fix === 'object') out.fix = fix;
 
-    // plan reuse requires BOTH plan.md on disk AND test.json successfully reused (the proof that
-    // the planner did not scope-stop/escalate) — never inferred from test.json alone without the
-    // file itself also being present, so a missing plan.md still forces a fresh (cheap) plan call.
-    const planPath = freshFile(itemDir, 'plan.md', sinceMs);
-    if (out.test && planPath) {
-      let planText = '';
-      try { planText = readFileSync(planPath, 'utf8'); } catch { /* best-effort — empty text still gates the plan-commitment probe off safely (fail-open) */ }
-      out.plan = { recommendScopeStop: false, recommendEscalate: false, approach: planText };
-    }
+    const progressPath = freshFile(itemDir, 'progress.json', sinceMs);
+    const progress = progressPath ? readJsonSafe(progressPath) : null;
+    const plan = progress && progress.planner;
+    if (plan && typeof plan.rootCause === 'string' && typeof plan.approach === 'string'
+        && typeof plan.recommendScopeStop === 'boolean' && typeof plan.recommendEscalate === 'boolean'
+        && (plan.steps === undefined || (Array.isArray(plan.steps) && plan.steps.every(s => typeof s === 'string')))
+        && (!planMs || statSync(progressPath).mtimeMs >= planMs)) out.plan = plan;
+    // Prose cannot prove control fields. A fresh plan also invalidates downstream reuse.
+    if (!out.plan && !(progress && progress.plannerRequired === false)) { out.test = null; out.fix = null; }
   } catch { /* best-effort — a read failure just means no reuse, never a crash */ }
   return out;
 }

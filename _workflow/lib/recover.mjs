@@ -75,8 +75,18 @@ export function recoveryFoldSkeleton(id, row, prior, cycle) {
   };
   // KI-E20 (review fix): `band` is a carried machine-evidence flag too — a FULL-band prior arms the
   // KI-E19 build+suite PAIR rule on the recovery fold as well (recovery is never a lighter path).
-  for (const k of ['codeChange', 'needsRealInfra', 'rootCauseFiles', 'verificationOnly', 'integrateRaw', 'band']) {
+  for (const k of ['codeChange', 'needsRealInfra', 'infraClassification', 'realInfraClassification', 'rootCauseFiles', 'verificationOnly', 'band', 'baselineFailures', 'planner', 'planDeviation']) {
     if (prior && prior[k] !== undefined) r[k] = prior[k];
+  }
+  r.integrateRaw = true;
+  r.recoveryVerification = { required: true };
+  if (prior && (prior.infraClassification || prior.realInfraClassification)) {
+    const key = 'adjudicator:realinfra-override';
+    const legacy = prior.realInfraClassification;
+    if (!r.infraClassification && legacy) r.infraClassification = { version: 1, original: legacy.original, effective: legacy.effective, adjudication: legacy.adjudication && { ...legacy.adjudication, reason: legacy.reason } };
+    if (prior.gates && prior.gates[key]) r.gates[key] = prior.gates[key];
+    const detail = (prior.gateDetails && prior.gateDetails[key]) || (legacy && legacy.adjudication);
+    if (detail) r.gateDetails = { [key]: detail };
   }
   // KI-E34 (review fix): a prior-less recovery (a seed-BLOCKED item that never ran) must not silently
   // take the codeChange=false no-machine-evidence path at the fold override. FILL-prompt the flag —
@@ -106,14 +116,16 @@ const STAGE_SEQUENCE = ['CLAIMED', 'RED', 'GREEN', 'BUILT', 'TESTED', 'GATED', '
 //     awkward to share safely. A multi-lens FULL-band re-audit death, or a death BEFORE
 //     REFUTE_OK (refuter itself missing, or no gate ever ran), returns stage:null — the caller
 //     falls back to a normal re-group for those.
-export function missingStageFrom(transitions, gates) {
+export function missingStageFrom(transitions, gates, failure) {
   const stages = Array.isArray(transitions) ? transitions : [];
-  const last = stages.length ? stages[stages.length - 1] : null;
-  if (last === 'REAUDITED') return { stage: 'integrator', lenses: [] };
+  const last = stages.filter(s => STAGE_SEQUENCE.includes(s)).pop();
+  const unavailable = failure && failure.kind === 'unavailable';
+  if (last === 'REAUDITED' && unavailable && failure.stage === 'integrator') return { stage: 'integrator', lenses: [] };
   if (last === 'REFUTE_OK') {
     const reaudit = gates && typeof gates.reaudit === 'string' ? gates.reaudit : '';
-    const lenses = reaudit.split(/\s+/).filter(Boolean).map((pair) => pair.split('=')[0]).filter(Boolean);
-    if (lenses.length) return { stage: 're-auditor', lenses };
+    const pairs = reaudit.split(/\s+/).filter(Boolean);
+    const lenses = pairs.filter(p => /^[^=]+=NULL$/.test(p)).map(p => p.split('=')[0]);
+    if (lenses.length && pairs.every(p => /^[^=]+=(ok|NULL)$/.test(p)) && (!failure || (unavailable && failure.stage === 're-auditor'))) return { stage: 're-auditor', lenses };
   }
   return { stage: null, lenses: [] };
 }

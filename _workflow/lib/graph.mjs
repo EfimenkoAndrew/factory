@@ -24,7 +24,7 @@ export function byId(graph) {
 export function computeReady(graph, ledger, opts) {
   const o = opts || {};
   const items = byId(graph);
-  const locks = lockedFiles(graph, ledger);
+  const locks = lockedFiles(graph, ledger, { repoRoot: o.repoRoot });
   const out = [];
   for (const wi of graph.items || []) {
     const row = ledger.items[wi.id];

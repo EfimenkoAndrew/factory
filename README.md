@@ -6,7 +6,7 @@ the item, proves it with a red→green test + an adversarial review stage (5 rol
 independent review flows) + a scoped re-audit, and hands the verified change off
 **for the human to commit**. See `PLAN.md` for the architecture.
 
-It runs on **Claude Code**: the worker plane is a Claude Code Workflow script; the
+It runs on **Claude Code Workflow** or the **OpenCode runtime adapter**; the
 control plane is zero-dependency Node (>= 20.11). Nothing to `npm install`.
 
 > **Every known issue, limitation, accepted constraint, and residual lives in
@@ -17,6 +17,69 @@ control plane is zero-dependency Node (>= 20.11). Nothing to `npm install`.
 > root-cause clustering (`cluster.mjs` → most findings are ~6 systemic patterns), cost-band triage, the
 > LIGHT review band (~4× cheaper long tail), and the build-time audit gate (`audit-diff.mjs`) that stops new
 > findings at PR time. Run `node _workflow/cluster.mjs` first — it reframes "N problems" as "a few sweeps."
+
+## Efficient execution and recovery
+
+The [efficiency review](FACTORY-EFFICIENCY-REVIEW.md) records the historical baseline;
+its [implementation status](FACTORY-EFFICIENCY-IMPLEMENTATION.md) documents current contracts.
+Both runtimes use full-content evidence identities, complete command/target evidence,
+structured recovery provenance, and independent verification after source mutations.
+Main-tree drift is diagnostic-only; owner edits are never automatically discarded.
+
+OpenCode can drive a claimed batch without relaying worker prompts through the controller:
+
+```text
+node <mount>/_workflow/opencode/runtime.mjs init ITEM --launch <run-args.json>
+node <mount>/_workflow/opencode/dispatch.mjs --url http://localhost:4096 --ids ITEM,OTHER
+```
+
+Initialize every selected item. Install the version-selected worker profiles first and
+configure provider/model overrides as needed; see the [runtime guide](_workflow/opencode/README.md).
+The dispatcher finalizes results; the controller folds them through the driver.
+The orchestrator also supports `--backend opencode`, with separate agent/build capacity.
+
+For Claude, exact replay keeps the original session/run identity. `resume --reuse` creates a
+fresh claim-fenced launcher and reuses only independently validated artifacts. Read the
+installed controller's recovery decision tree before relaunching.
+
+Attempt/retry/checkpoint costs, explicit human acceptance, and offline frozen-snapshot
+experiments are described in [CALIBRATION.md](_workflow/CALIBRATION.md). Model or reviewer
+changes require measured quality/cost results; call counts are not token bills.
+
+```text
+node _workflow/lib/_coretest.mjs
+node _workflow/lib/_selftest.mjs --no-git-mutations
+```
+
+The second command runs the shared regressions plus adapter, driver, setup, orchestration
+and measurement tests. Git invariants use nonmutating process-injection fixtures and
+read-only checkout checks; shell fixtures resolve an actual Bash installation. The
+[live capability verifier](_workflow/LIVE-CHECK.md) checks an isolated installed OpenCode
+server without sending model requests.
+
+### Current live evidence — 2026-09-19
+
+- **OpenCode 1.18.31 and official 2.0.10:** real Copilot GPT-5-mini doc fixtures
+  reached runtime checkpoint, finalize and actual driver fold **CLOSED**. These
+  use fixture bootstrap/static identity and temporary driver ledgers, not production
+  scheduler/worktree admission. Running-tool cancellation/retry passed; latest
+  startup-cancellation and stale-output race fixes were covered offline afterward,
+  with no full paid lifecycle rerun. [Evidence](_workflow/LIVE-OPENCODE-LIFECYCLE.md)
+- **Claude:** normal existing login, Workflow primitives and saved-session cached
+  replay passed. Actual `factory.js` has **no CLOSED result**: an earlier continuation
+  folded FAILED; the latest retained attempt hit subscription 429 and remains CLAIMED.
+  Request-metadata fidelity is now fixed/tested offline. Validation needs available
+  quota and a fresh latest-source launcher, not exact replay of the old script.
+  [Evidence and reproduction](_workflow/LIVE-CLAUDE.md)
+- **Measurement:** 6 initial + 12 held-out synthetic cases contain **11 seeded
+  defects total**. Held-out compact review used **14.0% less input / 8.4% less CLI
+  list cost versus a single original reviewer**; this is not production savings.
+  Controlled 5m/1h Workflow cache writes and reads were observed; expiration and
+  production stage gaps remain untested. [Benchmark](_workflow/LIVE-BENCHMARK.md)
+
+Existing Copilot and Claude authentication worked in these runs. Remaining rollout
+gaps are the quota-blocked native latest-contract run, live post-hardening checks,
+production code/scheduling/recovery coverage and a human-accepted production cohort.
 
 ## Use it in YOUR repo (clone & set up)
 

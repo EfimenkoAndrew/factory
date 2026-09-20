@@ -21,17 +21,29 @@ import { extractJson, lastMarkerCount, defaultCycleFor, runCommentGate, effectiv
 import { parseVerifyRaw, verdictFromParse, effectiveBaseline } from './buildtest.mjs';
 import { loadPolicies, POLICY_TEXT } from '../lib/policy.mjs';
 import { PROFILE_CAP } from '../lib/promptpack.mjs';
+import { digest } from './identity.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const RUNTIME = join(HERE, 'runtime.mjs');
 const FIXTURE = join(HERE, 'selftest-fixture.json');
 const FACTORY_ROOT = join(HERE, '..', '..');
-const SELFTEST_ITEM_DIR = join(FACTORY_ROOT, 'state', 'items', 'SELFTEST-ITEM');
+const testId = id => id.startsWith('SELFTEST-') ? id + '-P' + process.pid : id;
+const SELFTEST_ITEM_DIR = join(FACTORY_ROOT, 'state', 'items', testId('SELFTEST-ITEM'));
 
 let pass = 0, fail = 0;
 function assert(cond, msg) { if (cond) { pass++; } else { fail++; console.error('FAIL: ' + msg); } }
 function run(args) {
   try {
+    args = [...args];
+    args[1] = testId(args[1]);
+    if (args[0] === 'init' || args[0] === 'next' || args[0] === 'submit') args.push('--legacy');
+    if (args[0] === 'submit') {
+      let next = JSON.parse(execFileSync('node', [RUNTIME, 'next', args[1], '--legacy'], { encoding: 'utf8' }));
+      if (args.includes('test-author') && next.agents?.[0]?.role === 'plan-feasibility-probe') {
+        for (const role of ['plan-feasibility-probe', 'plan-quality-probe']) execFileSync('node', [RUNTIME, 'submit', args[1], '--role', role, '--legacy', '--json', tmpJson({ honored: true })], { encoding: 'utf8' });
+        execFileSync('node', [RUNTIME, 'next', args[1], '--legacy'], { encoding: 'utf8' });
+      }
+    }
     return { code: 0, out: execFileSync('node', [RUNTIME, ...args], { encoding: 'utf8' }) };
   } catch (e) {
     return { code: e.status, out: (e.stdout || '') + (e.stderr || '') };
@@ -42,7 +54,7 @@ function tmpJson(obj) {
   writeFileSync(p, JSON.stringify(obj));
   return p;
 }
-function itemsDirOf(id) { return join(FACTORY_ROOT, 'state', 'items', id); }
+function itemsDirOf(id) { return join(FACTORY_ROOT, 'state', 'items', testId(id)); }
 function progressFileOf(id) { return join(itemsDirOf(id), 'opencode-progress.json'); }
 function surgery(id, mutate) {
   const p = progressFileOf(id);
@@ -171,23 +183,23 @@ console.log('=== pure module tests ===');
   const pDisk = mkProgress('SELFTEST-INPROC-BL', { files: ['a.cs'], theme: 'x', severity: 'HIGH' });
   pDisk.res.baselineFailures = [];
   const rDisk = effectiveBaselineFor(pDisk, d1);
-  assert(rDisk.baseline === 6 && rDisk.fromDisk === true, 'effectiveBaselineFor: pre-fix baseline-raw.txt transcript counts (6) even when the run-reported array is empty (driver fold parity, cycle-47 ITEM-H15 class)');
+  assert(rDisk.baseline.status === 'invalid' && rDisk.fromDisk === true, 'baseline requires target and failed-test identities, not an aggregate count');
   const d2 = mkdtempSync(join(tmpdir(), 'oc-basel-'));
   const pRep = mkProgress('SELFTEST-INPROC-BL2', { files: ['a.cs'], theme: 'x', severity: 'HIGH' });
   pRep.res.baselineFailures = ['T1', 'T2'];
   const rRep = effectiveBaselineFor(pRep, d2);
-  assert(rRep.baseline === 2 && rRep.fromDisk === false, 'effectiveBaselineFor: no transcript -> run-reported array only');
+  assert(rRep.baseline.status === 'absent' && rRep.fromDisk === false, 'reported names cannot substitute for target-bound baseline');
   // reFix fence: a baseline (re)captured DURING this attempt is distrusted.
   const d3 = mkdtempSync(join(tmpdir(), 'oc-basel-'));
   writeFileSync(join(d3, 'baseline-raw.txt'), 'FACTORY::SUMMARY::suite exit=1 failed=6 passed=100 skipped=0\n');
   const pFence = mkProgress('SELFTEST-INPROC-BL3', { files: ['a.cs'], theme: 'x', severity: 'HIGH' });
   pFence.reFix = true; pFence.initAtMs = Date.now() - 3600 * 1000; pFence.res.baselineFailures = ['T1'];
   const rFence = effectiveBaselineFor(pFence, d3);
-  assert(rFence.baseline === 1 && rFence.ignoredReFixRecapture === true, 'effectiveBaselineFor: reFix fence — a transcript younger than this attempt is IGNORED (would launder the prior fix\'s breakage)');
+  assert(rFence.baseline.status === 'absent' && rFence.ignoredReFixRecapture === true, 'reFix recapture cannot launder prior breakage');
   const pOld = mkProgress('SELFTEST-INPROC-BL4', { files: ['a.cs'], theme: 'x', severity: 'HIGH' });
   pOld.reFix = true; pOld.initAtMs = Date.now() + 3600 * 1000; pOld.res.baselineFailures = [];
   const rOld = effectiveBaselineFor(pOld, d3);
-  assert(rOld.baseline === 6 && rOld.fromDisk === true, 'effectiveBaselineFor: reFix with a FIRST-round (pre-attempt) transcript keeps it');
+  assert(rOld.baseline.status === 'invalid' && rOld.fromDisk === true, 'old count-only baseline still lacks target/test evidence');
   // The self-feed regression itself: an integrate transcript with 3 suite failures and NO recorded
   // baseline must FAIL — the old code fed the integrate parse in as its own baseline (3-3=0) and
   // could structurally never report a suite regression.
@@ -195,7 +207,7 @@ console.log('=== pure module tests ===');
   const honest = verdictFromParse(integParse, effectiveBaselineFor(pRep, mkdtempSync(join(tmpdir(), 'oc-basel-'))).baseline);
   assert(honest.pass === false, 'integrate verdict: 3 new suite failures beyond a 2-strong recorded baseline FAILS honestly');
   const selfFed = verdictFromParse(integParse, effectiveBaseline([], integParse));
-  assert(selfFed.pass === true, '(defeat demo) feeding the integrate run\'s OWN parse as baseline reads every regression as pre-existing — exactly the bug fix #12 removes');
+  assert(selfFed.pass === false, 'self-fed legacy count cannot authorize failures');
 }
 {
   // Fix #20 — mechanical schema-parity: extract every `const <NAME>_SCHEMA = {...}` object literal
@@ -244,10 +256,10 @@ console.log('=== pure module tests ===');
   assert(prompt.includes('## Role: planner'), 'compose: inlines the real planner.md brief content');
   assert(prompt.includes('FINAL ANSWER FORMAT'), 'compose: appends the JSON-fence instruction');
   const probePrompt = compose('marker-probe', item, 'x', ctx);
-  assert(!probePrompt.includes('YOUR ROLE BRIEF'), 'compose: -probe roles get no brief section (none exists on disk)');
+  assert(probePrompt.includes('OUTPUT CONTRACT'), 'compose: probe receives its output contract');
   // Fix #15 — KI-D7 probe-etiquette line rides on review roles (factory.js compose parity).
   const gatePrompt = compose('gate-developer', item, null, ctx);
-  assert(gatePrompt.includes('PARALLEL REVIEW STAGE — LIVE-PROBE ETIQUETTE (KI-D7)'), 'compose: review roles carry the KI-D7 parallel-review probe-etiquette line');
+  assert(gatePrompt.includes('PARALLEL REVIEW STAGE — LIVE-PROBE ETIQUETTE'), 'compose: review roles carry probe etiquette');
   assert(!prompt.includes('LIVE-PROBE ETIQUETTE'), 'compose: non-review roles (planner) do NOT carry the KI-D7 line');
 }
 {
@@ -255,6 +267,7 @@ console.log('=== pure module tests ===');
   // for ALL roles incl. probes, exact injection label, and the #17 target-traversal guard.
   const tpl = mkdtempSync(join(tmpdir(), 'oc-tpl-')).replace(/\\/g, '/');
   mkdirSync(join(tpl, 'repo-profiles'), { recursive: true });
+  writeFileSync(join(tpl, 'fixer.md'), 'Fixer fixture brief');
   writeFileSync(join(tpl, 'repo-profiles', 'SAFE.md'), 'PROFILE-FACT-ALPHA: this repo uses xUnit.');
   writeFileSync(join(tpl, 'SAFE.md'), 'LEAKED-PARENT-PROFILE'); // what a `../SAFE` traversal would reach
   writeFileSync(join(tpl, 'repo-profiles', 'BIG.md'), 'HEAD-MARK ' + 'x'.repeat(PROFILE_CAP) + ' TAIL-SENTINEL-BEYOND-CAP');
@@ -278,12 +291,12 @@ console.log('=== pure module tests ===');
   assert(!offPrompt.includes('HOST POLICY — NO NEW COMMENTS (binding):') && !offPrompt.includes('HOST POLICY — NO DB/SCHEMA CHANGES (binding):'),
     'compose: shipped-engine defaults (policies off) inject NO policy block — prompt unchanged');
   assert(offPrompt.includes('PROFILE-FACT-ALPHA'), 'compose: repo profile injected for a normal role');
-  assert(offPrompt.includes('host-local overlay derived from that repo\'s own real merged PRs'), 'compose: profile injection label matches factory.js\'s exact parenthetical');
+  assert(offPrompt.includes('REPO-SPECIFIC STYLE PROFILE'), 'compose: profile is labeled');
   const probeProfilePrompt = compose('marker-probe', baseItem, null, { repoRoot: 'C:/fake/repo', worktreePath: 'C:/fake/wt', factoryRoot: offRoot, templatesDir: tpl });
-  assert(probeProfilePrompt.includes('PROFILE-FACT-ALPHA'), 'compose: profile injected for probe roles too (factory.js injects it for ALL roles)');
+  assert(!probeProfilePrompt.includes('PROFILE-FACT-ALPHA'), 'compose: mechanical probe omits unrelated profile');
   const bigPrompt = compose('fixer', { ...baseItem, target: 'BIG' }, null, { repoRoot: 'C:/fake/repo', worktreePath: 'C:/fake/wt', factoryRoot: offRoot, templatesDir: tpl });
   assert(bigPrompt.includes('HEAD-MARK'), 'compose: oversized profile head survives');
-  assert(!bigPrompt.includes('TAIL-SENTINEL-BEYOND-CAP'), 'compose: profile content capped at PROFILE_CAP (identical bound to the driver\'s readRepoProfiles)');
+  assert(bigPrompt.includes('TAIL-SENTINEL-BEYOND-CAP'), 'compose: full applicable profile survives');
   // #17 — a traversal-shaped target must NOT resolve a profile outside repo-profiles/.
   const evilPrompt = compose('fixer', { ...baseItem, target: '../SAFE' }, null, { repoRoot: 'C:/fake/repo', worktreePath: 'C:/fake/wt', factoryRoot: offRoot, templatesDir: tpl });
   assert(!evilPrompt.includes('LEAKED-PARENT-PROFILE') && !evilPrompt.includes('REPO-SPECIFIC STYLE PROFILE'), 'compose: a target containing ".."/separator skips the profile lookup entirely (no traversal)');
@@ -411,10 +424,12 @@ try { rmSync(SELFTEST_ITEM_DIR, { recursive: true, force: true }); } catch { /* 
   assert(existsSync(join(SELFTEST_ITEM_DIR, 'plan.md')), 'submit writes plan.md artifact');
   const s = run(['status', 'SELFTEST-ITEM']);
   const status = JSON.parse(s.out);
-  assert(status.phase === 'test', 'a valid plan submit advances phase plan -> test');
+  assert(status.phase === 'plan_review', 'valid plan advances to independent plan review');
 }
 {
   // Fix #15 — the Test-phase brief carries the KI-E43 Docker-less baseline instruction.
+  run(['submit', 'SELFTEST-ITEM', '--role', 'plan-feasibility-probe', '--json', tmpJson({ honored: true })]);
+  run(['submit', 'SELFTEST-ITEM', '--role', 'plan-quality-probe', '--json', tmpJson({ honored: true })]);
   const n = run(['next', 'SELFTEST-ITEM']);
   const parsed = JSON.parse(n.out);
   assert(parsed.agents && /FULL-SUITE BASELINE \(KI-E43\)/.test(parsed.agents[0].prompt), 'test-phase brief carries the KI-E43 pre-fix full-suite baseline instruction');
@@ -463,7 +478,7 @@ try { rmSync(SELFTEST_ITEM_DIR, { recursive: true, force: true }); } catch { /* 
   assert(r.code === 0, 'mech leftover completes on the fixture worktree (leftover-lint best-effort 0): ' + r.out.slice(0, 300));
   const s = JSON.parse(run(['status', 'SELFTEST-ITEM']).out);
   assert(s.gates['probe:leftover-scan'] === 'APPROVED', 'leftover-scan: 0 candidates -> APPROVED');
-  assert(s.phase === 'gates', 'leftover pass advances through editorial (no doc flows on a code-only item) to gates');
+  assert(s.phase === 'final_verify', 'leftover pass stops at independent final barrier');
   const commentPolicyOn = loadPolicies(FACTORY_ROOT).noNewComments;
   assert(commentPolicyOn ? ('mech:comment-scan' in s.gates) : !('mech:comment-scan' in s.gates),
     'comment gate runs (and records a verdict) ONLY when the host enables policies.noNewComments (effective=' + commentPolicyOn + ')');
@@ -471,7 +486,8 @@ try { rmSync(SELFTEST_ITEM_DIR, { recursive: true, force: true }); } catch { /* 
 {
   // Fix #15 — gate-band briefs carry staleGuard (reFix) + voGuard (verificationOnly) + the method
   // flows' BMAD-methodology line (factory.js parity).
-  surgery('SELFTEST-ITEM', (o) => { o.reFix = true; o.verificationOnly = true; });
+  writeFileSync(join(SELFTEST_ITEM_DIR, 'verify-raw.txt'), 'fixture evidence');
+  surgery('SELFTEST-ITEM', (o) => { o.reFix = true; o.verificationOnly = true; o.phase = 'gates'; o.evidence = { complete: true, ...o.content, rawHash: digest('fixture evidence') }; });
   const n = run(['next', 'SELFTEST-ITEM']);
   const parsed = JSON.parse(n.out);
   const dev = parsed.agents.find((a) => a.role === 'gate-developer');
@@ -482,7 +498,7 @@ try { rmSync(SELFTEST_ITEM_DIR, { recursive: true, force: true }); } catch { /* 
 }
 {
   // scope-stop path, tested independently on a second fixture item id so it doesn't disturb the happy-path item above.
-  const dir2 = join(FACTORY_ROOT, 'state', 'items', 'SELFTEST-ITEM-SCOPESTOP');
+  const dir2 = itemsDirOf('SELFTEST-ITEM-SCOPESTOP');
   try { rmSync(dir2, { recursive: true, force: true }); } catch { /* ignore */ }
   run(['init', 'SELFTEST-ITEM-SCOPESTOP', '--fixture', FIXTURE]);
   run(['next', 'SELFTEST-ITEM-SCOPESTOP']);
@@ -509,7 +525,7 @@ try { rmSync(SELFTEST_ITEM_DIR, { recursive: true, force: true }); } catch { /* 
 {
   // mech verify safety guard (KI-O1 fix): a codeChange item on a non-FULL band with NO filter
   // must refuse loudly rather than silently reporting "tests green" from build-only evidence.
-  const dir3 = join(FACTORY_ROOT, 'state', 'items', 'SELFTEST-ITEM-NOFILTER');
+  const dir3 = itemsDirOf('SELFTEST-ITEM-NOFILTER');
   try { rmSync(dir3, { recursive: true, force: true }); } catch { /* ignore */ }
   run(['init', 'SELFTEST-ITEM-NOFILTER', '--fixture', FIXTURE]);
   run(['next', 'SELFTEST-ITEM-NOFILTER']);
@@ -527,7 +543,7 @@ try { rmSync(SELFTEST_ITEM_DIR, { recursive: true, force: true }); } catch { /* 
   // suppresses test stdout (KI-L22), so suite's own transcript can NEVER carry a realInfra Console
   // marker, regardless of band — a FULL-band realInfra item verified via suite-only would be
   // STRUCTURALLY unable to ever close. The guard must fire for FULL band too, not just LIGHT.
-  const dir3b = join(FACTORY_ROOT, 'state', 'items', 'SELFTEST-ITEM-FULLBAND');
+  const dir3b = itemsDirOf('SELFTEST-ITEM-FULLBAND');
   try { rmSync(dir3b, { recursive: true, force: true }); } catch { /* ignore */ }
   const FULLBAND_FIXTURE = join(HERE, 'selftest-fixture-fullband.json');
   run(['init', 'SELFTEST-ITEM-FULLBAND', '--fixture', FULLBAND_FIXTURE]);
@@ -543,7 +559,8 @@ try { rmSync(SELFTEST_ITEM_DIR, { recursive: true, force: true }); } catch { /* 
 
   // Fix #3 — `next` idempotence on a POOLED phase: re-printing prompts must not reset received
   // verdicts. Surgery to the refute_reaudit phase (FULL band: refuter + 3 lenses = 4 pooled calls).
-  surgery('SELFTEST-ITEM-FULLBAND', (o) => { o.phase = 'refute_reaudit'; o.pendingSet = null; });
+  writeFileSync(join(dir3b, 'verify-raw.txt'), 'fixture evidence');
+  surgery('SELFTEST-ITEM-FULLBAND', (o) => { o.phase = 'refute_reaudit'; o.pendingSet = null; o.evidence = { complete: true, ...o.content, rawHash: digest('fixture evidence') }; });
   const n1 = JSON.parse(run(['next', 'SELFTEST-ITEM-FULLBAND']).out);
   assert(n1.agents && n1.agents.length === 4, 'refute_reaudit on FULL/CRITICAL idempotency theme pools 4 calls (refuter + code/edge-case/architecture lenses): ' + (n1.agents && n1.agents.length));
   assert(n1.agents.some((a) => /audit lens ONLY/.test(a.prompt)), 're-auditor briefs carry factory.js\'s scoped-lens mandate (not a bare "LENS:" tag)');
@@ -556,7 +573,7 @@ try { rmSync(SELFTEST_ITEM_DIR, { recursive: true, force: true }); } catch { /* 
     run(['submit', 'SELFTEST-ITEM-FULLBAND', '--role', 're-auditor:' + lens, '--json', tmpJson({ converged: true, findingGone: true, headline: 'ok' })]);
   }
   const sEnd = JSON.parse(run(['status', 'SELFTEST-ITEM-FULLBAND']).out);
-  assert(sEnd.phase === 'integrate', 'all 4 pooled verdicts in -> refute_reaudit completes -> escalatecheck passes through -> integrate (CLI-level pin of the #6 reposition)');
+  assert(sEnd.phase === 'escalatecheck', 'submit advances once; next owns deterministic escalation advancement');
   assert(sEnd.transitions.includes('REFUTE_OK') && sEnd.transitions.includes('REAUDITED'), 'REFUTE_OK + REAUDITED recorded');
   try { rmSync(dir3b, { recursive: true, force: true }); } catch { /* ignore */ }
 }
@@ -612,54 +629,49 @@ try { rmSync(SELFTEST_ITEM_DIR, { recursive: true, force: true }); } catch { /* 
   assert(s1.transitions.includes('GREEN') && s1.transitions.includes('TESTED'), 'doc e2e: GREEN/BUILT/TESTED recorded (factory.js pushes them for doc items after runner verify)');
   assert(s1.phase === 'editorial', 'doc e2e: edgescan/acceptance(single-clause)/leftover all skip for a doc item -> editorial');
   const en = JSON.parse(run(['next', id]).out);
-  assert(en.agents && en.agents.length === 2 && /Advisory editorial pass/.test(en.agents[0].prompt) && /REGENERATE the review pack/.test(en.agents[0].prompt),
+  assert(en.agents && en.agents.length === 1 && /Advisory editorial pass/.test(en.agents[0].prompt) && /REGENERATE the review pack/.test(en.agents[0].prompt),
     'doc e2e: editorial briefs carry factory.js\'s advisory + claims-lint + pack-regeneration + don\'t-break-the-test mandate');
   run(['submit', id, '--role', 'review-editorial-structure', '--json', tmpJson({ gate: 'editorial-structure', verdict: 'APPROVED', headline: 'clean' })]);
   run(['submit', id, '--role', 'review-editorial-prose', '--json', tmpJson({ gate: 'editorial-prose', verdict: 'APPROVED', headline: 'clean' })]);
+  run(['next', id]);
   const gs = JSON.parse(run(['status', id]).out);
-  assert(gs.phase === 'gates', 'doc e2e: editorial done -> gates');
-  for (const g of [['gate-developer', 'developer'], ['gate-qa', 'qa'], ['review-adversarial', 'adversarial'], ['review-testreview', 'testreview']]) {
-    run(['submit', id, '--role', g[0], '--json', tmpJson({ gate: g[1], verdict: 'APPROVED', headline: 'clean' })]);
-  }
-  const afterGates = JSON.parse(run(['status', id]).out);
-  assert(afterGates.phase === 'refute_reaudit', 'doc e2e (fix #7): LIGHT band SKIPS the po phase — gates pass straight to refute_reaudit');
-  assert(!('gate:po' in afterGates.gates), 'doc e2e: no gate:po verdict recorded on a LIGHT item');
-  assert(afterGates.transitions.includes('GATED'), 'doc e2e: GATED recorded without a PO run (factory.js pushes it after the band)');
-  const rn = JSON.parse(run(['next', id]).out);
-  assert(rn.agents && rn.agents.length === 1 && rn.agents[0].key === 're-auditor:code', 'doc e2e: LIGHT + adversarial flow present -> refuter covered, single code-lens re-audit');
-  run(['submit', id, '--role', 're-auditor:code', '--json', tmpJson({ converged: true, findingGone: true, headline: 'doc claim gone' })]);
-  const ri = JSON.parse(run(['status', id]).out);
-  assert(ri.phase === 'integrate' && ri.transitions.includes('REFUTE_OK') && ri.transitions.includes('REAUDITED'), 'doc e2e (fix #6): refute/re-audit pass -> escalatecheck (not escalate) -> integrate');
-  const ig = run(['mech', id, 'integrate']);
-  assert(ig.code === 0 && /doc-only/.test(ig.out), 'doc e2e: mech integrate takes the NO-BUILD path for !codeChange (factory.js integrator-brief parity)');
-  run(['submit', id, '--role', 'integrator', '--json', tmpJson({ globalGreen: true, regressionDelta: 0, handoff: 'branch ready for human commit', branch: 'fixture/none' })]);
+  assert(gs.phase === 'final_verify', 'doc e2e: serialized editorial stops at final verification');
+  run(['mech', id, 'verify']);
   const cs = JSON.parse(run(['status', id]).out);
-  assert(cs.toState === 'CLOSED' && cs.phase === 'checkpoint', 'doc e2e: integrator globalGreen -> CLOSED, awaiting checkpoint');
-  const cn = JSON.parse(run(['next', id]).out);
-  assert(cn.mechanical === 'checkpoint', 'doc e2e: CLOSED path demands the checkpoint');
+  assert(cs.toState === 'FAILED' && cs.phase === 'done', 'doc fixture without RED machine proof fails before reviewers');
   run(['mech', id, 'checkpoint']);
   const dn = JSON.parse(run(['next', id]).out);
-  assert(dn.done === true && dn.toState === 'CLOSED', 'doc e2e: checkpoint ends the loop; next reports done CLOSED');
+  assert(dn.done === true && dn.toState === 'FAILED', 'doc e2e: failure checkpoint ends loop');
   const resObj = JSON.parse(readFileSync(join(itemsDirOf(id), 'result.json'), 'utf8'));
-  assert(resObj.toState === 'CLOSED' && resObj.transitions.includes('INTEGRATED') && !('gate:po' in (resObj.gates || {})), 'doc e2e: persisted result.json carries the CLOSED path with no PO gate');
+  assert(resObj.toState === 'FAILED' && !resObj.transitions.includes('GATED'), 'missing proof cannot reach GATED');
   try { rmSync(itemsDirOf(id), { recursive: true, force: true }); } catch { /* ignore */ }
 }
 {
   // finalize (KI-O1 fix): wraps a bare per-item result.json into the {mode,cycle,results:[...]}
   // envelope `driver.mjs fold` actually requires — this is the exact gap a real validation run hit.
-  const dir4 = join(FACTORY_ROOT, 'state', 'items', 'SELFTEST-ITEM-FINALIZE');
+  const dir4 = itemsDirOf('SELFTEST-ITEM-FINALIZE');
   try { rmSync(dir4, { recursive: true, force: true }); } catch { /* ignore */ }
   run(['init', 'SELFTEST-ITEM-FINALIZE', '--fixture', FIXTURE]);
-  writeFileSync(join(dir4, 'result.json'), JSON.stringify({ id: 'SELFTEST-ITEM-FINALIZE', resultId: 'SELFTEST-ITEM-FINALIZE#1', toState: 'CLOSED', transitions: ['CLOSED'] }));
+  writeFileSync(join(dir4, 'result.json'), JSON.stringify({ id: 'SELFTEST-ITEM-FINALIZE', resultId: 'SELFTEST-ITEM-FINALIZE#1', toState: 'CLOSED', transitions: ['CLOSED'], needsRealInfra: false }));
+  writeFileSync(join(dir4, 'verify-raw.txt'), 'fixture evidence');
+  surgery('SELFTEST-ITEM-FINALIZE', o => { o.phase = 'done'; o.checkpointed = true; o.res = JSON.parse(readFileSync(join(dir4, 'result.json'), 'utf8')); o.evidence = { complete: true, ...o.content, rawHash: digest('fixture evidence') }; });
   const fin = run(['finalize', 'SELFTEST-ITEM-FINALIZE']);
   assert(fin.code === 0, 'finalize succeeds given a checkpointed result.json: ' + fin.out);
-  const outPath = join(FACTORY_ROOT, 'state', 'results-cycle-1-SELFTEST-ITEM-FINALIZE.json');
+  const outPath = join(FACTORY_ROOT, 'state', 'results-cycle-1-' + testId('SELFTEST-ITEM-FINALIZE') + '.json');
   assert(existsSync(outPath), 'finalize writes a results-cycle-<N>-<id>.json file');
   const wrapped = JSON.parse(readFileSync(outPath, 'utf8'));
   assert(Array.isArray(wrapped.results) && wrapped.results.length === 1 && wrapped.results[0].id === 'SELFTEST-ITEM-FINALIZE', 'finalize wraps the bare result into {results:[...]} — the shape driver.mjs fold requires (a bare object folds as ZERO results)');
   try { rmSync(dir4, { recursive: true, force: true }); rmSync(outPath, { force: true }); } catch { /* ignore */ }
 }
 
-console.log(`\nTOTAL: ${pass} passed, ${fail} failed`);
+await import('./_runtime-tests.mjs');
+await import('./_dispatch-e2e.mjs');
+await import('./_settlement-tests.mjs');
+await import('./_phase-catalog-tests.mjs');
+await import('./_admission-tests.mjs');
+await import('./_shadow-tests.mjs');
+await import('./_shared-helper-tests.mjs');
+await import('./_build-lease-tests.mjs');
+console.log(`\nTOTAL legacy/pure: ${pass} passed, ${fail} failed`);
 try { rmSync(SELFTEST_ITEM_DIR, { recursive: true, force: true }); } catch { /* ignore */ }
 process.exitCode = fail ? 1 : 0;

@@ -42,6 +42,7 @@ export function loadPolicies(factoryRoot) {
     const pol = cfg && cfg.policies;
     if (!pol || typeof pol !== 'object') continue;
     for (const k of Object.keys(DEFAULTS)) if (k in pol) out[k] = !!pol[k];
+    if (typeof pol.isolateWorktreeWrites === 'boolean') out.isolateWorktreeWrites = pol.isolateWorktreeWrites;
   }
   return out;
 }
@@ -49,7 +50,8 @@ export function loadPolicies(factoryRoot) {
 // One-line render for driver status output ("noNewComments=on noSchemaChanges=off").
 export function renderPolicies(policies) {
   const p = { ...DEFAULTS, ...(policies || {}) };
-  return Object.keys(DEFAULTS).map((k) => `${k}=${p[k] ? 'on' : 'off'}`).join(' ');
+  return Object.keys(DEFAULTS).map((k) => `${k}=${p[k] ? 'on' : 'off'}`).join(' ') +
+    (Object.hasOwn(p, 'isolateWorktreeWrites') ? ` isolateWorktreeWrites=${p.isolateWorktreeWrites === false ? 'off' : 'on'}` : '');
 }
 
 // The canonical HOST POLICY prompt blocks. Single source for the driver's recover prompts and the

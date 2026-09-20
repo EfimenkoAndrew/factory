@@ -5,23 +5,26 @@
 // (missing-checkpoint diagnostics), so a killed run's LATEST reached stage is visible instead of a
 // bare "no checkpoint — must re-run".
 //
-// Deliberately read-only / advisory: this module does NOT feed loadPriorAttempt or any relaunch
-// reuse decision (that is KI-E138, a separate, larger change — see prior-attempt.mjs's own comment
-// on why "verify onward always re-runs fresh" was drawn as a trust boundary, not an oversight). A
-// progress.json existing changes what a human/controller SEES, never what a relaunch SKIPS.
+// Reading a checkpoint does not authorize reuse. Native execution independently validates
+// canonical content/contract identity and the completed reviewer portfolio before skipping work.
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 // Canonical pipeline order — presentation-only (phrases "what's left"), not authoritative over
 // factory.js's own control flow. Kept here, alongside the stage-literal list the selftest greps
 // factory.js for, so the two cannot silently drift apart without a visible assertion failure.
-export const PROGRESS_STAGES = ['post-verify', 'post-preband', 'post-gates', 'post-reaudit'];
+export const PROGRESS_STAGES = ['admission', 'post-plan', 'post-test', 'post-verify', 'post-preband', 'post-gates', 'post-reaudit', 'sweep-apply-started', 'sweep-post-apply'];
 
 const REMAINING_AFTER = {
+  admission: 'semantic work has not yet completed; planning/test authoring, implementation, verification and reviews remain',
+  'post-plan': 'test authoring, implementation, verification and independent reviews',
+  'post-test': 'implementation, verification and independent reviews',
   'post-verify': 'the pre-band scan chain, the gate band, refute+re-audit, integrate',
   'post-preband': 'the gate band, refute+re-audit, integrate',
   'post-gates': 'refute+re-audit, integrate',
   'post-reaudit': 'integrate only',
+  'sweep-apply-started': 'site application, sweep verification and pattern reviews',
+  'sweep-post-apply': 'sweep verification and pattern reviews; partial apply reuse is not authorized',
 };
 
 function readJsonSafe(p) {
@@ -59,5 +62,5 @@ export function summarizeProgress(pr) {
   const gateKeys = Object.keys(gates);
   const tally = gateKeys.length ? gateKeys.map((k) => `${k}=${gates[k]}`).join(', ') : '(no gate/scan verdicts recorded yet)';
   const remaining = REMAINING_AFTER[pr.progressStage] || '(unknown remaining scope)';
-  return `progress.json (KI-E137): stage '${pr.progressStage}' reached — ${tally} — remaining: ${remaining} (not yet reusable on relaunch, KI-E138; re-runs fresh from \`fix\` onward per SKILL.md § Recovery)`;
+  return `progress.json (KI-E137): stage '${pr.progressStage}' reached — ${tally} — remaining: ${remaining} (reuse requires fresh content/contract identity and completed-review validation; see SKILL.md § Recovery)`;
 }

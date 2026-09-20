@@ -24,11 +24,8 @@ import { join } from 'node:path';
 
 const HEADING_CAP = 40;      // max headings per doc in the map (a data-flow doc can have 100s)
 const HEADING_LEN = 90;      // per-heading text bound
-const BRIEF_CAP = 12000;     // per-brief char bound (largest live brief is ~9k)
-// Repo profiles get their OWN cap: real profiles run 8-26KB (a BRIEF_CAP slice silently dropped
-// 30-53% of 3 of the 4 first live profiles — tail sections vanished with no warning). Exported so
-// the opencode port's compose (which reads profiles off disk itself) applies the IDENTICAL bound —
-// both runtimes must inject the same profile content for the same target (PR#9 review).
+// Legacy sizing reference retained for import compatibility; NEVER a truncation boundary.
+// Behavioral contracts (briefs and profiles) must be delivered completely.
 export const PROFILE_CAP = 30000;
 
 // Extract '## ' / '### ' headings with 1-based line numbers -> ['§ <text> @L<n>', ...] (capped).
@@ -61,7 +58,7 @@ export function buildDocMap(repoRoot, target, io) {
   return map;
 }
 
-// Read every agents/<role>.md into { role: briefText } (each capped). Returns {} on any dir-level
+// Read every agents/<role>.md into { role: completeBriefText }. Returns {} on any dir-level
 // failure — the factory's compose() then falls back to the legacy read-it-yourself pointer.
 export function readRoleBriefs(agentsDir, io) {
   const rf = (io && io.readFileSync) || readFileSync;
@@ -70,15 +67,14 @@ export function readRoleBriefs(agentsDir, io) {
   try {
     for (const f of rd(agentsDir)) {
       if (!/\.md$/i.test(f)) continue;
-      try { briefs[f.replace(/\.md$/i, '')] = String(rf(join(agentsDir, f), 'utf8')).slice(0, BRIEF_CAP); }
+      try { briefs[f.replace(/\.md$/i, '')] = String(rf(join(agentsDir, f), 'utf8')); }
       catch { /* skip one unreadable brief */ }
     }
   } catch { return {}; }
   return briefs;
 }
 
-// Read every agents/repo-profiles/<target>.md into { target: profileText } (each capped at
-// PROFILE_CAP — larger than BRIEF_CAP because real profiles run 8-26KB). Returns {} on any
+// Read every agents/repo-profiles/<target>.md into { target: completeProfileText }. Returns {} on any
 // dir-level failure (the directory not existing is the common case — most targets have no profile
 // yet) — compose() then simply omits the repo-specific overlay and every prompt behaves exactly as
 // it did before this profile existed. Profiles are HOST data: the dir ships gitignored except a
@@ -92,7 +88,7 @@ export function readRepoProfiles(profilesDir, io) {
     for (const f of rd(profilesDir)) {
       if (!/\.md$/i.test(f)) continue;
       if (/^(README|_example[^/]*)\.md$/i.test(f)) continue; // docs/template, never a real target key
-      try { profiles[f.replace(/\.md$/i, '')] = String(rf(join(profilesDir, f), 'utf8')).slice(0, PROFILE_CAP); }
+      try { profiles[f.replace(/\.md$/i, '')] = String(rf(join(profilesDir, f), 'utf8')); }
       catch { /* skip one unreadable profile */ }
     }
   } catch { return {}; }

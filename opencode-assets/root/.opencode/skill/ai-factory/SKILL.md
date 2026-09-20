@@ -44,7 +44,8 @@ RT  = node <mount>/_workflow/opencode/runtime.mjs
    boundary is `scope-stop` -> BLOCKED for the human, never "fixed".
 6. **Green build != done** — every fix needs its red->green test; money/security/concurrency
    items additionally need real-infra (Testcontainers) proof.
-7. **Reviewers are separate subagents.** Every role a `next` step hands you goes through `Task`
+7. **Reviewers are separate subagents.** Every pending role a `next` step hands you goes through
+   an independent session (`Task` in v1, `subagent` in v2, or the server dispatcher)
    as its own subagent — never played inline in this conversation. Nesting the reviewer in the
    implementer's reasoning trail is the one thing that makes the whole gate band meaningless.
 
@@ -57,23 +58,76 @@ RT  = node <mount>/_workflow/opencode/runtime.mjs
 
 ## The cycle loop
 
-OpenCode has no `Workflow` tool, so the worker plane runs through the `_workflow/opencode/`
-binding: **one item at a time**, driven by you.
+OpenCode has no `Workflow` tool. Use the Node server dispatcher for the claimed batch:
+
+```text
+RT init <id> --launch <mount>/state/run-args-<label>.json
+node <mount>/_workflow/opencode/dispatch.mjs --url <server-url> --ids <claimed-id[,claimed-id]>
+```
+
+Initialize each claimed item once. `--launch` can be omitted when the ledger's `runScript`
+locates its claim-matched run-args file. Repeated init on the same claim is refused.
+The dispatcher accepts `--version v1|v2` and `--config <file>`; otherwise it discovers the
+server version and loads `<mount>/config/opencode-dispatch.local.json` when present.
+These are dispatcher flags, not runtime-init or OpenCode-config fields. Neither CLI has a
+general `--help` contract; use `_workflow/opencode/README.md` for the exact commands.
+
+The dispatcher runs pending steps, finalizes terminal envelopes and returns batch outcomes.
+It does **not** fold: the controller folds the generated absolute result paths with its lease.
+For each completed item, the envelope is `<mount>/state/results-cycle-<N>-<id>.json`;
+`RT finalize <id>` can revalidate it and print its absolute path before folding. The
+dispatcher's stdout is a batch outcome array, not a fold envelope.
+Resume the same complete batch/config after interruption. Durable message completion,
+not prompt admission, SSE or idle status, determines whether an answer can be submitted.
+
+Example host-local **dispatcher** config (separate from `opencode.json`):
+
+```json
+{
+  "url": "http://127.0.0.1:4096",
+  "version": "v2",
+  "agentConcurrency": 4,
+  "buildConcurrency": 1,
+  "agentTimeoutMs": 1200000,
+  "pollMs": 1000,
+  "items": { "ITEM": { "target": "src/App.sln", "filter": "FullyQualifiedName~RegressionTests" } },
+  "roles": {
+    "gate-qa": { "providerID": "anthropic", "modelID": "claude-sonnet-4-6", "agent": "factory-reviewer-mechanical" }
+  }
+}
+```
+
+`roles[descriptor.role]` overrides `models[descriptor.route.model]`. Each override can
+specify `providerID`, `modelID`, `agent`, and v2 `variant` or `variants[effort]`.
+Absent overrides, the adapter selects the installed profile and queries its effective
+model in the item's worktree, preserving host model overrides. Missing profile/model
+definitions fail closed. V1 sends model/agent but no invented effort field; v2 supports
+model variants. Per-agent v2 `request` overlays are documented as not forwarded by its
+runner, so configure active provider/model settings instead.
+
+The independent `buildConcurrency` limit uses shared filesystem slots for mechanical
+and worker-issued `build|red|filter|suite|efmigration` commands through
+`build-lease.mjs`. Workers must use their prompt's wrapper; direct arbitrary shell commands
+are not intercepted. Orphaned/timed-out slots require process-tree inspection.
+
+## Manual Task/subagent fallback
 
 ```
 DRV cycle --max 1        # or: DRV suggest / DRV group --ids <id> --conc 1
     → claims the item, creates its worktree, writes the ledger row
-RT init <id>
+RT init <id> --launch <mount>/state/run-args-<label>.json
 loop:
   RT next <id>
     → {"mechanical":"<step>"}   run: RT mech <id> <verify|leftover|integrate|checkpoint>
-    → {"agents":[{role,key,phase,schema,prompt}, ...]}
-        dispatch ALL of them via Task — one subagent per entry, single message when >1 —
-        then feed each answer back: RT submit <id> --role <key> --json <file|->
+    → pending agent descriptors: read JSON promptRef and pass its prompt to the worker
+        dispatch ONLY pending entries, one independent session per dispatch identity;
+        parallelize independent readers, serialize overlapping writers
+        RT submit <id> --role <key> --dispatch <dispatch-id> --json <file|->
+        call RT next <id> after submission (submit does not auto-next)
   until `next` reports done (it keeps returning the checkpoint step until
   `RT mech <id> checkpoint` has written state/items/<id>/result.json)
 RT finalize <id>         # wraps result.json into the envelope fold requires
-DRV fold <mount>/state/results-cycle-<N>-<id>.json --controller <token>
+DRV fold <absolute-path-printed-by-finalize> --controller <token>
 DRV progress && DRV burndown && DRV escalations
 DRV gc --yes             # prune worktrees of CLOSED items (optional)
 ```
@@ -82,16 +136,44 @@ A BARE per-item `result.json` folds as "ZERO results" — always `finalize` befo
 EVERY terminal outcome (`FAILED`/`BLOCKED`/`ESCALATED` as much as `CLOSED`) must be
 checkpointed, or the ledger row stays CLAIMED forever with nothing to fold.
 
+The first code verify needs `RT mech <id> verify -- <solution> <filter>`; the `--` belongs
+after `verify`, before positional target/filter. Later mechanics use saved verification
+inputs. Mechanical commands may print the next descriptors; dispatch each identity only once.
+Recurring role keys alone are not identities: retain attempt/claim ID, dispatch ID,
+prompt/input hash and session ID exactly as emitted. Reject stale answers instead of
+retagging them for a new phase. Identical dispatch replay is a no-op; conflicting replay fails.
+`RT init <id> --launch <file> --legacy` explicitly enables historical full prompts/role-only
+submission; alternatively `RT next <id> --legacy` and
+`RT submit <id> --role <key> --json <file|-> --legacy` opt in per command. Put boolean
+`--legacy` last so it cannot consume a positional argument. Add `--model <actual-model>`
+only when known; manual dispatch otherwise records unknown, not the intended route.
+
+Setup supplies `factory-{writer|reviewer|probe}-{mechanical|standard|strong|planning|cheap}`
+worker profiles with provider-prefixed models. The adapter classifies `test-author`, `fixer`
+and `review-editorial-*` as writers; other roles ending `-probe` as probes; remaining roles
+(including planner, runner and integrator) as reviewers. Tier selection matches the intended
+model against `opencode-assets/worker-profiles.json`; preserve Sonnet 4.6 for mechanical work.
+Reviewers/probes deny product edits but retain live shell/network/build/infrastructure probe
+ability under host permissions; the controller persists their JSON. Record the **actual**
+model reported by the server, requested model and fallback separately. `small_model` is not
+worker routing. Confirm model aliases exist for the host provider before claiming work.
+
 Repeat until the target is drained or a stop condition fires. Between items report:
 CLOSED / FAILED / ESCALATED / BLOCKED deltas, cost if asked (`DRV cost`).
 
 ## Recovery
 
-- An item stuck CLAIMED/ACTIVE with no live run → `DRV reset <id>` re-queues it.
+- Inspect `DRV resume`, saved session/dispatch metadata and server durable state before
+  relaunching. Never reset a claim or create a duplicate dispatch while its worker is live.
 - `RT status <id>` prints the current phase / gates / pending keys — resume from there rather
-  than re-running `init` (which would restart the item's state machine).
-- `RT next` never resets already-submitted verdicts; a re-submit of a completed phase's role is
-  rejected loudly with no state change. Re-running `next` after an interruption is always safe.
+  than re-running `init` (which refuses an existing same-claim attempt).
+- Resume only pending dispatches in the existing attempt. Let the runtime validate content
+  fingerprints and invalidate stale downstream evidence; never manually reuse a verdict after
+  changing its reviewed input. Resume server work with the entire persisted batch and original
+  config; never narrow `--ids` while old server sessions may still be active.
+- For native Claude-origin claims, use original saved-session replay or `DRV resume --reuse`
+  and `mark-launched` as documented in the Claude controller manual; OpenCode progress is a
+  different protocol. `reset` is reserved for intentionally abandoned, confirmed-dead claims.
 - A FAILED/ESCALATED/BLOCKED item with a reviewer-converged remedy or owner ruling →
   `DRV recover <id>` scaffolds the direct-recovery (dissent digest, delta re-gate prompts,
   evidence contract, `#Nr` fold skeleton) — the dominant close path. You apply the remedy in the

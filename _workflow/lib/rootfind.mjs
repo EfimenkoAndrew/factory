@@ -9,8 +9,8 @@
 //   - swapMountPrefix: rewrite the committed config's stock-prefixed root/paths onto the real
 //     mount at load time, so the checked-in config stays pristine in every host.
 // Pure path math + injectable io (selftest-covered).
-import { existsSync } from 'node:fs';
-import { dirname, resolve, sep } from 'node:path';
+import { existsSync, realpathSync } from 'node:fs';
+import { dirname, resolve, relative, isAbsolute, sep } from 'node:path';
 
 export const STOCK_MOUNT = '_bmad-output/ai-factory';
 
@@ -36,6 +36,16 @@ export function resolveRepoRoot(factoryRoot, env, io) {
   const override = env && env.FACTORY_REPO_ROOT;
   if (override) return resolve(String(override));
   return findRepoRoot(factoryRoot, io) || resolve(factoryRoot, '..', '..');
+}
+
+export function containedMountRelative(repoRoot, factoryRoot) {
+  const inside = (root, mount) => {
+    const rel = relative(root, mount);
+    return rel && rel !== '..' && !rel.startsWith('..' + sep) && !isAbsolute(rel) ? toPosix(rel) : null;
+  };
+  if (!inside(resolve(repoRoot), resolve(factoryRoot))) return null;
+  try { return inside(realpathSync(repoRoot), realpathSync(factoryRoot)); }
+  catch { return null; }
 }
 
 // Rewrite cfg.root + every cfg.paths[*] whose value is the stock mount (or lives under it) onto

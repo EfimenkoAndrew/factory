@@ -39,18 +39,20 @@ fold or report on the factory.
 
 You have no native equivalent of Claude Code's `Workflow` tool, so use the `_workflow/opencode/`
 binding — a real Node CLI that re-implements the deterministic half of the pipeline and lets you
-supply the subagent calls via your own `Task` tool:
+supply independent sessions via v1 `Task`, v2 `subagent`, or the version-compatible
+Node dispatcher. Load the `ai-factory` controller skill before operating the protocol:
 
 ```
-node <mount>/_workflow/opencode/runtime.mjs init <itemId>
+node <mount>/_workflow/opencode/runtime.mjs init <itemId> --launch <mount>/state/run-args-<label>.json
 node <mount>/_workflow/opencode/runtime.mjs next <itemId>      # -> {mechanical:...} or {agents:[...]}
-node <mount>/_workflow/opencode/runtime.mjs submit <itemId> --role <key> --json <file|->
+node <mount>/_workflow/opencode/runtime.mjs submit <itemId> --role <key> --dispatch <dispatch-id> --json <file|->
 node <mount>/_workflow/opencode/runtime.mjs mech <itemId> <verify|leftover|integrate|checkpoint>
 node <mount>/_workflow/opencode/runtime.mjs finalize <itemId>
 ```
 
-Dispatch every agent in a `{agents:[...]}` step through `Task` — one genuinely separate subagent
-per role, all in a single message when there is more than one (that mirrors the native runtime's
-`Promise.all`, and keeps the reviewer independent of the implementer's reasoning trail, which is
-the invariant the whole review band rests on). Read `_workflow/opencode/README.md` for the full
-protocol and its documented fidelity gaps (KI-O1).
+Dispatch only pending entries, one genuinely separate session per dispatch ID; parallelize
+independent readers and serialize overlapping writers. Read each descriptor's JSON `promptRef`
+and pass its `prompt`. Call `next` after `submit`; submission does not auto-next.
+Prefer `node <mount>/_workflow/opencode/dispatch.mjs --url <server-url> --ids <claimed-ids>`
+with optional `--version v1|v2 --config <host-local-json>`. The dispatcher finalizes; the
+controller folds. Read `_workflow/opencode/README.md` for configuration and recovery.

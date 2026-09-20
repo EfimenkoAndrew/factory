@@ -1,0 +1,30 @@
+[
+  {
+    "version": 1,
+    "kind": "acceptance",
+    "id": "synthetic-human-decision-1",
+    "runId": "synthetic-run",
+    "itemId": "synthetic-item",
+    "status": "accepted",
+    "delivered": true,
+    "actor": "synthetic-human",
+    "sourceRef": "fixture:explicit-human-decision",
+    "recordedAt": "2026-09-19T12:00:00Z",
+    "escapedDefects": null,
+    "correctionMinutes": 5
+  },
+  {
+    "version": 1,
+    "kind": "finding",
+    "id": "synthetic-adjudication-1",
+    "runId": "synthetic-run",
+    "itemId": "synthetic-item",
+    "snapshotId": "synthetic-snapshot",
+    "role": "review-code",
+    "findingId": "synthetic-finding",
+    "canonicalFindingId": "synthetic-guard-missing",
+    "adjudication": "valid",
+    "independent": true,
+    "blind": true
+  }
+]

@@ -164,7 +164,7 @@ export function applyStallDetection(ledger, cfg, results, priorByItem) {
     if (!row) continue;
     const cur = gateFindingsSummary(r);
     const sig = failSignature(r.note);
-    if (cur) {
+    if (cur && cur.blockingGates) {
       // the richer, already-working comparison — unchanged, and it always wins when gate-band data
       // exists (this branch never second-guesses it with the coarser signature).
       const prev = (priorByItem && priorByItem[r.id]) || null;
@@ -183,6 +183,9 @@ export function applyStallDetection(ledger, cfg, results, priorByItem) {
       row.stallRounds = (row.stallRounds || 0) + 1;
       row.stallReason = 'signature';
       if (row.stallRounds >= maxStall) stalled.push({ id: r.id, stallRounds: row.stallRounds, reason: 'signature', signature: sig });
+    } else {
+      row.stallRounds = 0;
+      row.stallReason = null;
     }
     // Always advance to THIS round's signature (even null, even on a cur-truthy round) so the next
     // comparison is against the immediately-preceding round — never a stale one from several rounds

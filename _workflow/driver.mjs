@@ -18,9 +18,10 @@
 
 import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync, statSync, renameSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import { dirname, join, basename, relative, resolve as presolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { resolveRepoRoot, swapMountPrefix, toPosix, STOCK_MOUNT } from './lib/rootfind.mjs';
+import { resolveRepoRoot, containedMountRelative, swapMountPrefix, toPosix, STOCK_MOUNT } from './lib/rootfind.mjs';
 import {
   emptyLedger, loadLedger, syncFromGraph, transition, foldResults,
   countByState, writeJsonAtomic, readJson, unwrapResultEnvelope, ACTIVE, OFFRAMPS, FORWARD,
@@ -35,6 +36,10 @@ import { loadRouting, resolve as routeResolve, concurrencyFor } from './lib/rout
 import { addWorktree, removeWorktree, pruneStaleBranch, listWorktrees, changedFiles, pruneWorktrees, isFactoryWorktreePath, parseComposeLs, strayComposeProjects } from './lib/worktree.mjs';
 import { acquireLock, releaseLock } from './lib/lock.mjs';
 import { parseVerifyRaw, verdictFromParse, debrisFiles, parseRedRaw, hasRealInfraMarker, touchedRootCause, effectiveBaseline, decodeTranscript, flakeSuspects, isPhantomBaseline, annotateBaselineReason } from './lib/verify.mjs';
+import { captureBaseline } from './lib/baseline.mjs';
+import { EVIDENCE_IDENTITY_VERSION } from './lib/evidence-identity.mjs';
+import { resolvedBuildCapacity } from './lib/driver-integration.mjs';
+import { driverEngineMount, preflightProductGitlinks } from './lib/driver-evidence.mjs';
 import { preflight, dockerAvailable } from './lib/preflight.mjs';
 import { classifyFilesEntry, buildBasenameIndex, acceptanceSurfaceGaps } from './lib/graphaudit.mjs';
 import { renderFeedback, mergeFeedbackHistory } from './lib/feedback.mjs';
@@ -44,7 +49,7 @@ import { clusterBySimilarity, sharedLabel, perCliqueBatchPatterns, bestClosedPre
 import { loadController, isStale as controllerStale, claimController, verifyController, releaseController, DEFAULT_TTL_MINUTES } from './lib/controller.mjs';
 import { buildFactoryRouting } from './lib/routing-drift.mjs';
 import { githubIssueToItem, markdownChecklistToItems, ingestReport, enforceIngestTier, countCheckedBoxes } from './lib/ingest.mjs'; // KI-E27 — multi-source issue ingestion
-import { snapshotMainFiles, driftAgainstSnapshot, dirtyMainPaths, filesOverlapDirty, splitDriftByStatus, repairDirtyDrift, unclaimedMainDrift, matchWorktreeDebris } from './lib/mainguard.mjs';
+import { snapshotMainFiles, driftAgainstSnapshot, dirtyMainPaths, filesOverlapDirty, splitDriftByStatus, unclaimedMainDrift, matchWorktreeDebris } from './lib/mainguard.mjs';
 import { buildDocMap, readRoleBriefs, readRepoProfiles } from './lib/promptpack.mjs';
 import { loadPolicies, renderPolicies, POLICY_TEXT } from './lib/policy.mjs'; // PR#9 review — host-policy gating (no-comments / no-schema-changes are per-host, never universal)
 // KI-E7 — telemetry is OBSERVATIONAL ONLY (ai-factory-observability spine AD-1..3/AD-11): emit()
@@ -57,6 +62,8 @@ import { lintWorktreeDocClaims } from './lib/doclint.mjs'; // F2 — phantom doc
 import { findLeftovers } from './lib/leftover-scan.mjs'; // KI-D12 — deferral/tech-debt lexicon detection aid at fold (WARN-only)
 import { findComments } from './lib/comment-scan.mjs'; // KI-E59 — no-new-comments detection aid at fold (WARN-only)
 import { detectNarrativeVerdictContradiction, detectUnresolvedCaveatOnClose } from './lib/narrative-check.mjs'; // KI-E67 — narrative-vs-verdict contradiction detection aid at fold (WARN-only); KI-E74C — the mirror direction
+import { effectiveInfraRequirement } from './lib/effective-infra.mjs';
+import { eligibleItems, disjointItems, admitAttempt, lifecycleObservation, observe, observePhysical, observeAdmission, originalInfraRequirement, normalizedInfraResult, containedFile, verifyTranscript, verificationExpectations, verifyNativeReceipt, verifyFinalTranscript, verifyAttemptTranscript, verifyRecoveryTranscript, affectedVerificationTargets, invokedOpenCodeDispatch, worktreeGcGroups, usageIdentity, matchesClaim } from './lib/driver-integration.mjs';
 
 // KI-B1 (closed 2026-07-12): config-authoritative routing for every emitted batch — built from
 // config/model-routing.json via the SAME mapping the drift guard checks, injected into runArgs as
@@ -75,6 +82,7 @@ const FACTORY_ROOT = presolve(HERE, '..');           // the factory mount (stock
 // paths onto the actual mount, so ANY submodule/clone location works unchanged.
 const REPO_ROOT = resolveRepoRoot(FACTORY_ROOT, process.env);
 const MOUNT_REL = toPosix(relative(REPO_ROOT, FACTORY_ROOT));
+const MAIN_MOUNT_REL = containedMountRelative(REPO_ROOT, FACTORY_ROOT);
 const CONFIG_PATH = join(FACTORY_ROOT, 'config', 'factory.config.json');
 
 // KI-L60 — shadow-driver guard. Every factory ITEM WORKTREE is a full checkout containing its own
@@ -107,6 +115,39 @@ function loadConfig() {
 }
 function abs(p) { return presolve(REPO_ROOT, p); }
 function now() { return new Date().toISOString(); }
+function observeReservation(row, id) {
+  temit({ source: 'driver', event: 'claim_reserved', item: id, runId: row.runId,
+    attrs: { claimId: row.claimId, candidateAttemptNumber: row.attemptNumber, reservedAt: row.attemptIdentity.reservedAt } });
+}
+function collectAdmissions(cfg, ledger) {
+  let changed = false;
+  for (const row of Object.values(ledger.items || {})) {
+    if (!row.attemptIdentity) continue;
+    for (const name of ['progress.json', 'result.json', 'opencode-progress.json']) {
+      try {
+        const path = abs(join(cfg.paths.items, row.id, name));
+        const checkpoint = readJson(path);
+        const result = checkpoint.res || checkpoint;
+        if (result.id !== row.id || statSync(path).mtimeMs < Date.parse(row.attemptIdentity.reservedAt || row.attemptIdentity.startedAt)) continue;
+        changed = observeAdmission(result, row, temit) || changed;
+        observePhysical({ results: [result] }, ledger.items, temit);
+      } catch { /* checkpoint may not yet exist */ }
+    }
+  }
+  for (const row of Object.values(ledger.items || {})) {
+    const dir = abs(join(cfg.paths.items, row.id, 'dispatch'));
+    for (const file of existsSync(dir) ? readdirSync(dir).filter(n => n.endsWith('-session.json')) : []) {
+      try {
+        const state = readJson(join(dir, file));
+        if (state.runId !== row.runId || state.attemptId !== row.claimId || state.itemId !== row.id) continue;
+        if (invokedOpenCodeDispatch(state)) changed = observeAdmission({ id: row.id, runId: state.runId, claimId: state.attemptId,
+          admission: { attempted: true, startedAt: Number.isFinite(state.startedAt) ? new Date(state.startedAt).toISOString() : null } }, row, temit) || changed;
+        if (state.observation) observePhysical({ attemptObservations: [state.observation] }, ledger.items, temit);
+      } catch { /* dispatch persistence may still be in progress */ }
+    }
+  }
+  if (changed) writeJsonAtomic(abs(cfg.paths.ledger), ledger);
+}
 function parseFlags(argv) {
   const f = {}; const rest = [];
   for (let i = 0; i < argv.length; i++) {
@@ -386,6 +427,7 @@ function cmdSelect(flags) {
   const routing = loadRouting(abs(cfg.paths.modelRouting));
   const max = flags.max ? parseInt(flags.max, 10) : 4;
   const ready = computeReady(graph, ledger, {
+    repoRoot: REPO_ROOT,
     maxItemRetries: cfg.maxItemRetries,
     target: flags.target || null,
     themes: flags.themes ? String(flags.themes).split(',') : null,
@@ -401,12 +443,16 @@ function cmdSelect(flags) {
   } else {
     picked = ready.slice(0, max);
   }
+  picked = disjointItems(picked, flags.ids ? Infinity : max, { repoRoot: REPO_ROOT });
   let worktree = null;
   if (flags.worktree) {
     const [path, branch] = String(flags.worktree).split(':');
     worktree = { path, branch: branch || ('factory/' + (flags.target || 'cycle')) };
   }
   const runArgs = {
+    runId: randomUUID(), runtimeVersion: readFileSync(join(FACTORY_ROOT, 'VERSION'), 'utf8').trim(),
+    engineMount: driverEngineMount(REPO_ROOT, FACTORY_ROOT),
+    buildCapacity: resolvedBuildCapacity(cfg, flags), evidenceInputs: cfg.evidenceInputs || {},
     cycle: ledger.cycle + 1,
     posture: flags.posture || 'throttled',
     concurrency: concurrencyFor(routing, flags.posture || 'throttled'),
@@ -437,18 +483,46 @@ function cmdSelect(flags) {
     }),
   };
   writeJsonAtomic(abs(cfg.paths.runArgs), runArgs);
+  const runScriptPath = emitLauncherScript(cfg, runArgs);
   console.log(`select: ${picked.length}/${ready.length} schedulable item(s) -> ${cfg.paths.runArgs}`);
+  if (runScriptPath) console.log(`  launcher: Workflow({scriptPath: "${runScriptPath}"})`);
   console.log('picked:', picked.map((w) => `${w.id}(${w.severity}/${w.fixType})`).join(', ') || '(none)');
   for (const w of picked) console.log('  review-flows', w.id + ':', applicableReviewFlows(cfg, w).map((f) => f.skill.replace('bmad-', '') + (f.blocking ? '' : '~adv')).join(', ') || '(none)');
 }
 
-function cmdClaim(ids) {
+function cmdClaim(ids, flags = {}) {
   const cfg = loadConfig();
+  const engineMount = driverEngineMount(REPO_ROOT, FACTORY_ROOT);
+  preflightProductGitlinks(REPO_ROOT, engineMount);
   const graph = loadGraph(abs(cfg.paths.graph));
   const ledger = loadLedger(abs(cfg.paths.ledger));
   let n = 0;
-  for (const id of ids) { if (transition(ledger, id, 'CLAIMED', 'driver-claim')) { n++; temit({ source: 'driver', event: 'transition', item: id, cycle: ledger.cycle, outcome: 'CLAIMED' }); } } // KI-E7 finding #12: every state mutation emits, or the items gauge drifts
+  const runId = randomUUID();
+  const eligible = new Set(disjointItems(eligibleItems(graph, ledger, cfg, {}, { repoRoot: REPO_ROOT, dirty: dirtyMainPaths(REPO_ROOT), docker: dockerAvailable() }).filter(w => ids.includes(w.id)), Infinity, { repoRoot: REPO_ROOT }).map(w => w.id));
+  for (const id of eligible) if (ledger.items[id]?.worktree) preflightProductGitlinks(abs(ledger.items[id].worktree), engineMount);
+  for (const id of ids) {
+    if (!eligible.delete(id)) continue;
+    if (transition(ledger, id, 'CLAIMED', 'driver-claim')) {
+      n++;
+      admitAttempt(ledger.items[id], runId, { cycle: ledger.cycle + 1, band: bandFor(byId(graph)[id]) });
+      temit({ source: 'driver', event: 'transition', item: id, cycle: ledger.cycle, outcome: 'CLAIMED' });
+    }
+  }
   writeJsonAtomic(abs(cfg.paths.ledger), ledger);
+  try {
+    const launch = readJson(abs(cfg.paths.runArgs));
+    const admitted = ids.filter(id => ledger.items[id]?.runId === runId);
+    if (admitted.length && (launch.items || []).every(it => admitted.includes(it.id))) {
+      launch.runId = runId;
+      launch.buildCapacity = resolvedBuildCapacity(cfg, flags);
+      launch.evidenceInputs = cfg.evidenceInputs || {};
+      launch.engineMount = engineMount;
+      for (const it of launch.items) Object.assign(it, { runId, claimId: ledger.items[it.id].claimId, claimAt: ledger.items[it.id].attemptIdentity.reservedAt, attemptNumber: ledger.items[it.id].attemptNumber });
+      writeJsonAtomic(abs(cfg.paths.runArgs), launch);
+      emitLauncherScript(cfg, launch);
+    }
+  } catch { /* legacy claim may have no select envelope */ }
+  for (const id of ids) if (ledger.items[id]?.runId === runId) observeReservation(ledger.items[id], id);
   writeReports(cfg, ledger, graph);
   console.log(`claimed ${n}/${ids.length}`);
 }
@@ -481,19 +555,16 @@ function deterministicVerifyOverride(cfg, ledger, wi, r) {
   if (!claims.some((s) => FORWARD_PASS.has(s))) return null;
   const id = r.id;
   const readIf = (f) => { const p = abs(join(cfg.paths.items, id, f)); return existsSync(p) ? decodeTranscript(readFileSync(p)) : null; }; // KI-E54: BOM-aware decode, not a hardcoded 'utf8' assumption
-  const codeChange = !!r.codeChange;
-  // KI-E43 — effective baseline: the run-reported array OR the RED-time pre-fix full-suite transcript
-  // (baseline-raw.txt), whichever counts MORE pre-existing failures. Cycle 47 (ITEM-H15): the
-  // LIGHT-band verify skips the full suite, so baselineFailures folded [] while integrate's full suite
-  // carried 6 pre-existing Docker-unavailable Testcontainers failures — a 10/10-APPROVED item
-  // false-FAILED on exactly this comparison. The transcript is teed at RED time (tree still unfixed),
-  // so it can never launder a fix-broken test into the baseline; failures beyond it stay regressions.
+  const codeChange = !!r.codeChange || (wi?.files || []).some(f => /\.cs$/i.test(f));
+  // Only target-bound pre-fix machine evidence authorizes suite failure identities.
+  // Legacy reported counts remain diagnostic; they never grant a failure allowance.
   // KI-E43 reFix fence (review find): "the tree is still unfixed at RED time" holds ONLY on a first
   // attempt — a reFix worktree already carries the prior FAILED fix, so a baseline RE-captured during
   // the reFix round would launder that fix's own breakage into the allowance. The transcript is
   // trusted on a reFix (prevState FAILED/ESCALATED) only when its mtime PREDATES this attempt's
   // claim (i.e. it is the FIRST round's capture); a re-capture is ignored loudly. The brief also
   // tells the test-author not to re-capture — this fence is the deterministic backstop.
+  let baselineText = null;
   const baselineParse = (() => {
     const p = abs(join(cfg.paths.items, id, 'baseline-raw.txt'));
     if (!existsSync(p)) return null;
@@ -503,13 +574,16 @@ function deterministicVerifyOverride(cfg, ledger, wi, r) {
       const claimMs43 = ch.length ? Date.parse(ch[ch.length - 1].at) : 0;
       let mtime43 = Infinity; try { mtime43 = statSync(p).mtimeMs; } catch { /* unreadable -> distrust */ }
       if (claimMs43 && mtime43 >= claimMs43) {
-        console.log(`  KI-E43 reFix fence ${id}: baseline-raw.txt was (re)captured DURING this reFix attempt — the tree already carries the prior fix, so the transcript is IGNORED (the run-reported baseline stands)`);
+        console.log(`  KI-E43 reFix fence ${id}: baseline-raw.txt was (re)captured DURING this reFix attempt — the tree already carries the prior fix, so the transcript is IGNORED (no failure allowance)`);
         return null;
       }
     }
-    return parseVerifyRaw(decodeTranscript(readFileSync(p))); // KI-E54: BOM-aware decode
+    baselineText = decodeTranscript(readFileSync(p));
+    return parseVerifyRaw(baselineText);
   })();
-  const baseline = effectiveBaseline(r.baselineFailures, baselineParse);
+  const baselineCount = effectiveBaseline(r.baselineFailures, baselineParse);
+  const baselineOptions = { worktree: abs(ledger.items[id]?.worktree || r.worktree || '') };
+  const baseline = captureBaseline(baselineText, baselineOptions);
   // KI-E163 (ported from a host-mount session) — defense-in-depth for KI-E162's upstream fix.
   // `baseline` reads as 0 for two very different reasons that are indistinguishable in the number
   // alone: a REAL measurement (a baseline run genuinely found zero pre-existing failures) or a
@@ -521,7 +595,7 @@ function deterministicVerifyOverride(cfg, ledger, wi, r) {
   // instruction is not a guarantee an agent follows it every time, on every item shape. This is the
   // downstream half: even when the prompt-side fix does not take, the override's own message stops
   // presenting a phantom 0 with the same unqualified confidence as a real measurement.
-  const baselineIsPhantom = isPhantomBaseline(baseline, r.baselineFailures, baselineParse);
+  const baselineIsPhantom = isPhantomBaseline(baselineCount, r.baselineFailures, baselineParse);
   const annotateBaseline = (reason) => annotateBaselineReason(reason, baselineIsPhantom);
   const fail = (reason) => {
     r.transitions = ['FAILED']; r.toState = 'FAILED';
@@ -536,10 +610,31 @@ function deterministicVerifyOverride(cfg, ledger, wi, r) {
   // 2026-06-27: the runner self-reported green but did not tee verify-raw.txt; the integrate transcript proved
   // global green — failing the item on the missing intermediate file was wrong; the red proof + integrate
   // green are conclusive.)
-  const rawText = readIf('verify-raw.txt');
-  const intText = readIf('integrate-raw.txt');
-  const vVerdict = rawText ? verdictFromParse(parseVerifyRaw(rawText), baseline) : { pass: true, reason: 'no-machine-evidence' };
-  const iVerdict = intText ? verdictFromParse(parseVerifyRaw(intText), baseline) : { pass: true, reason: 'no-machine-evidence' };
+  const row = ledger.items[id] || {};
+  const recoveryProof = codeChange && (row.attemptIdentity?.recovery || r.recoveryVerification)
+    ? verifyRecoveryTranscript({ result: r, row, itemDir: abs(join(cfg.paths.items, id)), worktree: abs(row.worktree || r.worktree || ''), repoRoot: REPO_ROOT, baseline, evidenceInputs: cfg.evidenceInputs || {}, engineMount: driverEngineMount(REPO_ROOT, FACTORY_ROOT) }) : null;
+  if (recoveryProof && !recoveryProof.pass) return fail('recovery verification: ' + recoveryProof.reason);
+  const nativeProof = !recoveryProof ? verifyNativeReceipt({ result: r, row, item: wi, itemDir: abs(join(cfg.paths.items, id)),
+    worktree: abs(row.worktree || r.worktree || ''), repoRoot: REPO_ROOT, codeChange,
+    evidenceInputs: cfg.evidenceInputs || {}, engineMount: driverEngineMount(REPO_ROOT, FACTORY_ROOT),
+    expectedContract: { policies: loadPolicies(FACTORY_ROOT), profile: readRepoProfiles(join(abs(cfg.paths.agents), 'repo-profiles'))[wi?.target] || '',
+      briefs: readRoleBriefs(abs(cfg.paths.agents)), briefsDirectory: abs(cfg.paths.agents) } }) : null;
+  if (nativeProof && !nativeProof.pass) return fail('native evidence: ' + nativeProof.reason);
+  const finalProof = !recoveryProof ? verifyFinalTranscript({ result: r, item: wi, itemDir: abs(join(cfg.paths.items, id)),
+    worktree: abs(row.worktree || r.worktree || ''), repoRoot: REPO_ROOT,
+    claimAt: row.attemptIdentity?.recovery ? null : row.attemptIdentity?.reservedAt || row.attemptIdentity?.startedAt,
+    targets: row.verificationTargets || (wi?.solution ? [wi.solution] : []), baseline, nativeProof, evidenceInputs: cfg.evidenceInputs || {}, engineMount: driverEngineMount(REPO_ROOT, FACTORY_ROOT) }) : null;
+  if (finalProof && !finalProof.pass) return fail('final verification: ' + finalProof.reason);
+  const proofArgs = { result: r, row, item: wi, itemDir: abs(join(cfg.paths.items, id)), worktree: abs(row.worktree || r.worktree || ''),
+    repoRoot: REPO_ROOT, targets: row.verificationTargets || (wi?.solution ? [wi.solution] : []), baseline };
+  const initialProof = codeChange && !finalProof && !recoveryProof ? verifyAttemptTranscript({ ...proofArgs, phase: 'initial' }) : null;
+  const integrationProof = recoveryProof || (codeChange ? verifyAttemptTranscript({ ...proofArgs, phase: 'integrate' }) : null);
+  if (initialProof && !initialProof.pass) return fail('initial verification: ' + initialProof.reason);
+  if (integrationProof && !integrationProof.pass) return fail('integration verification: ' + integrationProof.reason);
+  const rawText = recoveryProof?.text || finalProof?.text || initialProof?.text || readIf('verify-raw.txt');
+  const intText = integrationProof?.text || readIf('integrate-raw.txt');
+  const vVerdict = rawText ? verdictFromParse(parseVerifyRaw(rawText), baseline, baselineOptions) : { pass: true, reason: 'no-machine-evidence' };
+  const iVerdict = intText ? verdictFromParse(parseVerifyRaw(intText), baseline, baselineOptions) : { pass: true, reason: 'no-machine-evidence' };
   if (!vVerdict.pass) return fail('verify transcript: ' + annotateBaseline(vVerdict.reason));
   if (!iVerdict.pass) return fail('integrate transcript: ' + annotateBaseline(iVerdict.reason));
   // P3 — a CODE item MUST carry machine green in EITHER transcript; absence in BOTH is agent-trust → FAIL.
@@ -561,7 +656,7 @@ function deterministicVerifyOverride(cfg, ledger, wi, r) {
       if (!t) return false;
       const p = parseVerifyRaw(t);
       return p.build && p.build.exit === 0 && p.build.errors === 0
-        && ((p.suite && (p.suite.failed - baseline) <= 0) || p.suiteExit === 0);
+        && (p.suite || p.suiteExit === 0) && verdictFromParse(p, baseline, baselineOptions).pass;
     });
     if (!pairOk) return fail('FULL-band code item lacks a build+suite green PAIR in any transcript (KI-E19 manifest rule) — build-only or filter-only evidence cannot CLOSE it');
   }
@@ -617,7 +712,8 @@ function deterministicVerifyOverride(cfg, ledger, wi, r) {
 
   // P2 — real-infra: a needsRealInfra item must carry a real container marker (not an EF in-memory green).
   // Accept the marker in EITHER transcript (the realInfra test may run in the verify OR the integrate suite).
-  if (r.needsRealInfra && !hasRealInfraMarker(rawText || '') && !hasRealInfraMarker(intText || '')) {
+  if (effectiveInfraRequirement(normalizedInfraResult(r), originalInfraRequirement(wi) || row.originalNeedsRealInfra === true)
+    && !hasRealInfraMarker(rawText || '') && !(finalProof ? false : hasRealInfraMarker(intText || ''))) {
     return fail('realInfra item has no FACTORY::REALINFRA:: container marker — a money/security/concurrency/idempotency CRITICAL/HIGH cannot CLOSE on an in-memory green');
   }
 
@@ -639,7 +735,7 @@ function deterministicVerifyOverride(cfg, ledger, wi, r) {
   // human can tell "retried after a fix" from "this test is unstable" — the distinction KI-E65's
   // flaky-test-folded-CLOSED incident had no signal for.
   try {
-    const flaky = [...new Set([...flakeSuspects(vText || ''), ...flakeSuspects(intText || '')])];
+    const flaky = [...new Set([...flakeSuspects(rawText || ''), ...flakeSuspects(intText || '')])];
     if (flaky.length) console.log(`  KI-E108 ${id}: FLAKE SUSPECT — test class(es) both PASSED and FAILED in this run: ${flaky.join(', ')}. Advisory only (a fix-then-retry shows the same pattern); if it was not a retry, this test is unstable and will re-band the item.`);
   } catch { /* advisory only — a flake scan must never affect a fold */ }
   // P9 — the fix must change real (non-test) code; a diff that touched ONLY tests greened the test, not the bug.
@@ -654,6 +750,7 @@ function deterministicVerifyOverride(cfg, ledger, wi, r) {
   if (codeChange && r.integrateRaw && (r.toState === 'INTEGRATED' || r.toState === 'CLOSED' || claims.includes('INTEGRATED'))) {
     if (!intText) return fail('code item reached INTEGRATED with no integrate-raw.txt — global green unverified');
     if (iVerdict.reason === 'no-machine-evidence') return fail('integrate-raw.txt has no FACTORY:: build/suite markers — global green unverified');
+    if (finalProof && (integrationProof?.mtimeMs || statSync(abs(join(cfg.paths.items, id, 'integrate-raw.txt'))).mtimeMs) < finalProof.mtimeMs) return fail('integrate transcript predates final verification snapshot');
   }
   return null;
 }
@@ -695,6 +792,8 @@ function cmdFold(file, flags) {
   const cfg = loadConfig();
   const graph = loadGraph(abs(cfg.paths.graph));
   const ledger = loadLedger(abs(cfg.paths.ledger));
+  collectAdmissions(cfg, ledger);
+  collectAdmissions(cfg, ledger);
   const items = byId(graph);
   // KI-L61: accept the results path repo-root-relative (canonical) OR factory-root-relative (the
   // the run protocol §3 example form `fold state/results-cycle-<N>.json`); absolute passes through the
@@ -709,14 +808,46 @@ function cmdFold(file, flags) {
   // KI-E31: accept the Workflow harness envelope directly (unwrap {…,result:{…}} → the fold payload), so
   // `fold <task-output>` no longer needs hand-extraction. A direct results file passes through unchanged.
   const results = unwrapResultEnvelope(readJson(foldPath)) || {};
-  const arr = Array.isArray(results) ? results : (Array.isArray(results.results) ? results.results : []);
+  const allResults = Array.isArray(results) ? results : (Array.isArray(results.results) ? results.results : []);
+  observePhysical(Array.isArray(results) ? { results } : results, ledger.items, temit);
+  const seenResults = new Set();
+  const arr = allResults.filter(r => {
+    if (!r || !ledger.items[r.id]) return false;
+    if (!r.resultId && (r.budgetStopped || r.budgetDeferred || r.failure?.kind === 'budget')) {
+      r.resultId = r.id + '#defer:' + (ledger.items[r.id].claimId || ('legacy-' + results.cycle));
+    }
+    const identity = r.resultId || r.id;
+    if (seenResults.has(identity)) return false;
+    seenResults.add(identity);
+    if (r.resultId && ledger.folded?.[r.resultId]) return false;
+    const row = ledger.items[r.id];
+    if (!matchesClaim(r, row)) { console.log('fold: claim identity mismatch for ' + r.id); return false; }
+    r.runId ||= results.runId;
+    if (r.runId && row?.runId && r.runId !== row.runId) {
+      console.log('fold: stale run identity rejected for ' + r.id); return false;
+    }
+    if (!r.runId && row?.attemptIdentity && (statSync(foldPath).mtimeMs < Date.parse(row.attemptIdentity.reservedAt || row.attemptIdentity.startedAt)
+      || (results.cycle && results.cycle !== row.attemptIdentity.cycle))) {
+      console.log('fold: legacy result predates current claim for ' + r.id); return false;
+    }
+    if (row?.attemptIdentity) {
+      r.runId ||= row.runId;
+      r.driverClaimId = row.claimId;
+      r.attemptNumber = row.attemptNumber;
+    }
+    return true;
+  });
   // Review fix (KI-E31 follow-up): a crashed/empty run's envelope must NOT fold 0 items with full
   // success affect (cycle bump + ledger rewrite + reports + exit 0). Zero results = loud stop.
-  if (!arr.length) {
+  if (!allResults.length) {
     console.error('fold: payload carried ZERO results — crashed/empty run or unexpected envelope shape (KI-E31)? Nothing folded; ledger untouched. If per-item checkpoints exist, use `driver reconstruct`.');
     process.exitCode = 1;
     return;
   }
+  if (!arr.length) { console.log('fold: no new current results (already folded or stale)'); return; }
+  for (const r of arr) observeAdmission({ ...r, admission: r.admission || results.admissionObservations?.find(a => a.itemId === r.id),
+    attemptObservations: [...(Array.isArray(r.attemptObservations) ? r.attemptObservations : []), ...(Array.isArray(results.attemptObservations) ? results.attemptObservations : [])] }, ledger.items[r.id], temit);
+  const executionStates = new Map(arr.map(r => [r.id, r.toState]));
   if (results.cycle) ledger.cycle = Math.max(ledger.cycle, results.cycle);
   // KI-L50 — infra-failure recovery. An agent that returns null after exhausting retries on a TERMINAL
   // infra error (out-of-credits, connection-closed, overloaded, rate-limit) makes the item finish
@@ -740,9 +871,20 @@ function cmdFold(file, flags) {
   const AUTO_INFRA_RE = /UNAVAILABLE \(null after retries|StructuredOutput retry cap \(\d+\) exceeded/; // KI-L68: harness-throw flavour of the KI-L50 infra class
   const infraCap = typeof cfg.maxInfraRetries === 'number' ? cfg.maxInfraRetries : 3;
   for (const r of arr) {
+    if (r.budgetDeferred || r.failure?.kind === 'budget' || r.budgetStopped) {
+      const row = ledger.items[r.id];
+      if (!row) continue;
+      row.budgetDeferrals = (row.budgetDeferrals || 0) + 1;
+      r.resultId ||= r.id + '#defer:' + (row.claimId || randomUUID());
+      r.attemptsDelta = 0;
+      r.toState = row.budgetDeferrals > (cfg.maxBudgetDeferrals ?? 3) ? 'ESCALATED' : 'FAILED';
+      r.transitions = [r.toState];
+      r.note = 'BUDGET-DEFERRED (quality attempt not counted; defer ' + row.budgetDeferrals + '): ' + (r.note || '');
+      continue;
+    }
     if (r.toState !== 'FAILED') continue;
     const manual = infraRetry.has(r.id);
-    const auto = !manual && (r.infraSuspect === true || AUTO_INFRA_RE.test(String(r.note || '')));
+    const auto = !manual && (r.infraSuspect === true || ['unavailable', 'malformed'].includes(r.failure?.kind) || AUTO_INFRA_RE.test(String(r.note || '')));
     if (!manual && !auto) continue;
     const row = ledger.items[r.id];
     const used = (row && row.infraRetries) || 0;
@@ -833,7 +975,8 @@ function cmdFold(file, flags) {
       // file, written unconditionally alongside last-failure.md, read by nothing else.
       writeFileSync(join(dir, 'last-failure.json'), JSON.stringify({
         id: r.id, cycle: cyc, transitions: r.transitions || [], gates: r.gates || {},
-        infraSuspect: !!r.infraSuspect, note: r.note || '',
+        infraSuspect: !!r.infraSuspect, failure: r.failure || null, note: r.note || '',
+        runId: r.runId, claimId: r.driverClaimId || r.claimId, attemptNumber: r.attemptNumber,
       }, null, 2));
     } catch { /* best-effort feedback artifact — never block the fold on it */ }
   }
@@ -934,16 +1077,9 @@ function cmdFold(file, flags) {
       // (no uncommitted edit, NOT untracked) can only have arrived via HUMAN commits (operator delivery).
       // Anything still dirty — including an UNTRACKED new file, which `git diff HEAD` cannot see (the
       // live ITEM-H5 stray shape; review fix) — keeps the wrote-outside-worktree contamination wording.
-      const { committed: committedDrift, dirty: dirtyDrift } = splitDriftByStatus(REPO_ROOT, drifted);
+      const { committed: committedDrift, dirty: dirtyDrift } = splitDriftByStatus(REPO_ROOT, drifted, { repoRoot: REPO_ROOT });
       if (dirtyDrift.length) {
-        // KI-E61 (2026-08-02): dirty drift has exactly one possible cause (splitDriftByStatus's own
-        // KI-E35 reasoning — the factory never commits), so auto-repair it instead of leaving a WARN
-        // for a human to notice hours later. Still loudly reported either way — repair success is
-        // NOT silent.
-        const repaired = repairDirtyDrift(REPO_ROOT, dirtyDrift);
-        const failed = dirtyDrift.filter((d) => d.repairError);
-        console.log(`  ⚠ MAIN-TREE CONTAMINATION ${r.id} (KI-L65) — AUTO-REPAIRED (KI-E61): item files had changed in the MAIN working tree during the run window (an agent wrote outside its worktree); restored to HEAD:\n` + repaired.map((d) => `      ${d.file} (${d.was} -> ${d.now}) -> restored`).join('\n'));
-        if (failed.length) console.log(`    ⚠ REPAIR FAILED for ${failed.length} file(s) — fix by hand:\n` + failed.map((d) => `      ${d.file}: ${d.repairError}`).join('\n'));
+        console.log(`  ⚠ MAIN-TREE DRIFT ${r.id}: dirty owner files differ from the claim snapshot; inspect before delivery. No files changed:\n` + dirtyDrift.map(d => `      ${d.file} (${d.was} -> ${d.now})`).join('\n'));
       }
       if (committedDrift.length) console.log(`  ℹ COMMITTED DELIVERY ${r.id} (KI-E35): item files changed in main via HUMAN commits during the run window (clean per git status) — likely the operator committed this item's output; verify intent, no repair needed:\n` + committedDrift.map((d) => `      ${d.file} (${d.was} -> ${d.now})`).join('\n'));
     } catch { /* detection aid only */ }
@@ -973,7 +1109,7 @@ function cmdFold(file, flags) {
         for (const f of Object.keys(snapFiles)) claimedPaths.add(f);
       } catch { /* no snapshot for this item, or unreadable — contributes nothing, matches cmdMainCheck */ }
     }
-    const unclaimed = unclaimedMainDrift(dirtyMainPaths(REPO_ROOT), MOUNT_REL, claimedPaths);
+    const unclaimed = unclaimedMainDrift(dirtyMainPaths(REPO_ROOT), MAIN_MOUNT_REL, claimedPaths, { repoRoot: REPO_ROOT });
     if (unclaimed.length) {
       // KI-E177 (ported from a host-mount session) — an unclaimed path that byte-matches this
       // fold's OWN item worktrees is overwhelming evidence of leaked contamination, not operator
@@ -996,11 +1132,12 @@ function cmdFold(file, flags) {
   // could not otherwise see what the previous round looked like. One snapshot, two consumers.
   const priorConvergence = {};
   for (const r of arr) { const row = ledger.items[r && r.id]; if (row && row.convergence) priorConvergence[r.id] = row.convergence; }
-  const bonuses = applyConvergenceBonus(ledger, cfg, arr);
+  const qualityResults = arr.filter(r => !r.budgetDeferred && !r.budgetStopped && r.failure?.kind !== 'budget');
+  const bonuses = applyConvergenceBonus(ledger, cfg, qualityResults);
   // KI-E105 — the opposite direction: two consecutive rounds with NO reduction in blocking findings
   // means the trajectory is not converging, so the remaining band(s) are near-certain waste. Park it
   // for a human instead (escalateExhausted below applies the transition).
-  const stalls = applyStallDetection(ledger, cfg, arr, priorConvergence);
+  const stalls = applyStallDetection(ledger, cfg, qualityResults, priorConvergence);
   // KI-E167 (ported from a host-mount session) — a stall can now be REPORTED via two distinct
   // evidence shapes — the original gate-band finding-count trend (`from`/`to`), or a pre-band failure
   // whose `note` signature repeated verbatim across consecutive rounds with no gate-band data to
@@ -1010,6 +1147,10 @@ function cmdFold(file, flags) {
     ? `  KI-E167 ${s.id}: NO-PROGRESS streak ${s.stallRounds} — the SAME pre-band failure ("${s.signature}") repeated verbatim with no gate-band data to compare — parking for a human instead of spending another band`
     : `  KI-E105 ${s.id}: NO-PROGRESS streak ${s.stallRounds} (findings ${s.from ? s.from.findings : '?'} -> ${s.to.findings}) — parking for a human instead of spending another band`);
   const escalated = escalateExhausted(ledger, cfg);
+  for (const r of arr) {
+    const row = ledger.items[r.id];
+    if (row?.attemptIdentity && applied.some(a => a.id === r.id)) row.attemptIdentity.completedAt ||= now();
+  }
   writeJsonAtomic(abs(cfg.paths.ledger), ledger);
   recordCostSnapshot(cfg, ledger); // per-cycle cost snapshot for the trend (observability, not a gate)
   writeReports(cfg, ledger, graph);
@@ -1028,6 +1169,8 @@ function cmdFold(file, flags) {
     for (const r of arr) {
       if (skippedIds.has(r.id) || !appliedIds.has(r.id)) continue;
       const row = ledger.items[r.id] || {};
+      if (row.attemptIdentity?.admitted && !r.budgetStopped) observe(lifecycleObservation(row.attemptIdentity, r.id, 'completed', row.state,
+        executionStates.get(r.id) === 'CLOSED' && row.state !== 'CLOSED'), temit);
       // KI-E47 — a recovery fold (#Nr resultId) emits NO derived stage timeline: the band's
       // timeline was emitted at the ORIGINAL fold, and the recovery's artifact mtimes measure the
       // operator-paced remedy/re-gate window (live: 4 re-gate rounds over hours folded as a fake
@@ -1063,7 +1206,7 @@ function cmdFold(file, flags) {
     temit({ source: 'driver', event: 'fold_summary', cycle: cyc, attrs: { file: basename(foldPath), applied: applied.length, rejected: rejected.length, skipped: skipped.length, overrides: overrides.length, infraRetries: infraApplied.length, escalated: escalated.length } });
     // KI-E23 (P6c): the run's token usage, returned by factory.js from the runtime budget counter —
     // cost analyses stop extrapolating from call counts. Observational only.
-    if (results && results.usage && typeof results.usage.outputTokens === 'number') temit({ source: 'driver', event: 'usage', cycle: cyc, attrs: { outputTokens: results.usage.outputTokens, file: basename(foldPath) } });
+    if (results && results.usage && typeof results.usage.outputTokens === 'number') temit({ source: 'driver', event: 'usage', runId: results.runId || arr[0]?.runId, cycle: cyc, attrs: { outputTokens: results.usage.outputTokens, usageId: usageIdentity({ ...results, results: arr }) } });
   } catch { /* observational only — a telemetry defect must never block a fold */ }
   console.log(`fold: applied ${applied.length}, rejected ${rejected.length}, skipped ${skipped.length}`
     + (overrides.length ? `, deterministic-overrides ${overrides.length}` : '')
@@ -1168,6 +1311,7 @@ function cmdResume(flags) {
   const graph = loadGraph(abs(cfg.paths.graph));
   const ledger = loadLedger(abs(cfg.paths.ledger));
   if (!ledger) { console.log('no ledger — nothing to resume'); return; }
+  collectAdmissions(cfg, ledger);
   const inflight = Object.values(ledger.items).filter((r) => ACTIVE.includes(r.state));
   console.log(`resume: cycle ${ledger.cycle}, ${inflight.length} in-flight item(s)`);
   // KI-E73: checkpoint detection now derives the relevant cycle from on-disk evidence (same rule as
@@ -1177,7 +1321,12 @@ function cmdResume(flags) {
   const hasCheckpoint = (id) => {
     const p = abs(join(cfg.paths.items, id, 'result.json'));
     if (!existsSync(p)) return false;
-    try { return readJson(p).resultId === id + '#' + cyc; } catch { return false; }
+    try {
+      const result = readJson(p), row = ledger.items[id];
+      return result.resultId === id + '#' + (row.attemptIdentity?.cycle || cyc)
+        && matchesClaim(result, row) && (!result.runId || result.runId === row.runId)
+        && (!row.attemptIdentity?.reservedAt || statSync(p).mtimeMs >= Date.parse(row.attemptIdentity.reservedAt));
+    } catch { return false; }
   };
   let resetN = 0;
   const relaunch = new Map(); // runScript -> [ids] — CLAIMED, no checkpoint, script still on disk
@@ -1226,15 +1375,9 @@ function cmdResume(flags) {
       try {
         const snapPath = abs(join(cfg.paths.items, id, 'main-snapshot.json'));
         if (!existsSync(snapPath)) continue;
-        const { committed, dirty } = splitDriftByStatus(REPO_ROOT, driftAgainstSnapshot(REPO_ROOT, (readJson(snapPath) || {}).files || {}));
+        const { committed, dirty } = splitDriftByStatus(REPO_ROOT, driftAgainstSnapshot(REPO_ROOT, (readJson(snapPath) || {}).files || {}), { repoRoot: REPO_ROOT });
         if (dirty.length) {
-          // KI-E61 (2026-08-02): same auto-repair as the fold check — dirty drift before a relaunch
-          // can only be contamination from the dead run (KI-E35), so fix it now rather than warn and
-          // let the relaunch read a poisoned main as its reference.
-          const repaired = repairDirtyDrift(REPO_ROOT, dirty);
-          const failed = dirty.filter((d) => d.repairError);
-          console.log(`    ⚠ MAIN-GUARD ${id} (KI-E41) — AUTO-REPAIRED (KI-E61): item files had DRIFTED in the MAIN tree since claim (an agent of the dead run wrote outside its worktree); restored to HEAD before relaunch:\n` + repaired.map((d) => `        ${d.file} (${d.was} -> ${d.now}) -> restored`).join('\n'));
-          if (failed.length) console.log(`      ⚠ REPAIR FAILED for ${failed.length} file(s) — fix by hand before relaunching:\n` + failed.map((d) => `        ${d.file}: ${d.repairError}`).join('\n'));
+          console.log(`    ⚠ MAIN-GUARD ${id}: dirty owner files differ from the claim snapshot; inspect before relaunch. No files changed:\n` + dirty.map(d => `        ${d.file} (${d.was} -> ${d.now})`).join('\n'));
         }
         if (committed.length) console.log(`    ℹ MAIN-GUARD ${id} (KI-E41/KI-E35): item files changed in main via HUMAN commits since claim (clean per git status) — verify the relaunch is still meaningful against the new main:\n` + committed.map((d) => `        ${d.file}`).join('\n'));
       } catch (e) { console.log(`    MAIN-GUARD ${id} SKIPPED (${e && e.message}) — treat as UNCHECKED, not clean (KI-E41; never blocks the relaunch listing)`); }
@@ -1302,6 +1445,7 @@ function cmdResume(flags) {
     // SKILL.md § Recovery; verify.json's on-disk shape was found to NOT reliably match the plain
     // pass/fail strings runItem() reads, so it is deliberately never reused — see lib/prior-attempt.mjs).
     // Best-effort: a failure to read/regenerate one script never blocks the relaunch line for the rest.
+    const freshLaunches = new Map();
     if (flags.reuse) {
       for (const [script, ids] of relaunch) {
         try {
@@ -1326,6 +1470,7 @@ function cmdResume(flags) {
             // KI-E158(i) (ported from a host-mount session) — a rejected attempt never reuses
             // test/fix; see lib/prior-attempt.mjs's own comment for the incident this fixes.
             const pa = loadPriorAttempt(itemDir, claimMs || undefined, it.reFix);
+            delete it.priorAttempt;
             const stages = priorAttemptStages(pa);
             if (stages.length) { it.priorAttempt = pa; reusedAny = true; console.log(`    KI-E69: ${id} will REUSE {${stages.join(', ')}} from its already-on-disk attempt — verify onward still runs fresh`); }
             // KI-E139 (ported from a host-mount session): attach a mid-pipeline progress.json
@@ -1335,17 +1480,47 @@ function cmdResume(flags) {
             // Still cycle-fenced (readProgressCheckpoint requires resultId === id#cyc, the SAME
             // fold-idempotency convention result.json uses) so a truly ancient checkpoint is never even
             // offered up for the hash check to evaluate.
-            const priorProgress = readProgressCheckpoint(itemDir, id, cyc);
-            if (priorProgress) { it.priorProgress = priorProgress; reusedAny = true; console.log(`    KI-E139: ${id} carries a progress.json at stage '${priorProgress.progressStage}' — factory.js hash-verifies the CURRENT worktree before trusting any of it (gate-band reuse only, never assumed)`); }
+             const priorProgress = readProgressCheckpoint(itemDir, id, row.attemptIdentity?.cycle || cyc);
+             const progressPath = join(itemDir, 'progress.json');
+             if (priorProgress && priorProgress.evidenceIdentity?.version === EVIDENCE_IDENTITY_VERSION
+               && (!priorProgress.runId || !row.runId || priorProgress.runId === row.runId)
+               && (!claimMs || statSync(progressPath).mtimeMs >= claimMs)) {
+               it.priorProgress = priorProgress; reusedAny = true;
+               console.log(`    KI-E139: ${id} carries a claim-matched canonical progress checkpoint at '${priorProgress.progressStage}'`);
+             } else delete it.priorProgress;
           }
-          if (reusedAny) {
-            const labelSlug = ((ledger.items[ids[0]] || {}).runLabel) || null;
-            const regenPath = emitLauncherScript(cfg, runArgs, labelSlug);
-            if (regenPath) console.log(`    KI-E69: regenerated ${regenPath} with the reuse above`);
-            else console.log('    KI-E69: WARN — regeneration failed; the relaunch line below still points at the UNMODIFIED script (full re-run)');
+          if (runArgs.sweep) throw new Error('artifact-reuse regeneration is item-only; re-group a sweep');
+          if (!ids.every(id => runArgs.items?.some(it => it.id === id && (!it.claimId || it.claimId === ledger.items[id].claimId)))) throw new Error('launcher does not match current claims');
+          runArgs.items = runArgs.items.filter(it => ids.includes(it.id));
+          runArgs.runId = randomUUID();
+          runArgs.buildCapacity = resolvedBuildCapacity(cfg, flags);
+          runArgs.evidenceInputs = cfg.evidenceInputs || {};
+          runArgs.engineMount = driverEngineMount(REPO_ROOT, FACTORY_ROOT);
+          for (const it of runArgs.items) preflightProductGitlinks(abs(ledger.items[it.id].worktree), runArgs.engineMount);
+          runArgs.cycle = Math.max(ledger.cycle, Number(runArgs.cycle) || 0) + 1;
+          const draft = structuredClone(ledger);
+          const labelSlug = 'reuse-' + runArgs.runId;
+          const freshArgsPath = abs(cfg.paths.runArgs.replace(/(\.[^.\/]+)$/, '-' + labelSlug + '$1'));
+          const freshScriptPath = abs(cfg.paths.runScript.replace(/(\.[^.\/]+)$/, '-' + labelSlug + '$1'));
+          for (const it of runArgs.items) {
+            const identity = admitAttempt(draft.items[it.id], runArgs.runId, { cycle: runArgs.cycle, band: bandFor(it) });
+            Object.assign(it, { runId: runArgs.runId, claimId: identity.claimId, claimAt: identity.reservedAt, attemptNumber: identity.attemptNumber });
+            draft.items[it.id].runScript = freshScriptPath;
+            draft.items[it.id].runLabel = labelSlug;
           }
+          const regenPath = emitLauncherScript(cfg, runArgs, labelSlug);
+          if (!regenPath) throw new Error('launcher regeneration failed; no fresh identity persisted');
+          writeJsonAtomic(freshArgsPath, runArgs);
+          Object.assign(ledger, draft);
+          writeJsonAtomic(abs(cfg.paths.ledger), ledger);
+          for (const id of ids) observeReservation(ledger.items[id], id);
+          freshLaunches.set(script, freshScriptPath);
+          console.log(`    regenerated ${regenPath}: fresh run ${runArgs.runId}, cycle ${runArgs.cycle}${reusedAny ? ', artifact reuse attached' : ', no reusable artifacts'}`);
         } catch (e) { console.log(`    KI-E69: reuse SKIPPED for script ${script} (${e && e.message}) — relaunching cold`); }
       }
+    }
+    for (const [oldScript, newScript] of freshLaunches) {
+      const ids = relaunch.get(oldScript); relaunch.delete(oldScript); relaunch.set(newScript, ids);
     }
     // KI-E160 (ported from a host-mount session, live incident) — `script` is recorded ONCE, at claim
     // time — the shared, UNLABELED default path (state/run-script.js/run-args.json) can be, and was,
@@ -1394,6 +1569,7 @@ function cmdReconstruct(flags) {
   const cfg = loadConfig();
   const ledger = loadLedger(abs(cfg.paths.ledger));
   if (!ledger) { console.log('no ledger'); return; }
+  collectAdmissions(cfg, ledger);
   // group emits the in-flight batch with cycle = ledger.cycle + 1; fold bumps ledger.cycle — so the
   // killed (unfolded) cycle is +1 by default. --cycle N overrides for unusual recoveries.
   // KI-L63 / KI-E73: derivation shared with cmdResume's checkpoint detection — see deriveUnfoldedCycle.
@@ -1407,6 +1583,12 @@ function cmdReconstruct(flags) {
     if (!r || r.id !== id) { console.log(`  WARN: ${id}/result.json carries id ${r && r.id} — mismatch, skipped`); continue; }
     if (r.resultId !== id + '#' + cyc) { stale.push(`${id} (${r.resultId})`); continue; } // an older cycle's checkpoint — inert, fold idempotency would skip it anyway
     if (ledger.folded && ledger.folded[r.resultId]) { already.push(id); continue; }
+    const row = ledger.items[id];
+    if (!matchesClaim(r, row) || (row?.runId && r.runId && row.runId !== r.runId)) { stale.push(id + ' (run/claim identity mismatch)'); continue; }
+    if (row?.attemptIdentity) {
+      if (!r.runId && statSync(p).mtimeMs < Date.parse(row.attemptIdentity.reservedAt || row.attemptIdentity.startedAt)) { stale.push(id + ' (checkpoint predates claim)'); continue; }
+      r.runId ||= row.runId; r.driverClaimId = row.claimId; r.attemptNumber = row.attemptNumber;
+    }
     results.push(r);
   }
   const claimed = Object.values(ledger.items).filter((r) => ACTIVE.includes(r.state)).map((r) => r.id);
@@ -1433,9 +1615,12 @@ function cmdReconstruct(flags) {
   // through; the fold's existing usage emit then fires exactly as on the live path. Observational
   // only — it never affects any verdict.
   const payload = { mode: 'reconstructed', cycle: cyc, results };
+  const runIds = [...new Set(results.map(r => r.runId).filter(Boolean))];
+  if (runIds.length === 1) payload.runId = runIds[0];
+  payload.attemptObservations = results.flatMap(r => r.attemptObservations || []);
   const rawUt = flags['usage-tokens'];
   const ut = rawUt ? parseInt(rawUt, 10) : NaN;
-  if (Number.isFinite(ut) && ut > 0) { payload.usage = { outputTokens: ut }; console.log(`  usage passthrough (KI-E44): outputTokens=${ut} will emit at fold`); }
+  if (Number.isFinite(ut) && ut > 0 && runIds.length <= 1) { payload.usage = { outputTokens: ut }; console.log(`  usage passthrough (KI-E44): outputTokens=${ut} will emit at fold`); }
   else if (rawUt !== undefined) console.log(`  --usage-tokens '${rawUt}' is not a positive integer — usage NOT stamped; re-run with the harness-reported output-token total (KI-E44)`);
   else console.log('  (no --usage-tokens <N> passed — checkpoints carry no usage, so this fold will emit NO usage event; pass the harness-reported output-token total to keep cost telemetry complete — KI-E44)');
   writeJsonAtomic(out, payload);
@@ -1654,11 +1839,7 @@ function cmdSuggest(flags) {
   if (!ledger) { console.log('no ledger — run init'); return; }
   const max = flags.max ? parseInt(flags.max, 10) : 6;   // batch-size cap per suggestion
   const min = flags.min ? parseInt(flags.min, 10) : 2;   // smallest cluster worth batching
-  let ready = computeReady(graph, ledger, {
-    maxItemRetries: cfg.maxItemRetries, target: flags.target || null,
-    themes: flags.themes ? String(flags.themes).split(',') : null, includeEscalate: !!flags['include-escalate'],
-  });
-  if (!flags['include-realinfra']) ready = ready.filter((w) => !w.realInfra);
+  let ready = eligibleItems(graph, ledger, cfg, flags, { repoRoot: REPO_ROOT, docker: dockerAvailable(), dirty: dirtyMainPaths(REPO_ROOT) });
   const sevRank = { CRITICAL: 3, HIGH: 2, MEDIUM: 1 };
   const clusters = clusterBySimilarity(ready)
     .filter((c) => c.length >= min)
@@ -1691,7 +1872,7 @@ function cmdSuggest(flags) {
       for (const wi of ordered) {
         const fs = wi.files || []; const s = simSig(wi);
         if (batch.length >= max
-          || fs.some((f) => seen.has(f))
+          || filesOverlapDirty(fs, { paths: [...seen], dirs: [] }, { repoRoot: REPO_ROOT }).length
           || (requireClique && !batchSigs.every((bs) => similarSigs(bs, s)))) { rest.push(wi.id); continue; }
         for (const f of fs) seen.add(f);
         batchSigs.push(s); batch.push(wi);
@@ -1735,7 +1916,7 @@ function cmdSuggest(flags) {
         ? 'none (no qualifying sub-clique — group will not stamp)'
         : (perClique.size === batch.length ? 'AUTO, whole batch (stamped by group)' : `AUTO, per-clique (KI-E62): ${perClique.size}/${batch.length} member(s) would be stamped`);
       say(`  batch-pattern: ${preview}`);
-      say(`  -> node ${MOUNT_REL}/_workflow/driver.mjs group --ids ${batch.map((w) => w.id).join(',')} --conc 3`);
+      say(`  -> node ${MOUNT_REL}/_workflow/driver.mjs group --ids ${batch.map((w) => w.id).join(',')} --conc ${flags.conc || cfg.concurrency?.default || 6}`);
     }
   }
   try {
@@ -1754,7 +1935,7 @@ function cmdSuggest(flags) {
 function emitLauncherScript(cfg, runArgs, labelSlug) {
   try {
     const MARKER = '/*__FACTORY_BATCH_INJECT__*/';
-    const factorySrc = readFileSync(join(HERE, 'factory.js'), 'utf8');
+    const factorySrc = readFileSync(join(HERE, 'factory.js'), 'utf8').replace(/\r\n?/g, '\n');
     if (!factorySrc.includes(MARKER)) throw new Error('factory.js missing ' + MARKER + ' marker');
     // Replace the post-meta marker (NOT prepend — `export const meta` must stay the first statement).
     // Function replacement so a `$` in the batch JSON is not interpreted as a String.replace pattern.
@@ -1768,6 +1949,8 @@ function emitLauncherScript(cfg, runArgs, labelSlug) {
 
 function cmdGroup(flags) {
   const cfg = loadConfig();
+  const engineMount = driverEngineMount(REPO_ROOT, FACTORY_ROOT);
+  if (!flags.dry) preflightProductGitlinks(REPO_ROOT, engineMount);
   // Graceful-stop drain guard (session 17, 2026-07-16): while state/STOP_REQUESTED.md exists the
   // factory is draining its in-flight lanes and MUST NOT start new ones (deterministic "prevent new"
   // that survives a context summarization — not just operator discipline). `fold`/`reconstruct`/
@@ -1783,28 +1966,13 @@ function cmdGroup(flags) {
   const graph = loadGraph(abs(cfg.paths.graph));
   const ledger = loadLedger(abs(cfg.paths.ledger));
   if (!ledger) { console.log('no ledger — run init'); return; }
+  if (!flags.dry) collectAdmissions(cfg, ledger);
   // KI-L26: the GRAPH is hand-editable (the ledger is not) — a hand-added graph item previously
   // needed a separate `driver init` before group could see it (it was silently dropped from an
   // --ids batch). Sync add-only here; persisted by the claim write below (--dry stays read-only).
   syncFromGraph(ledger, graph);
   const max = flags.max ? parseInt(flags.max, 10) : 2;
-  let ready = computeReady(graph, ledger, {
-    maxItemRetries: cfg.maxItemRetries, target: flags.target || null,
-    themes: flags.themes ? String(flags.themes).split(',') : null, includeEscalate: !!flags['include-escalate'],
-  });
-  if (flags.layer) ready = ready.filter((w) => w.layer === flags.layer);
-  if (!flags['include-realinfra']) ready = ready.filter((w) => !w.realInfra); // realInfra needs Docker+Testcontainers (Phase 3); opt-in
-  else if (!dockerAvailable()) {
-    // KI-E10 (2026-07-19): a realInfra band launched without Docker is deterministically DOOMED — the
-    // fold-time FACTORY::REALINFRA:: marker grep will FAIL it after the full band ran (ITEM-C7B
-    // cycle 39 burned ~15 agent calls incl. 8 opus exactly this way). HARD-EXCLUDE instead of warning
-    // through; --force-realinfra keeps the old warn-through for the rare deliberate case.
-    if (!flags['force-realinfra']) {
-      const excluded = ready.filter((w) => w.realInfra).map((w) => w.id);
-      ready = ready.filter((w) => !w.realInfra);
-      if (excluded.length) console.log('  KI-E10: Docker ABSENT — realInfra item(s) EXCLUDED from this batch (a full band would deterministically FAIL at the fold marker grep): ' + excluded.join(', ') + '. Run them on a Docker-capable host, or pass --force-realinfra to override (they will PARK BLOCKED:needs-docker at best).');
-    } else console.log('  WARN: --force-realinfra with Docker ABSENT — realInfra items will PARK (BLOCKED:needs-docker), never close on an in-memory green (KI-C5)');
-  }
+  let ready = eligibleItems(graph, ledger, cfg, flags, { repoRoot: REPO_ROOT, docker: dockerAvailable(), dirty: dirtyMainPaths(REPO_ROOT) });
   let picked;
   if (flags.ids) {
     const want = String(flags.ids).split(',');
@@ -1814,7 +1982,7 @@ function cmdGroup(flags) {
     // (unknown id / not in a claimable state / deps unmet / realInfra without the flag / file-locked).
     const dropped = want.filter((id) => !by[id]);
     if (dropped.length) console.log('  WARN: requested id(s) NOT schedulable (unknown, non-claimable state, deps unmet, realInfra without --include-realinfra, or file-locked):', dropped.join(', '));
-  } else picked = ready.slice(0, max);
+  } else picked = ready;
   // KI-E14 (2026-07-20): worktrees are created from HEAD, so an item whose files[] intersect
   // UNCOMMITTED main-tree changes gets a band that reviews a tree silently MISSING that sibling
   // work — and on apply-back the operator copy would CLOBBER the uncommitted fix (live near-miss:
@@ -1826,7 +1994,7 @@ function cmdGroup(flags) {
     const dirty = dirtyMainPaths(REPO_ROOT);
     const overlapped = [];
     picked = picked.filter((wi) => {
-      const hit = filesOverlapDirty(wi.files, dirty);
+      const hit = filesOverlapDirty(wi.files, dirty, { repoRoot: REPO_ROOT });
       if (hit.length) { overlapped.push(wi.id + ' [' + hit.join(', ') + ']'); return false; }
       return true;
     });
@@ -1853,11 +2021,13 @@ function cmdGroup(flags) {
   const batchFiles = new Set();
   const deferred = [];
   picked = picked.filter((wi) => {
+    if (!flags['force-unready'] && unreadyItems([wi]).length) { deferred.push(wi.id); return false; }
     const fs = wi.files || [];
     if (fs.some((f) => batchFiles.has(f))) { deferred.push(wi.id); return false; }
     for (const f of fs) batchFiles.add(f);
     return true;
   });
+  picked = disjointItems(picked, flags.ids ? Infinity : max, { repoRoot: REPO_ROOT });
   if (deferred.length) console.log('group: deferred (same-file collision within batch — stay READY for a later batch):', deferred.join(', '));
   if (!picked.length) { console.log('group: no schedulable items for the filter'); return; }
   // KI-E90 (2026-08-28, ported from the host-mount session) — advisory same-target pairing warning:
@@ -1927,17 +2097,20 @@ function cmdGroup(flags) {
       const gi = graphById[cid];
       if (!gi) continue; // a closed row whose graph entry was since removed — nothing to match against
       const closedAt = (row.history || []).filter((h) => h.to === 'CLOSED').slice(-1)[0]?.at || row.updatedAt || '';
-      closedCandidates.push({ id: cid, target: gi.target, theme: gi.theme, title: gi.title, closedAt });
+      const fixJson = join(cfg.paths.items, cid, 'fix.json');
+      const worktree = row.worktree;
+      if (!existsSync(abs(fixJson)) && !(worktree && existsSync(abs(worktree)))) continue;
+      closedCandidates.push({ id: cid, target: gi.target, theme: gi.theme, title: gi.title, closedAt, fixJson, worktree });
     }
     for (const wi of picked) {
       const prec = bestClosedPrecedent(wi, closedCandidates);
       if (!prec) continue;
-      const fixJsonRel = join('state', 'items', prec.id, 'fix.json');
+      const fixJsonRel = prec.fixJson;
       const fixJsonAbs = abs(fixJsonRel);
-      const wtRel = join('state', 'worktrees', prec.id);
-      const wtAbs = abs(wtRel);
+      const wtRel = prec.worktree;
+      const wtAbs = wtRel && abs(wtRel);
       const hasFix = existsSync(fixJsonAbs);
-      const hasWt = existsSync(wtAbs);
+      const hasWt = !!wtAbs && existsSync(wtAbs);
       if (!hasFix && !hasWt) continue; // nothing readable survives — skip, do not stamp a dead pointer
       precedentByItem.set(wi.id, {
         id: prec.id, target: prec.target, title: prec.title,
@@ -1969,7 +2142,8 @@ function cmdGroup(flags) {
   }
   // trim + ASCII-sanitize (a few normalizer strings carry → / em-dashes; keep args lean + plain)
   const trim = (s, n) => { s = (s || '').replace(/[‘’]/g, "'").replace(/[“”]/g, '"').replace(/[–—→]/g, '-').replace(/[…]/g, '...'); return s.length > n ? s.slice(0, n - 1) + '...' : s; };
-  const items = picked.map((wi) => {
+  const verificationById = new Map(picked.map(wi => [wi.id, affectedVerificationTargets(wi, cfg, REPO_ROOT, flags.solution || wi.solution || solutionFor(wi.target))]));
+  let items = picked.map((wi) => {
     // ABSOLUTE worktree path — robust to the driver's CWD. A repo-relative path is resolved by `git worktree
     // add` (and by the factory's agents) against the CURRENT directory, so running `driver.mjs` from a subdir
     // (e.g. _workflow/) doubled the path to `_workflow/_bmad-output/.../worktrees/<id>` — the run then ran
@@ -1978,7 +2152,10 @@ function cmdGroup(flags) {
     const wtAbs = abs(join(cfg.paths.worktreesState, wi.id));
     // KI-L25: --dry is a plan-only smoke test — it must NOT create worktrees (nor claim; see below).
     // The emitted worktree paths are just strings; the factory's dry mode spawns 0 agents.
-    if (!flags.dry) addWorktree(wtAbs, 'factory/' + wi.id); // per-item isolated worktree
+    if (!flags.dry) {
+      addWorktree(wtAbs, 'factory/' + wi.id);
+      preflightProductGitlinks(wtAbs, engineMount);
+    }
     return { // compact: NO routes (factory derives), NO reviewFlows (factory derives from files), NO fixHint (agent reads source) — fits the session arg limit
       // KI-L30: the 80/90-char trims were sized for the ~2KB args cap (KI-C1). The script-channel
       // launcher (512KB) removed that pressure, and the trims caused REAL incompleteness: cycle-20
@@ -1995,7 +2172,7 @@ function cmdGroup(flags) {
       // KI-L32 — peer surface ownership: each item's brief names the files its batch siblings own,
       // so a fixer following gate findings cannot silently redo a sibling's work in its own worktree.
       peers: picked.filter((o) => o.id !== wi.id).map((o) => ({ id: o.id, files: (o.files || []).slice(0, 12) })),
-      source: wi.source, solution: flags.solution ? undefined : solutionFor(wi.target), // per-item solution for multi-target groups; omitted when --solution sets config.solution
+      source: wi.source, solution: flags.solution || wi.solution || solutionFor(wi.target), verificationTargets: verificationById.get(wi.id),
       // Cache-strategic prompts (2026-07-18): a section index of the target's reference docs
       // (data-flows / CONTEXT / AGENTS headings + line numbers) rides in the shared per-item
       // prompt prefix so agents Read targeted offsets instead of whole large docs.
@@ -2013,6 +2190,7 @@ function cmdGroup(flags) {
   const labelSlug = flags.label ? String(flags.label).replace(/[^A-Za-z0-9._-]/g, '').slice(0, 40) : null;
   const labelPath = (p) => labelSlug ? p.replace(/(\.[^.\/]+)$/, '-' + labelSlug + '$1') : p;
   const runScriptRel = labelPath(cfg.paths.runScript || '_bmad-output/ai-factory/state/run-script.js');
+  const runId = randomUUID();
   if (!flags.dry) { // KI-L25: --dry claims nothing and writes no ledger — a re-run after a dry is a no-op-safe fresh group
     const claimFailed = [];
     for (const it of items) {
@@ -2020,8 +2198,12 @@ function cmdGroup(flags) {
       // but check the return rather than assume the invariant; surface a violation instead of silently
       // emitting an item whose ledger row never moved to CLAIMED.
       const prev = ledger.items[it.id] ? ledger.items[it.id].state : null; // KI-L51: remember the pre-claim state
-      if (!transition(ledger, it.id, 'CLAIMED', 'group-claim')) claimFailed.push(it.id);
+      if (!transition(ledger, it.id, 'CLAIMED', 'group-claim')) { claimFailed.push(it.id); continue; }
       const row = ledger.items[it.id];
+      const identity = admitAttempt(row, runId, { cycle: ledger.cycle + 1, band: bandFor(it) });
+      Object.assign(it, { runId, claimId: identity.claimId, claimAt: identity.reservedAt, attemptNumber: identity.attemptNumber });
+      row.verificationTargets = it.verificationTargets;
+      row.originalNeedsRealInfra = originalInfraRequirement(byId(graph)[it.id]);
       // record AT CLAIM so a kill-before-fold leaves the worktree + launch artifacts discoverable for
       // resume: prevState lets `resume --reset-stale` restore FAILED (keeping reFix provenance, KI-L51);
       // runLabel/runScript let `resume` print exact relaunch lines after a dead session (KI-L52).
@@ -2039,9 +2221,14 @@ function cmdGroup(flags) {
       } catch { /* best-effort — detection aid, never blocks a claim */ }
     }
     if (claimFailed.length) console.log('  WARN: group-claim REFUSED for (unexpected — not in a claimable state):', claimFailed.join(', '));
+    items = items.filter(it => !claimFailed.includes(it.id));
     writeJsonAtomic(abs(cfg.paths.ledger), ledger);
+    for (const it of items) observeReservation(ledger.items[it.id], it.id);
   }
   const runArgs = {
+    runId, runtimeVersion: readFileSync(join(FACTORY_ROOT, 'VERSION'), 'utf8').trim(),
+    engineMount: driverEngineMount(REPO_ROOT, FACTORY_ROOT),
+    buildCapacity: resolvedBuildCapacity(cfg, flags), evidenceInputs: cfg.evidenceInputs || {},
     // KI-E68: default was a bare hardcoded 2, disconnected from config.concurrency's documented
     // tiers (nothing ever read them). Now sources cfg.concurrency.default (operator-tunable in ONE
     // place); --conc still overrides per-invocation for an active-throttle/quiet judgment call.
@@ -2060,7 +2247,7 @@ function cmdGroup(flags) {
     // PR#9 review — host policies (no-comments / no-schema-changes) ride the batch so factory.js
     // gates the comment probe + injects the HOST POLICY prompt blocks only where a host opted in.
     policies: loadPolicies(FACTORY_ROOT),
-    budget: { reserve: (cfg.budget && cfg.budget.reserve) || 50000 }, // KI-C2: factory's graceful budget-stop reserve (binds ONLY when the launch turn set a token budget)
+    budget: { ...cfg.budget, reserve: (cfg.budget && cfg.budget.reserve) || 50000 }, // KI-C2: factory's graceful budget-stop reserve (binds ONLY when the launch turn set a token budget)
     dryRun: !!flags.dry, // --dry: factory returns the plan with ZERO agents (smoke-tests the launcher)
     items,
   };
@@ -2252,23 +2439,24 @@ function cmdGraphAudit(flags) {
 function cmdGc(flags) {
   const cfg = loadConfig();
   const ledger = loadLedger(abs(cfg.paths.ledger));
-  const closed = Object.entries(ledger.items).filter(([, r]) => r.state === 'CLOSED' && r.worktree);
-  console.log(`gc: ${closed.length} CLOSED item(s) with a worktree` + (flags.yes ? '' : ' (dry-run — pass --yes to remove; the human must have committed first)'));
-  for (const [id, r] of closed) console.log(`  ${id} @ ${r.worktree}`);
+  const groups = worktreeGcGroups(ledger.items, REPO_ROOT);
+  const safe = groups.filter(g => g.safe);
+  console.log(`gc: ${safe.length} worktree(s) referenced only by CLOSED items` + (flags.yes ? '' : ' (dry-run — pass --yes after human delivery)'));
+  for (const group of groups) console.log(`  ${group.path}: ${group.safe ? 'eligible' : 'REFUSED — unfinished reference'} ${group.rows.map(({ id, row }) => id + ':' + row.state).join(', ')}`);
   if (flags.yes) {
     let removed = 0;
-    for (const [id, r] of closed) {
-      const wtAbs = presolve(REPO_ROOT, r.worktree);
+    for (const group of safe) {
+      const wtAbs = group.path;
       try {
         if (existsSync(wtAbs)) removeWorktree(wtAbs, true);
-        // The same stale-branch gap as the CLI worktree-remove subcommand — close it identically.
-        if (r.branch) {
-          const pr = pruneStaleBranch(r.branch, REPO_ROOT);
-          if (!pr.deleted) console.log(`  ! ${id}: ${pr.reason}`);
+        for (const branch of new Set(group.rows.map(({ row }) => row.branch).filter(Boolean))) {
+          const pr = pruneStaleBranch(branch, REPO_ROOT);
+          if (!pr.deleted) console.log(`  ! ${branch}: ${pr.reason}`);
         }
-        r.worktree = null; r.branch = null; removed++;
+        for (const { row } of group.rows) { row.worktree = null; row.branch = null; }
+        removed++;
       }
-      catch (e) { console.log(`  ! could not remove ${id}: ${String((e && e.message) || e)}`); }
+      catch (e) { console.log(`  ! could not remove ${wtAbs}: ${String((e && e.message) || e)}`); }
     }
     try { pruneWorktrees(); } catch { /* best effort */ }
     writeJsonAtomic(abs(cfg.paths.ledger), ledger);
@@ -2283,7 +2471,9 @@ function cmdGc(flags) {
   try {
     const wtRoot = abs(cfg.paths.worktreesState);
     const raw = execFileSync('docker', ['compose', 'ls', '--all', '--format', 'json'], { encoding: 'utf8' });
-    const stray = strayComposeProjects(parseComposeLs(raw), wtRoot);
+    const protectedPaths = groups.filter(g => !g.safe).map(g => g.path.replace(/\\/g, '/').toLowerCase());
+    const stray = strayComposeProjects(parseComposeLs(raw), wtRoot).filter(p => !String(p.ConfigFiles).split(',').some(file =>
+      protectedPaths.some(root => file.trim().replace(/\\/g, '/').toLowerCase().startsWith(root + '/'))));
     if (stray.length) {
       console.log(`gc: ${stray.length} worktree-scoped docker-compose project(s)` + (flags.yes ? '' : ' (dry-run — pass --yes to `compose down -v` them)'));
       for (const p of stray) {
@@ -2307,9 +2497,14 @@ function cmdGc(flags) {
 function sweepsDir(cfg) { return abs(join(cfg.paths.items, '..', 'sweeps')); }
 function cmdSweep(flags, rest) {
   const cfg = loadConfig();
+  if (existsSync(abs(join(dirname(cfg.paths.ledger), 'STOP_REQUESTED.md'))) && !flags['stop-override']) {
+    console.log('refusing sweep: graceful-stop drain in effect'); return;
+  }
+  const graph = loadGraph(abs(cfg.paths.graph));
   const ledger = loadLedger(abs(cfg.paths.ledger));
   if (!ledger) { console.log('no ledger — run init'); return; }
   const n = rest[0] != null ? String(rest[0]) : '0'; // numeric cluster index OR a pattern slug (--emit-pattern)
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(n)) throw new Error('unsafe sweep index');
   const specPath = join(sweepsDir(cfg), 'sweep-' + n + '.json');
   if (!existsSync(specPath)) { console.log(`no sweep spec for ${n} — run: node _bmad-output/ai-factory/_workflow/cluster.mjs --emit ${n}`); return; }
   const spec = readJson(specPath);
@@ -2317,23 +2512,43 @@ function cmdSweep(flags, rest) {
   // the old defaults (--max-sites 6, 70-char titles). Default raised to 10 — the ceiling is now REVIEW
   // tractability (one gate reads the whole sweep diff), not transport; override per sweep as judgment says.
   const maxSites = flags['max-sites'] ? parseInt(flags['max-sites'], 10) : 10;
-  const sites = spec.sites.filter((s) => { const r = ledger.items[s.findingId]; return r && r.state !== 'CLOSED'; }).slice(0, maxSites);
-  if (!sites.length) { console.log(`sweep ${n}: all sites already CLOSED`); return; }
+  syncFromGraph(ledger, graph);
+  const requested = new Set((spec.sites || []).map(s => s.findingId));
+  const candidates = eligibleItems(graph, ledger, cfg, flags, { repoRoot: REPO_ROOT, docker: dockerAvailable(), dirty: dirtyMainPaths(REPO_ROOT) });
+  let sites = disjointItems(candidates.filter(w => requested.has(w.id)), maxSites, { repoRoot: REPO_ROOT }).map(w => ({ ...w, findingId: w.id }));
+  if (!sites.length) { console.log(`sweep ${n}: no eligible, ready, non-overlapping sites`); return; }
+  if (flags.dry) { console.log('sweep dry: ' + sites.map(s => s.findingId).join(', ')); return sites; }
+  for (const site of sites) site.verificationTargets = affectedVerificationTargets(site, cfg, REPO_ROOT, flags.solution || site.solution || solutionFor(site.target));
+  const engineMount = driverEngineMount(REPO_ROOT, FACTORY_ROOT);
+  preflightProductGitlinks(REPO_ROOT, engineMount);
+  const runId = randomUUID();
   const wtRel = abs(join(cfg.paths.worktreesState, 'sweep-' + n)); // ABSOLUTE (CWD-robust) — see the group call-site note
   addWorktree(wtRel, 'factory/sweep-' + n);
+  preflightProductGitlinks(wtRel, engineMount);
   const designExists = existsSync(join(sweepsDir(cfg), 'sweep-' + n + '-design.md'));
   const sweepSlug = 'sweep-' + n;
   const sweepScriptRel = (cfg.paths.runScript || '_bmad-output/ai-factory/state/run-script.js').replace(/(\.[^.\/]+)$/, '-' + sweepSlug + '$1');
   for (const s of sites) {
     const prev = ledger.items[s.findingId] ? ledger.items[s.findingId].state : null; // KI-L51
-    if (transition(ledger, s.findingId, 'CLAIMED', 'sweep-claim')) temit({ source: 'driver', event: 'transition', item: s.findingId, cycle: ledger.cycle, outcome: 'CLAIMED' }); // KI-E7 finding #12
+    if (!transition(ledger, s.findingId, 'CLAIMED', 'sweep-claim')) continue;
     const r = ledger.items[s.findingId];
+    const identity = admitAttempt(r, runId, { cycle: ledger.cycle + 1, band: 'SWEEP', mode: 'sweep' });
+    s.claimId = identity.claimId; s.claimAt = identity.reservedAt; s.attemptNumber = identity.attemptNumber;
     if (r) { r.worktree = wtRel; r.branch = 'factory/sweep-' + n; r.prevState = prev; r.runLabel = sweepSlug; r.runScript = sweepScriptRel; }
   }
+  sites = sites.filter(s => s.claimId);
+  if (!sites.length) return;
   writeJsonAtomic(abs(cfg.paths.ledger), ledger);
-  const compactSites = sites.map((s) => ({ findingId: s.findingId, target: s.target, files: s.files || [], title: (s.title || '').slice(0, 200), severity: s.severity }));
+  for (const s of sites) observeReservation(ledger.items[s.findingId], s.findingId);
+  const compactSites = sites.map((s) => ({ findingId: s.findingId, target: s.target, files: s.files || [], title: s.title || '', severity: s.severity,
+    acceptance: s.acceptance, regressionTest: s.regressionTest, autonomyTier: s.autonomyTier, originalNeedsRealInfra: originalInfraRequirement(s),
+    claimId: s.claimId, claimAt: s.claimAt, attemptNumber: s.attemptNumber, solution: flags.solution || s.solution || solutionFor(s.target), verificationTargets: s.verificationTargets }));
+  const transcript = join(sweepsDir(cfg), 'sweep-' + n + '-' + runId + '-verify-raw.txt');
   const runArgs = {
-    cycle: ledger.cycle + 1, concurrency: flags.conc ? parseInt(flags.conc, 10) : 3, attempts: cfg.attempts, repoRoot: REPO_ROOT, templatesDir: cfg.paths.agents,
+    runId, runtimeVersion: readFileSync(join(FACTORY_ROOT, 'VERSION'), 'utf8').trim(),
+    engineMount: driverEngineMount(REPO_ROOT, FACTORY_ROOT),
+    buildCapacity: resolvedBuildCapacity(cfg, flags), evidenceInputs: cfg.evidenceInputs || {},
+    cycle: ledger.cycle + 1, concurrency: flags.conc ? parseInt(flags.conc, 10) : (cfg.concurrency?.default || 6), attempts: cfg.attempts, repoRoot: REPO_ROOT, templatesDir: cfg.paths.agents,
     worktree: { path: wtRel, branch: 'factory/sweep-' + n },
     routing: injectedRouting(cfg), // KI-B1
     budget: { reserve: (cfg.budget && cfg.budget.reserve) || 50000 }, // KI-C2
@@ -2343,9 +2558,13 @@ function cmdSweep(flags, rest) {
     briefs: readRoleBriefs(abs(cfg.paths.agents)),
     repoProfiles: readRepoProfiles(join(abs(cfg.paths.agents), 'repo-profiles')),
     policies: loadPolicies(FACTORY_ROOT),
-    sweep: { index: n, label: spec.label, theme: spec.theme, skipDesign: designExists, sites: compactSites },
+    sweep: { index: n, label: spec.label, theme: spec.theme, skipDesign: designExists, sites: compactSites, verificationTranscript: transcript,
+      verificationTargets: [...new Set(compactSites.flatMap(s => s.verificationTargets))] },
   };
+  writeJsonAtomic(join(sweepsDir(cfg), 'claim-' + runId + '.json'), runArgs);
+  writeJsonAtomic(join(sweepsDir(cfg), 'sweep-' + n + '-claim.json'), { runId });
   writeJsonAtomic(abs(cfg.paths.runArgs), runArgs);
+  writeJsonAtomic(abs(cfg.paths.runArgs.replace(/(\.[^.\/]+)$/, '-' + sweepSlug + '$1')), runArgs);
   const sweepScriptPath = emitLauncherScript(cfg, runArgs, sweepSlug); // KI-L52 — sweeps get the same no-arg-limit launcher as group
   const bytes = JSON.stringify(runArgs).length;
   console.log(`sweep ${n} [${spec.label}]: claimed ${sites.length}/${spec.sites.length} site(s)` + (designExists ? ' (design exists -> skipDesign)' : ' (will design)') + ` @ ${wtRel} -> ${cfg.paths.runArgs} (${bytes} bytes)`);
@@ -2358,60 +2577,91 @@ function cmdSweepFold(file) {
   const cfg = loadConfig();
   const graph = loadGraph(abs(cfg.paths.graph));
   const ledger = loadLedger(abs(cfg.paths.ledger));
-  const result = readJson(presolve(REPO_ROOT, file));
+  const result = unwrapResultEnvelope(readJson(presolve(REPO_ROOT, file)));
   const sw = result.sweep || result;
-  const sites = sw.sites || [];
-  // PER-SITE close (KI-L8): a CHANGES_REQUIRED that flags only ONE site must NOT block the other GOOD sites.
-  // A site closes if it APPLIED and was NOT gate-flagged by a blocking (CRITICAL/HIGH) finding. If the gate
-  // is CHANGES_REQUIRED but NO site was flagged (a cross-cutting issue), be conservative -> re-queue all.
-  const someFlagged = sites.some((s) => s.gateFlagged);
-  const blockingFindings = (sw.findings || []).filter((f) => f.severity === 'CRITICAL' || f.severity === 'HIGH');
-  // Re-queue ALL only when a HIGH/CRITICAL blocker maps to NO site (an unisolable cross-cutting issue). A
-  // CHANGES_REQUIRED driven only by MEDIUM/LOW nits is NOT blocking — the applied sites close and the nits are
-  // forwarded to the human (cycle-9: the architect itself called the 2 MEDIUM test-table issues "surgical").
-  const unmappedBlocker = blockingFindings.length > 0 && !someFlagged;
-  const perSite = !unmappedBlocker;
-  // Deterministic per-site CONFORMANCE check — a DOC sweep has no build, so this is the per-site verification
-  // (the gate reviews the diff in aggregate; this catches a bad apply per-site): grep each applied site's files
-  // in the worktree for placeholder/TODO markers + confirm non-empty. A non-conforming site is NOT closed.
-  let specSites = {}; try { for (const s of readJson(join(sweepsDir(cfg), 'sweep-' + sw.index + '.json')).sites) specSites[s.findingId] = s.files || []; } catch { /* no spec */ }
-  const wtAbs = sw.worktree ? presolve(REPO_ROOT, sw.worktree) : null;
-  const conformance = (findingId) => {
-    if (!wtAbs || !existsSync(wtAbs)) return { ok: true };
-    for (const f of (specSites[findingId] || [])) {
-      const p = join(wtAbs, f); if (!existsSync(p)) continue;
-      const txt = readFileSync(p, 'utf8');
-      // Empty/near-empty = the apply failed. Do NOT grep for TODO/FIXME/REPLACE_WITH_/CHANGE_ME: a DOC
-      // legitimately MENTIONS those tokens when describing the code (a "Known Issues / TODOs" heading; a
-      // "fail-fast on a REPLACE_WITH_ placeholder" security note) — that grep false-flagged good docs (cycle-9 KI-L9).
-      if (txt.trim().length < 80) return { ok: false, why: f + ' is empty/near-empty (apply likely failed)' };
-    }
-    return { ok: true };
-  };
-  let closed = 0, reverted = 0, nonconf = 0;
-  for (const s of sites) {
-    const row = ledger.items[s.findingId]; if (!row) continue;
-    const conf = (s.applied && !s.gateFlagged) ? conformance(s.findingId) : { ok: true };
-    if (perSite && s.applied && !s.gateFlagged && conf.ok) {
-      const from = row.state; row.state = 'CLOSED';
-      row.history.push({ from, to: 'CLOSED', at: now(), note: 'closed via sweep-' + sw.index + ' (designed + applied + conformance-checked + gated' + (sw.gateVerdict === 'APPROVED' ? ' APPROVED' : '; site not flagged') + ')' });
-      row.updatedAt = now(); closed++;
-      temit({ source: 'driver', event: 'transition', item: s.findingId, cycle: ledger.cycle, outcome: 'CLOSED' }); // KI-E7 finding #12
-    } else {
-      if (!conf.ok) nonconf++;
-      if (transition(ledger, s.findingId, 'FAILED', 'sweep-' + sw.index + ': ' + (s.gateFlagged ? 'gate-flagged (re-fix needed)' : (!conf.ok ? 'conformance: ' + conf.why : (s.applied ? 'gate ' + sw.gateVerdict : 'not applied'))))) { reverted++; temit({ source: 'driver', event: 'transition', item: s.findingId, cycle: ledger.cycle, outcome: 'FAILED' }); } // KI-E7 finding #12
-    }
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(String(sw.index))) throw new Error('unsafe sweep index');
+  const runId = result.runId || sw.runId;
+  if (!runId || !/^[A-Za-z0-9-]+$/.test(runId)) throw new Error('sweep-fold: missing unique run provenance; return launch runId');
+  const launch = readJson(join(sweepsDir(cfg), 'claim-' + runId + '.json'));
+  if (launch.runId !== runId || String(launch.sweep.index) !== String(sw.index) || launch.cycle !== result.cycle
+    || abs(sw.worktree || '') !== abs(launch.worktree.path)) throw new Error('sweep-fold: claim/worktree/cycle mismatch');
+  observePhysical(result, ledger.items, temit);
+  const declared = launch.sweep.sites;
+  const returned = new Map();
+  for (const site of sw.sites || []) {
+    if (returned.has(site.findingId) || !declared.some(s => s.findingId === site.findingId)) throw new Error('sweep-fold: duplicate or unclaimed site');
+    returned.set(site.findingId, site);
   }
-  if (sw.cost && sites[0]) { const r = ledger.items[sites[0].findingId]; if (r) { r.cost = r.cost || {}; for (const [m, c] of Object.entries(sw.cost)) r.cost[m] = (r.cost[m] || 0) + c; } }
-  ledger.updatedAt = now();
+  const code = declared.some(s => s.files.some(f => !/\.(md|rst|txt)$/i.test(f)));
+  const ex = sw.execution;
+  let reason = !ex || ex.version !== 1 || ex.verificationCompleted !== true || ex.verificationPassed !== true || ex.reviewsCompleted !== true
+    || ex.verificationRequired !== code ? 'sweep execution incomplete or failed' : null;
+  const reviews = ['architect', 'security'].map(k => sw.reviews?.[k]);
+  if (reviews.some(g => !g || !['APPROVED', 'CHANGES_REQUIRED'].includes(g.verdict) || !Array.isArray(g.findings))) reason = 'required reviews unavailable or malformed';
+  const scopeStop = reviews.some(g => g?.scopeViolation === true);
+  const findings = reviews.flatMap(g => g?.findings || []);
+  const blockers = findings.filter(f => ['CRITICAL', 'HIGH'].includes(f.severity));
+  const mapsTo = (f, s) => typeof f.file === 'string' && s.files.some(p => f.file.replace(/\\/g, '/').split(':')[0] === p.replace(/\\/g, '/'));
+  if (blockers.some(f => !declared.some(s => mapsTo(f, s)))) reason = 'unmapped blocking finding';
+  if (reviews.some(g => g?.verdict === 'CHANGES_REQUIRED' && !g.findings.length)) reason = 'unexplained review dissent';
+  const wtAbs = abs(launch.worktree.path);
+  if (code && !reason) {
+    try {
+      const path = containedFile(sweepsDir(cfg), launch.sweep.verificationTranscript);
+      const earliest = Math.max(...declared.map(s => Date.parse(ledger.items[s.findingId]?.attemptIdentity?.reservedAt || ledger.items[s.findingId]?.attemptIdentity?.startedAt)));
+      if (!Number.isFinite(earliest) || statSync(path).mtimeMs < earliest) throw new Error('transcript predates sweep claim');
+      const text = decodeTranscript(readFileSync(path));
+      const proof = verifyTranscript(text, { worktree: wtAbs, targets: launch.sweep.verificationTargets });
+      if (!proof.pass) reason = proof.reason;
+      if (declared.some(s => s.originalNeedsRealInfra || originalInfraRequirement(byId(graph)[s.findingId])) && !hasRealInfraMarker(text)) reason = 'sweep real-infra marker missing';
+    } catch (e) { reason = 'sweep verification: ' + e.message; }
+  }
+  const arr = [];
+  for (const spec of declared) {
+    const row = ledger.items[spec.findingId], s = returned.get(spec.findingId);
+    const resultId = spec.findingId + '#sweep:' + spec.claimId;
+    if (ledger.folded?.[resultId]) continue;
+    if (!row || row.state !== 'CLAIMED' || row.claimId !== spec.claimId || row.runId !== runId || abs(row.worktree || '') !== wtAbs) {
+      console.log('sweep-fold: rejected stale/unclaimed site ' + spec.findingId); continue;
+    }
+    observeAdmission({ ...s, id: spec.findingId, runId, claimId: spec.claimId, admission: s?.admission }, row, temit);
+    let problem = reason;
+    try {
+      if (!spec.files.length) throw new Error('empty declared file set');
+      for (const f of spec.files) {
+        const p = containedFile(wtAbs, presolve(wtAbs, f));
+        if (!readFileSync(p, 'utf8').trim()) throw new Error('empty site file: ' + f);
+      }
+    } catch (e) { problem ||= 'conformance: ' + e.message; }
+    if (!s?.applied || s.gateFlagged || blockers.some(f => mapsTo(f, spec))) problem ||= 'site missing, unapplied or gate-flagged';
+    const currentItem = byId(graph)[spec.findingId];
+    const ownerStop = !currentItem || currentItem.autonomyTier === 'blocked'
+      || (currentItem.ownerDecision != null && currentItem.ownerDecisionResolved !== true);
+    const state = scopeStop || s?.scopeStop || ownerStop ? 'BLOCKED' : problem ? 'FAILED'
+      : spec.autonomyTier === 'escalate' || currentItem.autonomyTier === 'escalate' ? 'ESCALATED' : 'CLOSED';
+    arr.push({ id: spec.findingId, runId, claimId: spec.claimId, resultId, band: 'SWEEP', attemptsDelta: 1,
+      toState: state, transitions: state === 'CLOSED' ? FORWARD.slice(FORWARD.indexOf('RED')) : [state],
+      gates: sw.gates, note: 'sweep-' + sw.index + ': ' + (problem || (state === 'BLOCKED' ? 'scope-stop' : 'completed verification, reviews and site conformance')),
+      cost: arr.length === 0 && !ledger.sweepCosts?.[runId] ? sw.cost : {} });
+  }
+  const folded = foldResults(ledger, arr);
+  if (arr.length) (ledger.sweepCosts ||= {})[runId] = true;
+  ledger.cycle = Math.max(ledger.cycle, result.cycle || 0);
+  escalateExhausted(ledger, cfg);
+  for (const r of arr) ledger.items[r.id].attemptIdentity.completedAt ||= now();
   writeJsonAtomic(abs(cfg.paths.ledger), ledger);
+  recordCostSnapshot(cfg, ledger);
   writeReports(cfg, ledger, graph);
   cmdEscalationsSync(cfg, ledger, true);
-  // KI-E23 (P6c): a sweep run's usage event — same contract as cmdFold's (surfaced by the first
-  // live KI-E21-routed sweep, whose result carried usage that the fold silently dropped).
-  try { if (result && result.usage && typeof result.usage.outputTokens === 'number') temit({ source: 'driver', event: 'usage', cycle: result.cycle || ledger.cycle, attrs: { outputTokens: result.usage.outputTokens, file: basename(presolve(REPO_ROOT, file)) } }); } catch { /* observational only */ }
-  console.log(`sweep-fold ${sw.index} [${sw.label || ''}]: gate ${sw.gateVerdict} -> CLOSED ${closed}, re-queued ${reverted}` + (nonconf ? `, ${nonconf} non-conforming (placeholder/empty)` : '') + (sw.findings && sw.findings.length ? ` · ${sw.findings.length} gate finding(s)` : ''));
-  for (const f of (sw.findings || [])) console.log(`  [${f.severity}] ${f.file}: ${f.title}`);
+  for (const r of arr) {
+    const row = ledger.items[r.id];
+    if (row.attemptIdentity.admitted) observe(lifecycleObservation(row.attemptIdentity, r.id, 'completed', row.state, !!reason), temit);
+    temit({ source: 'driver', event: 'item_folded', item: r.id, runId, cycle: result.cycle, outcome: row.state, attempts: row.attempts,
+      attrs: { resultId: r.resultId, band: 'SWEEP', gates: r.gates, cost: r.cost } });
+  }
+  if (arr.length && typeof result.usage?.outputTokens === 'number') temit({ source: 'driver', event: 'usage', runId, cycle: result.cycle,
+    attrs: { outputTokens: result.usage.outputTokens, usageId: runId + ':usage:final' } });
+  console.log(`sweep-fold ${sw.index}: ${arr.length} new site results, ${folded.rejected.length} rejected${reason ? '; ' + reason : ''}`);
 }
 
 // KI-E20 (improvement-analysis P2) — `recover <id>`: first-class scaffold for the DOMINANT close
@@ -2427,7 +2677,7 @@ function cmdSweepFold(file) {
 // shape, machine-evidence flags carried from the prior checkpoint), and (e) a telemetry record so
 // recoveries stop being invisible in the stream. The OPERATOR stays in the loop: this prepares;
 // the operator applies the remedy in the worktree, runs the re-gate agents, fills the skeleton,
-// folds. Ledger READ-ONLY (writes only item artifacts — no lock, no lease).
+// folds. Recovery identity is driver-owned and persisted under the ledger lock/lease.
 function cmdRecover(flags, rest) {
   const id = rest[0];
   if (!id) { console.log('usage: driver.mjs recover <id>'); return; }
@@ -2435,6 +2685,7 @@ function cmdRecover(flags, rest) {
   const graph = loadGraph(abs(cfg.paths.graph));
   const ledger = loadLedger(abs(cfg.paths.ledger));
   if (!ledger || !ledger.items[id]) { console.error('recover: unknown item ' + id); process.exitCode = 1; return; }
+  collectAdmissions(cfg, ledger);
   const row = ledger.items[id];
   const wi = byId(graph)[id] || {};
   if (!['FAILED', 'ESCALATED', 'BLOCKED'].includes(row.state)) {
@@ -2457,7 +2708,50 @@ function cmdRecover(flags, rest) {
   const repoProfiles = readRepoProfiles(join(abs(cfg.paths.agents), 'repo-profiles'));
   const recPolicies = loadPolicies(FACTORY_ROOT); // PR#9 review — recover prompts carry the same HOST POLICY blocks as compose()
   const foldFile = join(recDir, 'recovery-fold.json');
-  writeJsonAtomic(foldFile, { mode: 'recovery', cycle: cyc, results: [recoveryFoldSkeleton(id, row, prior, cyc)] });
+  const recoveryCode = prior?.codeChange !== false || (wi.files || []).some(f => /\.cs$/i.test(f));
+  let recoveryExpected = null;
+  if (recoveryCode) {
+    if (!wtAbs) throw new Error('recover: code recovery requires a live worktree');
+    preflightProductGitlinks(wtAbs, driverEngineMount(REPO_ROOT, FACTORY_ROOT));
+    const targets = affectedVerificationTargets(wi, cfg, wtAbs, wi.solution || solutionFor(wi.target));
+    recoveryExpected = verificationExpectations({ item: wi, test: readJson(join(itemDir, 'test.json')), worktree: wtAbs, targets,
+      band: 'FULL', redText: decodeTranscript(readFileSync(join(itemDir, 'verify-red-raw.txt'))) });
+    row.verificationTargets = targets;
+  }
+  const runId = randomUUID();
+  const identity = admitAttempt(row, runId, { cycle: cyc, recovery: true, band: prior?.band || bandFor(wi), mode: 'recovery' });
+  const skeleton = recoveryFoldSkeleton(id, row, prior, cyc);
+  let recoveryOrdinal = (row.recoveryOrdinal || 0) + 1;
+  while (ledger.folded?.[id + '#' + cyc + 'r' + recoveryOrdinal]) recoveryOrdinal++;
+  row.recoveryOrdinal = recoveryOrdinal;
+  Object.assign(skeleton, { resultId: id + '#' + cyc + 'r' + recoveryOrdinal, runId, claimId: identity.claimId, attemptNumber: identity.attemptNumber });
+  const quote = value => "'" + String(value).replace(/'/g, "'\\''") + "'";
+  let recoveryCommands = 'Documentation recovery: independently recheck acceptance against the current worktree.';
+  if (recoveryCode) {
+    const prefix = join(itemDir, 'verify-recovery-' + runId + '-' + identity.claimId);
+    const contract = { version: 1, transcript: prefix + '.txt', metadataFile: prefix + '-metadata.json',
+      beforeIdentity: prefix + '-before.json', afterIdentity: prefix + '-after.json', expected: recoveryExpected };
+    row.recoveryVerification = contract;
+    skeleton.recoveryVerification = { required: true, transcript: contract.transcript };
+    writeJsonAtomic(contract.metadataFile, { engineMount: driverEngineMount(REPO_ROOT, FACTORY_ROOT), inputs: cfg.evidenceInputs || {}, acceptance: wi.acceptance, policies: recPolicies, profile: repoProfiles[wi.target] || '',
+      reviewerContract: { version: 'driver-recovery-v1', briefs, targets: recoveryExpected }, context: { item: wi, runId, claimId: identity.claimId } });
+    writeFileSync(contract.transcript, '', { flag: 'wx' });
+    const collect = `node ${quote(join(FACTORY_ROOT, '_workflow/evidence-identity.mjs'))} ${quote(wtAbs)} ${quote(contract.metadataFile)}`;
+    const commands = ['set -o pipefail', `${collect} > ${quote(contract.beforeIdentity)}`, `: > ${quote(contract.transcript)}`];
+    for (const sub of ['build', 'filter', 'suite']) for (const invocation of recoveryExpected[sub]) {
+      const target = typeof invocation === 'string' ? invocation : invocation.target;
+      commands.push(`bash ${quote(btAbs)} ${sub} ${quote(presolve(wtAbs, target))}${sub === 'filter' ? ' ' + quote(invocation.filter) : ''} 2>&1 | tee -a ${quote(contract.transcript)}`);
+    }
+    commands.push(`${collect} > ${quote(contract.afterIdentity)}`);
+    recoveryCommands = 'After the LAST remedy/source edit, run this complete fresh proof. Do not edit source afterward. Never copy historical transcripts.\n```bash\n' + commands.join('\n') + '\n```';
+  } else delete row.recoveryVerification;
+  if (prior?.realInfraClassification) {
+    skeleton.realInfraClassification = prior.realInfraClassification;
+    skeleton.gates['adjudicator:realinfra-override'] = prior.gates?.['adjudicator:realinfra-override'];
+  }
+  writeJsonAtomic(abs(cfg.paths.ledger), ledger);
+  writeJsonAtomic(foldFile, { mode: 'recovery', cycle: cyc, runId, results: [skeleton] });
+  observeReservation(row, id);
   const prompts = [];
   for (const d of dissent) {
     const role = roleForGateKey(d.key);
@@ -2507,7 +2801,7 @@ function cmdRecover(flags, rest) {
   if (!dissent.length) {
     let lastFailure = null;
     try { lastFailure = JSON.parse(readFileSync(join(itemDir, 'last-failure.json'), 'utf8')); } catch { /* pre-KI-E81 item, or never failed this way */ }
-    const missing = lastFailure ? missingStageFrom(lastFailure.transitions, lastFailure.gates) : { stage: null, lenses: [] };
+    const missing = lastFailure ? missingStageFrom(lastFailure.transitions, lastFailure.gates, lastFailure.failure) : { stage: null, lenses: [] };
     if (missing.stage) {
       const sfile = join(recDir, `recover-stage-${missing.stage}.md`);
       const sln = solutionFor(wi.target || '');
@@ -2542,8 +2836,7 @@ function cmdRecover(flags, rest) {
           'YOUR ROLE — integrator (finalize a verified item for human hand-off).',
           `1. Confirm the worktree diff (\`git -C ${wtAbs || '<worktree>'} diff\` / \`status --porcelain\` — read-only) is exactly the intended change set — no stray edits.`,
           `2. Run the global regression sweep, teeing to the EXACT path below (the fold re-greps it for FACTORY::BUILD/FACTORY::TEST::SUITE markers — a self-report with no transcript is rejected):`,
-          `   \`bash ${btAbs} build ${wtAbs ? join(wtAbs, sln) : '<worktree>/' + sln} 2>&1 | tee ${join(itemDir, 'integrate-raw.txt')}\``,
-          `   \`bash ${btAbs} suite ${wtAbs ? join(wtAbs, sln) : '<worktree>/' + sln} 2>&1 | tee -a ${join(itemDir, 'integrate-raw.txt')}\``,
+          recoveryCommands,
           '   It MUST stay green with zero new failures. If dotnet is not on PATH: `export DOTNET_ROOT="$HOME/.dotnet"; export PATH="$HOME/.dotnet:$HOME/.dotnet/tools:$PATH"` then retry. A pure DOC/CONFIG item (no .cs in the diff) skips dotnet — confirm the acceptance criterion holds in the current file content instead, and say so plainly.',
           `3. WRITE ${join(itemDir, 'integrate.md')} — branch name, changed files, the carried-forward gate verdicts (you are not re-judging them), one paragraph handoff note.`,
           '4. Do NOT copy into the main tree, stage, commit, or create/delete branches.',
@@ -2566,7 +2859,7 @@ function cmdRecover(flags, rest) {
       : '',
     `2. APPLY the reviewer-converged remedy IN THE WORKTREE (${wtAbs || '<none recorded>'}) — never the main tree; NO mutating git.`,
     '3. EVIDENCE CONTRACT (KI-E20 — the fold re-derives the verdict from these files, never from prose):',
-    `   - machine green (code items): \`bash ${btAbs} build <solution> 2>&1 | tee -a ${join(itemDir, 'integrate-raw.txt')}\` then \`bash ${btAbs} suite <solution> 2>&1 | tee -a ${join(itemDir, 'integrate-raw.txt')}\` — the keyed FACTORY::SUMMARY markers (KI-E19) make append order safe.`,
+    recoveryCommands,
     `   - probes / mutation evidence: tee to ${join(itemDir, 'mutation-proof.txt')} — NEVER into integrate-raw.txt or verify-raw.txt (keyed markers or not, keep transcripts clean).`,
     `   - a NEW red proof (only if a new regression test is part of the remedy): tee to ${join(itemDir, 'verify-red-raw.txt')} with its FACTORY::RED::<exit> marker; otherwise leave the prior round's red transcript untouched.`,
     '4. RE-GATE: run each regate-*.md as a SEPARATE agent; require APPROVED; save each verdict prose to state/items/<id>/<role>.md.',
@@ -2574,8 +2867,8 @@ function cmdRecover(flags, rest) {
     `   node ${MOUNT_REL}/_workflow/driver.mjs fold ${foldFile}`,
     '   (attemptsDelta:0 — a recovery consumes no retry budget; resultId #' + cyc + 'r keeps fold idempotency; the deterministic fold override re-checks ALL machine evidence exactly as for a live run.)',
     '',
-    row.state === 'ESCALATED' ? '_ESCALATED item: steps 2-4 may reduce to recording the human sign-off; the fold is the single CLOSED hop (KI-L62)._' : '',
-    row.state === 'BLOCKED' ? `_BLOCKED item (KI-E34): record the owner ruling on the GRAPH item first (\`ownerDecision\` + \`ownerDecisionResolved: true\`; fold ratified out-of-set files into \`files[]\`), then run \`node ${MOUNT_REL}/_workflow/driver.mjs reset ${id}\` BEFORE the fold — BLOCKED's only legal ledger edge is -> READY, and the fold re-enters via CLAIMED. If the ruling ratifies work already delivered by human commits, steps 2-3 need no new evidence: the prior round's transcripts stand — say so in the fold note. If the item NEVER RAN (seed-BLOCKED — no prior result/transcripts), do NOT fold a recovery from nothing: either run it live after the reset (group/run), or produce the full machine evidence first — the skeleton's FILLed codeChange keeps the fold override honest either way (review fix)._` : '',
+    row.state === 'ESCALATED' ? '_ESCALATED item: record human sign-off and produce the fresh recovery proof; the legal fold is a single CLOSED hop._' : '',
+    row.state === 'BLOCKED' ? `_BLOCKED item: record the owner ruling on the graph, then reset to READY before fold. Fresh recovery proof is mandatory even for previously delivered code; a never-run item needs a real regression contract before recovery preparation._` : '',
   ].join('\n'));
   temit({ source: 'driver', event: 'recovery_prepared', item: id, cycle: cyc, attrs: { fromState: row.state, dissenters: prompts.map((p) => p.key), hasFeedback: existsSync(join(itemDir, 'feedback.md')), hasCheckpoint: !!prior } });
   console.log(`recover ${id} (${row.state}, cycle #${cyc}r): scaffold -> ${recDir}`);
@@ -2983,7 +3276,7 @@ function cmdController(flags, rest) {
 function cmdMainCheck(rest, flags) {
   const cfg = loadConfig();
   let ids = (rest || []).filter(Boolean);
-  // KI-E82: fold's own KI-L65 auto-repair only ever inspects the items in the CURRENT fold
+  // KI-E82: fold's own KI-L65 diagnostic only ever inspects the items in the CURRENT fold
   // batch — contamination an EARLIER round's item leaked into the main tree, that no LATER
   // fold's batch happens to include, is never re-checked by anything automatic. `--all` (or
   // bare `main-check` with no ids at all) removes the need to already know which ids to
@@ -3035,7 +3328,7 @@ function cmdMainCheck(rest, flags) {
       const snapFiles = (readJson(snapPath) || {}).files || {};
       const drifted = driftAgainstSnapshot(REPO_ROOT, snapFiles);
       if (!drifted.length) { console.log(`MAIN-CHECK ${id}: clean — no main-tree drift on the snapshot set`); continue; }
-      const { committed, dirty } = splitDriftByStatus(REPO_ROOT, drifted);
+      const { committed, dirty } = splitDriftByStatus(REPO_ROOT, drifted, { repoRoot: REPO_ROOT });
       if (dirty.length) console.log(`⚠ MAIN-DRIFT ${id} (KI-E50/KI-L65): main-tree file(s) changed mid-run — an agent likely wrote outside its worktree. Do NOT edit or repair main yourself; report this line verbatim:\n` + dirty.map((d) => `    ${d.file} (${d.was} -> ${d.now})`).join('\n'));
       if (committed.length) console.log(`ℹ MAIN-CHECK ${id}: committed drift (human delivery, KI-E35) — verify intent, no repair needed:\n` + committed.map((d) => `    ${d.file}`).join('\n'));
     } catch (e) { console.log(`MAIN-CHECK ${id}: check failed (${e && e.message}) — treat as unknown, not clean`); }
@@ -3045,8 +3338,8 @@ function cmdMainCheck(rest, flags) {
   // that no item ever declared has no snapshot to diff against and is structurally invisible to it,
   // even under this function's own KI-E82 --all widening. See lib/mainguard.mjs's
   // unclaimedMainDrift header for the full reasoning; this call site just wires
-  // REPO_ROOT/MOUNT_REL/claimedPaths.
-  const unclaimed = unclaimedMainDrift(dirtyMainPaths(REPO_ROOT), MOUNT_REL, claimedPaths);
+  // REPO_ROOT/MAIN_MOUNT_REL/claimedPaths.
+  const unclaimed = unclaimedMainDrift(dirtyMainPaths(REPO_ROOT), MAIN_MOUNT_REL, claimedPaths, { repoRoot: REPO_ROOT });
   if (unclaimed.length) {
     // KI-E177 (ported from a host-mount session) — same upgrade as the fold-time sweep: a
     // byte-identical match against a claimed item's own worktree is overwhelming evidence of
@@ -3073,15 +3366,16 @@ function cmdMainCheck(rest, flags) {
 async function queryPrometheusTokenUsage(cfg, sinceMs, untilMs) {
   const base = (cfg && cfg.telemetry && cfg.telemetry.prometheusUrl) || process.env.FACTORY_PROM_URL || 'http://localhost:9090';
   try {
-    const { query, time } = buildTokenUsageQuery(sinceMs, untilMs);
+    const labels = cfg.telemetry?.tokenUsageLabels || {};
+    const { query, time } = buildTokenUsageQuery(sinceMs, untilMs, labels);
     const url = `${String(base).replace(/\/$/, '')}/api/v1/query?query=${encodeURIComponent(query)}&time=${time}`;
     const res = await fetch(url, { signal: AbortSignal.timeout(5000) });
     if (!res.ok) return null;
     const json = await res.json();
     if (!json || json.status !== 'success') return null;
     const vec = parseTokenUsageVector(json);
-    if (!vec.inputTokens && !vec.outputTokens && !vec.cacheReadTokens && !vec.cacheCreationTokens) return null; // empty result — nothing gathered for this window, never fabricate a zero
-    return tokenUsageSummary(vec);
+    if (Object.values(vec).every(v => v === null)) return null;
+    return tokenUsageSummary(vec, { source: 'prometheus', scope: Object.keys(labels).length ? 'label-filtered-metric-window' : 'unfiltered-metric-window', selector: labels });
   } catch {
     return null; // unreachable / timed out / malformed — observational only, never blocks (AD-3)
   }
@@ -3114,11 +3408,15 @@ async function cmdTelemetryReport(flags) {
   // report running, producing a real-looking but contaminated number. Falls back to a 24h lookback
   // from now only when the current cycle has no events at all yet (e.g. right after `cycle`/
   // `group`, before anything has landed — an actually-open cycle correctly wants "up to now").
-  const cycleTimes = events.filter((e) => e.cycle === ledger.cycle && e.ts).map((e) => Date.parse(e.ts)).filter(Number.isFinite);
+  const cycleTimes = events.filter((e) => e.cycle === ledger.cycle && e.ts && !['token_usage_snapshot', 'driver_cmd'].includes(e.event)).map((e) => Date.parse(e.ts)).filter(Number.isFinite);
   const untilMs = cycleTimes.length ? Math.max(...cycleTimes) : Date.now();
   const sinceMs = cycleTimes.length ? Math.min(...cycleTimes) : untilMs - 24 * 3600 * 1000;
   const usage = await queryPrometheusTokenUsage(cfg, sinceMs, untilMs);
-  if (usage) temit({ source: 'driver', event: 'token_usage_snapshot', cycle: ledger.cycle, attrs: { windowStartMs: sinceMs, windowEndMs: untilMs, ...usage } });
+  if (usage) {
+    const snapshot = { ts: now(), source: 'driver', event: 'token_usage_snapshot', cycle: ledger.cycle, attrs: { windowStartMs: sinceMs, windowEndMs: untilMs, ...usage } };
+    temit(snapshot);
+    events.push(snapshot);
+  }
   const agg = aggregateEvents(events);
   const md = renderTelemetryReport(agg, { file, generatedAt: now() });
   const out = abs(join(cfg.paths.reports, 'telemetry-latest.md'));
@@ -3127,7 +3425,7 @@ async function cmdTelemetryReport(flags) {
   console.log(`telemetry-report: ${events.length} event(s) from ${file}`);
   console.log(`  by source: ${JSON.stringify(agg.bySource)}`);
   console.log(`  outcomes:  ${JSON.stringify(agg.outcomes)}`);
-  console.log(usage ? `  session token usage: gathered (cache hit rate ${usage.cacheHitRate == null ? 'n/a' : Math.round(usage.cacheHitRate * 100) + '%'})` : '  session token usage: NOT gathered (see driver.mjs preflight — KI-E33/KI-E66)');
+  console.log(usage ? `  token usage: ${usage.scope} ${JSON.stringify(usage.selector)} (cache hit rate ${usage.cacheHitRate == null ? 'unknown' : Math.round(usage.cacheHitRate * 100) + '%'})` : '  token usage: NOT gathered (see driver.mjs preflight — KI-E33/KI-E66)');
   console.log(`  -> ${out}`);
 }
 
@@ -3136,7 +3434,7 @@ function dispatch(cmd, flags, rest) {
     case 'init': return cmdInit(flags);
     case 'status': return cmdStatus();
     case 'select': return cmdSelect(flags);
-    case 'claim': return cmdClaim(rest);
+    case 'claim': return cmdClaim(rest, flags);
     case 'reset': return cmdReset(rest);
     case 'fold': return cmdFold(rest[0], flags);
     case 'reconstruct': return cmdReconstruct(flags); // KI-L40 — rebuild results-cycle-<N>.json from per-item checkpoints after a kill
@@ -3169,14 +3467,14 @@ function dispatch(cmd, flags, rest) {
   }
 }
 
-function main() {
+async function main() {
   const [, , cmd, ...argv] = process.argv;
   const { flags, rest } = parseFlags(argv);
   // KI-B2/B3: a single advisory lock around every ledger-MUTATING command — a second concurrent driver
   // fails fast with a clear message instead of silently racing ledger.json. Read-only commands skip it.
   // 'controller' is lock-guarded too (its claim/release mutate controller.json under the same lock).
-  const MUTATING = new Set(['init', 'claim', 'reset', 'fold', 'group', 'cycle', 'sweep', 'sweep-fold', 'merge-graph', 'gc', 'controller']);
-  const needsLock = MUTATING.has(cmd) || (cmd === 'resume' && flags['reset-stale']);
+  const MUTATING = new Set(['init', 'claim', 'reset', 'fold', 'group', 'cycle', 'sweep', 'sweep-fold', 'recover', 'merge-graph', 'gc', 'controller']);
+  const needsLock = MUTATING.has(cmd) || ['resume', 'reconstruct'].includes(cmd);
   let lockPath = null;
   if (needsLock) {
     lockPath = abs(loadConfig().paths.ledger) + '.lock';
@@ -3193,7 +3491,10 @@ function main() {
     // KI-C11: every mutating command (except the lease manager itself) must hold the campaign lease —
     // the per-command lock above serializes single commands; the lease serializes the CAMPAIGN.
     if (needsLock && cmd !== 'controller' && !requireController(cmd, flags)) return;
-    dispatch(cmd, flags, rest);
+    if (!flags.dry && (['claim', 'group', 'cycle', 'sweep', 'recover'].includes(cmd) || (cmd === 'resume' && flags.reuse))) {
+      writeJsonAtomic(join(FACTORY_ROOT, 'state', 'build-capacity.json'), { version: 1, limit: resolvedBuildCapacity(loadConfig(), flags) });
+    }
+    await dispatch(cmd, flags, rest);
   }
   catch (e) { cmdThrew = true; throw e; }
   finally {
@@ -3204,4 +3505,4 @@ function main() {
   }
 }
 
-main();
+await main();

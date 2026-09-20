@@ -11,7 +11,8 @@
 import { appendFileSync, mkdirSync, existsSync, readFileSync, statSync, readdirSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { apportionTokensByCallShare } from './token-usage.mjs'; // KI-E66 — cache-hit-rate + per-item apportioned tokens
+import { apportionTokensByCallShare, tokenUsageSummary } from './token-usage.mjs';
+import { aggregateObservations, renderObservationReport, canonicalJson } from './observations.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url)); // _bmad-output/ai-factory/_workflow/lib
 export const FACTORY_ROOT = resolve(HERE, '..', '..');
@@ -20,7 +21,7 @@ export const FACTORY_ROOT = resolve(HERE, '..', '..');
 export const MAX_LINE = 8192;
 export const SOURCES = ['driver', 'agent', 'derived', 'orchestrator'];
 // Contextual envelope fields copied verbatim from a partial event (everything else rides in attrs).
-export const EVENT_FIELDS = ['runId', 'cycle', 'lane', 'item', 'stage', 'role', 'model', 'effort', 'outcome', 'durMs', 'attempts', 'session'];
+export const EVENT_FIELDS = ['id', 'runId', 'cycle', 'lane', 'item', 'stage', 'role', 'model', 'effort', 'outcome', 'durMs', 'attempts', 'session'];
 
 export function telemetryEnabled() { return process.env.FACTORY_TELEMETRY !== '0'; }
 export function telemetryFile() {
@@ -243,9 +244,37 @@ export function clampAgentEvent(name) {
 // historical events are fenced too. Fenced durations are excluded from percentiles and reported.
 export const GAP_FENCE_MS = 4 * 3600 * 1000;
 
-export function aggregateEvents(events) {
-  const agg = { total: 0, byEvent: {}, bySource: {}, outcomes: {}, cycles: {}, gates: {}, stages: {}, agentStages: {}, models: {}, infraSuspect: 0, items: {}, itemFolds: {}, failedAt: {}, gapOutliers: [], agentPairs: {}, usage: [], itemCallCounts: {}, tokenUsageSnapshots: [], callsByOutcome: {} };
+export function deduplicateTelemetryEvents(events) {
+  const groups = new Map(), legacy = [];
+  let duplicates = 0;
   for (const e of events || []) {
+    if (!e || typeof e !== 'object' || !e.event) continue;
+    const a = e.attrs || {};
+    let identity = a.observationId || a.usageId || e.id;
+    if (!identity && e.event === 'item_folded' && a.resultId) identity = JSON.stringify([e.item, a.resultId]);
+    if (!identity && e.event === 'usage' && e.runId) identity = e.runId;
+    if (!identity) { legacy.push(e); continue; }
+    const key = JSON.stringify([e.event, identity]);
+    const { ts, ...stable } = e;
+    if (!groups.has(key)) groups.set(key, new Map());
+    const variants = groups.get(key), signature = canonicalJson(stable);
+    if (variants.has(signature)) duplicates++; else variants.set(signature, e);
+  }
+  const records = [...legacy], conflicts = [];
+  for (const [key, variants] of groups) {
+    if (variants.size > 1) conflicts.push(key); else records.push([...variants.values()][0]);
+  }
+  const order = new Map((events || []).map((e, i) => [e, i]));
+  records.sort((a, b) => order.get(a) - order.get(b));
+  return { records, duplicates, conflicts, unidentified: legacy.length };
+}
+
+export function aggregateEvents(events, observationOptions = {}) {
+  const agg = { total: 0, byEvent: {}, bySource: {}, outcomes: {}, cycles: {}, gates: {}, stages: {}, agentStages: {}, models: {}, infraSuspect: 0, items: {}, itemFolds: {}, failedAt: {}, gapOutliers: [], agentPairs: {}, usage: [], itemCallCounts: {}, tokenUsageSnapshots: [], callsByOutcome: {} };
+  const dedup = deduplicateTelemetryEvents(events);
+  agg.deduplication = { duplicates: dedup.duplicates, conflicts: dedup.conflicts, unidentified: dedup.unidentified };
+  agg.observations = aggregateObservations((events || []).filter((e) => e?.event === 'attempt_observation').map((e) => e.attrs?.observation), observationOptions);
+  for (const e of dedup.records) {
     if (!e || typeof e !== 'object' || !e.event) continue;
     agg.total++;
     agg.byEvent[e.event] = (agg.byEvent[e.event] || 0) + 1;
@@ -310,9 +339,7 @@ export function aggregateEvents(events) {
     if (e.event === 'token_usage_snapshot' && e.attrs) {
       agg.tokenUsageSnapshots.push({
         cycle: e.cycle != null ? e.cycle : '?', ts: e.ts,
-        inputTokens: e.attrs.inputTokens || 0, outputTokens: e.attrs.outputTokens || 0,
-        cacheReadTokens: e.attrs.cacheReadTokens || 0, cacheCreationTokens: e.attrs.cacheCreationTokens || 0,
-        totalTokens: e.attrs.totalTokens || 0, cacheHitRate: typeof e.attrs.cacheHitRate === 'number' ? e.attrs.cacheHitRate : null,
+        ...tokenUsageSummary(e.attrs, { source: e.attrs.source || 'legacy-prometheus', scope: e.attrs.scope || 'unfiltered-metric-window' }),
       });
     }
     // KI-E13 liveness: pair agent stage_start/stage_end per item+role — an unmatched start is an
@@ -362,7 +389,7 @@ export function renderCallsByOutcome(callsByOutcome) {
     ...rows,
     '',
     `**Yield — calls landing on a CLOSED item: ${((closed / total) * 100).toFixed(1)}%** (${closed}/${total}).`,
-    `**FAILED spend: ${((failed / total) * 100).toFixed(1)}%** (${failed}/${total}) — work that produced no durable output. ESCALATED/BLOCKED spend is deliberately NOT counted here: those reached a human with the analysis intact, which is the system working, not waste.`,
+    `**FAILED spend: ${((failed / total) * 100).toFixed(1)}%** (${failed}/${total}) — calls on failed folds; some output may be reused later. This is neither wasted lifetime cost nor rejected human delivery.`,
   ].join('\n');
 }
 
@@ -398,7 +425,7 @@ export function renderTelemetryReport(agg, meta = {}) {
   // direct-recovery) and direct-recovery rate (closes that needed the run protocol §4 remedy path).
   const perItem = Object.values(agg.itemFolds || {});
   const closedItems = perItem.filter((fs) => fs.length && fs[fs.length - 1].st === 'CLOSED');
-  const firstPass = closedItems.filter((fs) => fs[0].st === 'CLOSED' && !fs[0].direct);
+  const firstPass = perItem.filter((fs) => fs[0].st === 'CLOSED' && !fs[0].direct);
   const recovered = closedItems.filter((fs) => fs.some((f) => f.st === 'CLOSED' && f.direct));
   const pct = (a, b) => b ? Math.round((a / b) * 100) + '%' : 'n/a';
   // KI-E48 — band-split first-pass (the §A.34 watch-list measurement): an item is keyed by the
@@ -409,16 +436,16 @@ export function renderTelemetryReport(agg, meta = {}) {
   const bandNames = [...new Set(perItem.map(bandOf))];
   if (bandNames.some((b) => b !== '(unstamped)')) {
     for (const b of bandNames.sort()) {
-      const closedB = closedItems.filter((fs) => bandOf(fs) === b);
-      const fpB = closedB.filter((fs) => fs[0].st === 'CLOSED' && !fs[0].direct);
-      bandRows.push(`| First-pass — ${b} band (KI-E48) | ${fpB.length}/${closedB.length} closed = ${pct(fpB.length, closedB.length)} (${perItem.filter((fs) => bandOf(fs) === b).length} folded) |`);
+      const allB = perItem.filter((fs) => bandOf(fs) === b);
+      const fpB = allB.filter((fs) => fs[0].st === 'CLOSED' && !fs[0].direct);
+      bandRows.push(`| First-observed-fold close — ${b} band | ${fpB.length}/${allB.length} = ${pct(fpB.length, allB.length)} |`);
     }
   }
   const kpi = [
     '| KPI | Value |', '|---|---|',
     `| Items folded (unique) | ${perItem.length} |`,
     `| Items closed | ${closedItems.length} |`,
-    `| First-pass close rate (clean first fold / closed) | ${firstPass.length}/${closedItems.length} = ${pct(firstPass.length, closedItems.length)} |`,
+    `| First-pass close rate (legacy proxy: clean first observed fold / all folded items) | ${firstPass.length}/${perItem.length} = ${pct(firstPass.length, perItem.length)} |`,
     `| Direct-recovery rate (recovered closes / closed) | ${recovered.length}/${closedItems.length} = ${pct(recovered.length, closedItems.length)} |`,
     ...bandRows,
   ].join('\n');
@@ -432,6 +459,9 @@ export function renderTelemetryReport(agg, meta = {}) {
     `_Generated ${meta.generatedAt || new Date().toISOString()} · source ${meta.file || 'events.jsonl'} · ${agg.total} event(s)_`,
     '',
     '## KPIs (KI-E13)', '', kpi, '',
+    '_Legacy folds cannot identify killed attempts or prove the observed first fold was the first attempt. Use versioned attempt observations below for the first-attempt cohort metric._', '',
+    `Event deduplication: ${agg.deduplication?.duplicates || 0} duplicates; ${agg.deduplication?.conflicts.length || 0} conflicting immutable identities excluded. Identity-less legacy events are not guessed from filenames or timestamps.`, '',
+    agg.observations ? renderObservationReport(agg.observations) : '', '',
     '## Events by type', '', kv(agg.byEvent, 'Event', 'Count'), '',
     '## Events by source', '', kv(agg.bySource, 'Source', 'Count'), '',
     '## Item outcomes (folded)', '', kv(agg.outcomes, 'State', 'Items'),
@@ -454,15 +484,14 @@ export function renderTelemetryReport(agg, meta = {}) {
         ...agg.usage.map((u) => `| ${u.cycle} | ${u.file} | ${u.outputTokens.toLocaleString('en-US')} |`),
         `| **total** | | **${agg.usage.reduce((a, u) => a + u.outputTokens, 0).toLocaleString('en-US')}** |`].join('\n')
       : '_none — usage events land on folds from KI-E23 onward_', '',
-    '## Session token usage & cache hit rate (KI-E66, cycle-scoped, Prometheus-derived)', '',
-    '_Requires `driver.mjs preflight` to report `cost telemetry: ready` for the session that ran the cycle (KI-E33) AND a reachable Prometheus with the claude_code_token_usage_tokens_total metric. NOT per-item — Claude Code has no concept of a factory work item, and the factory runs 2-3 items concurrently (SKILL.md), so a per-item window query would double-count overlapping siblings. See "Per-item apportioned tokens" below for the best available item-level view._', '',
+    '## Session token usage & cache hit rate (KI-E66, Prometheus-derived)', '',
+    '_Requires session OTLP and reachable Prometheus. A time window stamped with a cycle is not proof of cycle/session attribution: an unfiltered query includes every matching session/host in that Prometheus. Explicit source, selector and scope are required. Overlapping snapshots must not be summed, and missing token buckets stay unknown._', '',
     (agg.tokenUsageSnapshots || []).length
-      ? ['| Cycle | Input | Output | Cache read | Cache creation | Total | Cache hit rate |', '|---|---|---|---|---|---|---|',
-        ...agg.tokenUsageSnapshots.map((u) => `| ${u.cycle} | ${u.inputTokens.toLocaleString('en-US')} | ${u.outputTokens.toLocaleString('en-US')} | ${u.cacheReadTokens.toLocaleString('en-US')} | ${u.cacheCreationTokens.toLocaleString('en-US')} | ${u.totalTokens.toLocaleString('en-US')} | ${u.cacheHitRate == null ? 'n/a' : Math.round(u.cacheHitRate * 100) + '%'} |`)].join('\n')
+      ? ['| Cycle | Input | Output | Cache read | Cache creation | Total | Cache hit rate | Source / scope / selector |', '|---|---|---|---|---|---|---|---|',
+        ...agg.tokenUsageSnapshots.map((u) => `| ${u.cycle} | ${u.inputTokens?.toLocaleString('en-US') ?? 'unknown'} | ${u.outputTokens?.toLocaleString('en-US') ?? 'unknown'} | ${u.cacheReadTokens?.toLocaleString('en-US') ?? 'unknown'} | ${u.cacheCreationTokens?.toLocaleString('en-US') ?? 'unknown'} | ${u.totalTokens?.toLocaleString('en-US') ?? 'unknown'} | ${u.cacheHitRate == null ? 'unknown' : Math.round(u.cacheHitRate * 100) + '%'} | ${u.source} / ${u.scope} / ${JSON.stringify(u.selector)} |`)].join('\n')
       : '_NOT gathered — either the session lacked the OTLP metrics-exporter env (`driver.mjs preflight`) or Prometheus was unreachable when this report ran (`driver.mjs telemetry-report` re-attempts the query every time; re-run after fixing either)_', '',
     '## Per-item apportioned tokens (estimate — NOT a measurement, KI-E66)', '',
-    '_Real per-item token measurement is not available: the Workflow runtime exposes only a whole-run output-token counter (no per-item split), confirmed by this factory'
-      + "'s own multi-month history never achieving better despite KI-E23 wanting per-item granularity. This table divides each cycle's REAL, measured output-token total (the Fold-time token usage section above) across that cycle's items by their REAL, measured call-count share (ledger cost map) — a disclosed apportionment of a real number, never a fabricated one. Treat as directional, not exact._",
+    '_Legacy successful logical-call shares omit failed retries and bookkeeping. This table apportions run output tokens using those incomplete weights; it is not causal item attribution. Concurrent shared-counter deltas also cannot prove which item generated tokens. Use directly attributed runtime usage where available._',
     '',
     (() => {
       const rows = [];
@@ -472,10 +501,10 @@ export function renderTelemetryReport(agg, meta = {}) {
       }
       return rows.length ? ['| Cycle | Item | Apportioned output tokens (est.) |', '|---|---|---|', ...rows].join('\n') : '_none — needs both a fold-time usage event and item_folded cost data for the same cycle_';
     })(), '',
-    '## Agent-call volume by model (from fold cost)', '', kv(agg.models, 'Model', 'Calls'), '',
+    '## Legacy successful logical calls by requested model (from fold cost)', '', kv(agg.models, 'Requested model', 'Calls'), '',
     // KI-E107 — the yield section. See aggregateEvents for why call-count is the unit.
     '## Agent-call spend by outcome (KI-E107)', '',
-    '_The share of the factory\'s work that reached a CLOSED item. Call counts are the only per-item cost unit that is real and measured — KI-E66 established that per-item TOKEN counts are structurally unavailable inside the Workflow runtime (`budget` exposes a whole-run counter only, and a direct empirical test confirmed an `agent()` call\'s own cost is not recoverable from outside the sandbox). So this is a call-weighted proxy: directional, never a bill. It is the one number that makes a cost argument settleable — an optimisation that lowers total calls but lowers the CLOSED share is not a saving._', '',
+    '_Legacy cost maps count successful logical calls by requested route, not physical attempts, actual selected models or paid usage. Retries and bookkeeping can be absent. CLOSED is not human acceptance; failed-attempt work may be reused later. Use the observational lifetime cohort cost above for accepted-delivery comparisons._', '',
     renderCallsByOutcome(agg.callsByOutcome), '',
   ].join('\n');
 }

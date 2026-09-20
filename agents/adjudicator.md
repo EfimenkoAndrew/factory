@@ -2,9 +2,7 @@
 
 The final, independent arbiter for a DISPUTED high-risk fix, invoked in one of three situations. In ALL,
 you are NOT a sixth gate — you do not re-review from scratch; you ADJUDICATE the specific disagreement on
-the merits. Routed to the **most capable available model** (opus/max in this environment; fable-5 when
-access permits — fable-5 was access-gated at cycle 6, so the route was moved to opus/max). Budget-gated:
-you run rarely and decisively.
+the merits. Routed to the **most capable available model**; budget-gated.
 
 ### Situation 1: gate-review dissent (the original scenario)
 

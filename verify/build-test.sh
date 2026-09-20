@@ -112,6 +112,29 @@ emit_realinfra() {
   fi
 }
 
+prepare_test_results() {
+  _SD=$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)
+  _trx_dir=$(mktemp -d /tmp/factory-trx.XXXXXXXX) || return 1
+  trap 'rm -rf -- "$_trx_dir"' EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+}
+
+capture_test_results() {
+  evidence=$(node "$_SD/../_workflow/test-results.mjs" "$_trx_dir" "$cmd" "$code")
+  captured=$?
+  if ! printf '%s\n' "$evidence" | grep -q "^FACTORY::SUMMARY::$cmd exit=$captured "; then
+    echo 'FACTORY::TEST::DIAGNOSTIC {"status":"unavailable","reason":"TRX extractor invocation failed"}'
+    if [ "$code" -eq 0 ] || [ "$code" -eq 1 ]; then code=2; fi
+    echo "FACTORY::TEST::${cmd^^}::RESULT exit=$code"
+    echo "FACTORY::SUMMARY::$cmd exit=$code failed=-1 passed=-1 skipped=-1 total=-1"
+  else
+    code=$captured
+    echo "FACTORY::TEST::${cmd^^}::RESULT exit=$code"
+    printf '%s\n' "$evidence"
+  fi
+}
+
 cmd="${1:-}"; target="${2:-}"; filter="${3:-}"
 
 case "$cmd" in
@@ -149,30 +172,30 @@ case "$cmd" in
     # marker AND the testcontainers logs the emit_realinfra `elif` heuristic keys on). Display stays
     # bounded: we still print only the grepped summary + the extracted marker, never the full transcript.
     echo "FACTORY::TEST::FILTER::START $target :: $filter"
-    out=$(dotnet test "$target" --nologo --filter "$filter" --logger "console;verbosity=detailed" 2>&1)
+    if ! prepare_test_results; then
+      echo 'FACTORY::TEST::DIAGNOSTIC {"status":"unavailable","reason":"TRX temporary directory unavailable"}'
+      echo 'FACTORY::SUMMARY::filter exit=2 failed=-1 passed=-1 skipped=-1 total=-1'
+      exit 2
+    fi
+    out=$(dotnet test "$target" --nologo --filter "$filter" --logger "console;verbosity=detailed" --logger trx --results-directory "$_trx_dir" 2>&1)
     code=$?
     printf '%s\n' "$out" | grep -iE 'Passed!|Failed!|Passed:|Failed:|error|No test matches' | tail -20
     emit_realinfra "$out"
-    echo "FACTORY::TEST::FILTER::RESULT exit=$code"
-    echo "FACTORY::SUMMARY::filter exit=$code"  # KI-E19 evidence manifest
+    capture_test_results
     exit $code
     ;;
   suite)
     _guard_worktree_path "$target" "target"
     echo "FACTORY::TEST::SUITE::START $target"
-    out=$(dotnet test "$target" --nologo 2>&1)
+    if ! prepare_test_results; then
+      echo 'FACTORY::TEST::DIAGNOSTIC {"status":"unavailable","reason":"TRX temporary directory unavailable"}'
+      echo 'FACTORY::SUMMARY::suite exit=2 failed=-1 passed=-1 skipped=-1 total=-1'
+      exit 2
+    fi
+    out=$(dotnet test "$target" --nologo --logger trx --results-directory "$_trx_dir" 2>&1)
     code=$?
     printf '%s\n' "$out" | grep -iE 'Passed!|Failed!|Passed:|Failed:|Skipped:|error' | tail -30
-    echo "FACTORY::TEST::SUITE::RESULT exit=$code"
-    # KI-E19 evidence manifest: the suite's OWN counts on a keyed marker, so a later `filter` append
-    # in the same teed transcript can never shadow them (the ambient dotnet Passed!/Failed! line is
-    # type-agnostic and last-match-parsed). Counts read from the LAST dotnet summary line (same
-    # per-project caveat as the legacy parse); -1 = no summary line found (build error before tests).
-    sum=$(printf '%s\n' "$out" | grep -E 'Passed!|Failed!' | tail -1)
-    sf=$(printf '%s' "$sum" | sed -nE 's/.*Failed:[[:space:]]*([0-9]+).*/\1/p')
-    sp=$(printf '%s' "$sum" | sed -nE 's/.*Passed:[[:space:]]*([0-9]+).*/\1/p')
-    ss=$(printf '%s' "$sum" | sed -nE 's/.*Skipped:[[:space:]]*([0-9]+).*/\1/p')
-    echo "FACTORY::SUMMARY::suite exit=$code failed=${sf:--1} passed=${sp:--1} skipped=${ss:--1}"
+    capture_test_results
     exit $code
     ;;
   efmigration)
