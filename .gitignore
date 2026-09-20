@@ -4,7 +4,14 @@
 # this engine repo (KI-E26: findings name real systems, and the decision queue quotes
 # customer-reported detail verbatim).
 state/worktrees/
-state/run-args.json
+state/run-args*.json
+state/controller-assets.json
+state/orchestrator/
+state/opencode-dispatch.lock/
+state/opencode-dispatch-batch.json
+state/opencode-build-capacity.json
+state/build-capacity.json
+state/opencode-build-slots/
 state/items/
 state/normalized/
 # Runtime markers/leases + --fresh backups (KI-C11 / KI-E6 / setup/init.mjs)
@@ -13,6 +20,7 @@ state/STOP_REQUESTED.md
 state/*.pre-fresh-*
 # Host-local overrides (KI-E17 / SETUP.md § 6) — per-host, never committed
 config/factory.config.local.json
+config/opencode-dispatch.local.json
 verify/build-test.local.sh
 # Repo style profiles (KI-E60) are HOST data — derived from each host's own private repos' PRs, the
 # exact class KI-E26 keeps out of this engine repo. Only the README + the fictional example ship.

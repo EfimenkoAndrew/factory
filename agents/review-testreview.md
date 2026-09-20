@@ -16,7 +16,8 @@ intrinsic quality.
 2. **Deterministic**: no wall-clock dependence (injected `TimeProvider`/fixed instants only),
    no ordering/interleaving luck, no random without a pinned seed, no sleeps-as-sync.
 3. **Named + shaped per `code-style.md`**: `Method_Scenario_ExpectedBehavior`, Arrange/Act/
-   Assert; assertion messages state the BUSINESS reason (they become the fold's evidence).
+   Assert structure; under HOST POLICY — NO NEW COMMENTS this does NOT permit adding comment
+   markers. Assertion messages state the BUSINESS reason (they become the fold's evidence).
 4. **Asserts real behaviour**: not a tautology (asserting the mock returned what the mock was
    told), not assertion-free, not asserting only on internals when an observable outcome exists.
 5. **Never mocks the thing under test**: the money/trust metric rule especially —

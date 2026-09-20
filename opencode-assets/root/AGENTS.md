@@ -1,14 +1,13 @@
-# Agent instructions
+# AI factory controller guidance
 
 This repo has the **AI Implementation Factory** mounted — an in-project agentic
 implement-and-auto-evaluate engine. The mount is the directory containing
 `_workflow/driver.mjs` (default `_bmad-output/ai-factory`; check `.gitmodules` if moved).
 
-The factory's full always-on rules live in **`.opencode/ai-factory.md`**, registered via
-`opencode.json`'s `instructions` so every OpenCode session loads them automatically. The
-operating procedure is the **`ai-factory` skill** (`.opencode/skill/ai-factory/SKILL.md`).
-If you are an agent that reads only this file, read `.opencode/ai-factory.md` too before
-touching anything the factory owns.
+Read **`.opencode/ai-factory.md`** before touching factory-owned paths or work items.
+The operating procedure is the **`ai-factory` skill** (v1: `.opencode/skill/ai-factory/SKILL.md`;
+v2: `.opencode/skills/ai-factory/SKILL.md`). OpenCode v2 loads this `AGENTS.md` guidance;
+its `instructions` config array does not load files. Do not rely on `CLAUDE.md` fallback.
 
 The three rules that matter most, restated here so they are never a click away:
 
@@ -20,5 +19,10 @@ The three rules that matter most, restated here so they are never a click away:
 3. **`state/STOP_REQUESTED.md` is an owner-controlled drain marker** — never delete it from
    inference.
 
-Add this repo's own conventions below; `setup/init.mjs` only creates this file when it is
-absent, and never overwrites your edits (it writes `AGENTS.md.factory-new` alongside instead).
+4. **One controller lease, independent reviewers.** Read the controller manual before
+   dispatch. Product-scope red-lines require BLOCKED/owner ruling. Build/test markers,
+   including RED and required real-infra proof, outrank agent prose.
+
+Setup embeds this section in an `ai-factory` marker block while preserving surrounding
+host guidance. Untouched installed blocks upgrade by content hash; edited or unknown
+blocks receive an `AGENTS.md.factory-new` proposal for manual merging.

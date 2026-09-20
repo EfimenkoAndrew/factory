@@ -18,9 +18,10 @@
 // The check never blocks the fold — the ledger verdict concerns the WORKTREE; repairing main is
 // operator judgment (restore from HEAD or apply the gated worktree copy).
 import { createHash } from 'node:crypto'
-import { readFileSync } from 'node:fs'
+import { readFileSync, readdirSync } from 'node:fs'
 import { join } from 'node:path'
 import { execFileSync } from 'node:child_process'
+import { canonicalRepoPath, repoPathIdentity, repoPathOptions, repoPathsOverlap } from './repo-path.mjs'
 
 /** sha256 hex of a file, or null when missing/unreadable (null is a valid snapshot value: "absent"). */
 export function hashFile(p) {
@@ -30,7 +31,7 @@ export function hashFile(p) {
 /** Snapshot { relFile -> sha256|null } of files as they exist under repoRoot right now. */
 export function snapshotMainFiles(repoRoot, files) {
   const snap = {}
-  for (const f of files || []) snap[f] = hashFile(join(repoRoot, f))
+  for (const f of files || []) Object.defineProperty(snap, f, { value: hashFile(repoPathIdentity(f, { repoRoot }).absolute), enumerable: true, configurable: true, writable: true })
   return snap
 }
 
@@ -38,7 +39,7 @@ export function snapshotMainFiles(repoRoot, files) {
 export function driftAgainstSnapshot(repoRoot, snap) {
   const drifted = []
   for (const [f, h] of Object.entries(snap || {})) {
-    const cur = hashFile(join(repoRoot, f))
+    const cur = hashFile(repoPathIdentity(f, { repoRoot }).absolute)
     if (cur !== h) drifted.push({ file: f, was: h === null ? 'absent' : 'present', now: cur === null ? 'absent' : 'changed/present' })
   }
   return drifted
@@ -50,44 +51,26 @@ export function driftAgainstSnapshot(repoRoot, snap) {
 // commits). An UNTRACKED file is dirty here: `git diff HEAD` is blind to it (exit 0), which is exactly
 // how an agent-created stray (the live ITEM-H5 shape above) must NOT read as a committed delivery.
 // Any git failure classifies dirty — conservative: the ⚠ direction, same as the pre-split behavior.
-export function splitDriftByStatus(repoRoot, drifted) {
+export function splitDriftByStatus(repoRoot, drifted, options = {}) {
   const committed = []
   const dirty = []
+  let status
+  try { status = dirtyMainPaths(repoRoot) } catch { return { committed, dirty: [...(drifted || [])] } }
   for (const d of drifted || []) {
     let clean = false
-    try { clean = execFileSync('git', ['-C', repoRoot, 'status', '--porcelain', '--', d.file], { encoding: 'utf8' }).trim() === '' } catch { /* repo error -> dirty */ }
+    try { clean = filesOverlapDirty([d.file], status, options).length === 0 } catch { /* invalid path -> dirty */ }
     const bucket = clean ? committed : dirty
     bucket.push(d)
   }
   return { committed, dirty }
 }
 
-// KI-E61 (2026-08-02) — auto-repair for the DIRTY-drift case. splitDriftByStatus's own reasoning
-// already proves this is safe: the factory never commits (§ hard rule, PLAN.md/CLAUDE.md), so
-// dirty/untracked drift on a snapshotted path can ONLY have arrived via an agent writing outside
-// its worktree — there is no legitimate-human-action interpretation for it (that's the COMMITTED
-// bucket, left untouched, still operator judgment per KI-E35). Every prior fold treated dirty
-// drift as WARN-only ("repairing main is operator judgment") and left it for a human to notice —
-// this run's ITEM-H18 contamination sat in the tree until manually caught. Repair each dirty
-// entry to its pre-drift state: `was: 'present'` restores from HEAD (the file existed and was
-// overwritten); `was: 'absent'` removes it (a stray new file HEAD never had — checkout can't
-// restore what was never committed). Returns the entries it actually repaired; a repair failure
-// on one file is reported, never thrown — a partial repair must not crash the fold.
+// Compatibility diagnostic only: dirty drift can be uncommitted owner work. Never repair it.
 export function repairDirtyDrift(repoRoot, dirty) {
-  const repaired = []
   for (const d of dirty || []) {
-    try {
-      if (d.was === 'absent') {
-        execFileSync('git', ['-C', repoRoot, 'clean', '-f', '--', d.file], { encoding: 'utf8' })
-      } else {
-        execFileSync('git', ['-C', repoRoot, 'checkout', '--quiet', 'HEAD', '--', d.file], { encoding: 'utf8' })
-      }
-      repaired.push(d)
-    } catch (e) {
-      d.repairError = String((e && e.message) || e)
-    }
+    console.warn('MAIN-DRIFT: owner review required for ' + JSON.stringify(d.file) + ' in ' + JSON.stringify(repoRoot) + '; compare the current content with the claim snapshot and intended worktree changes. No repair performed.')
   }
-  return repaired
+  return []
 }
 
 // KI-E14 (2026-07-20) — pre-claim complement to the KI-L65 post-hoc drift check above.
@@ -99,55 +82,35 @@ export function repairDirtyDrift(repoRoot, dirty) {
 // `group` hard-excludes such items until the user commits (file-level precision — same-service
 // items on disjoint files still group). Pure helpers here; the driver owns the UX.
 
-// Fix (multi-lens review, 2026-08-25, ported from the origin host-mount session): git's porcelain
-// output C-quotes (double-quote wrapped, C-style-escaped) any path containing a quote, backslash,
-// control character, or — under the default `core.quotePath=true` — any non-ASCII byte (so a UTF-8
-// filename like "café.cs" comes out as `"caf\303\251.cs"`, one \NNN octal escape per raw byte). The
-// pre-fix `push` stripped only the OUTER quotes and left every `\NNN`/`\\`/`\"` literally in the
-// string — that string can never string-match the real on-disk path (claimedPaths.has(p),
-// filesOverlapDirty's f.startsWith(dir), etc.), so any dirty path with such a character was
-// permanently, silently unmatchable against anything claiming it. decodeGitQuotedPath reverses the
-// FULL escape grammar (verified live against real git output: a backslash, an embedded double-quote,
-// and a non-ASCII filename all round-trip correctly) back to raw bytes, then UTF-8-decodes them.
-function decodeGitQuotedPath(p) {
-  const bytes = []
-  for (let i = 0; i < p.length; i++) {
-    const c = p[i]
-    if (c !== '\\') { bytes.push(c.charCodeAt(0)); continue }
-    const n = p[i + 1]
-    if (n === 'n') { bytes.push(10); i++ }
-    else if (n === 't') { bytes.push(9); i++ }
-    else if (n === '\\') { bytes.push(92); i++ }
-    else if (n === '"') { bytes.push(34); i++ }
-    else if (n >= '0' && n <= '7') { bytes.push(parseInt(p.slice(i + 1, i + 4), 8) & 0xff); i += 3 }
-    else { bytes.push(c.charCodeAt(0)) } // unrecognized escape — keep the backslash literally, never throw
-  }
-  try { return Buffer.from(bytes).toString('utf8') } catch { return p }
-}
-
 /** Uncommitted paths in the main tree: { paths: [file...], dirs: [dir.../] } (porcelain v1; rename sources included; untracked dirs listed with a trailing slash). */
 export function dirtyMainPaths(repoRoot) {
-  let out = ''
-  try { out = execFileSync('git', ['-C', repoRoot, 'status', '--porcelain'], { encoding: 'utf8', maxBuffer: 16 * 1024 * 1024 }) } catch { return { paths: [], dirs: [] } }
+  const out = execFileSync('git', ['--no-optional-locks', '-C', repoRoot, 'status', '--porcelain=v1', '--untracked-files=normal', '-z'], { encoding: 'utf8', maxBuffer: 16 * 1024 * 1024 })
   const paths = []; const dirs = []
   const push = (p) => {
-    if (!p) return
-    if (p.startsWith('"') && p.endsWith('"')) p = decodeGitQuotedPath(p.slice(1, -1))
+    canonicalRepoPath(p)
     ;(p.endsWith('/') ? dirs : paths).push(p)
   }
-  for (const raw of out.split('\n')) {
-    if (!raw.trim()) continue
-    const entry = raw.slice(3)
-    const arrow = entry.indexOf(' -> ')
-    if (arrow >= 0) { push(entry.slice(0, arrow)); push(entry.slice(arrow + 4)) } else push(entry)
+  const entries = out.split('\0')
+  for (let i = 0; i < entries.length; i++) {
+    const raw = entries[i]
+    if (!raw) continue
+    if (raw.length < 4 || raw[2] !== ' ' || !/^[ MTADRCU?!]{2}$/.test(raw.slice(0, 2))) throw new Error('Invalid git status record')
+    push(raw.slice(3))
+    if (/[RC]/.test(raw.slice(0, 2))) push(entries[++i])
   }
   return { paths, dirs }
 }
 
 /** The subset of an item's files[] that collide with dirty main-tree state (exact file or under a dirty untracked dir). */
-export function filesOverlapDirty(files, dirty) {
+export function filesOverlapDirty(files, dirty, platform = process.platform, repoRoot) {
+  const options = repoPathOptions(platform, repoRoot)
   const d = dirty || { paths: [], dirs: [] }
-  return (files || []).filter((f) => d.paths.includes(f) || d.dirs.some((dir) => f.startsWith(dir)))
+  const paths = d.paths.map((p) => repoPathIdentity(p, options))
+  const dirs = d.dirs.map((p) => ({ ...repoPathIdentity(p, options), directory: true }))
+  return (files || []).filter((f) => {
+    const key = repoPathIdentity(f, options)
+    return [...paths, ...dirs].some((dirtyPath) => repoPathsOverlap(key, dirtyPath))
+  })
 }
 
 // KI-E89 (2026-08-24, ported from a host-mount session) — the inverse gap from KI-E14/KI-L65 above:
@@ -168,8 +131,7 @@ export function filesOverlapDirty(files, dirty) {
 // This can NOT distinguish unclaimed factory-worktree contamination from a human's own unrelated
 // work-in-progress sitting in the same tree — the caller (`main-check`, read-only/warn-only
 // throughout) surfaces it as a nudge to eyeball, never a silent miss and never an auto-repair
-// target (KI-E61's auto-repair stays scoped to the snapshot-confirmed case — an unclaimed path has
-// no snapshot to prove what "repair" would even mean).
+// target. Claimed and unclaimed dirty paths can both contain owner work.
 // Fix (multi-lens review, 2026-08-25, ported from the origin host-mount session): the `dirs` branch
 // below used to filter ONLY on `underMount`, never consulting `claimed` at all — so a directory an
 // item legitimately declared in its own files[] (e.g. a new test-project subfolder, which `git
@@ -179,13 +141,55 @@ export function filesOverlapDirty(files, dirty) {
 // this function's own header comment ("the union of every path any item has EVER claimed").
 // `dirClaimed` mirrors the pre-existing `filesOverlapDirty` helper's reversed direction: a claimed
 // FILE path starting with a dirty DIR path means that dir is accounted for.
-export function unclaimedMainDrift(dirty, mountRel, claimedPaths) {
+export function unclaimedMainDrift(dirty, mountRel, claimedPaths, platform = process.platform, repoRoot) {
+  const options = repoPathOptions(platform, repoRoot)
   const d = dirty || { paths: [], dirs: [] }
-  const claimed = claimedPaths || new Set()
-  const claimedArr = [...claimed]
-  const underMount = (p) => p === mountRel || p.startsWith(mountRel + '/')
-  const dirClaimed = (dir) => claimedArr.some((c) => c.startsWith(dir))
-  const files = d.paths.filter((p) => !underMount(p) && !claimed.has(p))
-  const dirs = d.dirs.filter((p) => !underMount(p) && !dirClaimed(p))
+  const claimedArr = [...(claimedPaths || [])].map((p) => repoPathIdentity(p, options))
+  const mount = mountRel === null || mountRel === '' || mountRel === '.' ? null : repoPathIdentity(mountRel, options)
+  const underMount = (p) => mount !== null && (p.path === mount.path || p.path.startsWith(mount.path + '/'))
+  const files = d.paths.filter((p) => {
+    const key = repoPathIdentity(p, options)
+    return !underMount(key) && !claimedArr.some((c) => repoPathsOverlap(c, key))
+  })
+  const dirs = d.dirs.filter((p) => {
+    const key = { ...repoPathIdentity(p, options), directory: true }
+    return !underMount(key) && !claimedArr.some((c) => repoPathsOverlap(c, key))
+  })
   return [...files, ...dirs]
+}
+
+// KI-E177 (ported from a host-mount session) — an UNCLAIMED main-tree path (KI-E89's own blind
+// spot: no item's snapshot ever declared it, so the snapshot-based checks above cannot even look)
+// is not equally likely to be leaked write-isolation contamination (KI-E149-class) vs the
+// operator's own unrelated work-in-progress — KI-E89's header comment treats the two as
+// indistinguishable, but a real, checkable signal exists: does the SAME relative path, with
+// BYTE-IDENTICAL content, already exist inside one of the just-folded items' OWN worktree? An
+// operator's genuine new file would have to coincidentally match both the exact path AND the exact
+// bytes of some item's worktree copy for that to happen by chance — it does not. Deliberately
+// still returns a SIGNAL only — KI-E89's own "never auto-repair an unclaimed path" posture is
+// UNCHANGED (an unclaimed path still has no snapshot to prove what "repair" would even mean, and a
+// human still confirms before anything is deleted from the shared main tree) — this only makes
+// the signal strong enough that a human does not have to manually re-derive the diff-check by hand.
+function listFilesUnder(dir) {
+  return readdirSync(dir, { withFileTypes: true }).flatMap((entry) => entry.isDirectory()
+    ? listFilesUnder(join(dir, entry.name)).map((p) => entry.name + '/' + p)
+    : entry.isFile() || entry.isSymbolicLink() ? [entry.name] : [])
+}
+export function matchWorktreeDebris(repoRoot, unclaimedPaths, itemIds, worktreesRoot) {
+  return (unclaimedPaths || []).map((p) => {
+    const identity = repoPathIdentity(p, { repoRoot })
+    const key = identity.path
+    const isDir = /[\\/]$/.test(p)
+    const relFiles = isDir ? listFilesUnder(identity.absolute).map((f) => canonicalRepoPath(key + '/' + f)) : [key]
+    for (const f of relFiles) {
+      const mainHash = hashFile(repoPathIdentity(f, { repoRoot }).absolute)
+      if (mainHash === null) continue
+      for (const id of itemIds || []) {
+        const worktree = repoPathIdentity(id, { repoRoot: worktreesRoot })
+        if (!worktree.exists || !worktree.directory) continue
+        if (hashFile(repoPathIdentity(f, { repoRoot: worktree.absolute }).absolute) === mainHash) return { path: p, matchedItem: id, matchedFile: f }
+      }
+    }
+    return { path: p, matchedItem: null, matchedFile: null }
+  })
 }

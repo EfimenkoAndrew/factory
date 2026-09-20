@@ -9,12 +9,9 @@
 // result. State persists to `state/items/<id>/opencode-progress.json` between calls, so the
 // controlling agent can drive this across many separate tool-call turns.
 //
-// Ported from `_workflow/factory.js`'s `runItem()` (single-item path only — sweep-mode/multi-item
-// batch parallelism are OUT OF SCOPE for this port; drive items one at a time). Mirrors its phase
-// sequence, retry/adjudication/bounded-amend logic, and produces a `state/items/<id>/result.json`
-// in the EXACT shape `driver.mjs fold` validates (see KNOWN-ISSUES.md KI-O1 for the fidelity gaps
-// this port documents, chiefly: no per-call model tiering — every agent step actually runs on
-// whatever model backs the controlling session's Task subagent, not the intended RT/FLOW_RT tier).
+// Per-item checkpoint machine. dispatcher.mjs drives multiple items with independently bounded
+// agent/build capacity and documented, versioned server routing. The legacy Task path is explicit.
+// Ordinary item results use the driver fold contract; sweep remains the native driver's domain.
 //
 // Usage (from the HOST repo root, same convention as driver.mjs):
 //   node tools/ai-factory/_workflow/opencode/runtime.mjs init <itemId>
@@ -24,13 +21,22 @@
 //   node tools/ai-factory/_workflow/opencode/runtime.mjs status <itemId>
 //   node tools/ai-factory/_workflow/opencode/runtime.mjs finalize <itemId>
 
-import { readFileSync, writeFileSync, existsSync, mkdirSync, renameSync, statSync } from 'node:fs';
+import { readFileSync, writeFileSync, existsSync, mkdirSync, statSync, readdirSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { validateNamed } from './schemas.mjs';
+import { validateNamed, SCHEMAS } from './schemas.mjs';
+import { digest, newIdentity, snapshotTree, withItemLock, writeJsonAtomic, isWriter, acceptSubmission, EVIDENCE_IDENTITY_VERSION } from './identity.mjs';
+import { completeCommand, lintCandidates, guardMechanical } from './contracts.mjs';
+import { roleRoute } from './routing.mjs';
+import { shadowEligible, shadowSnapshot, shadowCalls, shadowComparison, originalScanCalls } from './shadow-scan.mjs';
+import { captureBaseline } from '../lib/baseline.mjs';
+import { serviceRoots, mainDrift, efProbe, nativeProbeCalls } from './native-checks.mjs';
+import { effectiveInfraRequirement } from '../lib/effective-infra.mjs';
+import { attachDispatchEvidence } from './admission.mjs';
 import { flowsFor, routesFor, bandFor, reauditLenses, needsRealInfra as computeNeedsRealInfra, gateRolesFor } from './routing.mjs';
 import { compose, itemsDir as itemsDirFor } from './compose.mjs';
-import { runBuildTest, writeRaw, parseVerifyRaw, verdictFromParse, parseRedRaw, hasRealInfraMarker, debrisFiles, nonTestChanged, flakeSuspects, effectiveBaseline, decodeTranscript, dockerAvailable } from './buildtest.mjs';
+import { writeRaw, parseVerifyRaw, verdictFromParse, parseRedRaw, hasRealInfraMarker, debrisFiles, nonTestChanged, flakeSuspects, decodeTranscript, dockerAvailable } from './buildtest.mjs';
+import { limitedBuildTest as runBuildTest } from './build-lease.mjs';
 import { changedFiles } from '../lib/worktree.mjs';
 import { splitAcceptanceClauses } from '../lib/acceptance.mjs';
 import { normalizePlanSteps, hasPlanCommitmentLanguage } from '../lib/plan-commitment.mjs';
@@ -47,11 +53,6 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 const FACTORY_ROOT = join(HERE, '..', '..').replace(/\\/g, '/'); // tools/ai-factory, absolute, forward-slash
 
 function readJson(p) { return JSON.parse(readFileSync(p, 'utf8')); }
-function writeJsonAtomic(p, obj) {
-  mkdirSync(dirname(p), { recursive: true });
-  writeFileSync(p + '.tmp', JSON.stringify(obj, null, 2) + '\n');
-  renameSync(p + '.tmp', p);
-}
 
 // ---- locate + load the item spec and its ledger row (same on-disk files driver.mjs owns; READ-ONLY here) ----
 function loadGraph() { return readJson(join(FACTORY_ROOT, 'state', 'findings-graph.json')); }
@@ -83,7 +84,16 @@ function resolveMainRepoRoot(worktreePath) {
 }
 
 function progressPath(id) { return join(FACTORY_ROOT, 'state', 'items', id, 'opencode-progress.json'); }
-function loadProgress(id) { return readJson(progressPath(id)); }
+function loadProgress(id) {
+  const p = readJson(progressPath(id));
+  if (p.version === 2 && !p.fixture) {
+    const { row } = findLedgerRow(id);
+    const claim = (row.history || []).filter(h => h.to === 'CLAIMED').at(-1);
+    if (row.claimId !== p.claimId || row.runId !== p.runId || row.attemptNumber !== p.attemptNumber || row.state !== 'CLAIMED') throw new Error('attempt no longer belongs to the active claim');
+  }
+  p.res.needsRealInfra = effectiveInfraRequirement(p.res, p.originalNeedsRealInfra === true || computeNeedsRealInfra(p.item, (p.item.files || []).some(f => /\.cs$/i.test(f))));
+  return p;
+}
 function saveProgress(id, p) { writeJsonAtomic(progressPath(id), p); }
 
 function log(...a) { console.log(...a); }
@@ -107,14 +117,14 @@ function cmdInit(id, flags) {
   if (!id || !SAFE_ID_RE.test(id)) {
     throw new Error(`init: unsafe item id ${JSON.stringify(id)} — ids must match ${SAFE_ID_RE} (they become state/items/<id>/ path segments; separators and ".." are rejected so a poisoned graph cannot traverse)`);
   }
-  let item, worktreePath, branch, cycle, prevState, ledgerState;
+  let item, worktreePath, branch, cycle, prevState, ledgerState, launch = {}, claimId, claimAtMs, attemptNumber = null, lifecycle;
   if (flags.fixture) {
     // Self-test escape hatch (KI-O1): bypass findings-graph.json/ledger.json entirely so the state
     // machine can be exercised without touching a real item's on-disk artifacts. NEVER used for a
     // real run — `mech` steps that need an actual worktree/dotnet build will simply fail loudly if
     // pointed at a fixture whose worktreePath isn't a real checkout.
     const fx = readJson(flags.fixture);
-    item = fx.item; worktreePath = fx.worktreePath.replace(/\\/g, '/'); branch = fx.branch || 'fixture/none';
+    item = { ...fx.item, id }; worktreePath = fx.worktreePath.replace(/\\/g, '/'); branch = fx.branch || 'fixture/none';
     cycle = fx.cycle || 1; prevState = fx.prevState || null; ledgerState = fx.state || 'READY';
   } else {
     item = findItem(id);
@@ -123,8 +133,25 @@ function cmdInit(id, flags) {
     worktreePath = row.worktree.replace(/\\/g, '/'); branch = row.branch;
     cycle = defaultCycleFor(ledger.cycle, flags.cycle); // parity: driver.mjs cmdSelect/cmdGroup `cycle: ledger.cycle + 1` — see defaultCycleFor
     prevState = row.prevState; ledgerState = row.state;
+    const claim = (row.history || []).filter(h => h.to === 'CLAIMED').at(-1);
+    if (row.state !== 'CLAIMED' || !claim) throw new Error('init requires a live driver claim');
+    claimId = row.claimId;
+    claimAtMs = Date.parse(claim.at);
+    attemptNumber = row.attemptNumber;
+    const launchPath = flags.launch || (row.runScript && resolve(repoPathFromWorktree(worktreePath), row.runScript.replace(/run-script/, 'run-args').replace(/\.js$/, '.json')));
+    if (!launchPath || !existsSync(launchPath)) throw new Error('claim-matched enriched launch missing; pass --launch <run-args.json>');
+    launch = readJson(launchPath);
+    const enriched = (launch.items || []).find(it => it.id === id);
+    lifecycle = lifecycleForLaunch(row, launch, enriched);
+    if (!enriched || launch.cycle !== cycle || resolve(enriched.worktree?.path || '') !== resolve(worktreePath) || enriched.worktree?.branch !== branch || statSync(launchPath).mtimeMs < Date.parse(claim.at)) throw new Error('launch does not match current claim/cycle/worktree');
+    item = { ...item, ...enriched };
   }
   const repoRoot = flags.fixture ? worktreePath : resolveMainRepoRoot(worktreePath);
+  if (existsSync(progressPath(id))) {
+    const prior = readJson(progressPath(id));
+    if (!claimId || prior.claimId === claimId) throw new Error('progress already exists for this claim; resume with next');
+    writeJsonAtomic(join(dirname(progressPath(id)), 'attempts', (prior.attemptId || 'legacy') + '.json'), prior);
+  }
   const band = bandFor(item);
   const filesHaveCs = (item.files || []).some((f) => /\.cs$/i.test(f));
   const codeChange = filesHaveCs; // refined again after Test phase if the test-author's testFiles[] adds .cs
@@ -135,7 +162,7 @@ function cmdInit(id, flags) {
   // root-cause-touch check reads exactly this shape; the planner's own files[] never feeds it.
   const pureCoverage = item.theme === 'test-coverage' && !item.realInfra;
   const rootCauseFiles = pureCoverage ? [] : (item.files || []).filter((f) => /\.cs$/i.test(f) && !/Tests?\//i.test(f) && !/Tests?\.cs$/i.test(f));
-  const ctx = { repoRoot, worktreePath, branch, factoryRoot: FACTORY_ROOT, templatesDir: join(FACTORY_ROOT, 'agents').replace(/\\/g, '/') };
+  const ctx = { repoRoot, worktreePath, branch, factoryRoot: FACTORY_ROOT, templatesDir: join(FACTORY_ROOT, 'agents').replace(/\\/g, '/'), briefs: launch.briefs, repoProfiles: launch.repoProfiles, policies: launch.policies || loadPolicies(FACTORY_ROOT) };
   const res = {
     id: item.id,
     resultId: item.id + '#' + cycle,
@@ -161,17 +188,58 @@ function cmdInit(id, flags) {
     pending: null,
     pendingSet: null, // { phaseLabel, keys: [key,...], received: {key: result} } for pooled/concurrent phases
     edgeFinal: null,
-    reFix: prevState === 'FAILED' || ledgerState === 'FAILED',
-    initAtMs: Date.now(), // KI-E43 reFix fence anchor: a baseline-raw.txt (re)captured AFTER this attempt started is distrusted on a reFix (mirrors driver fold's claim-history mtime fence)
+    reFix: !!item.reFix || ['FAILED', 'CONFLICT', 'ESCALATED'].includes(prevState) || ledgerState === 'FAILED',
+    initAtMs: claimAtMs || Date.now(),
     checkpointed: false, // set by `mech checkpoint` — EVERY terminal (CLOSED and FAILED/BLOCKED/ESCALATED alike) must write result.json before `next` reports done
     history: [],
+    version: 2, attemptId: lifecycle?.attemptId || newIdentity('attempt'), claimId: claimId || newIdentity('fixture'),
+    runId: lifecycle?.runId || newIdentity('opencode-run'), startedAt: lifecycle?.startedAt || Date.now(), attemptNumber,
+    originalNeedsRealInfra: nri,
+    legacy: !!flags.legacy, fixture: !!flags.fixture, dispatchSequence: 0, submissions: {},
+    config: { ...readJson(join(FACTORY_ROOT, 'config', 'factory.config.json')), ...(existsSync(join(FACTORY_ROOT, 'config', 'factory.config.local.json')) ? readJson(join(FACTORY_ROOT, 'config', 'factory.config.local.json')) : {}), ...launch.config, ...(Object.hasOwn(launch, 'evidenceInputs') ? { evidenceInputs: launch.evidenceInputs } : {}) },
+    policies: ctx.policies, routing: launch.routing, launch,
   };
+  if (progress.fixture) progress.attemptId = progress.claimId;
+  ctx.briefs = launch.briefs || Object.fromEntries(readdirSync(ctx.templatesDir).filter(n => n.endsWith('.md') && n !== 'reporter.md').map(n => [n.slice(0, -3), readFileSync(join(ctx.templatesDir, n), 'utf8')]));
+  const profilesDir = join(ctx.templatesDir, 'repo-profiles');
+  ctx.repoProfiles = launch.repoProfiles || (existsSync(profilesDir) ? Object.fromEntries(readdirSync(profilesDir).filter(n => n.endsWith('.md')).map(n => [n.slice(0, -3), readFileSync(join(profilesDir, n), 'utf8')])) : {});
+  progress.contractHash = digest({ item, config: progress.config, policies: progress.policies, routing: progress.routing, briefs: ctx.briefs, profiles: ctx.repoProfiles });
+  progress.content = contentFor(progress);
+  progress.res.attemptId = progress.attemptId; progress.res.claimId = progress.claimId; progress.res.runId = progress.runId;
+  progress.res.attemptNumber = attemptNumber;
   saveProgress(id, progress);
   log(`init: ${id} cycle=${cycle} band=${band} fixType=${item.fixType} verificationOnly-candidate=${pureCoverage}`);
   log(`  repoRoot=${repoRoot}`);
   log(`  worktree=${worktreePath} branch=${branch}`);
   log(`  reFix=${progress.reFix} (prior feedback.md/gate-*.md/review-*.md should already exist if true)`);
   log('next: node ' + fileURLToPath(import.meta.url) + ' next ' + id);
+}
+
+export function lifecycleForLaunch(row, launch, item) {
+  if (!row.claimId || !row.runId || !Number.isInteger(row.attemptNumber) || row.attemptNumber < 1 || launch.runId !== row.runId || item?.runId !== row.runId || item?.claimId !== row.claimId || item?.attemptNumber !== row.attemptNumber) throw new Error('launch lifecycle identity differs from driver claim');
+  return { claimId: row.claimId, attemptId: row.claimId, runId: row.runId, attemptNumber: row.attemptNumber, startedAt: Date.parse(row.attemptIdentity?.startedAt) || Date.now() };
+}
+
+function repoPathFromWorktree(path) { return resolveMainRepoRoot(path); }
+function contentFor(progress) {
+  return progress.fixture ? { version: EVIDENCE_IDENTITY_VERSION, hash: digest(progress.item), codeHash: digest(progress.item), base: 'fixture' } : snapshotTree(progress.ctx.worktreePath, progress.contractHash, undefined, { inputs: progress.config?.evidenceInputs, engineMount: progress.launch?.engineMount, briefs: progress.ctx.briefs });
+}
+
+function currentScanSnapshot(progress) {
+  const dir = itemsDirFor(progress.ctx, progress.id);
+  return shadowSnapshot({ ...progress, content: contentFor(progress) }, readFileSync(join(dir, 'review-pack.md'), 'utf8'), readFileSync(join(dir, 'feedback.md'), 'utf8'));
+}
+
+export function invalidateSuffix(progress, current) {
+  progress.history.push({ event: 'content-invalidated', phase: progress.phase, prior: progress.content?.hash, current: current.hash });
+  progress.pendingSet = null;
+  progress.res.gates = {}; progress.res.gateDetails = {}; progress.edgeFinal = null;
+  progress.checkpointed = false; progress.editorialIndex = 0; progress.finalScans = false;
+  progress.completedAt = null; progress.evidence = null; progress.integrationEvidence = null;
+  progress.res.transitions = progress.res.transitions.filter(s => ['RED'].includes(s));
+  progress.res.toState = 'FAILED'; progress.res.note = ''; progress.res.integrateRaw = false;
+  progress.phase = progress.test ? 'verify' : progress.plan ? 'test' : progress.item.fixType === 'mechanical' ? 'test' : 'plan';
+  progress.content = current;
 }
 
 function finish(progress, toState, note) {
@@ -189,10 +257,21 @@ function ctxFor(progress) { return progress.ctx; }
 // safe to call repeatedly, e.g. after a crash/resume, exactly like re-printing a Workflow({scriptPath})
 // launch line is safe).
 // ---------------------------------------------------------------------------------------------
-function cmdNext(id) {
+function cmdNext(id, flags = {}) {
   const progress = loadProgress(id);
+  if (progress.version === 2) {
+    const now = contentFor(progress);
+    const writers = progress.pendingSet?.calls.some(c => isWriter(c.role));
+    if (!progress.pendingSet && !writers && progress.content?.hash !== now.hash && !['FAILED', 'BLOCKED'].includes(progress.res.toState)) invalidateSuffix(progress, now);
+    else if (!progress.pendingSet && !writers && progress.content?.hash !== now.hash && progress.phase !== 'done') invalidateSuffix(progress, now);
+    if (!progress.pendingSet && !writers && ['gates', 'gates_adjudicate', 'gates_regate', 'po', 'refute_reaudit', 'escalatecheck', 'integrate', 'integrate_judge', 'checkpoint'].includes(progress.phase) && !evidenceIntact(progress)) {
+      invalidateSuffix(progress, now);
+    }
+  }
   const { item, ctx, res } = progress;
   const out = planNext(progress);
+  if (flags.legacy || progress.legacy) for (const c of out.agents || []) c.prompt = readJson(c.promptRef).prompt;
+  saveProgress(id, progress);
   log(JSON.stringify(out, null, 2));
   return out;
 }
@@ -217,6 +296,27 @@ function edgeExtraFor(progress) {
 
 function planNext(progress) {
   const { item, ctx, res, phase } = progress;
+  if (['edgescan', 'acceptance'].includes(phase) && shadowEligible(progress) && !progress.shadowSampled) {
+    progress.shadowSampled = true;
+    progress.shadowResume = phase;
+    const dir = itemsDirFor(ctx, progress.id);
+    try {
+      if (progress.shadowPackReady === false) throw new Error('current review pack generation failed');
+      const pack = readFileSync(join(dir, 'review-pack.md'), 'utf8');
+      const feedback = readFileSync(join(dir, 'feedback.md'), 'utf8');
+      if (!pack.trim() || !feedback.trim()) throw new Error('empty frozen pack or feedback');
+      progress.shadowSnapshot = shadowSnapshot(progress, pack, feedback);
+      writeArtifact(progress, 'shadow-input', 'shadow-scan-input.json', progress.shadowSnapshot);
+      progress.phase = 'shadow_scan';
+      return planNext(progress);
+    } catch (e) {
+      const sample = shadowComparison({ version: 1, snapshotId: null, beforeAmendment: true, inputs: null }, {}, { snapshot: e.message });
+      writeArtifact(progress, 'shadow-scan', 'shadow-scan.json', sample);
+      res.gates['probe:consolidated-scan-shadow'] = 'SKIPPED';
+      res.gateDetails['probe:consolidated-scan-shadow'] = { verdict: 'SKIPPED', observational: true, headline: e.message, axes: sample.axes, findings: [] };
+    }
+  }
+  if (phase === 'shadow_scan') return agentStep(progress, phase, shadowCalls(progress.shadowSnapshot).map(c => c.role === 'consolidated-scan-shadow' ? { ...c, role: 'consolidated-scan-shadow' } : c));
   if (phase === 'done') {
     // KI-L48/KI-L40 parity: EVERY terminal outcome (FAILED/BLOCKED/ESCALATED as much as CLOSED) must
     // persist result.json — factory.js checkpoints both resolved AND crashed results the moment they
@@ -230,6 +330,13 @@ function planNext(progress) {
 
   if (phase === 'plan') {
     return agentStep(progress, 'plan', [{ role: 'planner', phaseLabel: 'Plan', schema: 'PLAN_SCHEMA', extra: null }]);
+  }
+  // KI-E134 — PLAN-DRIFT PREVENTION at the source (ported from factory.js; this runtime has no
+  // KI-E69 plan-reuse concept, so every plan call here is inherently "fresh" — no extra guard
+  // needed). Routed into by applyPhaseResults' 'plan' case, ONLY when the plan's own approach/
+  // blastRadius used commitment language but steps came back missing/under-decomposed.
+  if (phase === 'plan-steps-nudge') {
+    return agentStep(progress, 'plan-steps-nudge', [{ role: 'planner', phaseLabel: 'Plan', schema: 'PLAN_STEPS_NUDGE_SCHEMA', extra: 'Your own approach/blastRadius above uses commitment language ("MUST" / "required to") describing substantive, checkable work, but you did not decompose it into `steps` (brief point 6) — or decomposed fewer than 2. Re-read that point now. Return ONLY: `steps` — 2-8 ordered, individually checkable one-sentence steps covering the commitments your own approach/blastRadius text just made; leave it empty ONLY if the work is genuinely one atomic edit despite the commitment wording. `note` (required either way) — if steps is non-empty, one sentence is fine; if empty, EXPLICITLY justify why the commitment language does not actually decompose (do not just restate the approach).' }]);
   }
   if (phase === 'test') {
     const reFixNote = progress.reFix ? ' RE-FIX: read the prior feedback (state/items/' + progress.id + '/gate-*.md + review-*.md) and write the red proof for what is STILL broken.' : '';
@@ -262,8 +369,8 @@ function planNext(progress) {
   }
   if (phase === 'acceptance') {
     const clauses = splitAcceptanceClauses(progress.item.acceptance, 8);
-    if (progress.verificationOnly || clauses.length < 2) { progress.phase = 'leftover'; saveProgress(progress.id, progress); return planNext(progress); }
-    return agentStep(progress, 'acceptance', [{ role: 'acceptance-probe', phaseLabel: 'EdgeScan', schema: 'ACCEPT_SCHEMA', extra: 'ACCEPTANCE CLAUSE COVERAGE PROBE. Clauses (fail-open on missing verdict, fail-closed on an explicit false): ' + JSON.stringify(clauses) }]);
+    if (progress.verificationOnly || clauses.length < 2) { progress.phase = 'plancommit'; saveProgress(progress.id, progress); return planNext(progress); }
+    return agentStep(progress, 'acceptance', [{ ...originalScanCalls(progress)[0], role: 'acceptance-probe', phaseLabel: 'EdgeScan' }]);
   }
   if (phase === 'acceptance_amend') {
     return agentStep(progress, 'acceptance_amend', [{ role: 'fixer', phaseLabel: 'EdgeScan', schema: 'FIX_SCHEMA', extra: 'ACCEPTANCE-SCAN AMEND: address EVERY gap below, then re-run the targeted build+test. GAPS: ' + JSON.stringify((progress._acceptGaps || []).slice(0, 8)) }]);
@@ -277,6 +384,7 @@ function planNext(progress) {
   // schemas.mjs said so explicitly); PROSE mode falls back to the deterministic commitment-language
   // prefilter. `progress.plan` is null for a mechanical item (planner skipped), gating this off free.
   if (phase === 'plancommit') {
+    if (progress.planDeviationAccepted && progress.planDeviationHash === progress.content?.hash) { progress.phase = 'leftover'; return planNext(progress); }
     const pl = progress.plan;
     if (progress.verificationOnly || !pl) { progress.phase = 'leftover'; saveProgress(progress.id, progress); return planNext(progress); }
     const steps = normalizePlanSteps(pl.steps, 8);
@@ -284,9 +392,7 @@ function planNext(progress) {
     const stepMode = steps.length >= 2;
     if (!stepMode && !hasPlanCommitmentLanguage(commitmentText)) { progress.phase = 'leftover'; saveProgress(progress.id, progress); return planNext(progress); }
     progress._planStepMode = stepMode;
-    const body = stepMode
-      ? 'PLAN-STEP SCAN (KI-E101). This item\'s OWN plan decomposed the work into the numbered steps below. Read ' + itemsDirFor(ctx, progress.id) + '/review-pack.md, then for EACH step decide whether the diff carries CONCRETE evidence it was carried out. Judge COVERAGE of the plan\'s own steps, not general quality. honored=true ONLY if EVERY step is evidenced; otherwise honored=false with each un-evidenced step in gaps (quote the step in `commitment`, why in `why`). Do NOT edit anything.\nPLAN STEPS:\n' + steps.map((s, i) => '  ' + (i + 1) + '. ' + s).join('\n')
-      : 'PLAN-COMMITMENT SCAN (KI-E87). This item\'s OWN plan stated the commitment language below. Read ' + itemsDirFor(ctx, progress.id) + '/review-pack.md, then for each "MUST"/"required to" commitment decide whether the diff carries CONCRETE evidence it was honored. honored=true ONLY if EVERY commitment is evidenced; otherwise honored=false with each unhonored commitment in gaps. Do NOT edit anything.\nPLAN TEXT:\n' + commitmentText;
+    const body = originalScanCalls(progress)[1].extra;
     progress._planPrompt = body;
     saveProgress(progress.id, progress);
     return agentStep(progress, 'plancommit', [{ role: 'plan-commitment-probe', phaseLabel: 'EdgeScan', schema: 'PLAN_COMMITMENT_SCHEMA', extra: body }]);
@@ -305,7 +411,7 @@ function planNext(progress) {
     return agentStep(progress, 'ledger_anchor_classify', [{ role: 'ledger-anchor-probe', phaseLabel: 'EdgeScan', schema: 'LEDGER_ANCHOR_SCHEMA', extra: 'Judge each candidate for MATERIAL disagreement (a duplicate anchor whose entries genuinely contradict, or a claimed `standards-evolution:` call-site tag the file does not carry). clean=false only for a real defect. CANDIDATES: ' + JSON.stringify(progress._ledgerAnchorHits || []) }]);
   }
   if (phase === 'leftover') {
-    if (!progress.res.codeChange) { progress.phase = 'editorial'; saveProgress(progress.id, progress); return planNext(progress); }
+    if (!progress.res.codeChange) { progress.phase = ledgerAnchorNext(progress, itemsDirFor(ctx, progress.id)); saveProgress(progress.id, progress); return planNext(progress); }
     return { mechanical: 'leftover', note: 'run: node runtime.mjs mech ' + progress.id + ' leftover' };
   }
   if (phase === 'leftover_classify') {
@@ -313,16 +419,32 @@ function planNext(progress) {
   }
   if (phase === 'editorial') {
     const flows = flowsFor(progress.item).filter((f) => f.band === 'editorial');
-    if (!flows.length) { progress.phase = 'gates'; saveProgress(progress.id, progress); return planNext(progress); }
+    if ((progress.editorialIndex || 0) >= flows.length) { progress.phase = 'final_verify'; saveProgress(progress.id, progress); return planNext(progress); }
     // Parity: factory.js's editorial call extra — advisory + don't-break-the-delivered-test +
     // KI-E11 claims lint + KI-L34 pack regeneration, verbatim-adapted to this ctx.
     const wtPath = ctx.worktreePath;
     const packCmd = btFor(ctx) + ' pack ' + wtPath + ' ' + itemsDirFor(ctx, progress.id) + '/review-pack.md';
     const editorialExtra = 'Advisory editorial pass; apply doc fixes in the worktree but NEVER block the item. Do NOT break the delivered regression test (re-run it if you change anything it asserts on). If you changed ANY .md prose, run the claims lint `' + btFor(ctx) + ' claims ' + wtPath + '` and fix any FACTORY::CLAIMS-MISS your edits introduced (KI-E11). If you changed ANY file, REGENERATE the review pack as your LAST Bash action so the gate band reviews the FINAL diff (KI-L34): `' + packCmd + '`.';
-    return agentStep(progress, 'editorial', flows.map((f) => ({ role: routingRoleFor(f), phaseLabel: 'Verify', schema: 'GATE_SCHEMA', extra: editorialExtra, routeKey: f.routeKey })));
+    return agentStep(progress, 'editorial', flows.slice(progress.editorialIndex || 0, (progress.editorialIndex || 0) + 1).map((f) => ({ role: routingRoleFor(f), phaseLabel: 'Verify', schema: 'GATE_SCHEMA', extra: editorialExtra, routeKey: f.routeKey })));
   }
+  if (phase === 'plan_review') return agentStep(progress, phase, [
+    { role: 'plan-feasibility-probe', phaseLabel: 'Plan', schema: 'PLAN_COMMITMENT_SCHEMA', extra: 'Verify the plan is mechanically feasible before implementation. Read each named existing file and verify concrete code-level premises; explicitly proposed new files are allowed. honored=false with gaps for false premises. PLAN: ' + JSON.stringify(progress.plan) },
+    { role: 'plan-quality-probe', phaseLabel: 'Plan', schema: 'PLAN_COMMITMENT_SCHEMA', extra: 'Independently critique acceptance coverage, edge cases and cross-target blast radius in this plan. Advisory quality lens: return honored=false with actionable gaps for one bounded planner revision. PLAN: ' + JSON.stringify(progress.plan) },
+  ]);
+  if (phase === 'plan_revision') return agentStep(progress, phase, [{ role: 'planner', phaseLabel: 'Plan', schema: 'PLAN_SCHEMA', extra: 'Revise the plan once to resolve these independent feasibility/quality findings; preserve explicit scope-stop and human-signoff decisions. ' + JSON.stringify(progress.planReviewGaps) }]);
+  if (phase === 'final_verify') return { mechanical: 'verify', final: true, note: 'independent final mutation barrier; reuses complete code evidence only when code identity is unchanged' };
+  if (phase === 'native_checks') {
+    if (progress.version === 2 && contentFor(progress).hash !== progress.evidence?.hash) { progress.phase = 'final_verify'; return planNext(progress); }
+    const feedbackPath = join(itemsDirFor(ctx, progress.id), 'feedback.md');
+    const calls = nativeProbeCalls(progress, existsSync(feedbackPath) ? readFileSync(feedbackPath, 'utf8') : '');
+    if (!calls.length) { progress.phase = 'gates'; return planNext(progress); }
+    return agentStep(progress, phase, calls.map(c => ({ ...c, ...(c.role === 'prior-finding-probe' ? { role: 'prior-finding-probe' } : c.role === 'red-coverage-probe' ? { role: 'red-coverage-probe' } : { role: 'breadth-claim-probe' }), phaseLabel: 'FinalEvidence' })));
+  }
+  if (phase === 'native_amend') return agentStep(progress, phase, [{ role: 'fixer', phaseLabel: 'FinalEvidence', schema: 'FIX_SCHEMA', extra: 'ONE bounded pre-band amendment. Address every independent evidence gap or explain precisely why it is already satisfied. ' + JSON.stringify(progress.nativeGaps) }]);
+  if (phase === 'realinfra_adjudicate') return agentStep(progress, phase, [{ role: 'adjudicator', phaseLabel: 'Verify', schema: 'ADJUDICATE_SCHEMA', extra: 'Independently adjudicate a real-infrastructure classification override. OVERRULED only if this specific defect does not require real provider/container behavior. Default UPHELD when uncertain. Original requirement: ' + progress.res.needsRealInfra + '; declared reason: ' + progress.test.realInfraOverride }]);
+  if (phase === 'plan_deviation_adjudicate') return agentStep(progress, phase, [{ role: 'adjudicator', phaseLabel: 'EdgeScan', schema: 'ADJUDICATE_SCHEMA', extra: 'Independently judge EVERY remaining plan gap and declared deviation. OVERRULED only if ALL gaps are legitimately explained, not rationalized. Default UPHELD. GAPS: ' + JSON.stringify(progress._planGaps) + '\nDEVIATIONS: ' + JSON.stringify(progress.planDeviations) }]);
   if (phase === 'gates') {
-    const gateRoles = gateRolesFor(progress.item, progress.band, configuredGateSet()).filter((g) => g !== 'po');
+    const gateRoles = gateRolesFor(progress.item, progress.band, progress.config?.gateSet || configuredGateSet()).filter((g) => g !== 'po');
     const methodFlows = flowsFor(progress.item).filter((f) => f.band === 'method' && f.blocking && !(progress.edgeFinal && f.routeKey === 'review.edgecase'));
     // Parity: factory.js's gate band extras — tech gates carry (staleGuard + voGuard) || null; method
     // review flows carry the methodology line + both guards.
@@ -369,7 +491,7 @@ function planNext(progress) {
     return { mechanical: 'integrate', note: 'run: node runtime.mjs mech ' + progress.id + ' integrate' };
   }
   if (phase === 'integrate_judge') {
-    return agentStep(progress, 'integrate_judge', [{ role: 'integrator', phaseLabel: 'Integrate', schema: 'INTEG_SCHEMA', extra: null }]);
+    return agentStep(progress, 'integrate_judge', [{ role: 'integrator', phaseLabel: 'Integrate', schema: 'INTEG_SCHEMA', extra: 'HANDOFF ONLY. Machine verification has already completed for immutable content ' + progress.content?.hash + '. Read integrate-raw.txt and evidence.json; report the handoff. Do not run build/test again and do not modify the worktree. globalGreen must reflect machine evidence, never self-certification.' }]);
   }
   if (phase === 'checkpoint') {
     return { mechanical: 'checkpoint', note: 'run: node runtime.mjs mech ' + progress.id + ' checkpoint' };
@@ -400,23 +522,60 @@ function agentStep(progress, phaseKey, calls) {
   // (previously every `next` at a pooled phase overwrote received:{} and destroyed already-submitted
   // verdicts). A pendingSet from a PRIOR phase never survives here: submit/mech clear it on advance.
   if (!progress.pendingSet || progress.pendingSet.phaseKey !== phaseKey) {
-    progress.pendingSet = { phaseKey, keys, received: {}, calls };
+    const received = {};
+    let snapshotId;
+    if (['acceptance', 'plancommit', 'native_checks'].includes(phaseKey) && progress.initialScans) {
+      try { snapshotId = currentScanSnapshot(progress).snapshotId; } catch { /* Unavailable snapshots cannot authorize reuse. */ }
+    }
+    for (const c of calls) {
+      if (!SCHEMAS[c.schema]) throw new Error('unregistered dispatch schema: ' + c.schema);
+      const prior = progress.initialScans?.[c.role];
+      if (snapshotId && prior?.snapshotId === snapshotId && prior.extra === c.extra && validateNamed(c.schema, prior.result).ok) {
+        received[c.key] = prior.result;
+        c.reusedDispatchId = prior.dispatchId;
+        progress.history.push({ event: 'scan-reused', phase: phaseKey, role: c.role, snapshotId, dispatchId: prior.dispatchId });
+        continue;
+      }
+      c.dispatchId = (progress.attemptId || progress.id) + '-' + (++progress.dispatchSequence || (progress.dispatchSequence = 1));
+      c.route = roleRoute(progress.item, c, progress.routing);
+      c.inputHash = progress.content?.hash || digest(progress.item);
+      c.queuedAt = Date.now(); c.retry = 0;
+      const composed = compose(c.role, progress.item, c.extra, progress.ctx, { outputSchema: c.schema, handoffOnly: c.role === 'integrator' });
+      const entrypoint = 'node "' + progress.ctx.factoryRoot + '/_workflow/opencode/build-lease.mjs" "' + progress.ctx.factoryRoot + '"';
+      const prompt = composed.split('bash ' + progress.ctx.factoryRoot + '/verify/build-test.sh').join(entrypoint)
+        + '\nBUILD CAPACITY CONTRACT: invoke all build/red/filter/suite/EF commands via ' + entrypoint + ' <subcommand> <args>. This runs the same verify script under the factory-wide build lease. Do not invoke dotnet/build-test.sh directly or spawn nested worker sessions.'
+        + (!isWriter(c.role) ? '\nREAD-ONLY WORKER MODE: do not edit product files or write role artifacts. Return structured JSON; the controller writes artifacts. This mode supersedes any role-brief request to write a report or temporarily modify source. Read-only shell/build/network evidence probes remain permitted through the build lease.' : '')
+        + (typeof progress.config?.workerCommandHint === 'string' && progress.config.workerCommandHint.trim()
+          ? '\nHOST WORKER COMMAND CONTRACT (trusted launch configuration; overrides generic command spellings only, never evidence or verdict requirements):\n' + progress.config.workerCommandHint : '')
+        + (typeof progress.config?.workerRoleCommandHints?.[c.role] === 'string'
+          ? '\nCURRENT ROLE COMMANDS (' + c.role + '):\n' + progress.config.workerRoleCommandHints[c.role] : '');
+      c.promptHash = digest(prompt);
+      c.promptRef = join(itemsDirFor(progress.ctx, progress.id), 'dispatch', c.dispatchId + '.json');
+      writeJsonAtomic(c.promptRef, { dispatchId: c.dispatchId, prompt, schema: SCHEMAS[c.schema], route: c.route, inputHash: c.inputHash });
+    }
+    progress.pendingSet = { phaseKey, keys, received, calls };
+    if (keys.every(k => k in received)) {
+      applyPhaseResults(progress);
+      progress.pendingSet = null;
+      saveProgress(progress.id, progress);
+      return planNext(progress);
+    }
     saveProgress(progress.id, progress);
   }
   const received = progress.pendingSet.received || {};
   const outstanding = keys.filter((k) => !(k in received));
   return {
-    agents: calls.map((c) => ({
+    agents: progress.pendingSet.calls.filter(c => outstanding.includes(c.key)).map((c) => ({
       role: c.role,
       key: c.key,
       phase: c.phaseLabel,
       schema: c.schema,
-      prompt: compose(c.role, progress.item, c.extra, progress.ctx),
+      dispatchId: c.dispatchId, route: c.route, promptRef: c.promptRef, schemaRef: c.promptRef,
+      inputHash: c.inputHash, promptHash: c.promptHash, attemptId: progress.attemptId,
+      itemId: progress.id, runId: progress.runId, stage: phaseKey, retry: c.retry || 0, queuedAt: c.queuedAt,
     })),
     pendingKeys: outstanding, // keys still awaiting a submit (already-received ones survive a re-printed next)
-    note: calls.length > 1
-      ? `Dispatch ALL ${calls.length} of these via your Task tool in a SINGLE message (they are independent — this mirrors factory.js's Promise.all pooling), then submit each with: node runtime.mjs submit ${progress.id} --role <key> --json <file>  (use the "key" field, NOT "role" — they differ when multiple calls share a role, e.g. re-auditor lenses)${outstanding.length < keys.length ? ` — ${keys.length - outstanding.length} already submitted; still pending: ${outstanding.join(', ') || '(none)'}` : ''}`
-      : `Dispatch this via your Task tool, then: node runtime.mjs submit ${progress.id} --role ${keys[0]} --json <file>`,
+    note: 'Use dispatcher.mjs or read pending promptRef files for manual Task dispatch. Submit with --dispatch <dispatchId>; --legacy enables role-only fallback.',
   };
 }
 
@@ -425,6 +584,13 @@ function agentStep(progress, phaseKey, calls) {
 // ---------------------------------------------------------------------------------------------
 function cmdSubmit(id, flags) {
   const progress = loadProgress(id);
+  const raw = flags.json === '-' ? readAllStdin() : readFileSync(flags.json, 'utf8');
+  let parsed;
+  try { parsed = extractJson(raw); } catch (e) { throw new Error('could not parse JSON from --json input: ' + e.message); }
+  if (flags.dispatch && progress.submissions?.[flags.dispatch]) {
+    if (progress.submissions[flags.dispatch] !== digest(parsed)) throw new Error('conflicting replay');
+    return log(JSON.stringify({ id, replay: true, phase: progress.phase }));
+  }
   const key = flags.role; // see agentStep doc-comment: this is the CALL KEY, not always the bare role name
   if (!key) throw new Error('submit requires --role <key> (the "key" field next printed, e.g. "re-auditor:code")');
   // Stale-replay guard: once a phase completes, its pendingSet is CLEARED (see the applyPhaseResults
@@ -435,9 +601,7 @@ function cmdSubmit(id, flags) {
     throw new Error(`no pending call for key "${key}" in phase "${progress.phase}" (pending: ${progress.pendingSet ? progress.pendingSet.keys.join(', ') : 'none — this phase has no open agent calls; a stale re-submit of a completed phase is rejected'}) — call next first`);
   }
   const call = progress.pendingSet.calls.find((c) => c.key === key);
-  const raw = flags.json === '-' ? readAllStdin() : readFileSync(flags.json, 'utf8');
-  let parsed;
-  try { parsed = extractJson(raw); } catch (e) { throw new Error('could not parse JSON from --json input: ' + e.message); }
+  if (key in progress.pendingSet.received) throw new Error('dispatch already settled: ' + key);
   const v = validateNamed(call.schema, parsed);
   if (!v.ok) {
     console.error('VALIDATION FAILED for ' + key + ' against ' + call.schema + ':');
@@ -445,20 +609,30 @@ function cmdSubmit(id, flags) {
     process.exitCode = 1;
     return;
   }
-  progress.pendingSet.received[key] = parsed;
+  const current = progress.version === 2 ? contentFor(progress) : null;
+  if (current && ['gates', 'gates_adjudicate', 'gates_regate', 'po', 'refute_reaudit', 'integrate_judge'].includes(progress.phase) && !evidenceIntact(progress)) {
+    throw new Error('verification evidence changed; settle pending dispatches before invalidating suffix');
+  }
+  if (current && !isWriter(call.role) && current.hash !== call.inputHash) {
+    throw new Error('read-only dispatch inputs changed; settle pending dispatches before invalidating suffix');
+  }
+  if (progress.phase === 'integrate_judge' && (!progress.integrationEvidence?.complete || progress.integrationEvidence.hash !== current?.hash || digest(readFileSync(join(itemsDirFor(progress.ctx, id), 'integrate-raw.txt'))) !== progress.integrationEvidence.rawHash)) throw new Error('integration evidence changed or incomplete');
+  if (!acceptSubmission(progress, call, parsed, flags.dispatch || ((flags.legacy || progress.legacy) ? call.dispatchId : null))) return;
+  if (current) progress.content = current;
+  if (isWriter(call.role)) delete progress.initialScans;
   // Record actual-model-used cost tally under a clearly-labeled bucket (KI-O1: not the RT-intended tier).
-  progress.res.cost['opencode-session-model'] = (progress.res.cost['opencode-session-model'] || 0) + 1;
+  const actual = flags.model || 'unknown-manual-model';
+  progress.res.cost[actual] = (progress.res.cost[actual] || 0) + 1;
   const allIn = progress.pendingSet.keys.every((k) => k in progress.pendingSet.received);
   log(`submit: ${key} recorded for phase ${progress.phase} (${Object.keys(progress.pendingSet.received).length}/${progress.pendingSet.keys.length})`);
   if (!allIn) { saveProgress(id, progress); return; }
   // All pending keys in — write artifacts + apply phase-specific side effects, then advance.
-  applyPhaseResults(progress);
+  settlePhase(progress);
   // Phase advanced (or finished): CLEAR the satisfied pendingSet so it can never be replayed. The
   // chained cmdNext below re-arms a fresh pendingSet for the NEW phase when it is an agent step.
   progress.pendingSet = null;
   saveProgress(id, progress);
-  log('phase complete -> advancing. next:');
-  cmdNext(id);
+  log(JSON.stringify({ id, phase: progress.phase, complete: true }));
 }
 
 function readAllStdin() {
@@ -513,6 +687,91 @@ function applyPhaseResults(progress) {
   const id = progress.id;
   const recv = progress.pendingSet.received;
   const phaseKey = progress.pendingSet.phaseKey;
+  for (const c of progress.pendingSet.calls || []) {
+    if (!Object.hasOwn(recv, c.key)) throw new Error('phase incomplete: missing required role ' + c.key);
+    if (phaseKey === 'shadow_scan' && recv[c.key] === null) continue;
+    if (c.schema && !validateNamed(c.schema, recv[c.key]).ok) throw new Error('phase has invalid role response: ' + c.key);
+  }
+  for (const c of progress.pendingSet.calls || []) {
+    const filename = 'stage-' + phaseKey + '-' + c.key.replace(/[^A-Za-z0-9._-]/g, '_') + '.json';
+    writeArtifact(progress, 'stage:' + phaseKey + ':' + c.key, filename, recv[c.key]);
+  }
+  if (phaseKey === 'shadow_scan') {
+    let matching = false;
+    try { matching = currentScanSnapshot(progress).snapshotId === progress.shadowSnapshot.snapshotId; } catch { /* Missing inputs are not comparable. */ }
+    const failures = { ...progress.shadowFailures, ...(!matching ? { snapshot: 'snapshot changed or unavailable' } : {}) };
+    const sample = shadowComparison(progress.shadowSnapshot, recv, failures);
+    if (!matching) {
+      sample.verdict = 'SKIPPED';
+      for (const axis of Object.values(sample.axes)) axis.verdict = 'SKIPPED';
+    } else {
+      progress.initialScans = {};
+      for (const c of progress.pendingSet.calls) if (c.role !== 'consolidated-scan-shadow' && recv[c.key]) {
+        progress.initialScans[c.role] = { snapshotId: sample.snapshotId, extra: c.extra, result: recv[c.key], dispatchId: c.dispatchId };
+      }
+    }
+    writeArtifact(progress, 'shadow-scan', 'shadow-scan.json', sample);
+    progress.res.shadowObservation = sample;
+    progress.res.gates['probe:consolidated-scan-shadow'] = sample.verdict;
+    progress.res.gateDetails['probe:consolidated-scan-shadow'] = { verdict: sample.verdict, observational: true, headline: 'blinded pre-amendment comparison on ' + sample.snapshotId, axes: sample.axes, findings: [] };
+    progress.phase = progress.shadowResume;
+    return;
+  }
+  if (phaseKey === 'plan_review') {
+    const feasible = recv['plan-feasibility-probe'];
+    const quality = recv['plan-quality-probe'];
+    progress.planReviewGaps = { feasibility: feasible, quality };
+    if (!progress.planRevised && (!feasible.honored || !quality.honored)) { progress.phase = 'plan_revision'; return; }
+    if (!feasible.honored) return finish(progress, 'FAILED', 'plan infeasible after bounded revision: ' + JSON.stringify(feasible));
+    progress.phase = 'test'; return;
+  }
+  if (phaseKey === 'plan_revision') {
+    const plan = recv.planner;
+    if (plan.recommendScopeStop) return frameAndBlock(progress, 'revised plan scope-stop: ' + plan.rootCause);
+    progress._escalate ||= plan.recommendEscalate;
+    progress.plan = plan; progress.planRevised = true;
+    writeArtifact(progress, 'plan', 'plan.md', '# Revised plan\n\n' + JSON.stringify(plan, null, 2));
+    progress.phase = 'plan_review'; return;
+  }
+  if (phaseKey === 'native_checks') {
+    const gaps = [];
+    for (const c of progress.pendingSet.calls) {
+      const r = recv[c.key];
+      const ok = r[c.field] === true;
+      progress.res.gates['probe:' + c.role] = ok ? 'APPROVED' : 'CHANGES_REQUIRED';
+      progress.res.gateDetails['probe:' + c.role] = { verdict: ok ? 'APPROVED' : 'CHANGES_REQUIRED', headline: JSON.stringify(r), findings: (r.gaps || []).map(g => ({ severity: 'HIGH', title: g.commitment || g.clause, fix: g.why })) };
+      if (!ok) gaps.push({ role: c.role, result: r });
+    }
+    if (gaps.length) {
+      if (progress.nativeAmended) return finish(progress, 'FAILED', 'final evidence gaps after bounded amendment: ' + JSON.stringify(gaps));
+      progress.nativeGaps = gaps; progress.phase = 'native_amend'; return;
+    }
+    progress.phase = 'gates'; return;
+  }
+  if (phaseKey === 'native_amend') {
+    const fix = recv.fixer;
+    if (fix.scopeStop) return frameAndBlock(progress, fix.summary);
+    progress.nativeAmended = true; progress.phase = 'final_verify'; return;
+  }
+  if (phaseKey === 'realinfra_adjudicate') {
+    const ruling = recv.adjudicator;
+    const reason = progress.test.realInfraOverride;
+    progress.res.infraClassification = { version: 1, original: true, effective: ruling.verdict !== 'OVERRULED', adjudication: { ...ruling, reason } };
+    progress.res.gates['adjudicator:realinfra-override'] = ruling.verdict;
+    progress.res.gateDetails['adjudicator:realinfra-override'] = { ...ruling };
+    if (ruling.verdict !== 'OVERRULED') return finish(progress, 'FAILED', 'realinfra classification override upheld: ' + ruling.headline);
+    progress.res.needsRealInfra = effectiveInfraRequirement(progress.res, true);
+    if (progress.res.needsRealInfra) return finish(progress, 'FAILED', 'realinfra override lacks matching reasoned adjudication evidence');
+    progress.phase = 'verify'; return;
+  }
+  if (phaseKey === 'plan_deviation_adjudicate') {
+    const ruling = recv.adjudicator;
+    progress.res.gateDetails['adjudicator:plan-deviation'] = ruling;
+    progress.res.gates['adjudicator:plan-deviation'] = ruling.verdict;
+    if (ruling.verdict !== 'OVERRULED') return finish(progress, 'FAILED', 'plan deviation upheld: ' + ruling.headline);
+    progress.res.gates['probe:plan-commitment-scan'] = 'OVERRULED';
+    progress.planDeviationAccepted = true; progress.planDeviationHash = progress.content?.hash; progress.phase = 'leftover'; return;
+  }
 
   if (phaseKey === 'plan') {
     const plan = recv['planner'];
@@ -530,11 +789,32 @@ function applyPhaseResults(progress) {
     // self-reported `files` overwrite it means the port graded the diff against the planner's own
     // opinion of scope rather than the work item's, which is exactly the self-certification P9 exists
     // to prevent. plan.files stays informational (it is written into plan.md above).
-    progress.phase = 'test';
+    // KI-E134 — PLAN-DRIFT PREVENTION at the source (ported from factory.js). A plan whose OWN
+    // approach/blastRadius uses commitment language ("MUST"/"required to") describes substantive,
+    // checkable work — but if `steps` is missing/under-decomposed, that work never gets machine-
+    // checked against the diff (PROSE mode's hasPlanCommitmentLanguage prefilter is a coarser
+    // keyword heuristic than STEP mode's per-step evidence check). Route to ONE cheap bounded
+    // follow-up instead of advancing straight to 'test'; skipped entirely for the common case (no
+    // commitment language, or steps already present) — zero extra cost there.
+    if (normalizePlanSteps(plan.steps).length < 2 && hasPlanCommitmentLanguage((plan.approach || '') + ' ' + (plan.blastRadius || ''))) {
+      progress.phase = 'plan-steps-nudge';
+      return;
+    }
+    progress.phase = 'plan_review';
+    return;
+  }
+  if (phaseKey === 'plan-steps-nudge') {
+    const nudge = recv['planner'];
+    if (nudge && Array.isArray(nudge.steps) && normalizePlanSteps(nudge.steps).length >= 2) {
+      progress.plan = Object.assign({}, progress.plan, { steps: nudge.steps });
+      writeArtifact(progress, 'plan', 'plan.md', '# Plan\n\n' + JSON.stringify(progress.plan, null, 2) + '\n\n## Steps nudge (KI-E134)\n\n' + (nudge.note || ''));
+    }
+    progress.phase = 'plan_review';
     return;
   }
   if (phaseKey === 'test') {
     const test = recv['test-author'];
+    progress.test = test;
     writeArtifact(progress, 'test', 'test.json', test);
     progress.verificationOnly = !!(test.verificationOnly === true && !test.red);
     progress.res.verificationOnly = progress.verificationOnly;
@@ -552,6 +832,7 @@ function applyPhaseResults(progress) {
   }
   if (phaseKey === 'fix') {
     const fix = recv['fixer'];
+    progress.fix = fix;
     writeArtifact(progress, 'fix', 'fix.json', fix);
     if (fix.scopeStop) return frameAndBlock(progress, 'fixer scope-stop: ' + fix.summary);
     if (!fix.applied) { finish(progress, 'FAILED', 'fixer did not apply a fix: ' + fix.summary); return; }
@@ -638,12 +919,13 @@ function applyPhaseResults(progress) {
     const pc = recv['plan-commitment-probe'];
     progress.res.gates['probe:plan-commitment-scan'] = pc.honored === false ? 'CHANGES_REQUIRED' : 'APPROVED';
     progress.res.gateDetails['probe:plan-commitment-scan'] = planDetail(pc);
-    if (pc.honored === false && (pc.gaps || []).length) { progress._planGaps = pc.gaps; progress.phase = 'plancommit_amend'; return; }
+    if (pc.honored === false) { progress._planGaps = pc.gaps?.length ? pc.gaps : [{ commitment: 'plan rejected without detailed gaps', why: 'independently recheck every plan commitment' }]; progress.phase = 'plancommit_amend'; return; }
     progress.phase = 'leftover';
     return;
   }
   if (phaseKey === 'plancommit_amend') {
     const amend = recv['fixer'];
+    progress.planDeviations = amend.deviations || progress.fix?.deviations || [];
     writeArtifact(progress, 'plancommit-amend', 'plancommit-amend.json', amend);
     if (amend.scopeStop) return frameAndBlock(progress, 'fixer scope-stop during plan-commitment amend: ' + amend.summary);
     progress.phase = 'plancommit_reprobe';
@@ -654,6 +936,8 @@ function applyPhaseResults(progress) {
     progress.res.gates['probe:plan-commitment-scan'] = re.honored === false ? 'CHANGES_REQUIRED' : 'APPROVED';
     progress.res.gateDetails['probe:plan-commitment-scan'] = planDetail(re);
     if (re.honored === false) {
+      progress._planGaps = re.gaps || [];
+      if (progress.planDeviations?.some(d => d.reason?.trim())) { progress.phase = 'plan_deviation_adjudicate'; return; }
       const gapNote = (re.gaps || []).slice(0, 6).map((g) => String(g.commitment || '').slice(0, 90)).join(' | ');
       finish(progress, 'FAILED', 'plan-commitment-scan (' + (progress._planStepMode ? 'KI-E101 STEP mode' : 'KI-E87 PROSE mode') + '): the plan\'s own ' + planAxis() + '(s) have NO evidence in the diff after one bounded amend — ' + (gapNote || 'see gateDetails') + '. Pre-band fail; the fix must cover every ' + planAxis() + ' the plan itself laid out.');
       return;
@@ -672,7 +956,7 @@ function applyPhaseResults(progress) {
       return;
     }
     progress.res.gates['probe:ledger-anchor'] = 'APPROVED';
-    progress.phase = 'editorial';
+    progress.phase = progress.finalScans ? 'native_checks' : 'editorial';
     return;
   }
   if (phaseKey === 'leftover_classify') {
@@ -696,7 +980,8 @@ function applyPhaseResults(progress) {
       progress.res.gates[key] = r.verdict;
       progress.res.gateDetails[key] = { ...detail(role, r), advisory: true };
     }
-    progress.phase = 'gates';
+    progress.editorialIndex = (progress.editorialIndex || 0) + 1;
+    progress.phase = 'editorial';
     return;
   }
   if (phaseKey === 'gates' || phaseKey === 'gates_regate') {
@@ -867,7 +1152,7 @@ function configuredGateSet() {
 }
 
 function nextAfterGateBand(progress) {
-  const gateRoles = gateRolesFor(progress.item, progress.band, configuredGateSet());
+  const gateRoles = gateRolesFor(progress.item, progress.band, progress.config?.gateSet || configuredGateSet());
   if (gateRoles.includes('po')) { progress.phase = 'po'; return; }
   progress.res.transitions.push('GATED');
   progress.phase = 'refute_reaudit';
@@ -918,28 +1203,113 @@ export function runCommentGate(worktree, policies, scanFn = findComments) {
   }
 }
 
-// KI-E43 baseline parity with driver fold's deterministicVerifyOverride: the effective baseline is
-// effectiveBaseline(run-reported array, parse of the RED-stage pre-fix baseline-raw.txt) — the disk
-// transcript is trusted on a reFix ONLY when it predates this attempt (a re-capture would launder
-// the prior fix's own breakage into the allowance; driver fences on the ledger claim timestamp, this
-// port on progress.initAtMs). Returns { baseline, fromDisk, ignoredReFixRecapture }.
 export function effectiveBaselineFor(progress, dir) {
-  const reported = progress.res.baselineFailures || [];
   const p = join(dir, 'baseline-raw.txt');
-  if (!existsSync(p)) return { baseline: effectiveBaseline(reported, null), fromDisk: false, ignoredReFixRecapture: false };
+  if (!existsSync(p)) return { baseline: captureBaseline(''), fromDisk: false, ignoredReFixRecapture: false };
   if (progress.reFix && progress.initAtMs) {
     let mtime = Infinity; try { mtime = statSync(p).mtimeMs; } catch { /* unreadable -> distrust */ }
     if (mtime >= progress.initAtMs) {
-      log(`  KI-E43 reFix fence ${progress.id}: baseline-raw.txt was (re)captured DURING this reFix attempt — the tree already carries the prior fix, so the transcript is IGNORED (the run-reported baseline stands)`);
-      return { baseline: effectiveBaseline(reported, null), fromDisk: false, ignoredReFixRecapture: true };
+      log(`  KI-E43 reFix fence ${progress.id}: baseline-raw.txt was (re)captured DURING this reFix attempt — the transcript is IGNORED; reported names/counts cannot authorize suite failures`);
+      return { baseline: captureBaseline(''), fromDisk: false, ignoredReFixRecapture: true };
     }
   }
-  const baselineParse = parseVerifyRaw(decodeTranscript(readFileSync(p)));
-  return { baseline: effectiveBaseline(reported, baselineParse), fromDisk: true, ignoredReFixRecapture: false };
+  const baseline = captureBaseline(decodeTranscript(readFileSync(p)), { worktree: progress.ctx.worktreePath });
+  return { baseline, fromDisk: true, ignoredReFixRecapture: false };
+}
+
+export function executeVerification(progress, target, filter, commands, baseline, run = runBuildTest) {
+  const runs = []; let output = '';
+  for (const sub of commands) {
+    const r = run(progress.ctx.factoryRoot, sub, sub === 'filter' ? [target, filter] : [target], { cwd: progress.ctx.worktreePath });
+    output += r.output + '\n';
+    const verdict = completeCommand(r, sub, target, filter, baseline, { worktree: progress.ctx.worktreePath });
+    runs.push({ sub, target, filter: sub === 'filter' ? filter : undefined, code: r.code, complete: verdict.pass });
+    if (!verdict.pass) return { ...verdict, output, runs };
+  }
+  return { pass: true, output, runs };
+}
+
+function settlePhase(progress) {
+  if (progress.pendingSet.failure) {
+    progress.res.failureKind = 'agent-unavailable';
+    return finish(progress, 'FAILED', progress.pendingSet.failure);
+  }
+  return applyPhaseResults(progress);
+}
+
+export function evidenceIntact(progress) {
+  try { return !!progress.evidence?.complete && progress.evidence.version === EVIDENCE_IDENTITY_VERSION && progress.content?.version === EVIDENCE_IDENTITY_VERSION && progress.evidence.hash === progress.content?.hash && progress.evidence.rawHash === digest(readFileSync(join(itemsDirFor(progress.ctx, progress.id), 'verify-raw.txt'))); }
+  catch { return false; }
+}
+
+export function finalBarrier(progress, dir, deps = {}) {
+  const run = deps.run || runBuildTest;
+  const changedFilesFor = deps.changedFiles || changedFiles;
+  const content = deps.content || contentFor;
+  const persist = deps.save || saveProgress;
+  const wt = progress.ctx.worktreePath;
+  const redPath = join(dir, 'verify-red-raw.txt');
+  const red = existsSync(redPath) ? parseRedRaw(decodeTranscript(readFileSync(redPath))) : null;
+  if (typeof red?.exit !== 'number' || (progress.verificationOnly ? red.exit !== 0 : red.exit === 0)) {
+    finish(progress, 'FAILED', 'final barrier: missing or wrong-polarity RED proof'); persist(progress.id, progress); return;
+  }
+  if (progress.res.needsRealInfra && !hasRealInfraMarker(decodeTranscript(readFileSync(join(dir, 'verify-raw.txt'))))) {
+    if (progress.test?.realInfraOverride?.trim()) progress.phase = 'realinfra_adjudicate';
+    else finish(progress, 'FAILED', 'final barrier: required realinfra evidence missing');
+    persist(progress.id, progress); return;
+  }
+  const pack = run(progress.ctx.factoryRoot, 'pack', [wt, join(dir, 'review-pack.md')]);
+  if (pack.code !== 0) throw new Error('final review pack generation failed');
+  progress.barrierPasses = (progress.barrierPasses || 0) + 1;
+  if (progress.barrierPasses > 6) { finish(progress, 'FAILED', 'final evidence mutation loop exhausted'); persist(progress.id, progress); return; }
+  for (const [command, marker] of [['claims', 'CLAIMS'], ['countclaims', 'COUNTCLAIMS']]) {
+    const lint = run(progress.ctx.factoryRoot, command, [wt, dir]);
+    writeRaw(join(dir, command + '-raw.txt'), lint.output);
+    if (lint.code !== 0 || lastMarkerCount(lint.output, marker) !== 0) { finish(progress, 'FAILED', 'final ' + command + ' lint failed or unavailable'); persist(progress.id, progress); return; }
+  }
+  const drift = (deps.mainDrift || mainDrift)(progress, dir);
+  writeJsonAtomic(join(dir, 'main-check.json'), drift);
+  if (drift.unavailable || drift.dirty?.length) {
+    progress.item.verifyNote = 'MAIN-DRIFT: ' + JSON.stringify(drift);
+    if (progress.policies?.failLaneOnMainDrift) { finish(progress, 'FAILED', progress.item.verifyNote); persist(progress.id, progress); return; }
+  }
+  const changed = changedFilesFor(wt);
+  if (debrisFiles(changed, progress.item.files).length || (progress.res.codeChange && !progress.verificationOnly && progress.res.rootCauseFiles.length && !nonTestChanged(changed).length)) {
+    finish(progress, 'FAILED', 'final barrier: debris or missing root-cause change'); persist(progress.id, progress); return;
+  }
+  const services = serviceRoots(changed);
+  const extra = [];
+  if (services.length > 1) for (const service of services) {
+    const solution = progress.config?.solutions?.[service] || join(service, service.split('/').at(-1) + '.sln');
+    const target = resolve(wt, solution).replace(/\\/g, '/');
+    if (!target.startsWith(resolve(wt).replace(/\\/g, '/') + '/')) throw new Error('cross-target solution outside worktree');
+    if (!existsSync(target)) throw new Error('cross-target evidence requires solution mapping for ' + service);
+    const check = executeVerification(progress, target, null, ['build', 'suite'], effectiveBaselineFor(progress, dir).baseline, run);
+    writeRaw(join(dir, 'verify-' + service.replace(/[^a-z0-9]/gi, '_') + '-raw.txt'), check.output);
+    if (!check.pass) { finish(progress, 'FAILED', 'cross-target ' + check.reason); persist(progress.id, progress); return; }
+    extra.push({ service, runs: check.runs });
+  }
+  const ef = (deps.efProbe || efProbe)(progress, changed, dir, run);
+  progress.res.gateDetails['probe:efmigration'] = { results: ef };
+  if (ef.some(r => r.verdict === 'dirty')) { finish(progress, 'FAILED', 'EF pending model changes: ' + JSON.stringify(ef)); persist(progress.id, progress); return; }
+  if (ef.some(r => r.verdict === 'inconclusive')) { finish(progress, 'FAILED', 'EF pending-model check unavailable: ' + JSON.stringify(ef)); persist(progress.id, progress); return; }
+  const current = content(progress);
+  if (current.codeHash !== progress.evidence.codeHash) { progress.phase = 'final_verify'; progress.content = current; persist(progress.id, progress); return; }
+  progress.content = current;
+  progress.evidence = { ...progress.evidence, ...progress.content, crossTarget: extra, ef, complete: true, rawHash: digest(readFileSync(join(dir, 'verify-raw.txt'))) };
+  writeJsonAtomic(join(dir, 'evidence.json'), progress.evidence);
+  progress.finalScans = true;
+  progress.phase = 'edgescan';
+  persist(progress.id, progress);
 }
 
 function cmdMech(id, step, rest, flags) {
   const progress = loadProgress(id);
+  guardMechanical(progress, step);
+  if (progress.version === 2 && !['verify', 'leftover'].includes(step) && !(step === 'checkpoint' && ['FAILED', 'BLOCKED'].includes(progress.res.toState))) {
+    const now = contentFor(progress);
+    if (progress.content?.hash !== now.hash) { invalidateSuffix(progress, now); saveProgress(id, progress); throw new Error('mechanical inputs changed; suffix invalidated'); }
+  }
   const dir = itemsDirFor(progress.ctx, id);
   mkdirSync(dir, { recursive: true });
 
@@ -960,21 +1330,22 @@ function cmdMech(id, step, rest, flags) {
     // case-sensitive filesystem two paths differing by case ARE different trees, and folding them
     // would wrongly suppress the outside-worktree warning.
     const isAbsolute = /^[A-Za-z]:[\\/]/.test(t) || t.startsWith('/') || t.startsWith('\\\\');
-    if (!isAbsolute) {
-      const resolved = join(progress.ctx.worktreePath, t).replace(/\\/g, '/');
-      log(`[mech] relative target "${t}" -> resolved against the worktree: ${resolved}`);
-      return resolved;
-    }
+    if (!isAbsolute) t = resolve(progress.ctx.worktreePath, t).replace(/\\/g, '/');
     const fold = (s) => (process.platform === 'win32' ? s.toLowerCase() : s);
     const wt = fold(progress.ctx.worktreePath.replace(/\\/g, '/'));
     const abs = fold(t.replace(/\\/g, '/'));
-    if (!abs.startsWith(wt)) {
-      log(`[mech] WARNING: target "${t}" is OUTSIDE this item's worktree (${progress.ctx.worktreePath}) — verifying it would test whatever tree that path actually is, not this item's fix. Double-check this is intentional.`);
-    }
+    if (abs !== wt && !abs.startsWith(wt.replace(/\/$/, '') + '/')) throw new Error('verification target outside item worktree: ' + t);
     return t;
   }
 
   if (step === 'verify') {
+    const final = progress.phase === 'final_verify';
+    const current = contentFor(progress);
+    if (!progress.fixture && changedFiles(progress.ctx.worktreePath).some(f => /\.cs$/i.test(f))) progress.res.codeChange = true;
+    progress.content = current;
+    if (final && progress.evidence?.version === EVIDENCE_IDENTITY_VERSION && progress.evidence?.codeHash === current.codeHash && progress.evidence?.complete && progress.evidence.rawHash === digest(readFileSync(join(dir, 'verify-raw.txt')))) {
+      return finalBarrier(progress, dir);
+    }
     // Doc-only path (P10/parity): factory.js's runner brief for a !codeChange item says "the fix
     // touches NO .cs files, so do NOT run dotnet build/test. Run the regression-test check from the
     // spec (the grep/script assertion) + confirm the acceptance." — the mechanical equivalent is a
@@ -984,17 +1355,20 @@ function cmdMech(id, step, rest, flags) {
     if (!progress.res.codeChange) {
       const note = 'doc-only item: no build required (codeChange=false — the fix touches no .cs files and the test-author shipped no .cs test). Acceptance is verified by the spec\'s grep/script assertion (see verify-red-raw.txt) + the review band.';
       writeRaw(join(dir, 'verify-raw.txt'), note + '\n');
-      // Review pack still matters — reviewers read it first. Best-effort (a doc worktree is still a git tree).
-      runBuildTest(progress.ctx.factoryRoot, 'pack', [progress.ctx.worktreePath, join(dir, 'review-pack.md')]);
-      progress.res.transitions.push('GREEN', 'BUILT', 'TESTED');
-      progress.phase = 'edgescan'; // planNext then skips edgescan/leftover for !codeChange
+      const pack = runBuildTest(progress.ctx.factoryRoot, 'pack', [progress.ctx.worktreePath, join(dir, 'review-pack.md')]);
+      progress.shadowPackReady = pack.code === 0;
+      if (!progress.res.transitions.includes('TESTED')) progress.res.transitions.push('GREEN', 'BUILT', 'TESTED');
+      progress.evidence = { complete: true, ...current, rawHash: digest(note + '\n') };
+      if (final) return finalBarrier(progress, dir);
+      progress.phase = 'edgescan';
       saveProgress(id, progress);
       log('verify (doc-only, no build): recorded honest no-build evidence -> advancing. next:');
       return cmdNext(id);
     }
-    const [rawTarget, filter] = rest;
+    const [rawTarget, filter] = rest.length ? rest : [progress.verifyTarget || progress.item.solution || progress.config?.solution, progress.verifyFilter];
     if (!rawTarget) throw new Error('usage: mech <id> verify -- <target.sln-or-csproj> ["<filter>"]');
     const target = resolveTarget(rawTarget);
+    progress.verifyTarget = target; progress.verifyFilter = filter;
     const band = progress.band;
     // KI-O1 fix: a codeChange item with NO filter previously fell through to a build-only (or, for
     // FULL band, suite-only) run, yet verdictFromParse still reports "machine evidence: build
@@ -1009,24 +1383,17 @@ function cmdMech(id, step, rest, flags) {
     if (progress.res.codeChange && !filter) {
       throw new Error(`mech verify: codeChange=true (band=${band}) but no filter was given — a code item MUST run its targeted test with detailed-verbosity logging (build/suite-only evidence would silently read as "tests green" downstream, AND can never carry a realInfra Console marker regardless of band). Pass the dotnet --filter expression as the second arg.`);
     }
-    let combined = '';
-    const b = runBuildTest(progress.ctx.factoryRoot, 'build', [target]);
-    combined += b.output;
-    if (b.code !== 0) { writeRaw(join(dir, 'verify-raw.txt'), combined); return afterVerify(progress, combined); }
-    if (progress.res.codeChange) {
-      // KI-O1 fix: FULL band runs BOTH filter (detailed-verbosity targeted proof, the only path a
-      // realInfra marker can travel) AND suite (whole-solution regression proof) — matches the real
-      // pipeline's "FULL = build+filter+full suite" contract; this port previously ran suite ONLY.
-      const f = runBuildTest(progress.ctx.factoryRoot, 'filter', [target, filter]);
-      combined += '\n' + f.output;
-      if (band === 'FULL') {
-        const s = runBuildTest(progress.ctx.factoryRoot, 'suite', [target]);
-        combined += '\n' + s.output;
-      }
-    }
+    const { baseline } = effectiveBaselineFor(progress, dir);
+    const checked = executeVerification(progress, target, filter, band === 'FULL' ? ['build', 'filter', 'suite'] : ['build', 'filter'], baseline);
+    const combined = checked.output;
     writeRaw(join(dir, 'verify-raw.txt'), combined);
+    if (!checked.pass) { finish(progress, 'FAILED', checked.reason); saveProgress(id, progress); return cmdNext(id); }
+    progress.evidence = { complete: true, ...current, target, filter, runs: checked.runs, rawHash: digest(combined) };
+    writeJsonAtomic(join(dir, 'evidence.json'), progress.evidence);
+    if (final) return finalBarrier(progress, dir);
     // Review pack - cache-strategic snapshot every reviewer reads first.
-    runBuildTest(progress.ctx.factoryRoot, 'pack', [progress.ctx.worktreePath, join(dir, 'review-pack.md')]);
+    const pack = runBuildTest(progress.ctx.factoryRoot, 'pack', [progress.ctx.worktreePath, join(dir, 'review-pack.md')]);
+    progress.shadowPackReady = pack.code === 0;
     return afterVerify(progress, combined);
   }
   if (step === 'leftover') {
@@ -1037,21 +1404,13 @@ function cmdMech(id, step, rest, flags) {
     // spawn seam) and, unlike leftover-scan, has NO classify step: with the policy on, every hit is
     // an immediate FAILED, short-circuiting before the leftover scan (no point spending a
     // leftover-classify LLM call on an item that is going to FAIL regardless).
-    const policies = loadPolicies(FACTORY_ROOT);
+    const policies = progress.policies || loadPolicies(FACTORY_ROOT);
     const cg = runCommentGate(progress.ctx.worktreePath, policies);
     if (cg.skipped) {
       log('comment-scan: host policy noNewComments=off — comment check skipped entirely (leftover scan unchanged)');
     } else if (cg.unavailable) {
-      // GATE-UNAVAILABLE: findComments THREW (git itself failed — the scan could not run). Do NOT
-      // record any gate verdict: factory.js's comment-probe posture is fail-open-without-a-verdict
-      // ("A recorded APPROVED requires a real count 0" — a malformed/unavailable probe sets NO
-      // gate), and while fold merges gate VALUES as data (lib/ledger.mjs `row.gates = {...merge}`,
-      // no value-based blocking), a recorded key would still claim scan evidence that does not
-      // exist (last-failure.md's reachedGate wording + the item_folded telemetry read key
-      // presence). OMITTING the key is the variant that cannot change fold semantics; the fold's
-      // deterministic KI-E59 WARN backstop re-scans the worktree itself.
-      writeRaw(join(dir, 'comment-raw.txt'), 'FACTORY::COMMENT-SCAN-ERROR::' + String(cg.error).split('\n')[0].slice(0, 200) + '\n');
-      log('⚠ comment-scan GATE-UNAVAILABLE (KI-E59): the deterministic scanner could not run (' + String(cg.error).split('\n')[0].slice(0, 160) + ') — NO mech:comment-scan gate recorded (never a silent APPROVED, AP#19); the driver fold\'s KI-E59 backstop re-checks the worktree. Proceeding to the leftover scan.');
+      writeRaw(join(dir, 'comment-raw.txt'), 'FACTORY::COMMENT-SCAN-ERROR::' + cg.error + '\n');
+      throw new Error('required comment policy scan unavailable: ' + cg.error);
     } else {
       // Completed scan — write comment-raw.txt in the comment-lint CLI's exact marker format so the
       // on-disk artifact matches what the native pipeline's probe tees.
@@ -1070,16 +1429,16 @@ function cmdMech(id, step, rest, flags) {
       }
       progress.res.gates['mech:comment-scan'] = 'APPROVED';
     }
+    if (!progress.fixture) snapshotTree(progress.ctx.worktreePath, progress.contractHash);
     const r = runBuildTest(progress.ctx.factoryRoot, 'leftovers', [progress.ctx.worktreePath]);
     writeRaw(join(dir, 'leftover-raw.txt'), r.output);
     // Anchored LAST-match marker parse (see lastMarkerCount): a hit line QUOTING the literal
     // `FACTORY::LEFTOVER::0` no longer defeats the count, and a spawn/script failure (no marker at
     // all — leftover-lint always prints one on a completed run, even its own internal-error path)
     // is a LOUD error instead of parsing as clean.
-    const n = lastMarkerCount(r.output, 'LEFTOVER');
-    if (n === null) {
-      throw new Error('mech leftover: build-test.sh leftovers produced NO final FACTORY::LEFTOVER::<n> marker (spawn exit=' + r.code + ') — the scan did not run; refusing to treat a failed scan as clean. Output tail: ' + r.output.slice(-300));
-    }
+    const hits = lintCandidates(r.output, 'leftover');
+    const n = hits.length;
+    if (r.code !== (n ? 1 : 0)) throw new Error('leftover completion exit/count mismatch');
     if (n === 0) {
       progress.res.gates['probe:leftover-scan'] = 'APPROVED';
       progress.phase = ledgerAnchorNext(progress, dir);
@@ -1087,7 +1446,6 @@ function cmdMech(id, step, rest, flags) {
       log('leftover-scan: 0 candidates -> APPROVED, advancing. next:');
       return cmdNext(id);
     }
-    const hits = [...r.output.matchAll(/FACTORY::LEFTOVER-HIT::([^:]+)::([^:]+)::(\d+)/g)].map((m) => ({ file: m[1], lexeme: m[2], line: parseInt(m[3], 10) }));
     progress._leftoverHits = hits;
     progress.phase = 'leftover_classify';
     saveProgress(id, progress);
@@ -1095,24 +1453,24 @@ function cmdMech(id, step, rest, flags) {
     return cmdNext(id);
   }
   if (step === 'integrate') {
+    if (!evidenceIntact(progress)) throw new Error('final verification evidence stale or incomplete');
     // Doc-only path (parity: factory.js's integrator brief for !codeChange — "no .cs changed;
     // confirm the doc/config acceptance, report globalGreen=true, regressionDelta=0", no build).
     // Fold's P6 requires an integrate transcript only for codeChange items.
     if (!progress.res.codeChange) {
       writeRaw(join(dir, 'integrate-raw.txt'), 'doc-only item: no global build/suite required (codeChange=false)\n');
+      progress.integrationEvidence = { hash: progress.content.hash, rawHash: digest(readFileSync(join(dir, 'integrate-raw.txt'))), complete: true };
       progress.phase = 'integrate_judge';
       saveProgress(id, progress);
       log('integrate (doc-only, no build) -> dispatch the integrator agent. next:');
       return cmdNext(id);
     }
-    const [rawTarget] = rest.length ? rest : [flags.target];
+    const [rawTarget] = rest.length ? rest : [flags.target || progress.verifyTarget];
     if (!rawTarget) throw new Error('usage: mech <id> integrate -- <target.sln>');
     const target = resolveTarget(rawTarget);
-    let combined = '';
-    const b = runBuildTest(progress.ctx.factoryRoot, 'build', [target]);
-    combined += b.output;
-    const s = runBuildTest(progress.ctx.factoryRoot, 'suite', [target]);
-    combined += '\n' + s.output;
+    const reusable = progress.evidence.runs?.some(r => r.sub === 'suite' && r.target === target && r.complete);
+    const check = reusable ? { pass: true, output: decodeTranscript(readFileSync(join(dir, 'verify-raw.txt'))), runs: progress.evidence.runs } : executeVerification(progress, target, null, ['build', 'suite'], effectiveBaselineFor(progress, dir).baseline);
+    const combined = check.output;
     writeRaw(join(dir, 'integrate-raw.txt'), combined);
     const parsed = parseVerifyRaw(combined);
     // KI-E43 parity (driver fold's deterministicVerifyOverride): the baseline comes from the
@@ -1121,25 +1479,29 @@ function cmdMech(id, step, rest, flags) {
     // Feeding the integrate parse back in as its own baseline made a suite regression structurally
     // unreportable (every new failure counted as "pre-existing").
     const { baseline, fromDisk } = effectiveBaselineFor(progress, dir);
-    const verdict = verdictFromParse(parsed, baseline);
-    log('integrate machine verdict: ' + JSON.stringify(verdict) + ' (baseline=' + baseline + (fromDisk ? ', incl. pre-fix baseline-raw.txt' : ', run-reported only') + ')');
-    if (!verdict.pass) {
+    const verdict = verdictFromParse(parsed, baseline, { worktree: progress.ctx.worktreePath });
+    log('integrate machine verdict: ' + JSON.stringify(verdict) + ' (baseline=' + JSON.stringify(baseline) + (fromDisk ? ', pre-fix baseline-raw.txt' : ', absent') + ')');
+    if (!check.pass || !verdict.pass) {
       // Honest failure — same treatment as afterVerify's failing verify, and the same outcome
       // factory.js produces at this stage (a regressing integrate fails the item: `if
       // (!integ.globalGreen || regressionDelta > 0) return finish('FAILED', ...)`) — the fold's
       // deterministic iVerdict re-check would rewrite a forward claim to FAILED on this transcript
       // anyway. Never print "green" (or advance to the integrator) over a machine-visible regression.
-      finish(progress, 'FAILED', 'integrate: ' + verdict.reason);
+      finish(progress, 'FAILED', 'integrate: ' + (check.reason || verdict.reason));
       saveProgress(id, progress);
       log('FAILED (integrate regression). next:');
       return cmdNext(id);
     }
+    if (contentFor(progress).hash !== progress.content.hash) { invalidateSuffix(progress, contentFor(progress)); saveProgress(id, progress); throw new Error('integration commands changed review inputs'); }
+    progress.integrationEvidence = { hash: progress.content.hash, rawHash: digest(combined), complete: true, runs: check.runs };
+    writeJsonAtomic(join(dir, 'integration-evidence.json'), progress.integrationEvidence);
     progress.phase = 'integrate_judge';
     saveProgress(id, progress);
     log('mechanical build+suite done -> dispatch the integrator agent. next:');
     return cmdNext(id);
   }
   if (step === 'checkpoint') {
+    attachDispatchEvidence(progress, dir);
     const resultPath = join(dir, 'result.json');
     writeJsonAtomic(resultPath, progress.res);
     try { JSON.parse(readFileSync(resultPath, 'utf8')); } catch (e) { throw new Error('checkpoint write failed self-verification: ' + e.message); }
@@ -1148,6 +1510,7 @@ function cmdMech(id, step, rest, flags) {
     // FAILED/BLOCKED/ESCALATED terminals never reached a result.json at all).
     progress.checkpointed = true;
     progress.phase = 'done';
+    progress.completedAt ||= Date.now();
     saveProgress(id, progress);
     log('CHECKPOINT-OK -> ' + resultPath);
     log(JSON.stringify(progress.res, null, 2));
@@ -1167,12 +1530,15 @@ function cmdMech(id, step, rest, flags) {
 // writes only the new results file. The caller still runs `driver.mjs fold` on the printed path.
 function cmdFinalize(id) {
   const progress = loadProgress(id);
+  if (!progress.checkpointed || progress.phase !== 'done') throw new Error('finalize requires current terminal checkpoint');
+  if (progress.version === 2 && ['CLOSED', 'ESCALATED'].includes(progress.res.toState) && (contentFor(progress).hash !== progress.content.hash || !evidenceIntact(progress))) throw new Error('terminal evidence changed; call next to invalidate the review suffix');
   const p = join(FACTORY_ROOT, 'state', 'items', id, 'result.json');
   if (!existsSync(p)) throw new Error('no result.json for ' + id + ' at ' + p + ' — run `mech ' + id + ' checkpoint` first');
   const res = readJson(p);
+  if (res.resultId !== progress.res.resultId || digest(res) !== digest(progress.res)) throw new Error('checkpoint identity/content mismatch');
   const cycle = progress.cycle;
   const outPath = join(FACTORY_ROOT, 'state', 'results-cycle-' + cycle + '-' + id + '.json');
-  writeJsonAtomic(outPath, { mode: 'opencode-adapter', cycle, results: [res] });
+  writeJsonAtomic(outPath, { mode: 'opencode-adapter', cycle, runId: progress.runId, results: [res] });
   log('finalize: wrote ' + outPath);
   log('next: node ' + FACTORY_ROOT + '/_workflow/driver.mjs fold ' + 'state/results-cycle-' + cycle + '-' + id + '.json' + ' --controller <token>');
 }
@@ -1184,15 +1550,16 @@ function cmdFinalize(id) {
 // and advances rather than blocking a fix that may be perfectly correct.
 function ledgerAnchorNext(progress, dir) {
   const touches = ((progress.item && progress.item.files) || []).some((f) => /STANDARDS-DIVERGENCE-LEDGER\.md$/i.test(String(f)));
-  if (!touches) return 'editorial';
+  if (!touches) return progress.finalScans ? 'native_checks' : 'editorial';
   let out = '';
   try { out = runBuildTest(progress.ctx.factoryRoot, 'ledger-anchor', [progress.ctx.worktreePath]).output || ''; } catch (e) { out = ''; }
-  if (!out) { log('⚠ ledger-anchor (KI-E91): lint produced no output — check SKIPPED (announced, never silently clean).'); return 'editorial'; }
+  if (!out) throw new Error('ledger-anchor scan unavailable');
   try { writeRaw(join(dir, 'ledger-anchor-raw.txt'), out); } catch { /* artifact only */ }
-  const n = lastMarkerCount(out, 'LEDGER-ANCHOR');
+  const candidates = lintCandidates(out, 'ledger');
+  const n = candidates.length;
   if (n === null) { log('⚠ ledger-anchor (KI-E91): no FACTORY::LEDGER-ANCHOR::<n> marker — check SKIPPED (announced).'); return 'editorial'; }
-  if (n === 0) { progress.res.gates['probe:ledger-anchor'] = 'APPROVED'; log('ledger-anchor: 0 candidates -> APPROVED.'); return 'editorial'; }
-  progress._ledgerAnchorHits = [...out.matchAll(/FACTORY::LEDGER-ANCHOR-HIT::([^\n]+)/g)].map((m) => m[1]);
+  if (n === 0) { progress.res.gates['probe:ledger-anchor'] = 'APPROVED'; log('ledger-anchor: 0 candidates -> APPROVED.'); return progress.finalScans ? 'native_checks' : 'editorial'; }
+  progress._ledgerAnchorHits = candidates;
   log(`ledger-anchor: ${n} candidate(s) -> needs classification.`);
   return 'ledger_anchor_classify';
 }
@@ -1202,13 +1569,14 @@ function afterVerify(progress, combined) {
   // Same KI-E43 effective baseline the driver fold applies to the verify transcript (vVerdict) —
   // run-reported array + the pre-fix baseline-raw.txt when present/trusted, never this run's parse.
   const { baseline } = effectiveBaselineFor(progress, itemsDirFor(progress.ctx, progress.id));
-  const verdict = verdictFromParse(parsed, baseline);
+  const verdict = verdictFromParse(parsed, baseline, { worktree: progress.ctx.worktreePath });
   log('verify machine verdict: ' + JSON.stringify(verdict) + ' parsed=' + JSON.stringify(parsed));
   if (!verdict.pass) { finish(progress, 'FAILED', 'verify: ' + verdict.reason); saveProgress(progress.id, progress); log('FAILED. next:'); return cmdNext(progress.id); }
   progress.res.transitions.push('GREEN', 'BUILT', 'TESTED');
   if (progress.res.needsRealInfra) {
     const marker = hasRealInfraMarker(combined);
     if (!marker) {
+      if (progress.test?.realInfraOverride?.trim()) { progress.phase = 'realinfra_adjudicate'; saveProgress(progress.id, progress); return cmdNext(progress.id); }
       log('needsRealInfra=true but no FACTORY::REALINFRA:: marker in verify-raw.txt yet.');
       if (!dockerAvailable()) { finish(progress, 'BLOCKED', 'realInfra item needs Docker/Testcontainers — Docker absent on this runner; parked, NOT closed on an in-memory green'); saveProgress(progress.id, progress); log('BLOCKED. next:'); return cmdNext(progress.id); }
       finish(progress, 'FAILED', 'realInfra marker probe: verify-raw.txt has NO FACTORY::REALINFRA:: marker on disk — the regression test never bound a real container');
@@ -1247,7 +1615,7 @@ function afterVerify(progress, combined) {
       log('RED-proof marker OK (exit=' + redParse.exit + ').');
     } else {
       // Fail-open, ANNOUNCED — same posture as factory.js's null-probe path and KI-E20/KI-E41.
-      log('⚠ RED-proof marker (KI-E83): no readable FACTORY::RED:: marker in verify-red-raw.txt — check SKIPPED (the fold-time P1 remains the authority).');
+      finish(progress, 'FAILED', 'missing required RED machine proof'); saveProgress(progress.id, progress); return cmdNext(progress.id);
     }
   }
 
@@ -1329,13 +1697,28 @@ function main() {
   const [, , cmd, id, ...argv] = process.argv;
   const { flags, rest } = parseFlags(argv);
   try {
+    if (!SAFE_ID_RE.test(id || '')) throw new Error('unsafe item id');
+    return withItemLock(progressPath(id) + '.lock', () => {
     if (cmd === 'init') return cmdInit(id, flags);
-    if (cmd === 'next') return cmdNext(id);
+    if (cmd === 'next') return cmdNext(id, flags);
     if (cmd === 'submit') return cmdSubmit(id, flags);
-    if (cmd === 'mech') return cmdMech(id, rest[0], rest.slice(1), flags);
+    if (cmd === 'fail') return cmdFail(id, flags);
+    if (cmd === 'mech') {
+      guardMechanical(loadProgress(id), rest[0]);
+      try { return cmdMech(id, rest[0], rest.slice(1), flags); }
+      catch (e) {
+        const p = loadProgress(id);
+        p.mechanicalFailures ||= {};
+        const n = p.mechanicalFailures[p.phase] = (p.mechanicalFailures[p.phase] || 0) + 1;
+        p.history.push({ event: 'mechanical-unavailable', phase: p.phase, reason: e.message, attempt: n });
+        if (n >= 3) { p.res.failureKind = 'mechanical-unavailable'; finish(p, 'FAILED', e.message); }
+        saveProgress(id, p); throw e;
+      }
+    }
     if (cmd === 'status') return cmdStatus(id);
     if (cmd === 'finalize') return cmdFinalize(id);
     console.log('commands: init <id> | next <id> | submit <id> --role <r> --json <f|-> | mech <id> <verify|leftover|integrate|checkpoint> -- <args> | status <id> | finalize <id>');
+    });
   } catch (e) {
     console.error('ERROR: ' + (e && e.message || e));
     process.exitCode = 1;
@@ -1355,3 +1738,34 @@ if (invoked) main();
 // In-process seams for _selftest.mjs (lifecycle pins that cannot pass a real dotnet build run the
 // state functions directly). Everything here is the SAME code the CLI paths execute — no test forks.
 export { applyPhaseResults, planNext, progressPath, loadProgress, saveProgress };
+
+function cmdFail(id, flags) {
+  const p = loadProgress(id);
+  const call = p.pendingSet?.calls.find(c => c.dispatchId === flags.dispatch);
+  if (!call || p.pendingSet.phaseKey !== p.phase) throw new Error('failure for stale dispatch');
+  if (call.key in p.pendingSet.received) throw new Error('dispatch already settled: ' + call.key);
+  call.failures ||= [];
+  call.failures.push({ at: Date.now(), reason: String(flags.reason || 'agent unavailable'), retryable: !!flags.retryable });
+  p.history.push({ dispatchId: call.dispatchId, event: 'agent-failure', ...call.failures.at(-1) });
+  if (p.phase === 'shadow_scan') {
+    p.shadowFailures ||= {};
+    p.shadowFailures[call.key] = String(flags.reason || 'agent unavailable');
+    p.pendingSet.received[call.key] = null;
+    if (p.pendingSet.keys.every(k => k in p.pendingSet.received)) { applyPhaseResults(p); p.pendingSet = null; }
+    saveProgress(id, p);
+    return log(JSON.stringify({ id, phase: p.phase, observational: true }));
+  }
+  if (!flags.retryable || call.failures.length >= (p.config?.dispatch?.maxAttempts || 3)) {
+    p.pendingSet.failure ||= 'agent failed: ' + call.key + ': ' + flags.reason;
+    p.pendingSet.received[call.key] = null;
+    if (p.pendingSet.keys.every(k => k in p.pendingSet.received)) { settlePhase(p); p.pendingSet = null; }
+  } else {
+    call.dispatchId = p.attemptId + '-' + (++p.dispatchSequence);
+    call.retry = (call.retry || 0) + 1; call.queuedAt = Date.now();
+    const payload = readJson(call.promptRef);
+    call.promptRef = join(itemsDirFor(p.ctx, id), 'dispatch', call.dispatchId + '.json');
+    writeJsonAtomic(call.promptRef, { ...payload, dispatchId: call.dispatchId });
+  }
+  saveProgress(id, p);
+  log(JSON.stringify({ id, phase: p.phase, retry: p.phase !== 'done' }));
+}

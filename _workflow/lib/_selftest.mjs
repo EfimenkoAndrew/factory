@@ -1,7 +1,13 @@
 // Self-test for the factory lib (run: node _bmad-output/ai-factory/_workflow/lib/_selftest.mjs).
 // Exercises the state machine, deps/locks READY computation, fold, and atomic I/O —
 // the Phase-0 acceptance surface that does not need the Workflow runtime.
-import { mkdtempSync, mkdirSync, writeFileSync as fsWrite, readFileSync, existsSync } from 'node:fs';
+import { testRoot } from './_test-environment.mjs';
+import { prepareOfflineDotnetFixture } from './_offline-dotnet-fixture.mjs';
+import { resolveBash } from './bash.mjs';
+import { runGitFixture, runCheckoutCoverage } from './_git-fixture-tests.mjs';
+import { runMainGuardDriverTests } from './_mainguard-driver-tests.mjs';
+import { EVIDENCE_IDENTITY_VERSION } from './evidence-identity.mjs';
+import { mkdtempSync, mkdirSync, writeFileSync as fsWrite, readFileSync, existsSync, readdirSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join, dirname, basename, resolve as resolvePath, sep } from 'node:path';
@@ -15,7 +21,7 @@ import { isFactoryWorktreePath } from './worktree.mjs';
 import { makeLimiter, pool, retry } from './pool.mjs';
 import { loadRouting, resolve } from './router.mjs';
 import { conflictFor, lockedFiles } from './locks.mjs';
-import { parseVerifyRaw, verdictFromParse, debrisFiles, parseRedRaw, hasRealInfraMarker, touchedRootCause, effectiveBaseline, decodeTranscript } from './verify.mjs';
+import { parseVerifyRaw, verdictFromParse, debrisFiles, parseRedRaw, hasRealInfraMarker, touchedRootCause, effectiveBaseline, decodeTranscript, isPhantomBaseline, annotateBaselineReason } from './verify.mjs';
 import { acquireLock, releaseLock } from './lock.mjs';
 import { checkRoutingDrift, buildFactoryRouting } from './routing-drift.mjs';
 import { changedFiles } from './worktree.mjs';
@@ -24,7 +30,7 @@ import { renderFeedback } from './feedback.mjs';
 import { gateFindingsSummary, isStrictlyNarrower, applyConvergenceBonus, effectiveRetryBound } from './convergence.mjs';
 import { sig, jaccard, similarSigs, clusterBySimilarity, batchPatternFor, perCliqueBatchPatterns, bestClosedPrecedent } from './similarity.mjs';
 import { loadController, isStale as controllerStale, claimController, verifyController, releaseController } from './controller.mjs';
-import { execSmoke, smokeBatch } from './_execsmoke.mjs';
+import { execSmoke, smokeBatch, defaultAgentStub } from './_execsmoke.mjs';
 import { classifyLine as loClassify, firstLexeme as loLexeme, findLeftovers } from './leftover-scan.mjs';
 import { classifyCommentLine as csClassify, findComments } from './comment-scan.mjs';
 import { splitAcceptanceClauses } from './acceptance.mjs';
@@ -35,10 +41,40 @@ import { githubIssueToItem, markdownChecklistToItems, extractSection, severityFr
 import { costTelemetryReady, shimAvailable, dotnetAvailable } from './preflight.mjs';
 import { chmodSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
+import { compose as composePort } from '../opencode/compose.mjs';
+
+function portPrompt(role, item = {}) {
+  return composePort(role, { id: 'CONTRACT', files: [], ...item }, null, {
+    repoRoot: '/main', worktreePath: '/worktree', factoryRoot: '/factory',
+    briefs: { [role]: 'Complete fixture brief' }, repoProfiles: {}, policies: {},
+  });
+}
+
+const gitFixtureGroups = [];
+const shellFixtureGroups = [];
+let completed = false;
+function gitFixture(name) {
+  runGitFixture(name, { ok, eq });
+  gitFixtureGroups.push(name);
+}
+console.log('self-test: nonmutating git fixtures (process injection + real read-only checkout coverage)');
+process.once('exit', () => {
+  if (!completed) console.log(`self-test INCOMPLETE: ${pass} passed, ${fail} failed before abort`);
+  console.log(`self-test: ${gitFixtureGroups.length}/7 nonmutating git fixture groups completed; 0 git fixture groups skipped`);
+  console.log(`self-test: ${shellFixtureGroups.length}/3 shell fixture groups available (14 behavioral/syntax assertions)`);
+});
 
 let pass = 0, fail = 0;
 function ok(cond, msg) { if (cond) { pass++; } else { fail++; console.log('  FAIL: ' + msg); } }
 function eq(a, b, msg) { ok(JSON.stringify(a) === JSON.stringify(b), msg + ' (got ' + JSON.stringify(a) + ')'); }
+function hasUsableBash(group) {
+  if (!bashPath) { ok(false, group + ': ' + bashError); return false; }
+  shellFixtureGroups.push(group);
+  return true;
+}
+let bashPath, bashError;
+try { bashPath = resolveBash(); console.log('self-test Bash: ' + bashPath); }
+catch (error) { bashError = error.message; }
 
 // --- synthetic graph: A mechanical no-dep; B non-trivial dep-on-A; C owner-blocked; D shares a file with A ---
 const graph = { items: [
@@ -180,7 +216,7 @@ ok(canTransition('CLAIMED', 'READY'), 'CLAIMED->READY (un-claim) still legal');
   eq(verdictFromParse(parseVerifyRaw('FACTORY::BUILD::RESULT exit=1 errors=3'), 0).pass, false, 'verdict: build errors -> FAIL (overrides a false agent pass)');
   const testFail = 'FACTORY::BUILD::RESULT exit=0 errors=0\nFailed!  - Failed: 2, Passed: 10, Skipped: 0, Total: 12\nFACTORY::TEST::SUITE::RESULT exit=1';
   eq(verdictFromParse(parseVerifyRaw(testFail), 0).pass, false, 'verdict: new suite failures -> FAIL');
-  eq(verdictFromParse(parseVerifyRaw(testFail), 2).pass, true, 'verdict: failures within baseline -> PASS (deprived runner)');
+  eq(verdictFromParse(parseVerifyRaw(testFail), 2).pass, false, 'verdict: count-only baseline cannot authorize unidentified suite failures');
   eq(verdictFromParse(parseVerifyRaw(''), 0).reason, 'no-machine-evidence', 'verdict: empty transcript -> agent fallback');
   // cycle-8 live bug: a wrong-path FILTER retry (exit=1) precedes the correct run (exit=0) — the parser
   // MUST use the LAST marker, else it false-fails a passing test.
@@ -261,7 +297,7 @@ eq(debrisFiles(['verify.json', 'verify-raw.txt', 'Svc/src/Foo.cs'], ['Svc/src/Fo
   eq(decodeTranscript(utf8bom), plain, 'decodeTranscript: UTF-8 BOM is stripped');
   eq(decodeTranscript(Buffer.alloc(0)), '', 'decodeTranscript: empty buffer -> empty string, never throws');
   const dsrc54 = readFileSync(join(import.meta.dirname, '..', 'driver.mjs'), 'utf8');
-  ok(dsrc54.includes("decodeTranscript(readFileSync(p)) : null") && dsrc54.includes('parseVerifyRaw(decodeTranscript(readFileSync(p)))'), 'KI-E54: driver wires decodeTranscript at BOTH fold-time transcript read sites (readIf + the inline baseline-raw.txt read)');
+  ok(dsrc54.includes("decodeTranscript(readFileSync(p)) : null") && dsrc54.includes('baselineText = decodeTranscript(readFileSync(p))') && dsrc54.includes('parseVerifyRaw(baselineText)'), 'KI-E54: driver decodes both fold-time transcript reads before parsing');
 }
 
 // KI-C6: FAILED -> ESCALATED legal (retry-bound exhausted surfaces to the human queue).
@@ -340,18 +376,9 @@ ok(canTransition('FAILED', 'ESCALATED'), 'FAILED->ESCALATED (retry exhausted) le
 
 // changedFiles must NOT corrupt the first modified path (cycle-6 live bug: git().trim() stripped the
 // leading space of an unstaged-modified porcelain line " M path", shifting slice(3) to eat the first
-// char — "k8s/..." became "8s/..." → false debris). Real git in a temp repo locks the trimEnd fix.
-try {
-  const tdir = mkdtempSync(join(tmpdir(), 'factory-git-'));
-  const g = (...a) => execFileSync('git', ['-C', tdir, '-c', 'user.email=t@t', '-c', 'user.name=t', ...a], { stdio: ['ignore', 'pipe', 'ignore'] });
-  g('init', '-q');
-  fsWrite(join(tdir, 'kfile.cs'), 'original\n');
-  g('add', 'kfile.cs'); g('commit', '-qm', 'base');
-  fsWrite(join(tdir, 'kfile.cs'), 'modified\n'); // -> unstaged-modified, porcelain " M kfile.cs"
-  eq(changedFiles(tdir), ['kfile.cs'], 'changedFiles preserves the leading char of an unstaged-modified path (trim-bug guard)');
-} catch (e) {
-  console.log('  SKIP changedFiles git-integration test (git unavailable: ' + (e && e.message) + ')');
-}
+// char — "k8s/..." became "8s/..." → false debris). Injected porcelain locks the trimEnd fix.
+gitFixture('changedFiles porcelain integration');
+runCheckoutCoverage(resolvePath(import.meta.dirname, '../..'), { ok, eq });
 
 // Ported from a host-mount session (2026-08-29) — removeWorktree (worktree.mjs) drops the worktree
 // directory + git's worktree-admin entry but leaves the `factory/<id>` branch ref standing at its
@@ -366,39 +393,7 @@ try {
 // of HEAD carries no unique value and is safe to discard; one that is NOT (an unexpected commit landed
 // on it, which the hard rule forbids but this function must not blindly trust) is left standing for
 // manual review, never silently discarded.
-try {
-  const wtdir = mkdtempSync(join(tmpdir(), 'factory-prunebranch-'));
-  const wg = (...a) => execFileSync('git', ['-C', wtdir, '-c', 'user.email=t@t', '-c', 'user.name=t', ...a], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
-  wg('init', '-q');
-  fsWrite(join(wtdir, 'f.txt'), 'a\n');
-  wg('add', 'f.txt'); wg('commit', '-qm', 'base');
-  const defaultBranch = wg('symbolic-ref', '--short', 'HEAD').toString().trim(); // host-agnostic — init.defaultBranch varies (master/main)
-  wg('branch', 'factory/safe'); // no unique commits beyond base — safe to delete
-  wg('branch', 'factory/unsafe');
-  wg('checkout', '-q', 'factory/unsafe');
-  fsWrite(join(wtdir, 'g.txt'), 'b\n');
-  wg('add', 'g.txt'); wg('commit', '-qm', 'unexpected extra commit — the hard rule forbids this but the function must not trust that');
-  wg('checkout', '-q', defaultBranch);
-  const { pruneStaleBranch: PSB } = await import('./worktree.mjs');
-  const safe = PSB('factory/safe', wtdir);
-  eq(safe, { deleted: true, branch: 'factory/safe' }, 'KI-E100: a branch with zero commits beyond HEAD is deleted');
-  let branchesAfterSafeDelete = wg('branch').toString();
-  ok(!branchesAfterSafeDelete.includes('factory/safe'), 'KI-E100: the deleted branch no longer appears in `git branch`');
-  const unsafe = PSB('factory/unsafe', wtdir);
-  eq(unsafe.deleted, false, 'KI-E100: a branch with a commit NOT reachable from HEAD is left standing, never silently discarded');
-  ok(/not reachable from HEAD/.test(unsafe.reason), 'KI-E100: the left-standing reason names why, for a human to review');
-  ok(wg('branch').toString().includes('factory/unsafe'), 'KI-E100: the unsafe branch still exists after the declined delete');
-  eq(PSB(null, wtdir), { deleted: false, reason: 'no-branch-given' }, 'KI-E100: no branch given -> short-circuits, never touches git');
-  const missing = PSB('factory/does-not-exist', wtdir);
-  eq(missing.deleted, false, 'KI-E100: a nonexistent branch is never mistaken for a deletable one');
-  ok(/does not exist/.test(missing.reason), 'KI-E100: the nonexistent-branch reason is distinguishable from the has-unique-commits reason (not conflated)');
-  // refs/heads/ prefix form is accepted identically to the bare name (both are real call shapes:
-  // listWorktrees() porcelain output returns the refs/heads/ form; the ledger's r.branch is bare).
-  wg('branch', 'factory/prefixtest');
-  eq(PSB('refs/heads/factory/prefixtest', wtdir), { deleted: true, branch: 'factory/prefixtest' }, 'KI-E100: a refs/heads/-prefixed branch name is stripped and handled identically to the bare form');
-} catch (e) {
-  console.log('  SKIP pruneStaleBranch git-integration test (git unavailable: ' + (e && e.message) + ')');
-}
+gitFixture('KI-E100 pruneStaleBranch integration');
 {
   // Driver wiring: both removeWorktree call sites (the CLI worktree-remove subcommand and gc's
   // CLOSED-item sweep) now call pruneStaleBranch right after removing the worktree — closing the
@@ -407,7 +402,29 @@ try {
   ok(/import \{ addWorktree, removeWorktree, pruneStaleBranch,/.test(drvTextE100), 'KI-E100: driver.mjs imports pruneStaleBranch alongside removeWorktree');
   ok(/sub === 'worktree-remove'[\s\S]{0,400}listWorktrees\(\)\.find/.test(drvTextE100), 'KI-E100: the worktree-remove subcommand resolves the attached branch via listWorktrees() BEFORE removing (branch info is gone once the worktree is gone)');
   ok(/sub === 'worktree-remove'[\s\S]{0,700}pruneStaleBranch\(branch, REPO_ROOT\)/.test(drvTextE100), 'KI-E100: the worktree-remove subcommand calls pruneStaleBranch after removeWorktree');
-  ok(/if \(r\.branch\) \{[\s\S]{0,200}pruneStaleBranch\(r\.branch, REPO_ROOT\)/.test(drvTextE100), 'KI-E100: cmdGc calls pruneStaleBranch using the ledger\'s own r.branch for every CLOSED item it sweeps');
+  const { worktreeGcGroups } = await import('./driver-integration.mjs');
+  const gcStart = drvTextE100.indexOf('function cmdGc(');
+  const gcEnd = drvTextE100.indexOf('\nfunction sweepsDir(', gcStart);
+  const gcSource = drvTextE100.slice(gcStart, gcEnd);
+  const gcRows = { A: { state: 'CLOSED', worktree: 'state/worktrees/shared', branch: 'factory/shared' }, B: { state: 'FAILED', worktree: 'state/worktrees/shared', branch: 'factory/shared' } };
+  const removals = [], branches = [], dockerDown = [];
+  const gcRoot = resolvePath(dir, 'gc-host');
+  const cmdGc = new Function('loadConfig', 'loadLedger', 'abs', 'REPO_ROOT', 'worktreeGcGroups', 'existsSync', 'removeWorktree', 'pruneStaleBranch', 'pruneWorktrees', 'writeJsonAtomic', 'execFileSync', 'strayComposeProjects', 'parseComposeLs', 'console', 'return (' + gcSource + ')')(
+    () => ({ paths: { ledger: 'ledger', worktreesState: 'state/worktrees' } }), () => ({ items: gcRows }), p => resolvePath(gcRoot, p), gcRoot, worktreeGcGroups,
+    () => true, p => removals.push(p), b => { branches.push(b); return { deleted: true }; }, () => {}, () => {},
+    (command, args) => { if (command !== 'docker') throw new Error('unexpected command'); if (args.includes('down')) dockerDown.push(args); return '[]'; },
+    () => [{ Name: 'shared', ConfigFiles: resolvePath(gcRoot, 'state/worktrees/shared/compose.yml') }], JSON.parse, { log: () => {} });
+  cmdGc({ yes: true });
+  eq(removals, [], 'GC refuses a shared worktree with any unfinished item');
+  eq(branches, [], 'GC retains branches belonging to an unfinished shared worktree');
+  eq(dockerDown, [], 'GC retains compose resources belonging to an unfinished shared worktree');
+  eq(gcRows.A.worktree, 'state/worktrees/shared', 'GC retains even CLOSED references while a sibling remains unfinished');
+  gcRows.B.state = 'CLOSED';
+  cmdGc({ yes: true });
+  const gcPathKey = p => process.platform === 'win32' ? resolvePath(p).replace(/\\/g, '/').toLowerCase() : resolvePath(p);
+  eq(removals.map(gcPathKey), [gcPathKey(resolvePath(gcRoot, 'state/worktrees/shared'))], 'GC removes the same canonical fully CLOSED shared worktree exactly once');
+  eq(branches, ['factory/shared'], 'GC prunes its distinct ledger branch exactly once');
+  ok(Object.values(gcRows).every(row => row.worktree === null && row.branch === null), 'GC clears every reference only after the shared removal');
 }
 
 // KI-L27: graph files[] path classifier — ok / creation-target / stale(rewrite) / ambiguous.
@@ -466,6 +483,31 @@ try {
   ok(fb.includes('gate:qa — NULL'), 'feedback: a null (agent-returned-nothing) verdict is visible, fail-closed');
 }
 
+// KI-E166 (ported from a host-mount session) — feedback.md is regenerated on every fold, so a finding
+// raised by an EARLIER cycle is silently lost the moment a LATER cycle's own, different rejection
+// reason overwrites the file. mergeFeedbackHistory keeps the fresh content authoritative but appends
+// the prior file's content below a labeled header instead of discarding it, capped so a chronically-
+// failing item's file cannot grow unbounded.
+{
+  const { mergeFeedbackHistory, FEEDBACK_HISTORY_CAP } = await import('./feedback.mjs');
+  eq(mergeFeedbackHistory('fresh content', null), 'fresh content', 'KI-E166: no prior feedback.md -> byte-identical to fresh content (the common first-attempt case)');
+  eq(mergeFeedbackHistory('fresh content', ''), 'fresh content', 'KI-E166: an empty prior string is treated the same as absent');
+  eq(mergeFeedbackHistory('fresh content', '   \n  '), 'fresh content', 'KI-E166: a whitespace-only prior file is treated the same as absent');
+  const merged = mergeFeedbackHistory('## fold cycle 100\ndocsync gap', '## fold cycle 98\ntest-coverage gap, MEDIUM');
+  ok(merged.startsWith('## fold cycle 100\ndocsync gap'), 'KI-E166: the CURRENT cycle content stays first and authoritative');
+  ok(merged.includes('PRIOR CYCLE(S)\' FEEDBACK (KI-E166)'), 'KI-E166: the prior content is appended below a clearly-labeled header, not silently concatenated');
+  ok(merged.includes('## fold cycle 98\ntest-coverage gap, MEDIUM'), 'KI-E166: the OLDER finding (the SHOPPORTAL-M7-SWEEP incident shape — a still-open finding from an earlier, superseded cycle) survives in the merged file instead of vanishing');
+  ok(merged.includes('Re-verify EACH finding below against the CURRENT tree'), 'KI-E166: the appended section instructs re-verification, not blind trust of stale content');
+  const hugePrior = 'x'.repeat(FEEDBACK_HISTORY_CAP + 5000);
+  const mergedCapped = mergeFeedbackHistory('fresh', hugePrior);
+  ok(mergedCapped.length < 'fresh'.length + FEEDBACK_HISTORY_CAP + 500, 'KI-E166: an oversized prior file is truncated to FEEDBACK_HISTORY_CAP before being re-appended, so the merged file cannot grow unbounded across many cycles');
+  eq(FEEDBACK_HISTORY_CAP, 6000, 'KI-E166: the cap is the documented 6000 chars (mirrors KI-E121\'s PLAN_REUSE_CAP posture)');
+  // driver.mjs wiring
+  const drvTextE166 = readFileSync(join(import.meta.dirname, '..', 'driver.mjs'), 'utf8');
+  ok(drvTextE166.includes("import { renderFeedback, mergeFeedbackHistory } from './lib/feedback.mjs';"), 'KI-E166: driver.mjs imports mergeFeedbackHistory alongside the existing renderFeedback');
+  ok(drvTextE166.includes('writeFileSync(fbPath, mergeFeedbackHistory(fb, priorFb))'), 'KI-E166: the fold reads the existing feedback.md BEFORE overwriting it and routes both through the merge, instead of a bare writeFileSync(fb)');
+}
+
 // KI-L39: pure-coverage exemption — the factory source must gate the P2 text floor AND P9
 // rootCauseFiles on `theme === 'test-coverage' && !item.realInfra` (ITEM-C7 false-fail class:
 // a coverage item's acceptance text names the guards the NEW TEST covers, and its files[] names the
@@ -494,8 +536,10 @@ try {
     'KI-L44: deferral note is set so the fold context shows why the in-run check passed through');
   ok(src.includes("finish('BLOCKED', 'realInfra item needs Docker/Testcontainers"),
     'KI-L44: Docker-absent still PARKS (BLOCKED) — never a silent in-memory close');
-  ok(src.includes('const needsRealInfra = filesHaveCs && realInfraLikely'),
-    'KI-L45: needsRealInfra keys on filesHaveCs (fix surface), not codeChange (test language)');
+  const infraBatch = smokeBatch();
+  infraBatch.items = [{ ...infraBatch.items[0], realInfra: true }];
+  const infraRun = await execSmoke(src, infraBatch);
+  eq(infraRun.result.results[0].needsRealInfra, false, 'KI-L45: doc fix with a C# regression test does not require real infra');
 }
 
 // Ported from a host-mount session (2026-08-29) — REALINFRA_SIGNAL's bare `concurren` catch-all
@@ -675,9 +719,9 @@ try {
   ok(drv.includes('precedent: precedentByItem.get(wi.id) || undefined'), 'similarity: group forwards the per-item precedent stamp on every item entry (KI-E63)');
   ok(fsrc.includes('PRECEDENT — a gate-APPROVED instance of this exact change-shape already CLOSED: '), 'factory: precedent block present in shared prefix (KI-E63)');
   ok(fsrc.includes('never Edit it, never touch its files'), 'factory: precedent is explicitly framed as read-only, foreign-item reference material (KI-E63)');
-  const opsrc63 = readFileSync(join(import.meta.dirname, '..', 'opencode', 'compose.mjs'), 'utf8');
-  ok(opsrc63.includes('PRECEDENT — a gate-APPROVED instance of this exact change-shape already CLOSED: '), 'opencode compose: KI-E63 precedent block ported (runtime parity)');
-  ok(opsrc63.includes('never Edit it, never touch its files'), 'opencode compose: KI-E63 read-only framing ported (runtime parity)');
+  const precedentPrompt = portPrompt('fixer', { precedent: { id: 'OLD-2', fixJson: 'state/OLD-2/fix.json', worktree: 'wt/OLD-2' } });
+  ok(precedentPrompt.includes('OLD-2') && precedentPrompt.includes('/main/state/OLD-2/fix.json') && precedentPrompt.includes('/main/wt/OLD-2/'), 'KI-E63: actual port prompt includes precedent identity and anchored evidence paths');
+  ok(precedentPrompt.includes('never as evidence for YOUR verdict') && precedentPrompt.includes('worktree are READ-ONLY'), 'KI-E63: actual port prompt constrains precedent to read-only pattern reference');
 }
 
 // KI-C11: session-controller lease — the campaign-level single-owner guard. Two control-plane
@@ -797,6 +841,22 @@ try {
   eq(by['SMOKE-DISPUTE'] && by['SMOKE-DISPUTE'].toState, 'CLOSED', 'exec-smoke: OVERRULED + re-gate APPROVED proceeds past the gate band (P8)');
   eq(by['SMOKE-VONLY'] && by['SMOKE-VONLY'].toState, 'CLOSED', 'exec-smoke: verification-only reFix lane completes (KI-L37)');
   ok(!calls.some((c) => c.label === 'SMOKE-VONLY:fixer'), 'exec-smoke: verification-only lane SKIPS the fixer');
+  // KI-E161 (ported from a host-mount session) — SMOKE-VONLY is reFix:true, so its test-author prompt
+  // must carry the disk-proof mandate for a reFix verificationOnly claim, not just the prose-only
+  // instruction the pre-KI-E161 shape had.
+  const vonlyTestCall = calls.find((c) => c.label === 'SMOKE-VONLY:test-author');
+  ok(vonlyTestCall && vonlyTestCall.prompt.includes('RE-FIX VERIFICATIONONLY (KI-E161)'), 'KI-E161 exec-smoke: a reFix item\'s test-author prompt carries the KI-E161 disk-proof mandate');
+  ok(vonlyTestCall && vonlyTestCall.prompt.includes('OVERWRITE whatever is already there'), 'KI-E161 exec-smoke: the mandate explicitly instructs overwriting a stale earlier-round capture, the exact MKTADMIN-M10-shaped bug this closes');
+  // KI-E168 (ported from a host-mount session) — prior-finding-scan is gated on item.reFix, NOT on
+  // verificationOnly, so it must ALSO dispatch for the verification-only reFix lane (a claim that a
+  // finding is "already fixed" is exactly the claim most worth checking) and record APPROVED under
+  // the default stub (which returns honored:true for any PLAN_COMMITMENT_SCHEMA call).
+  ok(calls.some((c) => c.label === 'SMOKE-VONLY:prior-finding-probe'), 'KI-E168 exec-smoke: the verification-only reFix lane STILL dispatches prior-finding-scan (KI-E128-style posture)');
+  const vonlyPriorFindingCall = calls.find((c) => c.label === 'SMOKE-VONLY:prior-finding-probe');
+  ok(vonlyPriorFindingCall && vonlyPriorFindingCall.prompt.includes('VERIFICATION-ONLY LANE (mirrors KI-E128)'), 'KI-E168 exec-smoke: the verification-only variant of the prompt is the one actually dispatched, not the default fixer-diff framing');
+  eq(by['SMOKE-VONLY'] && by['SMOKE-VONLY'].gates && by['SMOKE-VONLY'].gates['probe:prior-finding-scan'], 'APPROVED', 'KI-E168 exec-smoke: a satisfied probe records APPROVED under its own gate key');
+  ok(!calls.some((c) => c.label === 'SMOKE-CODE:prior-finding-probe'), 'KI-E168 exec-smoke: a NON-reFix item (SMOKE-CODE) never dispatches prior-finding-scan at all — the probe has nothing to check on a first attempt');
+  ok(!calls.some((c) => c.label === 'SMOKE-DOC:prior-finding-probe'), 'KI-E168 exec-smoke: same for the doc lane — reFix-gating applies regardless of item shape');
   eq(by['SMOKE-SCOPEFLAG'] && by['SMOKE-SCOPEFLAG'].toState, 'CLOSED', 'KI-L57: an APPROVED gate with a stray scopeViolation flag does NOT hard-stop the item');
   ok(by['SMOKE-SCOPEFLAG'] && by['SMOKE-SCOPEFLAG'].gateDetails && by['SMOKE-SCOPEFLAG'].gateDetails['gate:developer'] && by['SMOKE-SCOPEFLAG'].gateDetails['gate:developer'].scopeViolationIgnored === true, 'KI-L57: the inconsistent flag is preserved on gateDetails for the audit trail');
   eq(by['SMOKE-SCOPESTOP'] && by['SMOKE-SCOPESTOP'].toState, 'BLOCKED', 'KI-L57: a CHANGES_REQUIRED gate with scopeViolation still hard-stops (genuine scope-stop path intact)');
@@ -845,6 +905,375 @@ try {
   ok(!calls.some((c) => c.label.startsWith('SMOKE-CODE:gate-')), 'KI-E101 fail-path: the item never reached the gate band — this is the entire economic argument for a pre-band probe (a FULL band is ~5 opus gates + refuter + multi-lens reaudit)');
   // sibling lanes are unaffected — one item's probe verdict must never leak across lanes
   eq(byE101['SMOKE-DOC'] && byE101['SMOKE-DOC'].toState, 'CLOSED', 'KI-E101 fail-path: a sibling lane whose own steps ARE evidenced still closes (per-item isolation holds)');
+}
+
+// KI-E168 (ported from a host-mount session) — prior-finding-scan's full round trip on a reFix item
+// that is NOT verificationOnly (a real fixer runs): a gap on the first probe call is closed by ONE
+// bounded amend + re-probe, and a gap that SURVIVES the amend fails the item pre-band. Custom batch:
+// smokeBatch()'s only reFix item (SMOKE-VONLY) is also verificationOnly, which would conflate this
+// scan's own fixer-amend call with "the lane skips the main fixer" — a fresh reFix+non-VO item keeps
+// the two concerns separate.
+{
+  const src = readFileSync(join(import.meta.dirname, '..', 'factory.js'), 'utf8');
+  const wtE168 = (id) => ({ path: '/tmp/exec-smoke-wt-e168/' + id, branch: 'factory/' + id });
+  const baseE168 = { target: 'X', layer: 'service', dependsOn: [], gateSet: [], autonomyTier: 'auto', source: 'smoke', solution: 'X/X.sln', peers: [] };
+  const batchE168 = {
+    runId: 'selftest-e168-amend',
+    cycle: 0, concurrency: 2, attempts: 1, repoRoot: '.', templatesDir: '_bmad-output/ai-factory/agents', config: {}, dryRun: false,
+    policies: {},
+    items: [{ ...baseE168, id: 'SMOKE-REFIX-GAP', title: 'reFix with a persisting-then-closed prior finding', severity: 'HIGH', theme: 'security-multitenancy', fixType: 'non-trivial', files: ['X/src/Some.cs'], acceptance: 'policy enforced', regressionTest: 'test', realInfra: false, reFix: true, worktree: wtE168('SMOKE-REFIX-GAP') }],
+  };
+  const gapFinding = { commitment: 'gate:security HIGH: missing tenant filter on GetById', why: 'no hunk in the diff touches the query\'s WHERE clause' };
+  let probeCalls = 0;
+  const { result, calls } = await execSmoke(src, batchE168, {
+    agentOverride: (prompt, opts) => {
+      if ((opts && opts.label) === 'SMOKE-REFIX-GAP:prior-finding-probe') {
+        probeCalls++;
+        // first call: a real gap. second call (post-amend re-probe): closed.
+        return probeCalls === 1 ? { honored: false, gaps: [gapFinding] } : { honored: true, gaps: [] };
+      }
+      return undefined;
+    },
+  });
+  const byE168 = Object.fromEntries((result.results || []).map((r) => [r.id, r]));
+  const refix168 = byE168['SMOKE-REFIX-GAP'];
+  ok(!(result.results || []).some((r) => String(r.note || '').startsWith('runItem threw')), 'KI-E168 amend-close: no runItem crash');
+  eq(refix168 && refix168.toState, 'CLOSED', 'KI-E168 amend-close: a gap closed by the bounded amend proceeds normally to CLOSED');
+  eq(refix168.gates['probe:prior-finding-scan'], 'APPROVED', 'KI-E168 amend-close: the FINAL (post-amend) verdict is what gets recorded, not the initial gap');
+  eq(calls.filter((c) => c.label === 'SMOKE-REFIX-GAP:prior-finding-probe').length, 2, 'KI-E168 amend-close: exactly TWO probe calls (initial + ONE re-probe) — the re-probe verdict is final, no further looping');
+  const amendCall = calls.find((c) => c.label === 'SMOKE-REFIX-GAP:fixer' && c.prompt.includes('PRIOR-FINDING AMEND (KI-E168)'));
+  ok(amendCall, 'KI-E168 amend-close: a dedicated fixer amend call carries the KI-E168 brief');
+  ok(amendCall.prompt.includes('missing tenant filter on GetById'), 'KI-E168 amend-close: the actual finding text reaches the fixer, not just a generic "fix findings" instruction');
+}
+{
+  const src = readFileSync(join(import.meta.dirname, '..', 'factory.js'), 'utf8');
+  const wtE168b = (id) => ({ path: '/tmp/exec-smoke-wt-e168b/' + id, branch: 'factory/' + id });
+  const baseE168b = { target: 'X', layer: 'service', dependsOn: [], gateSet: [], autonomyTier: 'auto', source: 'smoke', solution: 'X/X.sln', peers: [] };
+  const batchE168b = {
+    runId: 'selftest-e168-persist',
+    cycle: 0, concurrency: 2, attempts: 1, repoRoot: '.', templatesDir: '_bmad-output/ai-factory/agents', config: {}, dryRun: false,
+    policies: {},
+    items: [{ ...baseE168b, id: 'SMOKE-REFIX-PERSIST', title: 'reFix whose prior finding never gets addressed', severity: 'HIGH', theme: 'security-multitenancy', fixType: 'non-trivial', files: ['X/src/Other.cs'], acceptance: 'policy enforced', regressionTest: 'test', realInfra: false, reFix: true, worktree: wtE168b('SMOKE-REFIX-PERSIST') }],
+  };
+  const persistentGap = { commitment: 'gate:qa HIGH: the same off-by-one from the prior round is still present', why: 'the diff touches an unrelated file only' };
+  const { result, calls } = await execSmoke(src, batchE168b, {
+    agentOverride: (prompt, opts) => {
+      // SAME label covers the probe AND its re-probe — the gap survives the amend, so the item must
+      // fail rather than loop for a second amend.
+      if ((opts && opts.label) === 'SMOKE-REFIX-PERSIST:prior-finding-probe') return { honored: false, gaps: [persistentGap] };
+      return undefined;
+    },
+  });
+  const byE168b = Object.fromEntries((result.results || []).map((r) => [r.id, r]));
+  const persist168 = byE168b['SMOKE-REFIX-PERSIST'];
+  ok(!(result.results || []).some((r) => String(r.note || '').startsWith('runItem threw')), 'KI-E168 persistent-gap: no runItem crash');
+  eq(persist168 && persist168.toState, 'FAILED', 'KI-E168 persistent-gap: a finding that survives the bounded amend FAILS the item');
+  ok(String(persist168.note || '').includes('prior-finding-scan (KI-E168)'), 'KI-E168 persistent-gap: the note names the check that failed it');
+  ok(String(persist168.note || '').includes('the same off-by-one from the prior round'), 'KI-E168 persistent-gap: the actual unaddressed finding text reaches the operator-visible note');
+  ok(String(persist168.note || '').includes('Pre-band fail'), 'KI-E168 persistent-gap: the note states this was cheap — no gate band was spent, the entire economic argument for the probe');
+  eq(calls.filter((c) => c.label === 'SMOKE-REFIX-PERSIST:fixer' && c.prompt.includes('PRIOR-FINDING AMEND (KI-E168)')).length, 1, 'KI-E168 persistent-gap: exactly ONE KI-E168 amend call (on top of the item\'s own separate main fix) — no infinite retry loop on a stubborn finding');
+  eq(calls.filter((c) => c.label === 'SMOKE-REFIX-PERSIST:prior-finding-probe').length, 2, 'KI-E168 persistent-gap: exactly TWO probe calls (initial + ONE re-probe) before giving up');
+  ok(!calls.some((c) => c.label.startsWith('SMOKE-REFIX-PERSIST:gate-')), 'KI-E168 persistent-gap: the item never reached the expensive gate band');
+}
+
+// KI-E164 (ported from a host-mount session) — a HIGH editorial finding (a factual defect editorial
+// deliberately does not self-correct) now routes into ONE bounded fixer amend + a targeted re-scan of
+// just the flow(s) that found something, instead of sailing to the gate band unchanged. Custom batch:
+// a doc-touching item, since editorial only runs for doc-touching items.
+{
+  const src = readFileSync(join(import.meta.dirname, '..', 'factory.js'), 'utf8');
+  const wtE164 = (id) => ({ path: '/tmp/exec-smoke-wt-e164/' + id, branch: 'factory/' + id });
+  const baseE164 = { target: 'X', layer: 'service', dependsOn: [], gateSet: [], autonomyTier: 'auto', source: 'smoke', solution: 'X/X.sln', peers: [] };
+  const batchE164 = {
+    runId: 'selftest-e164-high',
+    cycle: 0, concurrency: 2, attempts: 1, repoRoot: '.', templatesDir: '_bmad-output/ai-factory/agents', config: {}, dryRun: false,
+    policies: {},
+    items: [{ ...baseE164, id: 'SMOKE-EDITORIAL-HIGH', title: 'doc with a fabricated field name', severity: 'HIGH', theme: 'doc-drift', fixType: 'doc-drift', files: ['doc/data-flows/X.md'], acceptance: 'doc fixed', regressionTest: 'grep', realInfra: false, worktree: wtE164('SMOKE-EDITORIAL-HIGH') }],
+  };
+  let editorialCalls = 0;
+  const { result, calls } = await execSmoke(src, batchE164, {
+    agentOverride: (prompt, opts) => {
+      if ((opts && opts.label) === 'SMOKE-EDITORIAL-HIGH:review-editorial-prose') {
+        editorialCalls++;
+        // first call: a real HIGH factual finding. second call (post-amend re-scan): resolved.
+        return editorialCalls === 1
+          ? { gate: 'review-editorial-prose', verdict: 'CHANGES_REQUIRED', findings: [{ severity: 'HIGH', title: 'fabricated event name FooEvent.Bar', file: 'doc/data-flows/X.md', fix: 'replace with the real field name' }], scopeViolation: false, acceptanceMet: false, redGreenConfirmed: true, headline: 'fabricated field name' }
+          : { gate: 'review-editorial-prose', verdict: 'APPROVED', findings: [], scopeViolation: false, acceptanceMet: true, redGreenConfirmed: true, headline: 'corrected' };
+      }
+      return undefined;
+    },
+  });
+  const byE164 = Object.fromEntries((result.results || []).map((r) => [r.id, r]));
+  const doc164 = byE164['SMOKE-EDITORIAL-HIGH'];
+  ok(!(result.results || []).some((r) => String(r.note || '').startsWith('runItem threw')), 'KI-E164: no runItem crash');
+  eq(doc164 && doc164.toState, 'CLOSED', 'KI-E164: editorial is advisory — even with a HIGH finding, the item still closes once the amend resolves it (editorial never itself blocks)');
+  eq(doc164.gates['editorial:prose'], 'APPROVED', 'KI-E164: the FINAL (post-amend re-scan) verdict is what gets recorded, not the initial HIGH finding');
+  const amendCallE164 = calls.find((c) => c.label === 'SMOKE-EDITORIAL-HIGH:fixer' && c.prompt.includes('EDITORIAL HIGH-FINDING AMEND (KI-E164)'));
+  ok(amendCallE164, 'KI-E164: a dedicated fixer amend call carries the KI-E164 brief');
+  ok(amendCallE164.prompt.includes('fabricated event name FooEvent.Bar'), 'KI-E164: the actual finding text (with its exact replacement already known) reaches the fixer verbatim');
+  eq(calls.filter((c) => c.label === 'SMOKE-EDITORIAL-HIGH:review-editorial-prose').length, 2, 'KI-E164: exactly TWO editorial-prose calls (initial + ONE targeted re-scan) — the re-scan verdict is final');
+  ok(!calls.some((c) => c.label === 'SMOKE-EDITORIAL-HIGH:review-editorial-structure' && c.prompt.includes('RE-SCAN (KI-E164)')), 'KI-E164: only the flow(s) that actually had a HIGH finding get re-scanned — a sibling editorial flow with no finding is not re-run needlessly');
+}
+{
+  // MEDIUM/LOW editorial findings stay purely advisory — they must NEVER trigger an amend, or a mere
+  // style opinion would force an expensive fixer call on every doc-touching item.
+  const src = readFileSync(join(import.meta.dirname, '..', 'factory.js'), 'utf8');
+  const wtE164b = (id) => ({ path: '/tmp/exec-smoke-wt-e164b/' + id, branch: 'factory/' + id });
+  const baseE164b = { target: 'X', layer: 'service', dependsOn: [], gateSet: [], autonomyTier: 'auto', source: 'smoke', solution: 'X/X.sln', peers: [] };
+  const batchE164b = {
+    runId: 'selftest-e164-medium',
+    cycle: 0, concurrency: 2, attempts: 1, repoRoot: '.', templatesDir: '_bmad-output/ai-factory/agents', config: {}, dryRun: false,
+    policies: {},
+    items: [{ ...baseE164b, id: 'SMOKE-EDITORIAL-MED', title: 'doc with a stylistic nit', severity: 'HIGH', theme: 'doc-drift', fixType: 'doc-drift', files: ['doc/data-flows/Y.md'], acceptance: 'doc fixed', regressionTest: 'grep', realInfra: false, worktree: wtE164b('SMOKE-EDITORIAL-MED') }],
+  };
+  const { result, calls } = await execSmoke(src, batchE164b, {
+    agentOverride: (prompt, opts) => {
+      if ((opts && opts.label) === 'SMOKE-EDITORIAL-MED:review-editorial-prose') return { gate: 'review-editorial-prose', verdict: 'CHANGES_REQUIRED', findings: [{ severity: 'MEDIUM', title: 'inconsistent heading capitalization', file: 'doc/data-flows/Y.md', fix: 'Title Case throughout' }], scopeViolation: false, acceptanceMet: true, redGreenConfirmed: true, headline: 'style nit' };
+      return undefined;
+    },
+  });
+  const byE164b = Object.fromEntries((result.results || []).map((r) => [r.id, r]));
+  ok(!(result.results || []).some((r) => String(r.note || '').startsWith('runItem threw')), 'KI-E164 MEDIUM: no runItem crash');
+  eq(byE164b['SMOKE-EDITORIAL-MED'] && byE164b['SMOKE-EDITORIAL-MED'].toState, 'CLOSED', 'KI-E164 MEDIUM: closes normally');
+  ok(!calls.some((c) => c.label === 'SMOKE-EDITORIAL-MED:fixer' && c.prompt.includes('EDITORIAL HIGH-FINDING AMEND')), 'KI-E164 MEDIUM: a MEDIUM-only editorial finding never triggers the amend — scoped to HIGH only, exactly as designed');
+  eq(calls.filter((c) => c.label === 'SMOKE-EDITORIAL-MED:review-editorial-prose').length, 1, 'KI-E164 MEDIUM: exactly ONE editorial-prose call — no re-scan was ever warranted');
+}
+
+// KI-E169 (ported from a host-mount session) — the HOST-POLICY-GATED, purely observational shadow
+// consolidated scan. Fires only when the host opts in AND all three real axes (acceptance/plan-
+// commitment/prior-finding) already ran and APPROVED this round; NEVER touches res.toState regardless
+// of AGREE/DISAGREE. Reuses the SMOKE-REFIX-GAP shape (reFix + non-verificationOnly, so all three real
+// scans are reachable) with no overrides on any of the three real probes, so they all APPROVE under
+// the default stub — isolating the shadow-scan behavior itself as the one variable under test.
+function shadowScanItem(id, extraFiles) {
+  const base = { target: 'X', layer: 'service', dependsOn: [], gateSet: [], autonomyTier: 'auto', source: 'smoke', solution: 'X/X.sln', peers: [] };
+  // Two real sentences (>= 20 chars each) so splitAcceptanceClauses actually yields >= 2 clauses —
+  // acceptance-scan (KI-E18) is deliberately SKIPPED for single-clause acceptances, and this test
+  // needs it to genuinely run and APPROVE so the shadow scan's gating condition can be reached.
+  return { ...base, id, title: 'reFix item, all three real axes clean', severity: 'HIGH', theme: 'security-multitenancy', fixType: 'non-trivial', files: extraFiles || ['X/src/Some.cs'], acceptance: 'Tenant filter is applied to every query. The response never leaks another tenant\'s data.', regressionTest: 'test', realInfra: false, reFix: true, worktree: { path: '/tmp/exec-smoke-wt-e169/' + id, branch: 'factory/' + id } };
+}
+function shadowScanBatch(id, policies, extraFiles) {
+  return { runId: 'selftest-shadow-' + id, cycle: 0, concurrency: 2, attempts: 1, repoRoot: '.', templatesDir: '_bmad-output/ai-factory/agents', config: {}, dryRun: false, policies: policies || {}, items: [shadowScanItem(id, extraFiles)] };
+}
+{
+  // off by default — never dispatches, even though all three real axes are satisfied and reachable.
+  const src = readFileSync(join(import.meta.dirname, '..', 'factory.js'), 'utf8');
+  const { result, calls } = await execSmoke(src, shadowScanBatch('SMOKE-SHADOW-OFF', {}), {});
+  ok(!(result.results || []).some((r) => String(r.note || '').startsWith('runItem threw')), 'KI-E169 off-by-default: no runItem crash');
+  eq(result.results[0] && result.results[0].toState, 'CLOSED', 'KI-E169 off-by-default: the item closes normally');
+  ok(!calls.some((c) => c.label === 'SMOKE-SHADOW-OFF:consolidated-scan-shadow'), 'KI-E169 off-by-default: with the policy OFF (the shipped-engine default), the shadow probe never dispatches even though every gating condition is otherwise met');
+}
+{
+  // on + agreement — the shadow call's answers match all three real verdicts.
+  const src = readFileSync(join(import.meta.dirname, '..', 'factory.js'), 'utf8');
+  const { result, calls } = await execSmoke(src, shadowScanBatch('SMOKE-SHADOW-AGREE', { shadowConsolidatedScan: true }, ['X/src/Agree.cs']), {
+    agentOverride: (prompt, opts) => {
+      if (opts?.schema?.properties?.codeHash) return { ...defaultAgentStub(opts), shadowSnapshotHash: 'abcd'.repeat(16) };
+      if ((opts && opts.label) === 'SMOKE-SHADOW-AGREE:consolidated-scan-shadow') return { acceptanceCovered: true, planHonored: true, findingHonored: true };
+      return undefined;
+    },
+  });
+  const shadowAgreeResult = result.results[0];
+  ok(!(result.results || []).some((r) => String(r.note || '').startsWith('runItem threw')), 'KI-E169 on+agree: no runItem crash');
+  eq(shadowAgreeResult && shadowAgreeResult.toState, 'CLOSED', 'KI-E169 on+agree: the item still closes normally — the shadow call never affects the outcome');
+  eq(shadowAgreeResult.gates['probe:consolidated-scan-shadow'], 'AGREE', 'KI-E169 on+agree: recorded AGREE when the shadow answers match every real verdict');
+  eq(shadowAgreeResult.gateDetails['probe:consolidated-scan-shadow'].originals, { acceptanceCovered: true, planHonored: true, findingHonored: true }, 'KI-E169 on+agree: all three original verdicts retained for snapshot comparison');
+  eq(shadowAgreeResult.gateDetails['probe:consolidated-scan-shadow'].findings.length, 0, 'KI-E169 on+agree: no findings recorded on agreement — nothing to flag');
+}
+{
+  // on + a FORCED disagreement on one axis — the critical safety property: outcome is UNCHANGED.
+  const src = readFileSync(join(import.meta.dirname, '..', 'factory.js'), 'utf8');
+  const { result, calls } = await execSmoke(src, shadowScanBatch('SMOKE-SHADOW-DISAGREE', { shadowConsolidatedScan: true }, ['X/src/Disagree.cs']), {
+    agentOverride: (prompt, opts) => {
+      if (opts?.schema?.properties?.codeHash) return { ...defaultAgentStub(opts), shadowSnapshotHash: 'abcd'.repeat(16) };
+      // the shadow call says the PLAN axis is NOT honored, contradicting the real plan-commitment-scan's APPROVED
+      if ((opts && opts.label) === 'SMOKE-SHADOW-DISAGREE:consolidated-scan-shadow') return { acceptanceCovered: true, planHonored: false, findingHonored: true };
+      return undefined;
+    },
+  });
+  const shadowDisagreeResult = result.results[0];
+  ok(!(result.results || []).some((r) => String(r.note || '').startsWith('runItem threw')), 'KI-E169 on+disagree: no runItem crash');
+  eq(shadowDisagreeResult && shadowDisagreeResult.toState, 'CLOSED', 'KI-E169 on+disagree: the item STILL closes normally — a shadow disagreement is data, never a verdict override (the entire point of "shadow mode")');
+  eq(shadowDisagreeResult.gates['probe:consolidated-scan-shadow'], 'DISAGREE', 'KI-E169 on+disagree: recorded DISAGREE when the shadow answer diverges from a real verdict');
+  eq(shadowDisagreeResult.gateDetails['probe:consolidated-scan-shadow'].originals?.planHonored, true, 'KI-E169 on+disagree: original plan verdict retained');
+  eq(shadowDisagreeResult.gateDetails['probe:consolidated-scan-shadow'].shadow?.planHonored, false, 'KI-E169 on+disagree: differing shadow plan verdict retained');
+}
+{
+  // gating unmet — a NON-reFix item never runs prior-finding-scan, so its gate is never 'APPROVED';
+  // the shadow probe must correctly decline to fire rather than treat a missing axis as satisfied.
+  const src = readFileSync(join(import.meta.dirname, '..', 'factory.js'), 'utf8');
+  const base = { target: 'X', layer: 'service', dependsOn: [], gateSet: [], autonomyTier: 'auto', source: 'smoke', solution: 'X/X.sln', peers: [] };
+  const notReFixItem = { ...base, id: 'SMOKE-SHADOW-GATEUNMET', title: 'non-reFix item', severity: 'HIGH', theme: 'security-multitenancy', fixType: 'non-trivial', files: ['X/src/GateUnmet.cs'], acceptance: 'policy enforced', regressionTest: 'test', realInfra: false, worktree: { path: '/tmp/exec-smoke-wt-e169/SMOKE-SHADOW-GATEUNMET', branch: 'factory/SMOKE-SHADOW-GATEUNMET' } };
+  const batchGateUnmet = { runId: 'selftest-shadow-unmet', cycle: 0, concurrency: 2, attempts: 1, repoRoot: '.', templatesDir: '_bmad-output/ai-factory/agents', config: {}, dryRun: false, policies: { shadowConsolidatedScan: true }, items: [notReFixItem] };
+  const { result, calls } = await execSmoke(src, batchGateUnmet, {});
+  ok(!(result.results || []).some((r) => String(r.note || '').startsWith('runItem threw')), 'KI-E169 gating-unmet: no runItem crash');
+  eq(result.results[0] && result.results[0].toState, 'CLOSED', 'KI-E169 gating-unmet: the item closes normally regardless');
+  ok(!calls.some((c) => c.label === 'SMOKE-SHADOW-GATEUNMET:consolidated-scan-shadow'), 'KI-E169 gating-unmet: policy ON but prior-finding-scan never ran (not a reFix item) -> the shadow probe correctly declines to fire, never treating a MISSING real axis as an implicitly-satisfied one');
+}
+{
+  // an unavailable shadow probe (null after retries) is infra noise, recorded SKIPPED — never
+  // misread as a disagreement (KI-L53 fail-open posture, same as every other probe in this pipeline).
+  const src = readFileSync(join(import.meta.dirname, '..', 'factory.js'), 'utf8');
+  const { result, calls } = await execSmoke(src, shadowScanBatch('SMOKE-SHADOW-SKIP', { shadowConsolidatedScan: true }, ['X/src/Skip.cs']), {
+    agentOverride: (prompt, opts) => {
+      if (opts?.schema?.properties?.codeHash) return { ...defaultAgentStub(opts), shadowSnapshotHash: 'abcd'.repeat(16) };
+      if ((opts && opts.label) === 'SMOKE-SHADOW-SKIP:consolidated-scan-shadow') return null;
+      return undefined;
+    },
+  });
+  const shadowSkipResult = result.results[0];
+  ok(!(result.results || []).some((r) => String(r.note || '').startsWith('runItem threw')), 'KI-E169 unavailable: no runItem crash');
+  eq(shadowSkipResult && shadowSkipResult.toState, 'CLOSED', 'KI-E169 unavailable: the item closes normally — an infra-unavailable OBSERVATIONAL probe never blocks anything');
+  eq(shadowSkipResult.gates['probe:consolidated-scan-shadow'], 'SKIPPED', 'KI-E169 unavailable: recorded SKIPPED, not DISAGREE — infra noise must never be misread as a real divergence signal');
+}
+
+// KI-E142A (ported from a host-mount session) — PLAN-REVIEW fail path: a feasibility gap that
+// survives one revision hard-fails BEFORE test-author, fixer, or verify ever run — the cheapest
+// possible fail this stage exists to prove.
+{
+  const src = readFileSync(join(import.meta.dirname, '..', 'factory.js'), 'utf8');
+  const { result, calls } = await execSmoke(src, smokeBatch(), {
+    agentOverride: (prompt, opts) => {
+      const label = (opts && opts.label) || '';
+      if (label === 'SMOKE-CODE:plan-feasibility-probe') return { honored: false, gaps: [{ commitment: 'Services/IDoesNotExist.cs', why: 'no such file in the worktree, and the plan never says it is new' }] };
+      return undefined;
+    },
+  });
+  const byPRA = Object.fromEntries((result.results || []).map((r) => [r.id, r]));
+  const codePRA = byPRA['SMOKE-CODE'];
+  ok(!(result.results || []).some((r) => String(r.note || '').startsWith('runItem threw')), 'KI-E142A fail-path: no runItem crash on any lane');
+  eq(codePRA && codePRA.toState, 'FAILED', 'KI-E142A fail-path: a feasibility gap surviving one revision FAILS the item');
+  ok(String(codePRA.note || '').includes('plan-review (KI-E142A)'), 'KI-E142A fail-path: the note names the stage that rejected it');
+  ok(String(codePRA.note || '').includes('no test-author, no fixer, no verify ran'), 'KI-E142A fail-path: the note states the cost claim the whole stage exists for');
+  eq(codePRA.gates['probe:plan-review'], 'CHANGES_REQUIRED', 'KI-E142A fail-path: the gate key records CHANGES_REQUIRED');
+  ok(!calls.some((c) => c.label === 'SMOKE-CODE:test-author'), 'KI-E142A fail-path: test-author never ran — this is the entire economic argument for reviewing the plan before implementation starts');
+  ok(!calls.some((c) => c.label === 'SMOKE-CODE:fixer'), 'KI-E142A fail-path: the fixer never ran either — no implementation cost was paid for a plan whose premise was already broken');
+  eq(calls.filter((c) => c.label === 'SMOKE-CODE:plan-feasibility-probe').length, 2, 'KI-E142A fail-path: exactly TWO feasibility probe calls (initial + ONE re-probe after the bounded revision) — no loop');
+  eq(calls.filter((c) => c.label === 'SMOKE-CODE:planner').length, 2, 'KI-E142A fail-path: exactly TWO planner calls (the original plan + ONE bounded revision) — the revision is bounded, not repeated');
+}
+
+// KI-E142A — PLAN-REVIEW: a quality/edge-case gap alone NEVER hard-fails (only feasibility can) — it
+// drives the same bounded revision and rides along as telemetry, but the item proceeds to implement.
+{
+  const src = readFileSync(join(import.meta.dirname, '..', 'factory.js'), 'utf8');
+  const { result, calls } = await execSmoke(src, smokeBatch(), {
+    agentOverride: (prompt, opts) => {
+      const label = (opts && opts.label) || '';
+      if (label === 'SMOKE-CODE:plan-quality-probe') return { honored: false, gaps: [{ commitment: 'concurrent access to the shared counter', why: 'the plan never mentions a lock or CAS pattern' }] };
+      return undefined;
+    },
+  });
+  const codePRB = (result.results || []).find((r) => r.id === 'SMOKE-CODE');
+  ok(!(result.results || []).some((r) => String(r.note || '').startsWith('runItem threw')), 'KI-E142A quality-only: no runItem crash');
+  ok(codePRB && codePRB.toState !== 'FAILED', 'KI-E142A quality-only: a quality/edge-case gap alone never fails the item pre-band (only an unfixable feasibility gap can)');
+  eq(codePRB.gates['probe:plan-review'], 'APPROVED', 'KI-E142A quality-only: still APPROVED — the asymmetry is deliberate (see the KI-E142 KNOWN-ISSUES.md entry)');
+  eq(calls.filter((c) => c.label === 'SMOKE-CODE:planner').length, 2, 'KI-E142A quality-only: the gap still earns exactly one bounded planner revision');
+}
+
+// KI-E142B — plan-deviation adjudication: a DECLARED, explained gap that the adjudicator OVERRULES
+// proceeds instead of failing — the whole point of not treating every unhonored commitment as fatal.
+{
+  const src = readFileSync(join(import.meta.dirname, '..', 'factory.js'), 'utf8');
+  const gapStep = 'Update the data-flow doc for the endpoint';
+  const { result, calls } = await execSmoke(src, smokeBatch(), {
+    agentOverride: (prompt, opts) => {
+      const label = (opts && opts.label) || '';
+      if (label === 'SMOKE-CODE:plan-commitment-probe') return { honored: false, gaps: [{ commitment: gapStep, why: 'no hunk anywhere in the diff touches the data-flow doc' }] };
+      if (label === 'SMOKE-CODE:fixer' && /PLAN-STEP AMEND/.test(String(prompt || ''))) {
+        return { applied: false, filesChanged: [], summary: 'no change needed', scopeStop: false, divergence: null, deviations: [{ commitment: gapStep, reason: 'this endpoint has no data-flow doc entry today (grepped doc/data-flows/) — nothing to update' }], note: 'declared deviation' };
+      }
+      if (label === 'SMOKE-CODE:adjudicator') return { verdict: 'OVERRULED', reasons: ['the endpoint genuinely has no doc entry to update — the plan step does not apply'], headline: 'deviation legitimate' };
+      return undefined;
+    },
+  });
+  const codeOV = (result.results || []).find((r) => r.id === 'SMOKE-CODE');
+  ok(!(result.results || []).some((r) => String(r.note || '').startsWith('runItem threw')), 'KI-E142B overruled: no runItem crash');
+  ok(codeOV && codeOV.toState !== 'FAILED', 'KI-E142B overruled: an adjudicated-legitimate deviation does NOT fail the item — this is the entire point of not treating silence and a reasoned deviation the same way');
+  eq(codeOV.gates['adjudicator:plan-deviation'], 'OVERRULED', 'KI-E142B overruled: the deviation-specific adjudicator gate key records OVERRULED');
+  eq(codeOV.gates['probe:plan-commitment-scan'], 'APPROVED', 'KI-E142B overruled: the ORIGINAL gate key flips to APPROVED once the deviation is adjudicated legitimate');
+  ok(codeOV.gateDetails['probe:plan-commitment-scan'].headline.includes('KI-E142B'), 'KI-E142B overruled: the headline records that this APPROVED came via adjudicated deviation, not a clean scan');
+  eq(calls.filter((c) => c.label === 'SMOKE-CODE:adjudicator').length, 1, 'KI-E142B overruled: exactly one adjudicator call — a declared deviation earns ONE independent ruling, not a loop');
+}
+
+// KI-E142B — the fail-safe direction: a DECLARED deviation the adjudicator UPHOLDS still fails the
+// item, with a message distinguishing it from a silent gap.
+{
+  const src = readFileSync(join(import.meta.dirname, '..', 'factory.js'), 'utf8');
+  const gapStep = 'Update the data-flow doc for the endpoint';
+  const { result } = await execSmoke(src, smokeBatch(), {
+    agentOverride: (prompt, opts) => {
+      const label = (opts && opts.label) || '';
+      if (label === 'SMOKE-CODE:plan-commitment-probe') return { honored: false, gaps: [{ commitment: gapStep, why: 'no hunk anywhere in the diff touches the data-flow doc' }] };
+      if (label === 'SMOKE-CODE:fixer' && /PLAN-STEP AMEND/.test(String(prompt || ''))) {
+        return { applied: false, filesChanged: [], summary: 'skipped', scopeStop: false, divergence: null, deviations: [{ commitment: gapStep, reason: 'ran out of time, will do it later' }], note: 'declared deviation' };
+      }
+      if (label === 'SMOKE-CODE:adjudicator') return { verdict: 'UPHELD', reasons: ['"will do it later" is not a legitimate reason the commitment no longer applies — this is an incomplete fix wearing a deviation label'], headline: 'deviation not legitimate' };
+      return undefined;
+    },
+  });
+  const codeUP = (result.results || []).find((r) => r.id === 'SMOKE-CODE');
+  ok(!(result.results || []).some((r) => String(r.note || '').startsWith('runItem threw')), 'KI-E142B upheld: no runItem crash');
+  eq(codeUP && codeUP.toState, 'FAILED', 'KI-E142B upheld: an UPHELD ruling still fails the item — adjudication is a real check, not a rubber stamp for any declared deviation');
+  eq(codeUP.gates['adjudicator:plan-deviation'], 'UPHELD', 'KI-E142B upheld: the deviation-specific gate key records UPHELD');
+  ok(String(codeUP.note || '').includes('adjudicator UPHELD'), 'KI-E142B upheld: the note distinguishes this from a silent-gap fail — an operator can tell a deviation was CLAIMED and rejected, not simply never explained');
+}
+
+// KI-E143C (ported from a host-mount session) — realInfra-classification adjudication: a
+// test-author-DECLARED, reasoned override that the adjudicator OVERRULES (agrees is legitimate)
+// proceeds instead of failing pre-band.
+{
+  const src = readFileSync(join(import.meta.dirname, '..', 'factory.js'), 'utf8');
+  const wt = (id) => ({ path: '/tmp/exec-smoke-wt/' + id, branch: 'factory/' + id });
+  const base = { target: 'X', layer: 'service', dependsOn: [], gateSet: [], autonomyTier: 'auto', source: 'smoke', solution: 'X/X.sln', peers: [] };
+  const batch = {
+    cycle: 0, concurrency: 2, attempts: 1, repoRoot: '.', templatesDir: '_bmad-output/ai-factory/agents', config: {}, dryRun: false, policies: {},
+    items: [{ ...base, id: 'SMOKE-REALINFRA', title: 'graph-flagged realInfra item', severity: 'HIGH', theme: 'money-correctness', fixType: 'non-trivial', files: ['X/src/Some.cs'], acceptance: 'exception wrapped correctly', regressionTest: 'test', realInfra: true, worktree: wt('SMOKE-REALINFRA') }],
+    runId: 'selftest-realinfra-override',
+  };
+  const overrideReason = 'pure exception-wrapping logic, no transactions/locking/provider-specific SQL involved';
+  const { result, calls } = await execSmoke(src, batch, {
+    agentOverride: (prompt, opts) => {
+      const label = (opts && opts.label) || '';
+      if (label === 'SMOKE-REALINFRA:test-author') return { red: true, testFiles: ['X/src/X.Tests/SomeTests.cs'], runCmd: 'stub', evidence: 'stub', note: 'stub', realInfraOverride: overrideReason };
+      if (label === 'SMOKE-REALINFRA:marker-probe') return { markerFound: false };
+      if (label === 'SMOKE-REALINFRA:adjudicator') return { verdict: 'OVERRULED', reasons: ['genuinely independent of real-DB semantics'], headline: 'override legitimate' };
+      return undefined;
+    },
+  });
+  const codeRI = (result.results || []).find((r) => r.id === 'SMOKE-REALINFRA');
+  ok(!(result.results || []).some((r) => String(r.note || '').startsWith('runItem threw')), 'KI-E143C overruled: no runItem crash');
+  ok(codeRI && codeRI.toState !== 'FAILED', 'KI-E143C overruled: an adjudicated-legitimate realInfra override does NOT fail the item — a graph misclassification does not have to sink a genuinely in-memory-provable defect');
+  eq(codeRI.gates['adjudicator:realinfra-override'], 'OVERRULED', 'KI-E143C overruled: the realinfra-override-specific gate key records OVERRULED');
+  // res.note is transient (later stages overwrite it on the way to a normal CLOSED — the exec-smoke
+  // happy-path default stubs carry this item all the way through); the durable record of WHAT
+  // happened is gateDetails, not the final note.
+  eq(codeRI.gateDetails['adjudicator:realinfra-override'].headline, 'override legitimate', 'KI-E143C overruled: gateDetails carries the adjudicator\'s own headline, durable even though res.note gets overwritten by the item\'s eventual normal close');
+  eq(calls.filter((c) => c.label === 'SMOKE-REALINFRA:adjudicator').length, 1, 'KI-E143C overruled: exactly one adjudicator call for the override');
+}
+
+// KI-E143C — the fail-safe direction: a SILENT realInfra gap (no override declared) still fails
+// exactly as before KI-E143C existed — nothing here weakens the original KI-E10 guarantee.
+{
+  const src = readFileSync(join(import.meta.dirname, '..', 'factory.js'), 'utf8');
+  const wt = (id) => ({ path: '/tmp/exec-smoke-wt/' + id, branch: 'factory/' + id });
+  const base = { target: 'X', layer: 'service', dependsOn: [], gateSet: [], autonomyTier: 'auto', source: 'smoke', solution: 'X/X.sln', peers: [] };
+  const batch = {
+    cycle: 0, concurrency: 2, attempts: 1, repoRoot: '.', templatesDir: '_bmad-output/ai-factory/agents', config: {}, dryRun: false, policies: {},
+    items: [{ ...base, id: 'SMOKE-REALINFRA2', title: 'graph-flagged realInfra item, no override', severity: 'HIGH', theme: 'money-correctness', fixType: 'non-trivial', files: ['X/src/Some.cs'], acceptance: 'concurrent access safe', regressionTest: 'test', realInfra: true, worktree: wt('SMOKE-REALINFRA2') }],
+    runId: 'selftest-realinfra-required',
+  };
+  const { result, calls } = await execSmoke(src, batch, {
+    agentOverride: (prompt, opts) => {
+      const label = (opts && opts.label) || '';
+      if (label === 'SMOKE-REALINFRA2:marker-probe') return { markerFound: false };
+      return undefined; // test-author falls to the default stub, which never sets realInfraOverride
+    },
+  });
+  const codeRI2 = (result.results || []).find((r) => r.id === 'SMOKE-REALINFRA2');
+  ok(!(result.results || []).some((r) => String(r.note || '').startsWith('runItem threw')), 'KI-E143C silent gap: no runItem crash');
+  eq(codeRI2 && codeRI2.toState, 'FAILED', 'KI-E143C silent gap: an un-overridden marker absence still fails exactly as before — silence never earns adjudication');
+  ok(!('adjudicator:realinfra-override' in (codeRI2.gates || {})), 'KI-E143C silent gap: the adjudicator is never even called when nothing was declared — no wasted cost on the common case');
+  ok(!calls.some((c) => c.label === 'SMOKE-REALINFRA2:adjudicator'), 'KI-E143C silent gap: confirmed zero adjudicator calls');
 }
 
 // KI-C2 (closed 2026-07-12): the budget-ACTIVE lane — a launch-turn token budget whose remaining()
@@ -944,31 +1373,14 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
 // pending fix). dirtyMainPaths reads porcelain (modified + untracked-dir + rename); filesOverlapDirty
 // is the pure overlap predicate group uses (exact file OR under a dirty untracked dir).
 {
-  const { dirtyMainPaths, filesOverlapDirty } = await import('./mainguard.mjs');
-  const { mkdtempSync: mkE, writeFileSync: wfE, mkdirSync: mdE, rmSync: rmE } = await import('node:fs');
-  const { tmpdir: tdE } = await import('node:os');
-  const { join: jE } = await import('node:path');
-  const { execFileSync: exE } = await import('node:child_process');
+  const { filesOverlapDirty } = await import('./mainguard.mjs');
   // pure predicate first (no git needed)
   const dirtyFix = { paths: ['Svc/src/Options.cs', 'Svc/doc.md'], dirs: ['Svc/tests/NewSuite/'] };
   eq(filesOverlapDirty(['Svc/src/Options.cs'], dirtyFix).length, 1, 'KI-E14: exact dirty-file overlap detected');
   eq(filesOverlapDirty(['Svc/tests/NewSuite/ATests.cs'], dirtyFix).length, 1, 'KI-E14: file under a dirty untracked dir overlaps (prefix match)');
   eq(filesOverlapDirty(['Svc/src/Other.cs', 'Elsewhere/B.cs'], dirtyFix).length, 0, 'KI-E14: disjoint files in the same service do NOT overlap (file-level precision)');
   eq(filesOverlapDirty([], dirtyFix).length + filesOverlapDirty(null, dirtyFix).length, 0, 'KI-E14: empty/null files[] never overlap');
-  // porcelain reader against a real throwaway repo: one committed-then-modified file + one untracked dir
-  const rootE = mkE(jE(tdE(), 'dirtymain-'));
-  exE('git', ['-C', rootE, 'init', '-q']);
-  wfE(jE(rootE, 'tracked.cs'), 'original');
-  exE('git', ['-C', rootE, 'add', '.']);
-  exE('git', ['-C', rootE, '-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-q', '-m', 'x', '--no-gpg-sign', '--no-verify']);
-  wfE(jE(rootE, 'tracked.cs'), 'MODIFIED');
-  mdE(jE(rootE, 'newdir'), { recursive: true });
-  wfE(jE(rootE, 'newdir', 'new.cs'), 'new');
-  const dE = dirtyMainPaths(rootE);
-  ok(dE.paths.includes('tracked.cs'), 'KI-E14: modified tracked file appears in dirty paths');
-  ok(dE.dirs.includes('newdir/'), 'KI-E14: untracked dir appears in dirty dirs (trailing slash)');
-  eq(filesOverlapDirty(['newdir/new.cs', 'clean.cs'], dE).length, 1, 'KI-E14: live-repo overlap resolves through the untracked dir');
-  rmE(rootE, { recursive: true, force: true });
+  gitFixture('KI-E14 dirtyMainPaths integration');
   // driver wiring pin: group carries the guard + the escape flag
   const dsrc = readFileSync(new URL('../driver.mjs', import.meta.url), 'utf8');
   ok(dsrc.includes('force-dirty-overlap') && dsrc.includes('dirtyMainPaths(REPO_ROOT)'), 'KI-E14: cmdGroup wires the dirty-overlap guard with a --force-dirty-overlap escape');
@@ -982,10 +1394,6 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
 // ever claimed, it returns whatever dirt remains unexplained.
 {
   const { unclaimedMainDrift } = await import('./mainguard.mjs');
-  const { mkdtempSync: mkF, writeFileSync: wfF, mkdirSync: mdF, rmSync: rmF } = await import('node:fs');
-  const { tmpdir: tdF } = await import('node:os');
-  const { join: jF } = await import('node:path');
-  const { execFileSync: exF } = await import('node:child_process');
   // pure predicate first (no git needed)
   const dirtyF = { paths: ['Svc/src/Leak.cs', '_bmad-output/ai-factory/state/ledger.json'], dirs: ['Svc/tests/Leaked/'] };
   eq(unclaimedMainDrift(dirtyF, '_bmad-output/ai-factory', new Set()).sort().join(','), 'Svc/src/Leak.cs,Svc/tests/Leaked/', 'KI-E89: an unclaimed outside-mount file AND an unclaimed outside-mount dir both surface; the mount bookkeeping file never does');
@@ -994,71 +1402,24 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
   eq(unclaimedMainDrift({ paths: ['_bmad-output/ai-factory'], dirs: [] }, '_bmad-output/ai-factory', new Set()).length, 0, 'KI-E89: exact-equal mount path (no trailing slash) is excluded, not just prefix matches');
   eq(unclaimedMainDrift({ paths: [], dirs: [] }, '_bmad-output/ai-factory', new Set()).length, 0, 'KI-E89: nothing dirty -> nothing unclaimed');
   eq(unclaimedMainDrift(null, '_bmad-output/ai-factory', null).length, 0, 'KI-E89: null dirty/claimedPaths never throws, resolves to empty');
+  eq(unclaimedMainDrift(dirtyF, null, new Set()).sort(), [...dirtyF.paths, ...dirtyF.dirs].sort(), 'KI-E203: external engine null exclusion preserves all unclaimed host dirt');
   // Fix (multi-lens review, 2026-08-25, ported): the `dirs` branch used to ignore claimedPaths
   // entirely (only `underMount` gated it) — a directory an item legitimately declared in its own
   // files[] (e.g. a new untracked test-project subfolder, which git reports at the DIRECTORY level
-  // per its own shallowest-untracked-boundary convention — see the live-repo proof below) was
+  // per its own shallowest-untracked-boundary convention) was
   // permanently reported as unclaimed, contradicting this function's own header comment.
   eq(unclaimedMainDrift({ paths: [], dirs: ['Svc/NewFeature/'] }, '_bmad-output/ai-factory', new Set(['Svc/NewFeature/File.cs'])).length, 0, 'KI-E89 fix: a dirty untracked DIRECTORY is excluded when a claimed FILE lives inside it — the dirs branch now consults claimedPaths, mirroring filesOverlapDirty\'s reversed-direction check');
   eq(unclaimedMainDrift({ paths: [], dirs: ['Svc/NewFeature/'] }, '_bmad-output/ai-factory', new Set(['Svc/Unrelated/Other.cs'])).join(','), 'Svc/NewFeature/', 'KI-E89 fix: a claimed path that does NOT live under the dirty dir still leaves that dir correctly reported as unclaimed (the fix does not over-exclude)');
-  // live-repo proof: a mount dir with its own dirty bookkeeping, an outside-mount CLAIMED modified
-  // file, and an outside-mount UNCLAIMED new dir
-  const rootF = mkF(jF(tdF(), 'unclaimedmain-'));
-  exF('git', ['-C', rootF, 'init', '-q']);
-  mdF(jF(rootF, '_bmad-output', 'ai-factory', 'state'), { recursive: true });
-  wfF(jF(rootF, '_bmad-output', 'ai-factory', 'state', 'ledger.json'), '{}');
-  mdF(jF(rootF, 'Svc', 'Tests'), { recursive: true }); // the outer test-project dir already exists and is tracked
-  wfF(jF(rootF, 'Svc', 'Tests', 'Existing.cs'), 'pre-existing tracked test file');
-  wfF(jF(rootF, 'Svc', 'tracked.cs'), 'original');
-  exF('git', ['-C', rootF, 'add', '.']);
-  exF('git', ['-C', rootF, '-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-q', '-m', 'x', '--no-gpg-sign', '--no-verify']);
-  wfF(jF(rootF, '_bmad-output', 'ai-factory', 'state', 'ledger.json'), '{"cycle":72}'); // driver's own legit churn
-  wfF(jF(rootF, 'Svc', 'tracked.cs'), 'CLAIMED CHANGE'); // an item's own approved delivery
-  mdF(jF(rootF, 'Svc', 'Tests', 'Helpers'), { recursive: true }); // the only genuinely NEW, untracked leaf
-  wfF(jF(rootF, 'Svc', 'Tests', 'Helpers', 'Skip.cs'), 'leaked'); // nobody claimed this
-  const { dirtyMainPaths: dmpF } = await import('./mainguard.mjs');
-  const dirtyLiveF = dmpF(rootF);
-  const unclaimedLiveF = unclaimedMainDrift(dirtyLiveF, '_bmad-output/ai-factory', new Set(['Svc/tracked.cs']));
-  eq(unclaimedLiveF.join(','), 'Svc/Tests/Helpers/', 'KI-E89 live repro: the claimed tracked-file edit and the mount\'s own bookkeeping churn both stay silent; only the never-claimed leaked directory surfaces');
-  rmF(rootF, { recursive: true, force: true });
-  // Fix (multi-lens review, 2026-08-25, ported): dirtyMainPaths stripped only the OUTER quotes git
-  // wraps around a path containing a quote/backslash/non-ASCII byte, leaving the C-style \NNN octal
-  // escapes literally in the string — verified live against real git output before writing the fix.
-  // KI-E102: `"` and `\` are RESERVED characters in a Win32 filename — `weird"quote.cs` throws
-  // ENOENT at writeFileSync, and `back\slash.cs` would silently become a `back/` subdirectory
-  // instead of a one-file name. Both were written UNCONDITIONALLY, so on Windows this fixture threw
-  // UNCAUGHT and aborted the entire selftest at ~line 987 of 2953: every later assertion (roughly
-  // two thirds of the suite, including the KI-E87 plan-commitment block right below) never ran, and
-  // `node _workflow/lib/_selftest.mjs` — the command CLAUDE.md mandates be green after EVERY change
-  // — could not pass at all on the platform KI-E59 already calls "the very platform the gate was
-  // born on". The UTF-8 case is a legal filename everywhere and stays unconditional; the two
-  // POSIX-only cases are platform-gated and ANNOUNCE their skip, so silence never reads as "passed"
-  // (the KI-E41/E42 announce-never-skip-silently posture, and the same try/catch-SKIP convention the
-  // git-unavailable fixtures above already use). POSIX coverage is byte-for-byte unchanged — CI runs
-  // ubuntu-latest, so the decode assertions this fixture exists for still gate every push.
-  const rootQ = mkF(jF(tdF(), 'quotepath-'));
-  exF('git', ['-C', rootQ, 'init', '-q']);
-  const posixOnlyNames = process.platform !== 'win32';
-  wfF(jF(rootQ, 'café.cs'), 'utf8 filename');
-  if (posixOnlyNames) {
-    wfF(jF(rootQ, 'weird"quote.cs'), 'embedded quote');
-    wfF(jF(rootQ, 'back\\slash.cs'), 'embedded backslash');
-  }
-  const dirtyQ = dmpF(rootQ);
-  ok(dirtyQ.paths.includes('café.cs'), 'KI-E89 fix: a non-ASCII (UTF-8) filename decodes back to its real form, not the raw \\NNN octal escapes git emits');
-  if (posixOnlyNames) {
-    ok(dirtyQ.paths.includes('weird"quote.cs'), 'KI-E89 fix: an embedded double-quote decodes correctly');
-    ok(dirtyQ.paths.includes('back\\slash.cs'), 'KI-E89 fix: an embedded backslash decodes correctly (not doubled, not dropped)');
-  } else {
-    console.log('  SKIP KI-E89 quote/backslash filename decode (2 asserts — win32 reserves " and \\ in filenames; the café.cs UTF-8 decode case above still ran)');
-  }
-  rmF(rootQ, { recursive: true, force: true });
+  gitFixture('KI-E89 unclaimedMainDrift integration');
+  gitFixture('KI-E89 quoted-path porcelain integration');
   // driver wiring pins
   const dsrc89 = readFileSync(new URL('../driver.mjs', import.meta.url), 'utf8');
-  ok(dsrc89.includes("import { snapshotMainFiles, driftAgainstSnapshot, dirtyMainPaths, filesOverlapDirty, splitDriftByStatus, repairDirtyDrift, unclaimedMainDrift } from './lib/mainguard.mjs';"), 'KI-E89: driver.mjs imports unclaimedMainDrift alongside its KI-E14/E61 siblings');
+  const mainguardImports = dsrc89.match(/import \{([^}]+)\} from '\.\/lib\/mainguard\.mjs'/)?.[1].split(',').map(s => s.trim()) || [];
+  ok(['snapshotMainFiles', 'driftAgainstSnapshot', 'dirtyMainPaths', 'filesOverlapDirty', 'splitDriftByStatus', 'unclaimedMainDrift', 'matchWorktreeDebris'].every(name => mainguardImports.includes(name)), 'KI-E89: driver imports all shared diagnostic helpers');
+  ok(!mainguardImports.includes('repairDirtyDrift'), 'driver does not import the obsolete repair capability');
   const cmcBody = dsrc89.slice(dsrc89.indexOf('function cmdMainCheck'), dsrc89.indexOf('function cmdMainCheck') + 9000);
   ok(cmcBody.includes('const claimedPaths = new Set();') && cmcBody.includes('for (const f of Object.keys(snapFiles)) claimedPaths.add(f);'), 'KI-E89: claimedPaths is accumulated from every claimed item\'s snapshot files — the true ceiling of what the unclaimed sweep can see');
-  ok(cmcBody.includes('unclaimedMainDrift(dirtyMainPaths(REPO_ROOT), MOUNT_REL, claimedPaths)'), 'KI-E89: cmdMainCheck wires the real REPO_ROOT/MOUNT_REL/claimedPaths into the pure helper — reuses dirtyMainPaths (KI-E14), does not hand-roll a fresh git call');
+  await runMainGuardDriverTests('main-check', { ok, eq });
   ok(cmcBody.includes('MAIN-DRIFT unclaimed (KI-E89)'), 'KI-E89: the new warning is labeled distinctly from KI-E50/E82\'s per-item warning so a reader/grep can tell which mechanism found it');
   // Fix (multi-lens review, 2026-08-25, ported): claimedPaths used to be built ONLY from the
   // requested `ids` — correct under --all (ids WAS already every claimed item) but wrong on a
@@ -1160,7 +1521,7 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
   ok(fsrcPC.includes("res.gates['probe:plan-commitment-scan']"), 'KI-E87: the probe writes a distinctly-named gate key');
   ok(fsrcPC.slice(0, 2000).includes('plan-commitment scan'), 'KI-E87: factory.js\'s own meta.description names the plan-commitment scan stage, matching what the code actually runs');
   const planCommitBlock = fsrcPC.slice(fsrcPC.indexOf('4c-bis. PLAN-COMMITMENT SCAN'), fsrcPC.indexOf('4d-pre. COMMENT SCAN'));
-  eq((planCommitBlock.match(/finish\('FAILED'/g) || []).length, 1, 'KI-E87: fail-open — exactly one finish(\'FAILED\', ...) call site in the whole plan-commitment block');
+  eq((planCommitBlock.match(/finish\('FAILED'/g) || []).length, 2, 'KI-E87/KI-E142B (ported): the whole plan-commitment block now has TWO finish(\'FAILED\', ...) call sites — the original fail-open, and the new KI-E142B declared-deviation fail-open when the adjudicator does not overrule');
   // Fix (multi-lens review, 2026-08-25, ported) — KI-E10 gap this repo specifically lacked: the
   // PLAN-COMMITMENT AMEND prompt explicitly offers the fixer a note-only response, but the re-probe
   // used to fire ONLY on `amend.applied` — a fixer taking that option got failed anyway on the
@@ -1182,7 +1543,7 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
 // re-order, a routing CONSTANT — was invisible: KI-E97's REALINFRA_SIGNAL narrowing landed in canon
 // only and drifted for days with both suites passing. This block is the forcing gate.
 {
-  const { extractFactoryRoles, extractPortRoles, namedConstantSource, parityGaps } = await import('./port-parity.mjs');
+  const { extractFactoryRoles, extractPortRoles, namedConstantSource, parityGaps, extractFactoryGateKeys } = await import('./port-parity.mjs');
   // --- pure-function coverage first (the helpers must be trustworthy before the gate leans on them)
   eq([...extractFactoryRoles("await call('planner', X) ... call( 'red-proof-probe' , Y)")].sort(), ['planner', 'red-proof-probe'], 'KI-E103: extractFactoryRoles finds role literals incl. whitespace-padded call sites');
   eq([...extractFactoryRoles('call(x.role, R, S)')], [], 'KI-E103: a dynamically-constructed role is deliberately NOT extracted (both sides build gates/review-flows the same dynamic way from shared tables, so there is no literal to drift)');
@@ -1190,6 +1551,10 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
   eq(namedConstantSource('export const A = /x/;', 'A'), '/x/', 'KI-E103: namedConstantSource normalises the `export` prefix and trailing semicolon (style, not semantics)');
   eq(namedConstantSource("const A = ['x']", 'A'), "['x']", 'KI-E103: a semicolon-less canonical-style declaration reads identically');
   eq(namedConstantSource('const B = 1', 'A'), null, 'KI-E103: an absent constant returns null, never a partial read');
+  // KI-E138 (ported from a host-mount session): extractFactoryGateKeys — the colon-qualified sibling
+  // of extractFactoryRoles, for manifest entries about a SPECIFIC call-site of an already-covered role.
+  eq([...extractFactoryGateKeys("res.gates['adjudicator:realinfra-override'] = 'CHANGES_REQUIRED' ... res.gates['adjudicator:realinfra-override'] = 'APPROVED'")], ['adjudicator:realinfra-override'], 'KI-E138: extractFactoryGateKeys finds a gate key assigned twice as ONE entry (Set dedup), not two');
+  eq([...extractFactoryGateKeys("res.gates[k] = v")], [], 'KI-E138: a dynamically-keyed assignment is deliberately NOT extracted — no literal to compare');
   {
     const g = parityGaps(new Set(['a', 'b', 'c', 'd']), new Set(['a']), { mechanical: { b: 'why' }, unported: { c: 'why' } });
     eq(g.undeclared, ['d'], 'KI-E103: a canonical stage that is neither dispatched nor declared is reported — the silent-fork class this gate exists for');
@@ -1198,6 +1563,14 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
     eq(g2.staleDeclared, ['a'], 'KI-E103: declaring a stage the port actually DISPATCHES is reported — the manifest cannot claim a gap that no longer exists');
     eq(g2.deadDeclared, ['gone'], 'KI-E103: declaring a stage factory.js no longer has is reported — dead manifest entries cannot accumulate');
     eq(parityGaps(new Set(['a']), new Set(), { mechanical: { a: 'x' }, unported: { a: 'y' } }).doubleDeclared, ['a'], 'KI-E103: a stage declared BOTH mechanical and unported is contradictory and reported');
+    // KI-E138: a colon-qualified declared key is checked against gateKeys, NOT factoryRoles/portRoles —
+    // a bare-role match (even of the SAME pre-colon text) must never satisfy or falsely retire it.
+    const g3 = parityGaps(new Set(['adjudicator']), new Set(['adjudicator']), { unported: { 'adjudicator:realinfra-override': 'why' } }, new Set(['adjudicator:realinfra-override']));
+    eq(g3.deadDeclared, [], 'KI-E138: a gate-keyed entry whose key IS present in factoryGateKeys is NOT dead, even though the composite string is absent from factoryRoles entirely');
+    eq(g3.staleDeclared, [], 'KI-E138: a gate-keyed entry is NEVER staleDeclared, even when the port dispatches the SAME bare role (`adjudicator`) for its OTHER, already-mechanical call-site — role-level dispatch cannot prove THIS specific call-site is covered');
+    const g4 = parityGaps(new Set(['adjudicator']), new Set(['adjudicator']), { unported: { 'adjudicator:realinfra-override': 'why' } }, new Set()); // the mechanism's gate key no longer exists in factory.js at all
+    eq(g4.deadDeclared, ['adjudicator:realinfra-override'], 'KI-E138: a gate-keyed entry IS deadDeclared once its own gate key is gone from factory.js — the manifest cannot outlive the mechanism it describes');
+    eq(parityGaps(new Set(['a']), new Set(), { unported: { 'x:y': 'why' } }).deadDeclared, ['x:y'], 'KI-E138: omitting factoryGateKeys entirely (older call sites, backward compat) treats every gate-keyed entry as dead rather than silently passing it — fail-visible, never fail-open, on a caller that has not been updated');
   }
   // --- the live gate against the real files
   const facSrc103 = readFileSync(new URL('../factory.js', import.meta.url), 'utf8');
@@ -1205,7 +1578,7 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
   const routeSrc103 = readFileSync(new URL('../opencode/routing.mjs', import.meta.url), 'utf8');
   const { STAGE_PARITY, SHARED_CONSTANTS } = await import('../opencode/stage-parity.mjs');
   const facRoles103 = extractFactoryRoles(facSrc103);
-  const gaps103 = parityGaps(facRoles103, extractPortRoles(rtSrc103), STAGE_PARITY);
+  const gaps103 = parityGaps(facRoles103, extractPortRoles(rtSrc103), STAGE_PARITY, extractFactoryGateKeys(facSrc103)); // KI-E138 (ported): 4th arg routes a colon-qualified declared entry through the gate-key set instead of the role set
   ok(facRoles103.size >= 15, 'KI-E103: the extractor actually finds factory.js\'s agent stages (guard against a silent regex break making this whole gate vacuous) — found ' + facRoles103.size);
   eq(gaps103.undeclared, [], 'KI-E103 PARITY GATE: every factory.js agent stage is either dispatched by the port, or declared MECHANICAL/UNPORTED in _workflow/opencode/stage-parity.mjs. Undeclared stage(s) found — implement it in runtime.mjs planNext/applyPhaseResults, or add it to that manifest with a reason');
   eq(gaps103.staleDeclared, [], 'KI-E103 PARITY GATE: no manifest entry claims a gap for a stage the port now dispatches (delete the stale entry)');
@@ -1218,13 +1591,17 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
       ok(typeof why === 'string' && why.trim().length >= 40, 'KI-E103: stage-parity ' + bucket + '.' + role + ' states a substantive reason, not a placeholder');
     }
   }
-  // the three genuinely-absent stages are named explicitly, so closing one is a visible manifest edit
-  // KI-E112: the UNPORTED set is now EMPTY — every canonical agent stage is either dispatched by the
-  // port or implemented mechanically. This assertion is deliberately an equality against `[]` rather
+  // the genuinely-absent stages are named explicitly, so closing (or re-opening) one is a visible
+  // manifest edit. This assertion is deliberately an equality against the EXACT expected set rather
   // than a "<= N" bound: re-opening a gap must be a visible, arguable edit to this line, not a
   // quietly-growing list. If a future stage genuinely cannot be ported, add it to UNPORTED with a
-  // reason AND change this assertion in the same commit.
-  eq(Object.keys(STAGE_PARITY.unported), [], 'KI-E112: NO canonical stage is unported — the four KI-E103 disclosed gaps (red-proof KI-E83, plan-commitment/plan-step KI-E87+E101, ledger-anchor KI-E91, rootcause KI-E104) are all closed');
+  // reason AND change this assertion in the same commit — exactly what KI-E175/E179 (ported from a
+  // host-mount session) just did: `red-coverage-probe` (the test.json-vs-verify.json class-name
+  // cross-check) and `breadth-claim-probe` (the universal-quantifier scan-boundary re-verification)
+  // are both hours-old, separately-scoped pre-band scans on the origin host with no equivalent
+  // planNext/applyPhaseResults phase in this runtime, so they are genuinely UNPORTED, not a silent
+  // regression.
+  eq(Object.keys(STAGE_PARITY.unported).sort(), [], 'PARITY: all native stages have a declared port binding');
   ok(Object.keys(STAGE_PARITY.mechanical).length >= 5, 'KI-E112: the mechanical set carries the stages implemented deterministically instead of via an agent (runner, marker, comment, red-proof, rootcause)');
   // --- shared-constant byte parity (the KI-E97 drift class)
   for (const name of SHARED_CONSTANTS) {
@@ -1277,7 +1654,7 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
   ok(!/import \{[^}]*\btouchedRootCause\b[^}]*\} from '\.\/buildtest\.mjs'/.test(rt112), 'KI-E112: the dead touchedRootCause import is gone (it was imported and never called)');
   ok(!/import \{[^}]*\bappendRaw\b[^}]*\} from '\.\/buildtest\.mjs'/.test(rt112), 'KI-E112: the dead appendRaw import is gone');
   ok(rt112.includes('progress.item.verifyNote = caveats112.join'), 'KI-E112: the KI-E74B verify-note channel is now POPULATED — compose.mjs had rendered it since KI-E74B with nothing ever setting it (a dead render)');
-  ok(cp112.replace(/^\s*\/\/\s?/gm, '').replace(/\s+/g, ' ').includes('no longer a dead render'), 'KI-E112: ... and compose.mjs\'s disclosure comment is corrected rather than left claiming a gap that is closed (comment markers stripped then whitespace-flattened — the phrase straddles a comment line wrap)');
+  ok(portPrompt('gate-developer', { verifyNote: 'UNRESOLVED-CONTRACT-CAVEAT' }).includes('UNRESOLVED-CONTRACT-CAVEAT'), 'KI-E112: populated verify note reaches the actual reviewer prompt');
   ok(rt112.includes('if (integ.branch) progress.res.branch = integ.branch;'), 'KI-E112: the integrator\'s branch reaches the folded result — the hand-off the human is meant to commit (KI-E1)');
   ok(rt112.includes('function configuredGateSet()') && !rt112.includes('gateRolesFor(progress.item, progress.band, null)'), 'KI-E112: the host\'s configured gateSet is READ — both call sites passed null, silently ignoring a host that customised it');
   ok(bt112.includes('flakeSuspects'), 'KI-E112: buildtest re-exports flakeSuspects so the port can record the KI-E108 caveat');
@@ -1319,8 +1696,8 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
   const nonMech = { id: 'A', fixType: 'non-trivial' };
   const mech = { id: 'B', fixType: 'mechanical' };
   ok(projectedCalls(nonMech, 'FULL') > projectedCalls(nonMech, 'LIGHT'), 'KI-E110: FULL projects more calls than LIGHT');
-  eq(projectedCalls(nonMech, 'FULL') - projectedCalls(nonMech, 'LIGHT'), 7, 'KI-E110: the FULL premium is the 3 extra role gates + 4 extra review/refute/lens calls the band actually dispatches — derived from the pipeline, not invented');
-  eq(projectedCalls(nonMech, 'LIGHT') - projectedCalls(mech, 'LIGHT'), 1, 'KI-E110: a mechanical item skips exactly the planner call (factory.js: crit = fixType !== "mechanical")');
+  eq(projectedCalls(nonMech, 'FULL') - projectedCalls(nonMech, 'LIGHT'), 4, 'projection: generic FULL adds three role gates and refuter; no extra theme-specific lenses');
+  eq(projectedCalls(nonMech, 'LIGHT') - projectedCalls(mech, 'LIGHT'), 3, 'projection: mechanical skips planner and two plan reviews; post-test replaces post-plan checkpoint');
   eq(projectedCalls(nonMech, 'nonsense'), projectedCalls(nonMech, 'LIGHT'), 'KI-E110: an unknown band falls back to LIGHT rather than throwing or inventing a tier');
   {
     const p = projectBatch([nonMech, nonMech, mech], (wi) => (wi.fixType === 'mechanical' ? 'LIGHT' : 'FULL'));
@@ -1333,9 +1710,9 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
   eq(renderProjection({ total: 0, byBand: {} }), '', 'KI-E110: nothing to project renders nothing — no "~0 calls" noise line');
   {
     const line = renderProjection(projectBatch([nonMech, mech], (wi) => (wi.fixType === 'mechanical' ? 'LIGHT' : 'FULL')));
-    ok(line.includes('agent calls'), 'KI-E110: the line names the unit explicitly');
-    ok(line.includes('a floor'), 'KI-E110: ... and states it is a FLOOR — retries/amends/adjudication add more, so the estimate under-promises (the safe direction for a planning aid)');
-    ok(line.includes('KI-E107'), 'KI-E110: ... and points at the report that measures the same unit, so the projection can actually be calibrated rather than becoming folklore');
+    ok(line.includes('native agent invocations'), 'projection names physical native invocations');
+    ok(line.includes('conditional fresh-success floor') && line.includes('Reuse or early failure can cost less'), 'projection discloses conditional floor and cheaper recovery/failure paths');
+    ok(line.includes('not legacy successful-call cost maps, API requests, tokens or bills'), 'projection never equates invocation count with billed cost');
   }
   const dsrc110 = readFileSync(new URL('../driver.mjs', import.meta.url), 'utf8');
   ok(dsrc110.includes("import { projectBatch, renderProjection } from './lib/band-cost.mjs'"), 'KI-E110: driver imports the projection');
@@ -1400,6 +1777,60 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
   ok(fsrc109.indexOf('failLaneOnMainDrift') < fsrc109.indexOf('// 5. REVIEW band'), 'KI-E109: it fails BEFORE the gate band — the entire point is not paying for a run that already wrote outside its worktree');
   const cfg109 = JSON.parse(readFileSync(new URL('../../config/factory.config.json', import.meta.url), 'utf8'));
   eq(cfg109.policies.failLaneOnMainDrift, false, 'KI-E109: shipped config default is OFF');
+}
+
+// KI-E144/E144B/E145 (ported from a host-mount session) — main-drift detection is now an
+// INDEPENDENT probe re-grepping disk-authoritative evidence, never the runner's own claim about it
+// (prose OR a self-reported boolean). History there: a naive substring match (KI-E144) let one
+// unrelated item's stray file fail an entire 6-item batch across five services (driver.mjs
+// main-check always appends a repo-wide "unclaimed" sweep after the per-id result, and the runner
+// pastes the whole output into its own note); an id-anchored regex fix (still KI-E144) was defeated
+// on the very next retry by a runner correctly quoting the marker format IN NEGATION to prove its
+// own absence (KI-E144B); a self-reported boolean field (still KI-E144B) removed the wording risk
+// but was still an unverified self-report. KI-E145 stops asking the runner to characterize the
+// evidence AT ALL — it only tees `main-check`'s output to disk, and a separate `main-drift-probe`
+// call greps that file directly, mirroring the established KI-E10/E83/E104 posture (never trust the
+// claim, re-derive the fact).
+{
+  const src = readFileSync(new URL('../factory.js', import.meta.url), 'utf8');
+  const wt = (id) => ({ path: '/tmp/exec-smoke-wt/' + id, branch: 'factory/' + id });
+  const base = { target: 'X', layer: 'service', dependsOn: [], gateSet: [], autonomyTier: 'auto', source: 'smoke', solution: 'X/X.sln', peers: [] };
+  const batchFor = (id) => ({
+    cycle: 0, concurrency: 2, attempts: 1, repoRoot: '.', templatesDir: '_bmad-output/ai-factory/agents', config: {}, dryRun: false,
+    policies: { failLaneOnMainDrift: true },
+    items: [{ ...base, id, title: 'x', severity: 'HIGH', theme: 'money-correctness', fixType: 'non-trivial', files: ['X/src/Some.cs'], acceptance: 'x', regressionTest: 'test', realInfra: false, worktree: wt(id) }],
+    runId: 'selftest-main-drift-' + id,
+  });
+  const runWithProbe = async (id, probeResult, verifyNote) => {
+    const { result, calls } = await execSmoke(src, batchFor(id), {
+      agentOverride: (prompt, opts) => {
+        const label = (opts && opts.label) || '';
+        if (label === id + ':runner') return { build: 'pass', targetedTest: 'pass', suite: { passed: 2, failed: 0, skipped: 0 }, realInfraExercised: false, debris: [], evidence: 'stub', note: verifyNote || 'stub' };
+        if (label === id + ':main-drift-probe') return probeResult;
+        return undefined;
+      },
+    });
+    return { r: (result.results || []).find((r) => r.id === id), calls };
+  };
+  // (a) the probe correctly finds nothing (whether because there really is no drift, or because —
+  //     the exact live cycle-93 shape — the only thing main-check printed was an UNRELATED item's
+  //     drift plus the repo-wide unclaimed sweep) — must NOT fail, regardless of what the runner's
+  //     own note happens to say about it (the note is no longer read for this decision at all).
+  const { r: codeInnocent } = await runWithProbe('SMOKE-INNOCENT', { markerFound: false },
+    '⚠ MAIN-DRIFT SMOKE-GUILTY (KI-E50/KI-L65): main-tree file(s) changed mid-run.\n⚠ MAIN-DRIFT unclaimed (KI-E89): a stray path exists, could be leaked contamination OR unrelated work-in-progress.');
+  ok(codeInnocent && codeInnocent.toState !== 'FAILED', 'KI-E145 innocent: probe markerFound=false must NOT fail me, regardless of what unrelated drift text appears in my own note');
+  // (b) the probe correctly finds THIS item's own drift line — must fail, citing the probe's line.
+  const { r: codeGuilty } = await runWithProbe('SMOKE-GUILTY', { markerFound: true, line: '⚠ MAIN-DRIFT SMOKE-GUILTY (KI-E50/KI-L65): X/src/Some.cs (present -> changed/present)' });
+  eq(codeGuilty && codeGuilty.toState, 'FAILED', 'KI-E145 guilty: probe markerFound=true fails the lane — the real detection is preserved');
+  ok(String(codeGuilty.note || '').includes('an independent probe confirmed'), 'KI-E145 guilty: the message cites the independent probe, not the runner\'s own claim');
+  // (c) KI-E144B's exact defeated shape, reproduced directly: the runner's OWN note quotes the
+  //     marker format in negation to prove absence — but since note is never read for the verdict
+  //     anymore, this can no longer matter either way. Pair it with markerFound=true to prove the
+  //     PROBE's answer wins even when the runner's prose points the opposite direction.
+  const { r: codeNegation } = await runWithProbe('SMOKE-NEGATION', { markerFound: true, line: '⚠ MAIN-DRIFT SMOKE-NEGATION (KI-E50/KI-L65): X/src/Some.cs (present -> changed/present)' },
+    'MAIN-CHECK SMOKE-NEGATION: clean. No `⚠ MAIN-DRIFT SMOKE-NEGATION (` line and no `⚠ MAIN-DRIFT unclaimed (KI-E89)` line printed.');
+  eq(codeNegation && codeNegation.toState, 'FAILED', 'KI-E144B regression check: the runner\'s own prose disproving drift does NOT override a probe that independently found real drift — the probe is authoritative regardless of what the runner\'s note claims, closing the exact ambiguity that defeated the prior fix');
+  ok(![codeInnocent, codeGuilty, codeNegation].some((r) => String((r && r.note) || '').startsWith('runItem threw')), 'KI-E144/144B/E145: no runItem crash across all three scenarios');
 }
 
 // KI-E106 (2026-09-02) — ITEM READINESS: the deterministic input-contract gate at group time.
@@ -1487,20 +1918,91 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
     ok(!isStalled({ maxStallRounds: 0 }, led.items.A), 'KI-E105: ... and isStalled honours the same opt-out even on an already-high counter');
   }
   {
-    // a pre-gate failure carries no gateDetails -> not a judgeable trajectory, counter untouched
+    // A missing signature breaks the consecutive comparable-failure streak.
     const cfg = { maxStallRounds: 2 };
     const led = { items: { A: { state: 'FAILED', stallRounds: 1 } } };
     applyStallDetection(led, cfg, [{ id: 'A', toState: 'FAILED' }], { A: S(3) });
-    eq(led.items.A.stallRounds, 1, 'KI-E105: a pre-gate failure (test/verify/fold stage — no gateDetails) neither increments nor resets: nothing was adjudicated, so there is no trajectory to judge');
+    eq(led.items.A.stallRounds, 0, 'KI-E105: incomparable failure resets the consecutive stall streak');
     eq(gateFindingsSummary({ toState: 'FAILED' }), null, 'KI-E105: gateFindingsSummary returns null for that shape (the guard this relies on)');
+  }
+  // KI-E167 (ported from a host-mount session) — failSignature: a coarse, deterministic fingerprint
+  // of a FAILED result's note, cut at the first ": " or " — " separator (or a 60-char cap).
+  {
+    const { failSignature } = await import('./convergence.mjs');
+    eq(failSignature(null), null, 'KI-E167: no note -> null, never a throw');
+    eq(failSignature(''), null, 'KI-E167: an empty note -> null');
+    eq(failSignature('realInfra marker probe (KI-E10): verify-raw.txt has NO FACTORY::REALINFRA:: marker on disk'), 'realinfra marker probe (ki-e10)', 'KI-E167: cuts at the first ": " separator and lowercases');
+    eq(failSignature('worktree-isolation mismatch (KI-E170) — test-author reports testFiles path(s) OUTSIDE'), 'worktree-isolation mismatch (ki-e170)', 'KI-E167: cuts at the first " — " separator when it comes before any ": "');
+    eq(failSignature('a'.repeat(100)), 'a'.repeat(60), 'KI-E167: a note with neither separator falls back to a 60-char cap');
+  }
+  // KI-E167 fallback: two consecutive PRE-BAND failures (no gateDetails at all) with the SAME
+  // failSignature are a stall the ORIGINAL findings-based mechanism is structurally blind to — this
+  // is the exact ANALYTICS-H5 shape (a realInfra-marker failure repeating verbatim with zero gate-band
+  // data either round).
+  {
+    const cfg = { maxStallRounds: 2 };
+    const led = { items: { A: { state: 'FAILED' } } };
+    const preBandFail = (note) => [{ id: 'A', toState: 'FAILED', note }];
+    applyStallDetection(led, cfg, preBandFail('realInfra marker probe (KI-E10): no marker on disk'), {});
+    eq(led.items.A.stallRounds, 0, 'KI-E167: first signature starts with zero repeated failures');
+    eq(led.items.A.lastFailSignature, 'realinfra marker probe (ki-e10)', 'KI-E167: the signature is recorded for the NEXT round to compare against');
+    const out = applyStallDetection(led, cfg, preBandFail('realInfra marker probe (KI-E10): no marker on disk'), {});
+    eq(led.items.A.stallRounds, 1, 'KI-E167: a SECOND consecutive round with the IDENTICAL signature increments the SAME stallRounds counter the findings-based path uses');
+    eq(led.items.A.stallReason, 'signature', 'KI-E167: stallReason records WHICH mechanism fired, so the escalation note can match the actual evidence');
+    eq(out.length, 0, 'KI-E167: still below maxStallRounds (2) — not yet reported');
+    const out2 = applyStallDetection(led, cfg, preBandFail('realInfra marker probe (KI-E10): no marker on disk'), {});
+    eq(led.items.A.stallRounds, 2, 'KI-E167: a THIRD consecutive identical-signature round reaches the bound');
+    eq(out2.length, 1, 'KI-E167: ... and is reported, exactly like the findings-based path');
+    eq(out2[0].reason, 'signature', 'KI-E167: the reported stall names its evidence shape');
+    eq(out2[0].signature, 'realinfra marker probe (ki-e10)', 'KI-E167: ... and carries the actual repeating signature for the log line');
+  }
+  {
+    // a DIFFERENT pre-band failure signature the next round is NOT a stall — the fixer's change
+    // demonstrably changed WHICH check failed, even though it is still failing overall.
+    const cfg = { maxStallRounds: 2 };
+    const led = { items: { A: { state: 'FAILED', stallRounds: 1, lastFailSignature: 'realinfra marker probe (ki-e10)' } } };
+    const out = applyStallDetection(led, cfg, [{ id: 'A', toState: 'FAILED', note: 'build failed: CS0103 undeclared identifier' }], {});
+    eq(led.items.A.stallRounds, 0, 'KI-E167: a different signature resets the consecutive-repeat counter');
+    eq(out.length, 0, 'KI-E167: never reported for a non-repeating signature');
+    const repeated = applyStallDetection(led, cfg, [{ id: 'A', toState: 'FAILED', note: 'build failed: still broken', gateDetails: { qa: { verdict: 'APPROVED' } } }], {});
+    eq(led.items.A.stallRounds, 1, 'repeated late failure counts even when all gates approved');
+    eq(repeated.length, 0, 'one repeat after a changed signature does not inherit the previous streak');
+  }
+  {
+    // gate-band data ALWAYS wins over the signature fallback, even when a signature also matches —
+    // the richer comparison is never second-guessed by the coarser one.
+    const cfg = { maxStallRounds: 2 };
+    const led = { items: { A: { state: 'FAILED', stallRounds: 1, lastFailSignature: 'gate:qa' } } };
+    const res = [{ id: 'A', toState: 'FAILED', note: 'gate:qa: still failing', gateDetails: { 'gate:qa': { verdict: 'CHANGES_REQUIRED', findings: [{ severity: 'HIGH' }] } } }];
+    applyStallDetection(led, cfg, res, { A: S(3) }); // 3 -> 1 finding: real progress
+    eq(led.items.A.stallRounds, 0, 'KI-E167: gate-band data takes the findings-based branch even though a matching signature ALSO exists — the richer comparison is never overridden by the coarser fallback');
+    eq(led.items.A.stallReason, undefined, 'KI-E167: real progress takes the reset branch, which does not touch stallReason at all (it stays whatever it was — irrelevant once stallRounds is back to 0) — gate-band data still wins over the stale matching signature');
   }
   // driver wiring
   const dsrc105 = readFileSync(new URL('../driver.mjs', import.meta.url), 'utf8');
   ok(dsrc105.includes('applyStallDetection, isStalled') || (dsrc105.includes('applyStallDetection') && dsrc105.includes('isStalled')), 'KI-E105: driver imports both stall helpers from the single convergence module');
-  ok(dsrc105.indexOf('const priorConvergence = {}') < dsrc105.indexOf('applyConvergenceBonus(ledger, cfg, arr)'), 'KI-E105: the prior-round summary is captured BEFORE the bonus pass overwrites row.convergence — otherwise the stall pass compares a round against itself');
-  ok(dsrc105.includes('applyStallDetection(ledger, cfg, arr, priorConvergence)'), 'KI-E105: the stall pass receives that snapshot');
+  const convergenceStart = dsrc105.indexOf('const priorConvergence = {}');
+  const convergenceEnd = dsrc105.indexOf('// KI-E167', convergenceStart);
+  ok(convergenceStart >= 0 && convergenceEnd > convergenceStart, 'KI-E105: locate actual driver convergence block');
+  const qualityRound = { id: 'A', toState: 'FAILED', gateDetails: { qa: { verdict: 'CHANGES_REQUIRED', findings: [{ severity: 'HIGH' }] } } };
+  const priorSummary = { blockingGates: 1, findingCount: 2, maxSeverity: 'HIGH' };
+  const row = { convergence: priorSummary };
+  let bonusInput, stallInput, stallPrior;
+  new Function('ledger', 'cfg', 'arr', 'applyConvergenceBonus', 'applyStallDetection', dsrc105.slice(convergenceStart, convergenceEnd))(
+    { items: { A: row } }, {}, [qualityRound, { id: 'A', budgetDeferred: true }, { id: 'A', budgetStopped: true }, { id: 'A', failure: { kind: 'budget' } }],
+    (_ledger, _cfg, results) => { bonusInput = results; row.convergence = { overwritten: true }; return []; },
+    (_ledger, _cfg, results, prior) => { stallInput = results; stallPrior = prior; return []; });
+  eq(bonusInput, [qualityRound], 'driver excludes all budget-deferral shapes from quality convergence');
+  eq(stallInput, [qualityRound], 'driver stall comparison uses the same quality-only results');
+  eq(stallPrior.A, priorSummary, 'driver snapshots prior convergence before bonus processing overwrites the row');
   ok(dsrc105.includes('const stalled = isStalled(cfg, row)') && dsrc105.includes('row.attempts > bound || stalled'), 'KI-E105: escalateExhausted parks on EITHER stop condition — one decision point, so scheduling and parking cannot disagree');
   ok(/NO-PROGRESS on \$\{row\.stallRounds\}/.test(dsrc105), 'KI-E105: the parked row records WHY it was parked (stall, not budget exhaustion) in its transition note');
+  // KI-E167 (ported from a host-mount session) — the escalation note and the fold-time stall log line
+  // both branch on the actual evidence shape (row.stallReason / s.reason) instead of always phrasing
+  // the note as if gate-band findings existed, which would be actively misleading for a signature-only
+  // stall (no gate band ever ran).
+  ok(dsrc105.includes("row.stallReason === 'signature'") && dsrc105.includes('repeated verbatim with no gate-band data to compare'), 'KI-E167: the escalation note phrases a signature-based stall in its own terms, not the findings-based template');
+  ok(dsrc105.includes("s.reason === 'signature'") && dsrc105.includes('KI-E167 ${s.id}'), 'KI-E167: the fold-time stall log line also branches on reason, logging under its own KI-E167 tag rather than misattributing to KI-E105');
   const cfg105 = JSON.parse(readFileSync(new URL('../../config/factory.config.json', import.meta.url), 'utf8'));
   eq(cfg105.maxStallRounds, 2, 'KI-E105: the shipped default is 2 consecutive no-progress rounds');
 }
@@ -1540,7 +2042,11 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
   const fsrc104 = readFileSync(new URL('../factory.js', import.meta.url), 'utf8');
   ok(fsrc104.includes("const ROOTCAUSE_SCHEMA = { type: 'object'") && fsrc104.includes("required: ['nonTestCount']"), 'KI-E104: ROOTCAUSE_SCHEMA is defined with the non-colliding nonTestCount field');
   ok(!/ROOTCAUSE_SCHEMA[^\n]*required: \['count'\]/.test(fsrc104), 'KI-E104: the schema does NOT use a bare `count` — COMMENT_SCHEMA already owns that name with the OPPOSITE polarity (zero=good), and shape-sniffing consumers collide on it');
-  const rcBlock = fsrc104.slice(fsrc104.indexOf('4a4. ROOT-CAUSE TOUCH PROBE'), fsrc104.indexOf('Editorial (Band C)'));
+  // KI-E168 (ported from a host-mount session) inserted its OWN pre-band probe — with its own
+  // finish('FAILED') call — between the root-cause-touch probe and the editorial pass, so the slice
+  // isolating THIS probe's block now ends at KI-E168's leading comment rather than at 'Editorial
+  // (Band C)' directly; re-scoped to match the new, intentional boundary rather than widen the count.
+  const rcBlock = fsrc104.slice(fsrc104.indexOf('4a4. ROOT-CAUSE TOUCH PROBE'), fsrc104.indexOf('PRIOR-FINDING SCAN (KI-E168'));
   ok(rcBlock.length > 200, 'KI-E104: the probe block exists between the RED-proof probe and the editorial pass');
   ok(rcBlock.includes("if (codeChange && !verificationOnly && (res.rootCauseFiles || []).length) {"), 'KI-E104: gated exactly as the fold gates P9 — code items, never verificationOnly (KI-L55), only when a non-test touch-set was predicted');
   eq((rcBlock.match(/finish\('FAILED'/g) || []).length, 1, 'KI-E104: exactly one finish(\'FAILED\') call site in the probe block');
@@ -1606,7 +2112,7 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
   ok(pcBlock101.includes("const axis = stepMode ? 'plan step' : 'plan commitment'"), 'KI-E101: one `axis` noun renders both modes through the shared tail');
   ok(pcBlock101.includes('PLAN-STEP SCAN (KI-E101') && pcBlock101.includes('PLAN-COMMITMENT SCAN (KI-E87'), 'KI-E101: both probe prompts are present — the KI-E87 prose prompt is preserved verbatim as the fallback');
   ok(pcBlock101.includes('PLAN-STEP AMEND (KI-E101') && pcBlock101.includes('PLAN-COMMITMENT AMEND (KI-E87'), 'KI-E101: both amend prompts are present');
-  eq((pcBlock101.match(/finish\('FAILED'/g) || []).length, 1, 'KI-E101: the two modes still share ONE finish(\'FAILED\') call site — the KI-E87 fail-open invariant is not duplicated per mode');
+  eq((pcBlock101.match(/finish\('FAILED'/g) || []).length, 2, 'KI-E101/KI-E142B (ported): the two modes still share the SAME two finish(\'FAILED\') call sites — the KI-E87 fail-open invariant, and the new KI-E142B declared-deviation fail-open, are each not duplicated per mode');
   eq((pcBlock101.match(/call\('plan-commitment-probe'/g) || []).length, 2, 'KI-E101: still exactly one probe + one bounded re-probe across both modes (no extra call was introduced)');
   eq((pcBlock101.match(/call\('fixer'/g) || []).length, 1, 'KI-E101 scope bound: exactly ONE fixer call in the block — steps decompose CHECKING, never EXECUTION (a per-step fixer would defeat fixer.md\'s whole-diff SIBLING-PATTERN/DEAD-CODE/ADJACENT-CLAIM/CANCELLATIONTOKEN self-checks, KI-E94/E95/E96, which guard the #1 rejection class KI-E51)');
   ok(pcBlock101.includes("res.gates['probe:plan-commitment-scan']") && !pcBlock101.includes("res.gates['probe:plan-step-scan']"), 'KI-E101: both modes share the EXISTING gate key — a second key would silently orphan telemetry/recover/feedback consumers keyed off it');
@@ -1625,63 +2131,47 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
   ok(plannerFlat101.includes('RETURN: `rootCause`, `approach`, `steps`'), 'KI-E101: planner.md\'s return contract lists steps (the brief and the schema agree)');
 }
 
-// KI-E35 (review fix): splitDriftByStatus — behavioral, throwaway real-git repo: only COMMITTED drift
+// KI-E35 (review fix): splitDriftByStatus — injected porcelain: only COMMITTED drift
 // reads as human delivery; an uncommitted edit AND an untracked stray (the live ITEM-H5 shape,
 // invisible to `git diff HEAD`) both stay in the contamination bucket.
-{
-  const { splitDriftByStatus } = await import('./mainguard.mjs');
-  const { mkdtempSync: mk35, writeFileSync: wf35, rmSync: rm35 } = await import('node:fs');
-  const root35 = mk35(join(tmpdir(), 'e35split-'));
-  const g35 = (...a) => execFileSync('git', ['-C', root35, ...a], { encoding: 'utf8' });
-  g35('init', '-q');
-  wf35(join(root35, 'committed.txt'), 'v1');
-  wf35(join(root35, 'modified.txt'), 'v1');
-  g35('add', '.');
-  g35('-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-q', '-m', 'base', '--no-gpg-sign', '--no-verify');
-  wf35(join(root35, 'committed.txt'), 'v2');
-  g35('add', 'committed.txt');
-  g35('-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-q', '-m', 'human delivery', '--no-gpg-sign', '--no-verify');
-  wf35(join(root35, 'modified.txt'), 'v2');
-  wf35(join(root35, 'untracked-new.txt'), 'stray');
-  const s35 = splitDriftByStatus(root35, [{ file: 'committed.txt' }, { file: 'modified.txt' }, { file: 'untracked-new.txt' }]);
-  eq(s35.committed.map((d) => d.file), ['committed.txt'], 'KI-E35: committed drift classifies as human delivery');
-  eq(s35.dirty.map((d) => d.file), ['modified.txt', 'untracked-new.txt'], 'KI-E35: an uncommitted edit AND an untracked stray both classify as contamination (review fix)');
-  rm35(root35, { recursive: true, force: true });
-}
+gitFixture('KI-E35 splitDriftByStatus integration');
 
-// KI-E61 (2026-08-02): repairDirtyDrift — auto-repair for exactly the dirty bucket splitDriftByStatus
-// proves is agent contamination (never human delivery). A present->changed file restores from HEAD;
-// an absent->present file (a stray the worktree agent created) is removed; a repair failure on one
-// path is recorded on that entry and never thrown (a partial repair must not crash the fold).
+// Dirty drift cannot establish authorship: owner edits and new files must survive detection.
 {
-  const { splitDriftByStatus: sds66, repairDirtyDrift } = await import('./mainguard.mjs');
-  const { mkdtempSync: mk66, writeFileSync: wf66, readFileSync: rf66, existsSync: ex66, rmSync: rm66 } = await import('node:fs');
+  const { mkdtempSync: mk66, writeFileSync: wf66, readFileSync: rf66, rmSync: rm66 } = await import('node:fs');
   const root66 = mk66(join(tmpdir(), 'l66repair-'));
-  const g66 = (...a) => execFileSync('git', ['-C', root66, ...a], { encoding: 'utf8' });
-  g66('init', '-q');
-  wf66(join(root66, 'existing.cs'), 'ORIGINAL');
-  g66('add', '.');
-  g66('-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-q', '-m', 'base', '--no-gpg-sign', '--no-verify');
-  wf66(join(root66, 'existing.cs'), 'CONTAMINATED BY A ROGUE AGENT');
-  wf66(join(root66, 'stray.md'), 'a file HEAD never had');
-  const { dirty: dirty66 } = sds66(root66, [{ file: 'existing.cs', was: 'present' }, { file: 'stray.md', was: 'absent' }]);
-  eq(dirty66.length, 2, 'KI-E61: both the mutated tracked file and the new stray classify as dirty');
-  const repaired66 = repairDirtyDrift(root66, dirty66);
-  eq(repaired66.length, 2, 'KI-E61: both dirty entries report as repaired');
-  eq(rf66(join(root66, 'existing.cs'), 'utf8'), 'ORIGINAL', 'KI-E61: present->changed file restored to its HEAD content');
-  ok(!ex66(join(root66, 'stray.md')), 'KI-E61: absent->present stray file removed (checkout cannot restore what HEAD never had)');
-  // a git failure (invalid repo path) must fail closed per-entry, not throw the whole fold
-  const badRepair = repairDirtyDrift(join(root66, 'not-a-repo'), [{ file: 'x.cs', was: 'present' }]);
-  eq(badRepair.length, 0, 'KI-E61: a git failure repairs nothing (excluded from the repaired list)');
-  rm66(root66, { recursive: true, force: true });
-  // driver wiring pin: both the fold-time (KI-L65) and relaunch pre-flight (KI-E41) dirty-drift
-  // checks call the auto-repair, not just report it — a fix that only touches mainguard.mjs and
-  // never gets called would leave the bug live.
+  try {
+    const source = readFileSync(new URL('./mainguard.mjs', import.meta.url), 'utf8');
+    const start = source.indexOf('export function repairDirtyDrift(');
+    const end = source.indexOf('\n}', start) + 2;
+    ok(start >= 0 && end > start, 'diagnostic compatibility entry point exists');
+    let commands = 0;
+    const warnings = [];
+    const repairDirtyDrift = new Function('execFileSync', 'console', 'return (' + source.slice(start, end).replace(/^export /, '') + ')')(() => {
+      commands++;
+      throw new Error('selftest forbids every git invocation from the diagnostic-only helper');
+    }, { warn: message => warnings.push(message) });
+    wf66(join(root66, 'existing.cs'), 'OWNER UNCOMMITTED EDIT\r\n');
+    wf66(join(root66, 'stray.md'), 'OWNER NEW FILE\n');
+    const dirty = [{ file: 'existing.cs', was: 'present', now: 'changed/present' }, { file: 'stray.md', was: 'absent', now: 'changed/present' }, { file: 'missing.cs', was: 'present', now: 'absent' }];
+    const dirtyBefore = structuredClone(dirty);
+    const before = snapshotMainFilesForTest(root66);
+    eq(repairDirtyDrift(root66, dirty), [], 'diagnostic reports no repaired entries');
+    eq(commands, 0, 'diagnostic must not even attempt a git command (throwing effect boundary, never fake success)');
+    eq(snapshotMainFilesForTest(root66), before, 'existing owner edits, untracked owner file, and absent file remain byte-identical');
+    eq(dirty, dirtyBefore, 'diagnostic does not mutate caller-owned drift records');
+    eq(warnings.length, dirty.length, 'each drifted entry produces an explicit diagnostic');
+    ok(dirty.every(d => warnings.some(w => w.includes(d.file) && w.includes('owner review required') && w.includes('No repair performed'))), 'diagnostics name each path and require owner review without claiming repair');
+    eq(repairDirtyDrift(join(root66, 'nonexistent'), [{ file: 'x.cs', was: 'present' }]), [], 'missing root also cannot report a repair');
+    eq(repairDirtyDrift(root66, null), [], 'absent drift list is a nonmutating no-op');
+    eq(commands, 0, 'all diagnostic cases leave git uninvoked');
+    function snapshotMainFilesForTest(root) {
+      return readdirSync(root).sort().map(name => [name, rf66(join(root, name)).toString('hex')]);
+    }
+  } finally { rm66(root66, { recursive: true, force: true }); }
   const dsrc66 = readFileSync(new URL('../driver.mjs', import.meta.url), 'utf8');
-  const foldSite = dsrc66.indexOf('MAIN-TREE CONTAMINATION');
-  const resumeSite = dsrc66.indexOf('MAIN-GUARD ${id} (KI-E41)');
-  ok(foldSite > 0 && dsrc66.slice(Math.max(0, foldSite - 400), foldSite).includes('repairDirtyDrift('), 'driver: KI-E61 fold-time contamination check calls repairDirtyDrift before reporting');
-  ok(resumeSite > 0 && dsrc66.slice(Math.max(0, resumeSite - 400), resumeSite).includes('repairDirtyDrift('), 'driver: KI-E61 resume pre-flight main-guard calls repairDirtyDrift before reporting');
+  ok(!/\brepairDirtyDrift\s*\(/.test(dsrc66), 'driver fold/resume never call the obsolete repair entry point');
+  ok(!dsrc66.includes('AUTO-REPAIRED'), 'driver never claims it restored owner content');
 }
 
 // KI-E36 (review fix): parkedAtMs + allCommittedAfter — the delivered-in-HEAD date logic, pure.
@@ -1841,7 +2331,9 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
   ok(md.includes('## Stage durations — derived') && md.includes('## Gate verdicts') && md.includes('gate:security'), 'telemetry: report renders the evaluation sections');
   // worker-plane wiring (AD-10): compose() briefs every stage agent with the absolute emit CLI
   const fsrc = rfT(new URL('../factory.js', import.meta.url), 'utf8');
-  ok(fsrc.includes("telemetry-emit.mjs --event stage_start") && fsrc.includes('--outcome <ok|fail|blocked>'), 'telemetry: factory.js compose() carries the TELEMETRY brief (AD-10)');
+  const telemetryRun = await execSmoke(fsrc, smokeBatch());
+  const telemetryPrompt = telemetryRun.calls.find(c => c.label === 'SMOKE-CODE:gate-qa')?.prompt || '';
+  ok(telemetryPrompt.includes('telemetry-emit.mjs') && telemetryPrompt.includes('--event stage_start') && telemetryPrompt.includes('--event stage_end') && telemetryPrompt.includes('--outcome <ok|fail|blocked>'), 'telemetry: actual native reviewer prompt carries start/end execution-health instructions');
   // review finding #2: the agent CLI must NOT accept --source (authority forgery) — a forged
   // value rides into attrs and the event stays source:agent.
   execFileSync('node', [cli, '--event', 'stage_end', '--item', 'T-9', '--role', 'fixer', '--source', 'derived', '--durMs', '5'], { env: { ...process.env } });
@@ -1899,6 +2391,34 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
   // Other real phrasings the same regex is designed to cover (not yet built/created/implemented, is Wave N).
   eq(D99.findMissingClaims(['The retry queue does not exist yet in this service.'], entries99), [], 'KI-E99: "does not exist yet" phrasing is recognized');
   eq(D99.findMissingClaims(['`Infra/dr-failover.yaml` is not yet built; tracked for Wave 3.'], entries99), [], 'KI-E99: "not yet built" phrasing is recognized');
+}
+
+// KI-E182 (2026-09-18, EGS-4-3 recovery incident) — sibling linter to doclint's phantom-path
+// check, for "N/M passed" test-count claims instead of file-path claims. Live incident: a fixer
+// round added a test (changing a real count from 2257/2282 to 2258/2283) but left the OLD count
+// standing in 3 prose locations, caught only by a fresh, expensive gate-developer re-dispatch.
+{
+  const C = await import('./countclaims.mjs');
+  eq(C.extractCountClaims('- IntegrationEventEncryptorTests: 23/23 passed'), [{ passed: 23, total: 23, text: '23/23' }], 'countclaims: extracts a plain N/M-passed claim');
+  eq(C.extractCountClaims('Released on 9/18 for the sprint.'), [], 'countclaims: an N/M shape with no "passed" nearby is not a count claim (date-like false positive)');
+  eq(C.extractCountClaims('Full ProductsService suite: 2258/2283 passed (was 2257/2282; +1 from the new test added during recovery)'), [], 'countclaims: a line honestly narrating a SUPERSEDED count is exempt entirely (line-granular, same tradeoff as doclint\'s NOT_YET_EXISTS_RE — the CURRENT-looking claim on this line is re-verifiable from the very next unremarkable line elsewhere in the same doc, so skipping the whole line costs nothing real)');
+  eq(C.extractCountClaims('previously 22/22 passed, now 23/23 passed after the fix'), [], 'countclaims: "previously" framing exempts the whole line, including its current-sounding second claim (line-granular, same tradeoff as doclint)');
+  eq(C.extractCountClaims('Backwards ratio 25/10 passed makes no sense as a pass-count'), [], 'countclaims: passed > total is never a real pass-count ratio (skipped as a probable coincidental match)');
+  eq(C.extractCountClaims('11/11 passed and 23/23 passed on the same line'), [{ passed: 11, total: 11, text: '11/11' }, { passed: 23, total: 23, text: '23/23' }], 'countclaims: multiple genuine claims on one line are all extracted');
+
+  eq([...C.extractEvidencePairs('Passed!  - Failed:     0, Passed:  2258, Skipped:     0, Total:  2283, Duration: 15 s')], ['2258/2283'], 'countclaims: extracts a pair from a real dotnet suite-summary line');
+  eq([...C.extractEvidencePairs('Failed!  - Failed:     1, Passed:   685, Skipped:     0, Total:   686, Duration: 9 s')], ['685/686'], 'countclaims: extracts a pair from a FAILING dotnet summary line too (passed count is still real evidence)');
+  eq([...C.extractEvidencePairs('FACTORY::SUMMARY::suite exit=0 failed=0 passed=413 skipped=0 dockerfail=0')], ['413/413'], 'countclaims: extracts a pair from the keyed FACTORY::SUMMARY::suite marker (failed=0 -> total=passed)');
+  eq([...C.extractEvidencePairs('FACTORY::SUMMARY::suite exit=1 failed=25 passed=2257 skipped=0 dockerfail=25')].sort(), ['2257/2282'], 'countclaims: keyed marker total = passed+failed+skipped even when failed>0');
+  const multi = 'Passed!  - Failed: 0, Passed: 11, Skipped: 0, Total: 11\nsome other line\nPassed!  - Failed: 0, Passed: 23, Skipped: 0, Total: 23';
+  eq([...C.extractEvidencePairs(multi)].sort(), ['11/11', '23/23'], 'countclaims: a transcript with multiple dotnet invocations yields multiple distinct pairs');
+
+  const evidence = new Set(['2258/2283', '11/11']);
+  eq(C.findUnevidencedCountClaims(['- Full ProductsService suite: check 2257/2282 passed'], evidence), ['2257/2282'], 'countclaims: a stale claim not matching any evidenced pair is flagged (the EGS-4-3 witness)');
+  eq(C.findUnevidencedCountClaims(['- Full ProductsService suite: 2258/2283 passed'], evidence), [], 'countclaims: a claim matching a real evidenced pair is NOT flagged');
+  eq(C.findUnevidencedCountClaims(['11/11 passed', '11/11 passed again'], evidence), [], 'countclaims: a repeated identical claim is deduped and, once evidenced, never flagged');
+  eq(C.findUnevidencedCountClaims([], evidence), [], 'countclaims: no added lines -> no findings');
+  eq(C.findUnevidencedCountClaims(['- 9/9 passed'], new Set()), ['9/9'], 'countclaims: an empty evidence set (no test run recorded yet) flags every claim — correct, an unverifiable claim is exactly as suspect as a stale one');
 }
 
 // Exporter pure core (telemetry/exporter/lib/aggregate.mjs — spine AD-5/AD-12/AD-13 + review
@@ -1979,8 +2499,8 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
   // data-flows, CONTEXT.md, or AGENTS.md file, exactly what buildDocMap indexes).
   ok(fsrc.includes("lines.push('  ' + REPO + '/' + d)"), 'factory: KI-E61 docMap entries are REPO-anchored, not bare-relative');
   ok(fsrc.includes('THIS path is ALSO in your files[] touch-set') && fsrc.includes("Your edit target for"), 'factory: KI-E61 docMap warns when a reference doc is also an edit target, naming the worktree path');
-  const opsrc66 = readFileSync(join(LIBDIR, '..', 'opencode', 'compose.mjs'), 'utf8');
-  ok(opsrc66.includes('THIS path is ALSO in your files[] touch-set'), 'opencode compose: KI-E61 docMap edit-anchor warning ported (runtime parity)');
+  const docPrompt = portPrompt('fixer', { files: ['Svc/CONTEXT.md'], docMap: ['Svc/CONTEXT.md :: section'] });
+  ok(docPrompt.includes('/main/Svc/CONTEXT.md') && docPrompt.includes('do NOT Edit this REPO-ROOT copy') && docPrompt.includes('/worktree/Svc/CONTEXT.md'), 'KI-E61: actual port prompt separates read-only doc reference from worktree edit target');
   ok(fsrc.includes("--verdict <APPROVED|CHANGES_REQUIRED>"), 'factory: telemetry verdict split for review roles');
   ok(fsrc.includes("' pack ' + wtPath"), 'factory: runner PACKCMD seam present');
   ok(fsrc.includes('REGENERATE the review pack'), 'factory: editorial pass regenerates the pack (KI-L34 final-diff invariant)');
@@ -2017,7 +2537,7 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
   // 8-26KB and the BRIEF_CAP slice silently dropped 30-53% of 3 of the first 4 live profiles.
   ok(PROFILE_CAP > 12000, 'PR#9: PROFILE_CAP exceeds BRIEF_CAP (profiles are bigger than role briefs)');
   const big = { readdirSync: () => ['Big.md'], readFileSync: () => 'y'.repeat(PROFILE_CAP + 5000) };
-  eq(readRepoProfiles('/p', big)['Big.md'.replace(/\.md$/, '')].length, PROFILE_CAP, 'PR#9: an oversize profile truncates at PROFILE_CAP (both runtimes share this bound)');
+  eq(readRepoProfiles('/p', big).Big, big.readFileSync(), 'F13: oversize profile survives byte-for-byte rather than silently dropping mandatory guidance');
   const mid = { readdirSync: () => ['Mid.md'], readFileSync: () => 'y'.repeat(20000) };
   eq(readRepoProfiles('/p', mid)['Mid'].length, 20000, 'PR#9: a 20k profile (over the old 12k BRIEF_CAP) now survives whole');
 
@@ -2051,8 +2571,9 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
   const reviewBranchIdx = fsrc74.indexOf('const isReviewRole = ');
   const verifyNoteRenderIdx = fsrc74.indexOf('VERIFY-STAGE NOTE (from the runner');
   ok(reviewBranchIdx >= 0 && verifyNoteRenderIdx > reviewBranchIdx, 'KI-E74B: the verifyNote render lives inside the review-role branch, not the shared prefix every role sees');
-  const csrc74 = readFileSync(join(import.meta.dirname, '..', 'opencode', 'compose.mjs'), 'utf8');
-  ok(/if \(item\.verifyNote\) lines\.push\('', 'VERIFY-STAGE NOTE/.test(csrc74), 'KI-E74B: opencode/compose.mjs mirrors the SAME render (disclosed gap: the setting half is not yet wired into runtime.mjs\'s different step-dispatch model)');
+  const noteItem = { verifyNote: 'RUNNER-CAVEAT-CONTRACT' };
+  ok(portPrompt('review-code', noteItem).includes('RUNNER-CAVEAT-CONTRACT'), 'KI-E74B: reviewer receives actual runner caveat');
+  ok(!portPrompt('fixer', noteItem).includes('RUNNER-CAVEAT-CONTRACT'), 'KI-E74B: review-only caveat does not leak into the shared implementation prefix');
 }
 
 // KI-E60: exec-smoke — a populated A.repoProfiles for the smoke batch's own target ("X") must not
@@ -2112,22 +2633,36 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
   ok(fsrc2.includes('GREP-ANCHORED SELF-REPORT (KI-E10)'), 'KI-E10: runner realInfra self-report is grep-anchored');
   ok(fsrc2.includes('DOC-CLAIM SELF-CHECK (KI-E11)'), 'KI-E11: fixer briefed with the claims self-check');
   ok(fsrc2.includes('DOC-CLAIM LINT (KI-E11)'), 'KI-E11: runner tees the claims lint for doc-touching items');
+  ok(fsrc2.includes('COUNT-CLAIM SELF-CHECK (KI-E182)'), 'KI-E182: fixer briefed with the count-claim self-check');
+  ok(fsrc2.includes('COUNT-CLAIM LINT (KI-E182)'), 'KI-E182: runner tees the count-claims lint for doc-touching items');
+  ok((fsrc2.match(/\+ claimsHint \+ countClaimsHint/g) || []).length === 7, 'KI-E182: the count-claims hint rides EVERY one of the 7 fixer/amend dispatch sites the doc-claims hint already reaches (initial fix + 6 amend rounds)');
   ok(fsrc2.includes('routine machine-state bookkeeping'), 'KI-D8: checkpoint preamble opens with the bookkeeping framing (4th mitigation)');
   // driver.mjs source contracts
   const dsrc = readFileSync(new URL('../driver.mjs', import.meta.url), 'utf8');
   ok(!dsrc.includes('if (!heavy && /edge-case/i.test(f.skill)) continue'), 'KI-E12: driver applicableReviewFlows agreement updated (edge-case for every code item)');
-  ok(dsrc.includes('KI-E10: Docker ABSENT'), 'KI-E10: group hard-excludes realInfra items when Docker is absent');
-  ok(dsrc.includes("flags['force-realinfra']"), 'KI-E10: --force-realinfra escape hatch present');
+  const { eligibleItems } = await import('./driver-integration.mjs');
+  const infraItem = { ...graph.items[0], id: 'INFRA', files: ['Svc/Handler.cs'], realInfra: true,
+    acceptance: 'The persisted value survives a concurrent update.', regressionTest: 'Assert the persisted value after concurrent writes.' };
+  const infraGraph = { items: [infraItem] }, infraLedger = emptyLedger('infra-contract');
+  syncFromGraph(infraLedger, infraGraph);
+  eq(eligibleItems(infraGraph, infraLedger, { maxItemRetries: 2 }, { 'include-realinfra': true }, { docker: false }), [], 'KI-E10: shared group/sweep eligibility excludes real infra without Docker');
+  eq(eligibleItems(infraGraph, infraLedger, { maxItemRetries: 2 }, { 'include-realinfra': true, 'force-realinfra': true }, { docker: false }).map(w => w.id), ['INFRA'], 'KI-E10: explicit force-realinfra overrides Docker absence');
+  eq(eligibleItems(infraGraph, infraLedger, { maxItemRetries: 2 }, {}, { docker: true }), [], 'KI-E10: Docker presence alone does not bypass real-infra opt-in');
   ok(dsrc.includes('at.gapSuspect = true') && dsrc.includes('at.final = r.toState'), 'KI-E13: fold stamps gapSuspect + final on derived stage events');
   // build-test.sh claims mode + the CLI (single source of truth with lib/doclint.mjs)
   const bts2 = readFileSync(new URL('../../verify/build-test.sh', import.meta.url), 'utf8');
   ok(bts2.includes('claims)') && bts2.includes('claims-lint.mjs'), 'KI-E11: build-test.sh claims subcommand wired to the CLI');
   const clisrc = readFileSync(new URL('../claims-lint.mjs', import.meta.url), 'utf8');
   ok(clisrc.includes('FACTORY::CLAIMS::') && clisrc.includes('lintWorktreeDocClaims'), 'KI-E11: claims CLI emits the machine marker from the SAME doclint lib the fold F2 uses');
+  ok(bts2.includes('countclaims)') && bts2.includes('countclaims-lint.mjs'), 'KI-E182: build-test.sh countclaims subcommand wired to the CLI');
+  const ccclisrc = readFileSync(new URL('../countclaims-lint.mjs', import.meta.url), 'utf8');
+  ok(ccclisrc.includes('FACTORY::COUNTCLAIMS::') && ccclisrc.includes('lintItemCountClaims'), 'KI-E182: countclaims CLI emits the machine marker from the SAME countclaims lib');
   // briefs
   ok(readFileSync(new URL('../../agents/review-edgecase.md', import.meta.url), 'utf8').includes('EARLY POSITION (KI-E12'), 'KI-E12: edge-case brief carries the early-position contract');
   ok(readFileSync(new URL('../../agents/marker-probe.md', import.meta.url), 'utf8').includes('marker-probe (KI-E10)'), 'KI-E10: marker-probe brief exists');
   ok(readFileSync(new URL('../../agents/fixer.md', import.meta.url), 'utf8').includes('DOC-CLAIM SELF-CHECK (KI-E11)'), 'KI-E11: fixer card carries the claims self-check');
+  const countBrief = readFileSync(new URL('../../agents/fixer.md', import.meta.url), 'utf8');
+  ok(countBrief.includes('countclaims <worktree> <ARTIFACTS DIR>') && countBrief.includes('FACTORY::COUNTCLAIMS::0'), 'KI-E182: fixer contract requires the mechanical command and zero-miss result');
   ok(readFileSync(new URL('../../agents/test-author.md', import.meta.url), 'utf8').includes('REAL-SHAPE SEEDING (KI-E38'), 'KI-E38: test-author brief carries the real-shape seeding rule');
   ok(readFileSync(new URL('../../agents/review-testreview.md', import.meta.url), 'utf8').includes('Seed-shape completeness (KI-E38'), 'KI-E38: test-review brief carries the seed-shape completeness lens');
   const ta38 = readFileSync(new URL('../../agents/test-author.md', import.meta.url), 'utf8');
@@ -2253,20 +2788,8 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
   ok(csClassify('X/Page.razor', '@* razor comment *@').kind === 'razor', 'PR#9: a Razor @* *@ comment IS a hit');
   ok(csClassify('X/run.ps1', '<# block #>').kind === 'block', 'PR#9: a PowerShell <# #> block comment IS a hit');
   ok(!csClassify('X/run.sh', '#!/usr/bin/env bash'), 'PR#9: a shebang is NOT a hit');
-  // Move-suppression + Windows-safe untracked reads (findComments level) — real git fixture:
-  {
-    const mvd = mkdtempSync(join(tmpdir(), 'csmove-'));
-    const g = (...a) => execFileSync('git', ['-C', mvd, ...a], { encoding: 'utf8' });
-    g('init', '-q', '.'); g('config', 'user.email', 't@t'); g('config', 'user.name', 't');
-    fsWrite(join(mvd, 'Move.cs'), 'namespace Old.Ns\n{\n    // pre-existing invariant comment\n    class A { }\n}\n');
-    g('add', '-A'); g('commit', '-qm', 'base');
-    fsWrite(join(mvd, 'Move.cs'), 'namespace New.Ns;\n\n// pre-existing invariant comment\nclass A { }\n// BRAND NEW comment\n');
-    fsWrite(join(mvd, 'NewTests.cs'), 'public class T {\n    // untracked comment in new test file\n}\n');
-    const mhits = findComments(mvd, 50);
-    eq(mhits.map((h) => h.line).sort(), ['// BRAND NEW comment', '// untracked comment in new test file'],
-      'PR#9: a byte-identical MOVED/re-indented comment is suppressed (file-scoped-ns conversion no longer hard-fails); genuinely new + untracked-file comments still hit');
-    eq(mhits.skipped, 0, 'PR#9: untracked files read via readFileSync (no cat dependency), zero skipped');
-  }
+  // Move-suppression + Windows-safe untracked reads (findComments level).
+  gitFixture('KI-E59 comment move/untracked integration');
   // factory wiring contract (grep-visible; exec-smoke below RUNS the FAIL path)
   const fsrc = readFileSync(join(import.meta.dirname, '..', 'factory.js'), 'utf8');
   ok(fsrc.includes('const COMMENT_SCHEMA') && fsrc.includes("call('comment-probe'"), 'KI-E59: factory declares COMMENT_SCHEMA + runs the haiku comment-probe');
@@ -2374,14 +2897,21 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
 // PR#9 review — the host-policy seam itself: lib/policy.mjs loader + the driver/factory wiring.
 {
   const pd = mkdtempSync(join(tmpdir(), 'pol-'));
-  eq(loadPolicies(pd), { noNewComments: false, noSchemaChanges: false, failLaneOnMainDrift: false }, 'policy: no config at all -> all OFF (shipped-engine default; KI-E109 added failLaneOnMainDrift)');
+  eq(loadPolicies(pd), { noNewComments: false, noSchemaChanges: false, failLaneOnMainDrift: false, shadowConsolidatedScan: false }, 'policy: no config at all -> all OFF (shipped-engine default; KI-E109 added failLaneOnMainDrift, KI-E171 shadowConsolidatedScan)');
   mkdirSync(join(pd, 'config'), { recursive: true });
   fsWrite(join(pd, 'config', 'factory.config.json'), JSON.stringify({ policies: { noNewComments: false, noSchemaChanges: false } }));
   fsWrite(join(pd, 'config', 'factory.config.local.json'), JSON.stringify({ policies: { noNewComments: true } }));
-  eq(loadPolicies(pd), { noNewComments: true, noSchemaChanges: false, failLaneOnMainDrift: false }, 'policy: gitignored local overlay flips a policy per host (KI-E17 seam)');
+  eq(loadPolicies(pd), { noNewComments: true, noSchemaChanges: false, failLaneOnMainDrift: false, shadowConsolidatedScan: false }, 'policy: gitignored local overlay flips a policy per host (KI-E17 seam)');
   fsWrite(join(pd, 'config', 'factory.config.local.json'), '{ broken json');
-  eq(loadPolicies(pd), { noNewComments: false, noSchemaChanges: false, failLaneOnMainDrift: false }, 'policy: an unreadable overlay never throws — falls back to the committed config');
-  eq(renderPolicies({ noNewComments: true }), 'noNewComments=on noSchemaChanges=off failLaneOnMainDrift=off', 'policy: renderPolicies one-liner for the driver status prints');
+  eq(loadPolicies(pd), { noNewComments: false, noSchemaChanges: false, failLaneOnMainDrift: false, shadowConsolidatedScan: false }, 'policy: an unreadable overlay never throws — falls back to the committed config');
+  eq(renderPolicies({ noNewComments: true }), 'noNewComments=on noSchemaChanges=off failLaneOnMainDrift=off shadowConsolidatedScan=off', 'policy: renderPolicies one-liner for the driver status prints');
+  // KI-E171 (ported from a host-mount session) — the INTEGRATION gap that let shadowConsolidatedScan
+  // (KI-E169) ship silently inert on the origin host: this is the loader's OWN merge round-trip from a
+  // local-overlay config, the exact path a real group/sweep launch uses — exec-smoke's batch.policies
+  // injection bypasses this loader entirely, so it structurally could not have caught a key missing
+  // from DEFAULTS. A future policy addition MUST have a round-trip assertion here in the SAME change.
+  fsWrite(join(pd, 'config', 'factory.config.local.json'), JSON.stringify({ policies: { shadowConsolidatedScan: true } }));
+  eq(loadPolicies(pd).shadowConsolidatedScan, true, 'KI-E171: shadowConsolidatedScan actually round-trips through the REAL loader from a local overlay — the path a live group/sweep launch uses, not just exec-smoke\'s direct batch.policies injection');
   // Committed config ships BOTH policies OFF — a public engine must not default to one owner's rules.
   const shipped = JSON.parse(readFileSync(join(import.meta.dirname, '..', '..', 'config', 'factory.config.json'), 'utf8'));
   eq(!!(shipped.policies && shipped.policies.noNewComments), false, 'policy: shipped config has noNewComments OFF');
@@ -2410,13 +2940,17 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
 // wiring it here makes every release/install/upgrade gate cover the port too).
 {
   let oout = '';
+  let portSucceeded = false;
   try {
     oout = execFileSync(process.execPath, [join(import.meta.dirname, '..', 'opencode', '_selftest.mjs')],
-      { encoding: 'utf8', cwd: join(import.meta.dirname, '..', '..'), maxBuffer: 16 * 1024 * 1024 });
+      { encoding: 'utf8', cwd: join(import.meta.dirname, '..', '..'), maxBuffer: 16 * 1024 * 1024, timeout: 120000, stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, GIT_OPTIONAL_LOCKS: '0' } });
+    portSucceeded = true;
   } catch (e) {
-    oout = String((e && e.stdout) || '') + '\nSPAWN-FAILED: ' + String((e && e.message) || e);
+    oout = String(e.stdout || '') + String(e.stderr || '') + '\nSPAWN-FAILED: ' + String(e.message || e);
   }
-  ok(/TOTAL: \d+ passed, 0 failed/.test(oout), 'PR#9: the opencode suite runs green under the main selftest (' + ((/TOTAL: [^\n]+/.exec(oout) || ['no TOTAL line'])[0]) + ')');
+  const portSummary = /^TOTAL(?: legacy\/pure)?: ([1-9]\d*) passed, 0 failed$/m.exec(oout);
+  if (!portSucceeded || !portSummary) console.log(oout);
+  ok(portSucceeded && !!portSummary, 'PR#9: the opencode suite exits successfully and reports green (' + (portSummary?.[0] || 'no TOTAL line') + ')');
 }
 
 // KI-E17: portable mounts — host-repo-root walk-up + stock-prefix config rewrite.
@@ -2547,7 +3081,9 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
   eq(sameTargetPairs(null), [], 'KI-E90: null picked -> no throw, empty result');
   ok(dsrc20.includes('sameTargetPairs(picked)') && dsrc20.includes('KI-E90 WARN'), 'KI-E90: cmdGroup wires the pure same-target warn core');
   ok(dsrc20.includes('unwrapResultEnvelope(readJson(foldPath)') && dsrc20.includes('payload carried ZERO results'), 'KI-E31 (review fix): cmdFold wires the unwrap AND stops loudly on a zero-result payload (no success affect)');
-  ok(readFileSync(join(import.meta.dirname, '..', 'factory.js'), 'utf8').includes('means EXACTLY a product-scope.md red-line'), 'KI-E30: the shared gate prompt carries the scopeViolation clarification');
+  const scopeRun = await execSmoke(readFileSync(join(import.meta.dirname, '..', 'factory.js'), 'utf8'), smokeBatch());
+  const scopePrompt = scopeRun.calls.find(c => c.label === 'SMOKE-CODE:gate-qa')?.prompt || '';
+  ok(scopePrompt.includes('`scopeViolation:true` means ONLY a product-scope.md red-line') && scopePrompt.includes('touch-set deviation is a normal finding'), 'KI-E30: actual gate prompt distinguishes product-scope stops from touch-set findings');
   ok(/return `## \$\{id\} — \$\{r\.state\}\\n\\n- \$\{lastNote\(r\)\}/.test(dsrc20), 'KI-E53: escalations per-item line renders lastNote(r) (the real last-transition reason) — not the never-populated static r.note field');
 }
 
@@ -2812,6 +3348,24 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
   eq(effectiveBaseline(['A', 'B', 'C'], parseVerifyRaw('FACTORY::SUMMARY::suite exit=1 failed=1 passed=9')), 3, 'KI-E43: a bigger reported array is never shrunk by the transcript');
   eq(effectiveBaseline([], parseVerifyRaw('no markers here')), 0, 'KI-E43: an unparseable baseline transcript contributes 0');
   eq(effectiveBaseline([], parseVerifyRaw('FACTORY::SUMMARY::suite exit=0 failed=0 passed=10')), 0, 'KI-E43: a GREEN baseline transcript adds nothing — no free failure allowance');
+  // KI-E163 (ported from a host-mount session) — a phantom baseline (never captured or reported) and
+  // a real baseline that genuinely measured zero both read as effectiveBaseline()===0; isPhantomBaseline
+  // distinguishes them, and annotateBaselineReason appends a caveat ONLY to a real "beyond baseline 0"
+  // failure reason when that 0 is phantom.
+  eq(isPhantomBaseline(0, [], null), true, 'KI-E163: baseline=0, no reported array, no transcript at all -> phantom');
+  eq(isPhantomBaseline(0, undefined, null), true, 'KI-E163: an absent (not just empty) reported array is still phantom');
+  eq(isPhantomBaseline(0, [], parseVerifyRaw('FACTORY::SUMMARY::suite exit=0 failed=0 passed=10')), false, 'KI-E163: a REAL baseline transcript that measured 0 failures is NOT phantom, even though effectiveBaseline is also 0');
+  eq(isPhantomBaseline(0, ['A'], null), false, 'KI-E163: a non-empty reported array (even if effectiveBaseline somehow computed 0) is not phantom');
+  eq(isPhantomBaseline(3, [], null), false, 'KI-E163: a non-zero baseline is never phantom by definition (only 0 is ambiguous)');
+  eq(annotateBaselineReason('integrate transcript: 5 new suite failure(s) beyond baseline 0', true), 'integrate transcript: 5 new suite failure(s) beyond baseline 0 (⚠ KI-E163: baseline=0 here is a DEFAULT, not a measurement — no baseline-raw.txt exists and no baselineFailures were ever reported for this item; if these failures are genuinely pre-existing, capturing a real baseline resolves this, not the diff)', 'KI-E163: a phantom-0 "beyond baseline 0" reason gets the caveat appended');
+  eq(annotateBaselineReason('integrate transcript: 5 new suite failure(s) beyond baseline 0', false), 'integrate transcript: 5 new suite failure(s) beyond baseline 0', 'KI-E163: the SAME reason text is returned byte-identical when the baseline is NOT phantom (a real, measured 0)');
+  eq(annotateBaselineReason('verify transcript: build failed', true), 'verify transcript: build failed', 'KI-E163: a reason that does not even mention "beyond baseline 0" is never touched, regardless of phantom status — an unrelated failure (build/targetedTest) must not get a baseline caveat that has nothing to do with it');
+  eq(annotateBaselineReason('', true), '', 'KI-E163: an empty reason is returned unchanged, never a throw');
+  // driver.mjs wiring
+  const drvTextE163 = readFileSync(join(import.meta.dirname, '..', 'driver.mjs'), 'utf8');
+  ok(drvTextE163.includes("import { parseVerifyRaw, verdictFromParse, debrisFiles, parseRedRaw, hasRealInfraMarker, touchedRootCause, effectiveBaseline, decodeTranscript, flakeSuspects, isPhantomBaseline, annotateBaselineReason } from './lib/verify.mjs';"), 'KI-E163: driver.mjs imports isPhantomBaseline/annotateBaselineReason alongside the existing verify.mjs helpers');
+  ok(drvTextE163.includes('const baselineIsPhantom = isPhantomBaseline(baselineCount, r.baselineFailures, baselineParse)'), 'KI-E163: phantom flag uses the diagnostic baseline count and the original report/transcript');
+  ok(drvTextE163.includes("fail('verify transcript: ' + annotateBaseline(vVerdict.reason))") && drvTextE163.includes("fail('integrate transcript: ' + annotateBaseline(iVerdict.reason))"), 'KI-E163: BOTH the verify- and integrate-transcript fail paths route their reason through the annotator — a phantom baseline can fail via either transcript');
   const drvText43 = readFileSync(join(import.meta.dirname, '..', 'driver.mjs'), 'utf8');
   const facText43 = readFileSync(join(import.meta.dirname, '..', 'factory.js'), 'utf8');
   ok(/baseline-raw\.txt/.test(drvText43) && /effectiveBaseline\(/.test(drvText43), 'KI-E43: the fold override merges the RED-time baseline transcript');
@@ -2834,6 +3388,13 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
   // factory.js/agents/*.md — it genuinely IS agent improvisation and must stay flagged.
   eq(T42.nonCanonicalArtifacts(['leftover-raw.txt', 'leftover-final.txt', 'plan.md']), ['leftover-final.txt'], 'KI-E71: leftover-raw.txt is canonical (KI-D12 probe output); leftover-final.txt is genuine improvisation and still flags');
   eq(T42.stageForArtifact('leftover-raw.txt'), 'probe:leftover-scan', 'KI-E71: leftover-raw.txt maps to the probe:leftover-scan stage');
+  // KI-E137/KI-E140 (ported from a host-mount session — live there: the very first `resume` run after
+  // launch-meta.json existed flagged it as non-canonical debris — the documented `resume --quarantine`
+  // step would have swept away the ONE file the KI-E140 task-liveness reminder exists to surface, and
+  // (had a real relaunch run quarantine first) equally have broken KI-E137's diagnostics / KI-E139's
+  // gate-band reuse the next time progress.json was needed. Both are control files a LIVE attempt
+  // still needs.
+  eq(T42.nonCanonicalArtifacts(['progress.json', 'launch-meta.json', 'RESULT.md']), ['RESULT.md'], 'KI-E137/KI-E140: progress.json and launch-meta.json are canonical control files, never debris — only genuine improvisation still flags');
   const drvText42 = readFileSync(join(import.meta.dirname, '..', 'driver.mjs'), 'utf8');
   ok(/resume --quarantine/.test(drvText42) && /flags\.quarantine/.test(drvText42), 'KI-E42: resume detects debris always, moves only on --quarantine');
   ok(/MAIN-GUARD/.test(drvText42) && /KI-E41/.test(drvText42), 'KI-E41: resume diffs main-snapshot.json for relaunch candidates before printing the launch lines');
@@ -2865,10 +3426,10 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
   ]);
   eq(agg46.itemFolds['A'].map((f) => f.direct), [false, true], 'KI-E46: the scaffolded recovery fold classifies direct in aggregation');
   const md46 = T.renderTelemetryReport(agg46, { generatedAt: 'T', file: 'f' });
-  ok(md46.includes('First-pass close rate (clean first fold / closed) | 2/3'), 'KI-E46: a recovery close is never first-pass');
+  ok(md46.includes('First-pass close rate (legacy proxy: clean first observed fold / all folded items) | 2/3'), 'KI-E46: a recovery close is never first-pass and the denominator includes all observed items');
   ok(md46.includes('Direct-recovery rate (recovered closes / closed) | 1/3'), 'KI-E46: the scaffolded recovery close now counts in the KPI');
-  ok(md46.includes('| First-pass — FULL band (KI-E48) | 1/1 closed = 100% (1 folded) |'), 'KI-E48: FULL-band split row renders');
-  ok(md46.includes('| First-pass — LIGHT band (KI-E48) | 1/2 closed = 50% (2 folded) |'), 'KI-E48: LIGHT-band split row renders');
+  ok(md46.includes('| First-observed-fold close — FULL band | 1/1 = 100% |'), 'KI-E48: FULL-band split row renders');
+  ok(md46.includes('| First-observed-fold close — LIGHT band | 1/2 = 50% |'), 'KI-E48: LIGHT-band split row renders');
   const aggLegacy = T.aggregateEvents([{ event: 'item_folded', source: 'driver', item: 'A', attrs: { toState: 'CLOSED', gates: {} } }]);
   ok(!T.renderTelemetryReport(aggLegacy, { generatedAt: 'T', file: 'f' }).includes('KI-E48'), 'KI-E48: a pure-legacy (unstamped) stream renders no band rows');
   // KI-E48 — ts-paired agent durations (agents never pass --durMs; the table was permanently empty)
@@ -2890,7 +3451,7 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
   ok(/case 'main-check'/.test(drv46) && /KI-E50/.test(drv46), 'KI-E50: driver main-check command exists (read-only, warn-only)');
   ok(!/MUTATING = new Set\(\[[^\]]*main-check/.test(drv46), 'KI-E50: main-check is NOT in the mutating set (no lock, no lease)');
   const fac46 = readFileSync(join(import.meta.dirname, '..', 'factory.js'), 'utf8');
-  ok(/MAIN-DRIFT CHECK \(KI-E50\)/.test(fac46) && /main-check ' \+ id/.test(fac46), 'KI-E50: the runner verify hint carries the mid-band main-check command');
+  ok(/MAIN-DRIFT CHECK \(KI-E50/.test(fac46) && /main-check ' \+ id/.test(fac46), 'KI-E50: the runner verify hint carries the mid-band main-check command'); // KI-E145 (ported): the label grew a trailing "/KI-E145" — pin the stable prefix, not the exact closing paren
   const emit46 = readFileSync(join(import.meta.dirname, '..', 'telemetry-emit.mjs'), 'utf8');
   ok(/clampAgentEvent/.test(emit46) && /origEvent/.test(emit46), 'KI-E49: telemetry-emit clamps the vocabulary and preserves the original name');
   ok(readFileSync(join(import.meta.dirname, '..', '..', 'agents', 'fixer.md'), 'utf8').includes('COUNT-CLAIM SELF-CHECK (KI-E51)'), 'KI-E51: fixer card carries the count-claim self-check');
@@ -2907,7 +3468,7 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
   for (const b of ['fixer', 'test-author', 'gate-developer', 'review-code', 'planner']) {
     const bt = readFileSync(join(import.meta.dirname, '..', '..', 'agents', b + '.md'), 'utf8');
     ok(bt.includes('HOST POLICY —'), 'PR#9: ' + b + ' card conditions its policy section on the HOST POLICY prompt block');
-    ok(/When NO such block is present/i.test(bt), 'PR#9: ' + b + ' card states the policy-OFF behaviour explicitly');
+    ok(/When NO such block is present|Without (?:that|the)\s+policy/i.test(bt), 'PR#9: ' + b + ' card states the policy-OFF behaviour explicitly');
   }
   ok(readFileSync(join(import.meta.dirname, '..', '..', 'agents', 'fixer.md'), 'utf8').includes('the ledger entry alone'), 'PR#9: fixer Do-6 waives the call-site tag comment under the no-comments policy (Do-6/Do-7 contradiction resolved)');
   ok(readFileSync(join(import.meta.dirname, '..', '..', 'agents', 'gate-architect.md'), 'utf8').includes('HOST POLICY — NO DB/SCHEMA CHANGES'), 'PR#9: gate-architect reconciles the CLI-migrations norm with the no-schema-changes policy');
@@ -2946,17 +3507,12 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
   // real syntax error with a host that simply has no usable bash, and printing a scary false failure
   // about shipped release tooling. On Windows `bash` typically resolves to the WSL launcher stub,
   // which does NOT throw ENOENT: it runs and exits non-zero ("execvpe(/bin/bash) failed"), so even an
-  // errno check would not have separated the two. A trivial `bash -c "exit 0"` does. Announced SKIP,
-  // matching the git-unavailable fixtures in this file — silence never reads as a pass.
-  let bashUsable52 = true;
-  try { exf52('bash', ['-c', 'exit 0'], { stdio: 'ignore' }); } catch { bashUsable52 = false; }
-  if (bashUsable52) {
+  // errno check would not have separated the two. The shared resolver probes every candidate.
+  if (hasUsableBash('KI-E52 shell syntax checks')) {
     let parse52 = true;
     let parseErr52 = '';
-    try { for (const s of ['install.sh', 'release.sh', '_e2e.sh']) exf52('bash', ['-n', join(ROOT, 'setup', s)], { stdio: 'pipe' }); } catch (e) { parse52 = false; parseErr52 = String((e && e.stderr) || (e && e.message) || ''); }
+    try { for (const s of ['install.sh', 'release.sh', '_e2e.sh']) exf52(bashPath, ['-n', join(ROOT, 'setup', s)], { stdio: 'pipe' }); } catch (e) { parse52 = false; parseErr52 = String((e && e.stderr) || (e && e.message) || ''); }
     ok(parse52, 'KI-E52: install.sh / release.sh / _e2e.sh all parse (bash -n)' + (parse52 ? '' : ' — ' + parseErr52.slice(0, 300)));
-  } else {
-    console.log('  SKIP KI-E52 bash -n syntax check (1 assert — no usable bash on this host; on Windows `bash` resolves to the WSL stub and exits non-zero rather than ENOENT). CI runs ubuntu-latest, so the shipped scripts are still syntax-gated on every push.');
   }
   ok(existsSync(join(ROOT, 'setup', '_e2e.sh')), 'KI-E52: the hermetic E2E harness ships in-tree — the "E2E-tested" claim is re-runnable');
   ok(/REFUSING to touch/.test(inst), 'KI-E52: an existing-but-unparseable settings.local.json is refused, never clobbered (review fix)');
@@ -2988,8 +3544,8 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
     { metric: { type: 'somethingUnknown' }, value: [1700000000, '99999'] },
   ] } });
   eq(vec, { inputTokens: 1000, outputTokens: 200, cacheReadTokens: 5000, cacheCreationTokens: 300 }, 'KI-E66: parseTokenUsageVector sums by the exact dashboard type labels, ignoring an unrecognized type');
-  eq(U.parseTokenUsageVector({ status: 'success', data: { result: [] } }), { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0 }, 'KI-E66: empty Prometheus result -> all-zero, never a throw');
-  eq(U.parseTokenUsageVector(null), { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0 }, 'KI-E66: null/malformed input -> all-zero, never a throw');
+  eq(U.parseTokenUsageVector({ status: 'success', data: { result: [] } }), { inputTokens: null, outputTokens: null, cacheReadTokens: null, cacheCreationTokens: null }, 'usage: empty vector remains unknown rather than fabricated zero');
+  eq(U.parseTokenUsageVector(null), { inputTokens: null, outputTokens: null, cacheReadTokens: null, cacheCreationTokens: null }, 'usage: malformed vector remains unknown rather than fabricated zero');
   ok(U.parseTokenUsageVector({ data: { result: [{ metric: { type: 'input' }, values: [[1, '1'], [2, '7']] }] } }).inputTokens === 7, 'KI-E66: a range-vector series (values[]) reads the LATEST sample, not the first');
 
   // cacheHitRate — the SAME formula already authored in the "Prompt-cache hit ratio" Grafana panel
@@ -3027,7 +3583,7 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
   eq(agg66.itemCallCounts[57], { X: 3, Y: 1 }, 'KI-E66: per-item call counts aggregate keyed by cycle');
   eq(agg66.tokenUsageSnapshots.length, 1, 'KI-E66: token_usage_snapshot events collect into tokenUsageSnapshots');
   const md66 = T.renderTelemetryReport(agg66, { generatedAt: 'T', file: 'f' });
-  ok(md66.includes('## Session token usage & cache hit rate (KI-E66, cycle-scoped, Prometheus-derived)'), 'KI-E66: the cache-hit-rate section header renders');
+  ok(md66.includes('## Session token usage & cache hit rate (KI-E66, Prometheus-derived)'), 'KI-E66: cache section renders without claiming causal cycle attribution');
   ok(md66.includes('| 57 | 1,000 | 200 | 5,000 | 300 | 6,500 | 79% |'), 'KI-E66: the cycle-level token/cache-hit-rate row renders with the correct rounded percentage');
   ok(md66.includes('## Per-item apportioned tokens (estimate — NOT a measurement, KI-E66)'), 'KI-E66: the per-item apportionment section header renders, explicitly labeled as an estimate');
   ok(md66.includes('| 57 | X | 750 |') && md66.includes('| 57 | Y | 250 |'), 'KI-E66: per-item apportioned tokens render proportional to real call-count share (X:3 calls=750, Y:1 call=250, of the real 1000-token cycle total)');
@@ -3142,44 +3698,48 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
   const P = await import('./prior-attempt.mjs');
   const pdir = mkdtempSync(join(tmpdir(), 'factory-priorattempt-'));
   const beforeWrite = Date.now() - 5000; // a claim timestamp strictly BEFORE any fixture file below is written
+  const structuredPlan = { rootCause: 'Missing guard', approach: 'The fix MUST include the brownfield note.', steps: ['Add the required handler guard', 'Cover the boundary with a test'], recommendScopeStop: false, recommendEscalate: true };
+  const checkpoint = (directory, planner = structuredPlan) => fsWrite(join(directory, 'progress.json'), JSON.stringify({ planner, plannerRequired: true }));
 
   // Empty dir -> nothing to reuse, never throws.
   eq(P.loadPriorAttempt(join(pdir, 'nope'), beforeWrite), { plan: null, test: null, fix: null }, 'KI-E69: a nonexistent item dir -> all-null, no throw');
 
-  // test.json alone (fixer never got that far) -> test reused, fix stays null, plan stays null
-  // (plan.md itself is not on disk, so the safe stand-in is correctly withheld too).
+  // Missing planner provenance blocks downstream reuse unless the checkpoint proves no planner ran.
   const d1 = join(pdir, 'd1'); mkdirSync(d1, { recursive: true });
   fsWrite(join(d1, 'test.json'), JSON.stringify({ red: true, testFiles: ['a.cs'] }));
   const pa1 = P.loadPriorAttempt(d1, beforeWrite);
-  ok(pa1.test && pa1.test.red === true, 'KI-E69: test.json alone is reused when fresh (mtime after the claim)');
+  eq(pa1.test, null, 'F07: test.json alone cannot prove planner control fields and is not reused');
   eq(pa1.fix, null, 'KI-E69: fix stays null when fix.json is absent');
-  eq(pa1.plan, null, 'KI-E69: plan stand-in is withheld when plan.md itself is not on disk, even though test.json reused');
-  eq(P.priorAttemptStages(pa1), ['test'], 'KI-E69: priorAttemptStages reports exactly the reused stages');
+  eq(pa1.plan, null, 'F07: absent structured plan remains null');
+  eq(P.priorAttemptStages(pa1), [], 'F07: missing structured planner does not fabricate a reused stage');
+  fsWrite(join(d1, 'progress.json'), JSON.stringify({ plannerRequired: false }));
+  eq(P.priorAttemptStages(P.loadPriorAttempt(d1, beforeWrite)), ['test'], 'F07: an explicit planner-free checkpoint permits fresh test reuse');
 
-  // plan.md + test.json + fix.json all present and fresh -> all three reused; plan is the safe
-  // {recommendScopeStop:false, recommendEscalate:false} stand-in for the two structured flags
-  // (never a PARSE of the prose file — no attempt to extract structured fields from markdown), PLUS
-  // (fix, multi-lens review 2026-08-25, ported) the raw plan.md text carried verbatim as `approach`
-  // so the KI-E87 PLAN-COMMITMENT SCAN has real text to check on a relaunch, instead of silently
-  // never firing (see lib/prior-attempt.mjs's fix comment).
+  // Only validated checkpoint planner fields authorize reuse; prose cannot establish sign-off state.
   const d2 = join(pdir, 'd2'); mkdirSync(d2, { recursive: true });
   fsWrite(join(d2, 'plan.md'), '# Plan\nproceed.');
   fsWrite(join(d2, 'test.json'), JSON.stringify({ red: false, verificationOnly: true }));
   fsWrite(join(d2, 'fix.json'), JSON.stringify({ applied: true, scopeStop: false, summary: 'did it' }));
+  eq(P.loadPriorAttempt(d2, beforeWrite), { plan: null, test: null, fix: null }, 'F07: legacy prose-only plan cannot synthesize false escalation or reuse its downstream artifacts');
+  checkpoint(d2);
   const pa2 = P.loadPriorAttempt(d2, beforeWrite);
-  eq(pa2.plan, { recommendScopeStop: false, recommendEscalate: false, approach: '# Plan\nproceed.' }, 'KI-E69/E87: plan reuses the safe scope/escalate stand-in PLUS the verbatim plan.md text as approach (not a structured-field parse) once test.json is ALSO present');
-  eq(pa2.test.verificationOnly, true, 'KI-E69: test.json reused verbatim');
-  eq(pa2.fix.applied, true, 'KI-E69: fix.json reused verbatim');
+  eq(pa2.plan, structuredPlan, 'F07: checkpoint preserves real planner escalation, steps and approach verbatim');
+  eq(pa2.test?.verificationOnly, true, 'KI-E69: test.json reused verbatim');
+  eq(pa2.fix?.applied, true, 'KI-E69: fix.json reused verbatim');
   eq(P.priorAttemptStages(pa2), ['plan', 'test', 'fix'], 'KI-E69: all three stages report reused');
-  // KI-E87 fix regression proof: a plan.md carrying real commitment language IS now visible to
-  // hasPlanCommitmentLanguage through the reused stand-in — this is the exact gap that was silently
-  // open before (the pre-fix stand-in had no text fields at all).
+  const escalationBatch = smokeBatch();
+  escalationBatch.items = [{ ...escalationBatch.items[1], priorAttempt: { plan: pa2.plan } }];
+  const escalationRun = await execSmoke(readFileSync(new URL('../factory.js', import.meta.url), 'utf8'), escalationBatch);
+  eq(escalationRun.result.results[0].toState, 'ESCALATED', 'F07: reused structured escalation still stops for human sign-off');
+  ok(!escalationRun.calls.some(c => c.label.endsWith(':integrator')), 'F07: reused escalation never integrates before human sign-off');
+  // Commitment language survives through the same structured approach used on a fresh attempt.
   const { hasPlanCommitmentLanguage: hpclE69 } = await import('./plan-commitment.mjs');
   const dCommit = join(pdir, 'd-commit'); mkdirSync(dCommit, { recursive: true });
   fsWrite(join(dCommit, 'plan.md'), '# Plan\nThe fix MUST include the brownfield note.');
   fsWrite(join(dCommit, 'test.json'), JSON.stringify({ red: true, testFiles: ['a.cs'] }));
+  checkpoint(dCommit);
   const paCommit = P.loadPriorAttempt(dCommit, beforeWrite);
-  ok(hpclE69(paCommit.plan.approach), 'KI-E87 fix: a relaunched item\'s reused plan stand-in carries real plan.md commitment language the pre-fix stub would have silently hidden from hasPlanCommitmentLanguage');
+  ok(hpclE69(paCommit.plan?.approach), 'KI-E87: reused structured approach retains commitment language');
 
   // Stale artifacts (mtime BEFORE the current claim) are a prior cycle's leftovers, never reused —
   // a claim timestamp set strictly AFTER these already-written files simulates exactly that (this
@@ -3192,21 +3752,64 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
   const d3 = join(pdir, 'd3'); mkdirSync(d3, { recursive: true });
   fsWrite(join(d3, 'test.json'), '{ not valid json');
   fsWrite(join(d3, 'fix.json'), JSON.stringify({ applied: true }));
+  checkpoint(d3);
   const pa3 = P.loadPriorAttempt(d3, beforeWrite);
   eq(pa3.test, null, 'KI-E69: malformed test.json -> null, never a throw');
   ok(pa3.fix && pa3.fix.applied === true, 'KI-E69: a sibling malformed file never poisons an otherwise-valid one');
+
+  // KI-E158(i) (ported from a host-mount session) — a REJECTED attempt (real review verdict, not a
+  // killed-mid-flight run) must never reuse test/fix verbatim: the rejection's own feedback would
+  // never reach a fresh fixer/test-author call. isReFix unconditionally disables ALL reuse.
+  const { utimesSync: utimesE158 } = await import('node:fs');
+  const dReFix = join(pdir, 'd-refix'); mkdirSync(dReFix, { recursive: true });
+  fsWrite(join(dReFix, 'plan.md'), '# Plan\nproceed.');
+  fsWrite(join(dReFix, 'test.json'), JSON.stringify({ red: true, testFiles: ['a.cs'] }));
+  fsWrite(join(dReFix, 'fix.json'), JSON.stringify({ applied: true, scopeStop: false, summary: 'did it' }));
+  checkpoint(dReFix);
+  eq(P.loadPriorAttempt(dReFix, beforeWrite, true), { plan: null, test: null, fix: null }, 'KI-E158(i): isReFix=true disables ALL reuse even though plan/test/fix are all fresh and well-formed — a rejected attempt is not a crash to recover from');
+  const paNotReFix = P.loadPriorAttempt(dReFix, beforeWrite, false);
+  ok(paNotReFix.test && paNotReFix.test.red === true, 'KI-E158(i): isReFix=false (or omitted) preserves the pre-existing KI-E69 reuse behavior');
+
+  // KI-E158(ii) (ported from a host-mount session) — a REPLAN (a fresh plan.md written after
+  // test.json/fix.json already exist) supersedes whatever test/fix were authored against the OLDER
+  // plan; a test/fix predating the current plan.md must not be reused even though it is otherwise
+  // fresh and well-formed (the KI-E69 "artifacts older than the claim" guard alone does not catch
+  // this, since the replan can happen AFTER the current claim too).
+  const dReplan = join(pdir, 'd-replan'); mkdirSync(dReplan, { recursive: true });
+  const oldMs = Date.now() - 10000;
+  fsWrite(join(dReplan, 'test.json'), JSON.stringify({ red: true, testFiles: ['old.cs'] }));
+  fsWrite(join(dReplan, 'fix.json'), JSON.stringify({ applied: true, scopeStop: false, summary: 'old fix' }));
+  utimesE158(join(dReplan, 'test.json'), new Date(oldMs), new Date(oldMs));
+  utimesE158(join(dReplan, 'fix.json'), new Date(oldMs), new Date(oldMs));
+  fsWrite(join(dReplan, 'plan.md'), '# Replan\nthe old approach is superseded.'); // written AFTER test/fix -> newer mtime
+  checkpoint(dReplan);
+  const paReplan = P.loadPriorAttempt(dReplan, oldMs - 5000);
+  eq(paReplan.test, null, 'KI-E158(ii): test.json predating a later plan.md is NOT reused, even though it is fresh relative to the claim and well-formed');
+  eq(paReplan.fix, null, 'KI-E158(ii): fix.json predating a later plan.md is NOT reused, for the same reason');
+  const malformed = join(pdir, 'malformed-plan'); mkdirSync(malformed);
+  fsWrite(join(malformed, 'test.json'), JSON.stringify({ red: true }));
+  for (const planner of [{ ...structuredPlan, recommendEscalate: 'false' }, { ...structuredPlan, steps: [42] }, { approach: 'prose only' }]) {
+    checkpoint(malformed, planner);
+    eq(P.loadPriorAttempt(malformed, beforeWrite), { plan: null, test: null, fix: null }, 'F07: malformed structured control fields fail closed without downstream reuse');
+  }
+  // Both artifacts predate the replan but postdate the claim; freshness alone cannot reject them.
 
   // Wiring: factory.js consults item.priorAttempt at exactly the plan/test/fix call sites, never at
   // verify (which must ALWAYS run fresh — the shape-mismatch risk above is exactly why).
   const facText69 = readFileSync(join(import.meta.dirname, '..', 'factory.js'), 'utf8');
   ok(facText69.includes("(item.priorAttempt && item.priorAttempt.plan) ||"), 'KI-E69: runItem() plan stage consults item.priorAttempt.plan');
-  ok(facText69.includes("(item.priorAttempt && item.priorAttempt.test) ||"), 'KI-E69: runItem() test stage consults item.priorAttempt.test');
-  ok(facText69.includes("(item.priorAttempt && item.priorAttempt.fix) ||"), 'KI-E69: runItem() fix stage consults item.priorAttempt.fix');
+  // KI-E170/E172 (ported from a host-mount session) restructured the test/fix reuse check from an
+  // inline `(item.priorAttempt && item.priorAttempt.X) || await call(...)` into an explicit
+  // `xReused` flag + `let x = xReused ? item.priorAttempt.x : await call(...)`, so the reuse
+  // consults the SAME field via a different, still-source-text-pinnable shape.
+  ok(facText69.includes("const testReused = !!(item.priorAttempt && item.priorAttempt.test)"), 'KI-E69: runItem() test stage consults item.priorAttempt.test');
+  ok(facText69.includes("const fixReused = !!(item.priorAttempt && item.priorAttempt.fix)"), 'KI-E69: runItem() fix stage consults item.priorAttempt.fix');
   ok(!facText69.includes('item.priorAttempt.verify') && !facText69.includes('item.priorAttempt && item.priorAttempt.verify'), 'KI-E69: verify is NEVER read from item.priorAttempt — always runs fresh (unsafe on-disk shape)');
   ok(facText69.includes('res.priorAttemptReuse'), 'KI-E69: the result always carries priorAttemptReuse (empty array when nothing was reused) — never silently absent');
 
   const drvText69 = readFileSync(join(import.meta.dirname, '..', 'driver.mjs'), 'utf8');
   ok(drvText69.includes("if (flags.reuse) {") && drvText69.includes('loadPriorAttempt(itemDir'), 'KI-E69: cmdResume gates the regeneration behind an explicit --reuse flag (never a silent default-behavior change)');
+  ok(drvText69.includes('loadPriorAttempt(itemDir, claimMs || undefined, it.reFix)'), 'KI-E158(i): cmdResume passes it.reFix through to loadPriorAttempt, so a relaunched reFix item never reuses a rejected test/fix');
   ok(drvText69.includes('priorAttemptReuse: (r.priorAttemptReuse'), 'KI-E69: item_folded telemetry surfaces priorAttemptReuse whenever a relaunch reused a killed run\'s artifacts');
   // Live-caught review fix (same day, cutting the actual cycle-58 recovery): run-args.json is a
   // group-time snapshot that does not see a LATER hand-edit to the emitted run-script (exactly what
@@ -3222,14 +3825,16 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
 // fresh re-auditor, and several others needing only a fresh integrator.
 {
   // -- pure missingStageFrom: the decision table --
-  eq(missingStageFrom(['CLAIMED', 'RED', 'GREEN', 'BUILT', 'TESTED', 'GATED', 'REFUTE_OK', 'REAUDITED'], {}).stage,
-    'integrator', 'KI-E81: last stage reached is REAUDITED -> only integrator is missing');
+  eq(missingStageFrom(['CLAIMED', 'RED', 'GREEN', 'BUILT', 'TESTED', 'GATED', 'REFUTE_OK', 'REAUDITED', 'FAILED'], {}, { kind: 'unavailable', stage: 'integrator' }).stage,
+    'integrator', 'F10: unavailable integrator is recovered through terminal FAILED transition');
+  eq(missingStageFrom(['REAUDITED', 'FAILED'], {}, { kind: 'failed', stage: 'integrator' }).stage, null, 'F10: completed failing integration requires remediation, not an infrastructure shortcut');
+  eq(missingStageFrom(['REAUDITED', 'FAILED'], {}).stage, null, 'F10: missing failure provenance cannot authorize integration-only recovery');
   eq(missingStageFrom(['CLAIMED', 'RED', 'GREEN', 'BUILT', 'TESTED', 'GATED', 'REFUTE_OK'], { reaudit: 'code=NULL' }).stage,
     're-auditor', 'KI-E81: last stage reached is REFUTE_OK -> re-auditor is missing');
   eq(missingStageFrom(['CLAIMED', 'RED', 'GREEN', 'BUILT', 'TESTED', 'GATED', 'REFUTE_OK'], { reaudit: 'code=NULL' }).lenses,
     ['code'], 'KI-E81: the single-lens case reads the lens name directly from the already-recorded gates.reaudit string, never re-derived');
   eq(missingStageFrom(['CLAIMED', 'RED', 'GREEN', 'BUILT', 'TESTED', 'GATED', 'REFUTE_OK'], { reaudit: 'code=ok edge-case=NULL' }).lenses,
-    ['code', 'edge-case'], 'KI-E81: a multi-lens reaudit string parses every lens name, in order, not just the first');
+    ['edge-case'], 'F10: recovery reruns only unavailable lenses and preserves completed approvals');
   eq(missingStageFrom(['CLAIMED', 'RED', 'GREEN', 'BUILT', 'TESTED', 'GATED', 'REFUTE_OK'], {}).stage,
     null, 'KI-E81: reached REFUTE_OK but gates.reaudit was never even started (no string at all) -> refuses to guess, stage:null (falls back to a normal re-group)');
   eq(missingStageFrom(['CLAIMED', 'RED', 'GREEN', 'BUILT', 'TESTED', 'GATED'], {}).stage,
@@ -3250,7 +3855,7 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
 
   // -- wiring: cmdRecover actually calls missingStageFrom and gates the auto-generated prompt
   // behind "no structured dissent" (never fires alongside a real regate-*.md prompt) --
-  ok(dsrc81.includes('missingStageFrom(lastFailure.transitions, lastFailure.gates)'), 'KI-E81: cmdRecover calls missingStageFrom with the last-failure.json fields');
+  ok(dsrc81.includes('missingStageFrom(lastFailure.transitions, lastFailure.gates, lastFailure.failure)'), 'KI-E81/F10: cmdRecover passes failure provenance along with transitions and gate outcomes');
   ok(dsrc81.includes('if (!dissent.length) {') && dsrc81.indexOf('if (!dissent.length) {') < dsrc81.indexOf('missingStageFrom(lastFailure.transitions'),
     'KI-E81: the missing-stage detection is gated behind "no dissent" — never overrides a real regate-*.md prompt with a stage-prompt guess');
   ok(dsrc81.includes("join(recDir, `recover-stage-${missing.stage}.md`)"), 'KI-E81: the generated prompt file is named recover-stage-<role>.md, distinct from regate-<role>.md');
@@ -3506,9 +4111,875 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
   ok(fixerMd93.includes('NO-INVENTION SELF-CHECK (KI-E95)'), 'KI-E95: fixer brief carries the no-invention self-check');
   ok(fixerMd93.includes('ADJACENT-CLAIM RE-CHECK (KI-E95)'), 'KI-E95: fixer brief carries the adjacent-claim re-check');
   ok(fixerMd93.includes('CANCELLATIONTOKEN CHAIN SELF-CHECK (KI-E96)'), 'KI-E96: fixer brief carries the CancellationToken chain self-check');
-  ok(fixerMd93.indexOf('9. **RE-FIX') < fixerMd93.indexOf('10. **SIBLING-PATTERN SWEEP'), 'KI-E94: sibling-pattern sweep is numbered AFTER the existing RE-FIX step, not spliced ahead of it');
-  ok(fixerMd93.indexOf('10. **SIBLING-PATTERN SWEEP') < fixerMd93.indexOf('11. **CANCELLATIONTOKEN'), 'KI-E96: CancellationToken self-check follows the sibling-pattern sweep in list order');
+  ok(fixerMd93.indexOf('**RE-FIX') >= 0 && fixerMd93.indexOf('**RE-FIX') < fixerMd93.indexOf('**SIBLING-PATTERN SWEEP'), 'KI-E94: sibling-pattern sweep follows RE-FIX independently of list numbering');
+  ok(fixerMd93.indexOf('**SIBLING-PATTERN SWEEP') < fixerMd93.indexOf('**CANCELLATIONTOKEN'), 'KI-E96: CancellationToken self-check follows sibling-pattern sweep');
 }
 
+// KI-E132 (ported from a host-mount session, 2026-09-04) — fold's P1 verificationOnly branch read
+// r.verificationOnly, a copy embedded in the checkpoint/result object at whatever point it was
+// captured. It goes STALE when an item is re-claimed for a later, redundant re-verification round:
+// that round's fresh test.json/verify-red-raw.txt overwrite the very files P1 reads, but nothing
+// ever updates the embedded r.verificationOnly it also reads — so a fully-gate-APPROVED item's
+// legitimate "still passes, exit=0" re-confirmation gets folded as if it were a normal lane's
+// vacuous test. Live on the origin host: three fully-approved closes folded to FAILED by this bug
+// alone. Fix: re-derive from the on-disk test.json (same freshness tier as verify-red-raw.txt, read
+// via the same readIf) and prefer it on disagreement. driver.mjs has no exports (a CLI script, not
+// a module) — this pins the corrected SHAPE at the source level, the same convention every other
+// driver.mjs-internal behavior in this suite already uses.
+{
+  const dsrc132 = readFileSync(new URL('../driver.mjs', import.meta.url), 'utf8');
+  const p1Start = dsrc132.indexOf('// P1 — RED proof:');
+  ok(p1Start > 0, 'KI-E132: the P1 RED-proof block is still findable by its own comment anchor');
+  const p1Block = dsrc132.slice(p1Start, p1Start + 4200);
+  ok(p1Block.includes("readIf('test.json')"), 'KI-E132: P1 re-reads test.json fresh from disk, the same freshness tier as verify-red-raw.txt');
+  ok(/const diskVO = !!\(tj\.verificationOnly === true && !tj\.red\)/.test(p1Block), 'KI-E132: the on-disk verificationOnly is recomputed with the SAME formula factory.js uses in the first place (test.verificationOnly===true && !test.red), not trusted as a bare flag');
+  ok(/if \(diskVO !== effectiveVO\)/.test(p1Block), 'KI-E132: a mismatch between the embedded flag and the on-disk file is DETECTED and logged, not silently overwritten');
+  ok(p1Block.includes('effectiveVO = diskVO;'), 'KI-E132: and the on-disk value WINS the disagreement — it is the live test-author attestation, the embedded copy is not');
+  ok(!/if \(r\.verificationOnly === true\)/.test(p1Block), 'KI-E132: the branch condition no longer reads the possibly-stale r.verificationOnly directly');
+  ok(p1Block.includes('if (effectiveVO) {'), 'KI-E132: the branch now decides on the re-derived value');
+  ok(p1Block.includes('r.verificationOnly = effectiveVO;'), 'KI-E132: the embedded flag is written back so the LATER P9/filesChanged checks (which also read r.verificationOnly) see the corrected value too');
+  ok(p1Block.includes('try {') && p1Block.includes('catch { /* unparseable test.json'), 'KI-E132: an unparseable/absent test.json falls back to the embedded flag rather than throwing or defaulting to false');
+}
+
+// KI-E134 (ported from a host-mount session, 2026-09-04) — PREVENTION guard: every build-test.sh
+// subcommand that takes a worktree-rooted path and invokes dotnet now refuses to run unless that
+// path resolves under state/worktrees/<id>/. Real behavioral tests (actual script invocation, real
+// exit codes / stderr), not source-text pins — this is the mechanism directly motivated by the
+// origin session's repeated main-tree contamination incidents.
+if (hasUsableBash('KI-E134 worktree-guard behavioral fixture (11 assertions)')) {
+  const { mkdtempSync: mkH, mkdirSync: mdH, rmSync: rmH } = await import('node:fs');
+  const { tmpdir: tdH } = await import('node:os');
+  const { join: jH } = await import('node:path');
+  const { execFileSync: exH } = await import('node:child_process');
+  const btPathH = join(import.meta.dirname, '..', '..', 'verify', 'build-test.sh');
+  const runBt = (args, cwd) => {
+    try { const out = exH(bashPath, [btPathH, ...args], { cwd, stdio: ['ignore', 'pipe', 'pipe'], encoding: 'utf8' }); return { code: 0, stdout: out, stderr: '' }; }
+    catch (e) { return { code: e.status, stdout: String(e.stdout || ''), stderr: String(e.stderr || '') }; }
+  };
+
+  // A cwd OUTSIDE any state/worktrees/ tree — the four dotnet-invoking subcommands must refuse
+  // before touching anything.
+  const outsideH = mkH(jH(tdH(), 'bt134-outside-'));
+  for (const args of [['build', 'SomeProject.sln'], ['red', 'SomeProject.sln', 'SomeFilter'], ['filter', 'SomeProject.sln', 'SomeFilter'], ['suite', 'SomeProject.sln']]) {
+    const r = runBt(args, outsideH);
+    eq(r.code, 65, `KI-E134: '${args[0]}' from OUTSIDE any worktree refuses with exit 65, not a silent wrong-tree operation`);
+    ok(r.stderr.includes('FACTORY::WORKTREE-GUARD::REFUSED'), `KI-E134: '${args[0]}'s refusal is announced on stderr with the guard marker`);
+  }
+  // `claims` (a read-only git/node lint, not a dotnet invocation) is DELIBERATELY not guarded — a
+  // placeholder/non-worktree path is a legitimate way to exercise its wiring, and it fails (or
+  // degrades) for its own reason, never the guard's. Confirm the narrower scope is pinned, not just
+  // documented.
+  const rClaims = runBt(['claims', 'SomeNonexistentWorktree'], outsideH);
+  ok(!rClaims.stderr.includes('WORKTREE-GUARD'), 'KI-E134: `claims` (a read-only lint, no dotnet invocation) is NOT guarded — it fails for its own reason, never the guard\'s');
+
+  // A cwd INSIDE a (fake) state/worktrees/<id>/ tree — the guard passes; whatever happens next is a
+  // REAL dotnet failure (bogus project), never the guard's exit 65.
+  const insideParentH = jH(tdH(), 'bt134-fake-mount', 'state', 'worktrees');
+  mdH(insideParentH, { recursive: true });
+  const insideH = mkH(jH(insideParentH, 'FAKE-ITEM-'));
+  const rBuild = runBt(['build', 'NoSuchProject.sln'], insideH);
+  ok(rBuild.code !== 65 || !rBuild.stderr.includes('WORKTREE-GUARD'), 'KI-E134: from INSIDE a state/worktrees/<id>/ tree, the guard passes (a bogus project fails for its OWN reason, not the guard)');
+
+  // An explicit ABSOLUTE state/worktrees/... path is accepted even when cwd is OUTSIDE any worktree —
+  // this is the controller's own usage pattern (invoked from the factory root).
+  const absoluteTarget = jH(insideH, 'NoSuchProject.sln').replace(/\\/g, '/').replace(/^([A-Za-z]):\//, (_, drive) => '/' + drive.toLowerCase() + '/');
+  const rAbs = runBt(['build', absoluteTarget], outsideH);
+  ok(rAbs.code !== 65 || !rAbs.stderr.includes('WORKTREE-GUARD'), 'KI-E134: an absolute state/worktrees/-rooted target passes the guard regardless of cwd — the controller\'s own invocation style stays supported');
+
+  rmH(outsideH, { recursive: true, force: true });
+  rmH(jH(tdH(), 'bt134-fake-mount'), { recursive: true, force: true });
+}
+
+// KI-E134 exec-smoke (ported from a host-mount session, 2026-09-04) — the plan-steps nudge must
+// ACTUALLY fire and feed into STEP mode, not just pin as source text (a TDZ/reference/shape crash
+// in a newly-added branch is invisible to `node --check` and to every source-text assertion). Live
+// motivation on the origin host: two items in one batch both died in PROSE mode with "no evidence
+// in the diff after one bounded amend" — a STEP-mode probe would have named the exact missing piece
+// instead of a vague prose match.
+{
+  const src134 = readFileSync(join(import.meta.dirname, '..', 'factory.js'), 'utf8');
+  let planCallCount134 = 0;
+  const { result: res134, calls: calls134 } = await execSmoke(src134, smokeBatch(), {
+    agentOverride: (prompt, opts) => {
+      if ((opts && opts.label) === 'SMOKE-CODE:planner') {
+        planCallCount134++;
+        if (planCallCount134 === 1) {
+          // the INITIAL call: commitment language present, but steps under the 2-entry floor.
+          return { rootCause: 'stub', approach: 'The fix MUST thread the CancellationToken through the repository call.', steps: [], files: [], testStrategy: 'stub', blastRadius: 'stub', ruleRisks: 'stub', recommendEscalate: false, recommendScopeStop: false };
+        }
+        // the NUDGE call: supply real decomposition.
+        return { steps: ['Thread the CancellationToken through OrderService.SubmitAsync', 'Thread it through the downstream repository call', 'Add a regression test asserting cancellation propagates'], note: 'decomposed on request' };
+      }
+      return undefined;
+    },
+  });
+  eq(planCallCount134, 2, 'KI-E134 exec-smoke: a plan with commitment language and no steps triggers exactly ONE nudge call (never a loop)');
+  const plannerCalls134 = calls134.filter((c) => c.label === 'SMOKE-CODE:planner');
+  eq(plannerCalls134.length, 2, 'KI-E134 exec-smoke: exactly two SMOKE-CODE:planner calls are recorded — the initial plan plus the one nudge follow-up');
+  const by134 = Object.fromEntries((res134.results || []).map((r) => [r.id, r]));
+  ok(by134['SMOKE-CODE'] && by134['SMOKE-CODE'].gateDetails && by134['SMOKE-CODE'].gateDetails['probe:plan-commitment-scan'] && by134['SMOKE-CODE'].gateDetails['probe:plan-commitment-scan'].headline.includes('[STEP mode]'),
+    'KI-E134 exec-smoke: the nudged steps feed into the SAME plan object the probe reads — STEP mode engages instead of falling through to the weaker PROSE mode');
+  ok(!(res134.results || []).some((r) => String(r.note || '').startsWith('runItem threw')), 'KI-E134 exec-smoke: no runItem crash (KI-L36 class) — the new branch is shape-safe under the Workflow AsyncFunction execution model');
+
+  // The common case (default stub already returns 2+ steps, no commitment language needed to trigger
+  // it either way) must NOT spend a second call — every pre-existing exec-smoke call-count assertion
+  // elsewhere in this suite already regression-covers this: if the nudge over-fired on an unrelated
+  // item/lane, those counts would shift and this suite would fail elsewhere.
+  ok(!/if \(plan && item\.priorAttempt\)/.test(src134), 'KI-E134: sanity — the nudge gate reads freshPlanCall, not a re-derived priorAttempt check (avoids two sources of truth for the same condition)');
+  ok(/const freshPlanCall = !\(item\.priorAttempt && item\.priorAttempt\.plan\)/.test(src134), 'KI-E134: a KI-E69 reused plan is excluded from the nudge — re-asking about a PRIOR call\'s authorship makes no sense, and reuse exists specifically to skip the planner call for cost');
+
+  // Ported to the opencode runtime too (the schema-parity gate — Fix #20 in opencode/_selftest.mjs —
+  // requires every factory.js *_SCHEMA to have a byte-identical schemas.mjs counterpart, COMMENT_SCHEMA
+  // being the one sanctioned exception for a genuine architectural reason that does not apply here).
+  // That runtime has no KI-E69 reuse concept at all (grepped: zero priorAttempt references), so every
+  // plan call there is inherently "fresh" — no equivalent guard needed on that side.
+  const rt134 = readFileSync(join(import.meta.dirname, '..', 'opencode', 'runtime.mjs'), 'utf8');
+  const sc134 = readFileSync(join(import.meta.dirname, '..', 'opencode', 'schemas.mjs'), 'utf8');
+  ok(sc134.includes('export const PLAN_STEPS_NUDGE_SCHEMA') && sc134.includes('PLAN_SCHEMA, PLAN_STEPS_NUDGE_SCHEMA,'), 'KI-E134: opencode/schemas.mjs exports PLAN_STEPS_NUDGE_SCHEMA and registers it in SCHEMAS');
+  ok(/if \(phase === 'plan-steps-nudge'\)/.test(rt134), 'KI-E134: opencode/runtime.mjs dispatches the nudge as its own phase (this runtime is an external-dispatch state machine, not a single async function — a new phase is the correct shape, not a nested await)');
+  ok(/if \(normalizePlanSteps\(plan\.steps\)\.length < 2 && hasPlanCommitmentLanguage/.test(rt134), 'KI-E134: opencode\'s plan-result handler checks the SAME condition as factory.js before routing to the nudge phase');
+  ok(/progress\.phase = 'plan-steps-nudge'/.test(rt134) && /if \(phaseKey === 'plan-steps-nudge'\)/.test(rt134), 'KI-E134: the nudge phase is both entered (on the plan side) and its result consumed (merged into progress.plan) — not a dead-end phase');
+  ok(rt134.indexOf("if (phaseKey === 'plan-steps-nudge')") > rt134.indexOf("if (phaseKey === 'plan')"), 'KI-E134: the nudge result-handler is wired AFTER the plan result-handler in source order, matching the phase transition direction');
+}
+
+// KI-E146 (ported from a host-mount session) — the KI-E89 unclaimed-drift sweep now also runs at fold
+// time, not just when an operator remembers to invoke `main-check` by hand. Injected execution plus
+// source pins confirm the new block exists inside cmdFold, wires the real REPO_ROOT/MOUNT_REL
+// through the same pure helper unclaimedMainDrift (no hand-rolled reimplementation), aggregates
+// claimedPaths from every item's OWN main-snapshot.json (not just the one item cmdMainCheck was asked
+// about), fails safe (never crashes a fold on a missing/corrupt items dir), and runs BEFORE
+// foldResults so a drifting fold's output is never truncated by an exception in the new code.
+{
+  const drv146 = readFileSync(join(import.meta.dirname, '..', 'driver.mjs'), 'utf8');
+  const cmdFoldStart146 = drv146.indexOf('function cmdFold(file, flags)');
+  ok(cmdFoldStart146 !== -1, 'KI-E146: cmdFold still exists under its expected signature');
+  const foldResultsCall146 = drv146.indexOf('const { applied, rejected, skipped } = foldResults(ledger, arr)', cmdFoldStart146);
+  ok(foldResultsCall146 !== -1 && foldResultsCall146 > cmdFoldStart146, 'KI-E146: sanity — foldResults call still exists after cmdFold\'s start');
+  const cfBody146 = drv146.slice(cmdFoldStart146, foldResultsCall146 + 100);
+  ok(cfBody146.includes('KI-E146'), 'KI-E146: the new block is labeled so a reader/grep can find why fold now scans for unclaimed drift');
+  const ki146Idx = cfBody146.indexOf('KI-E146');
+  const foldResultsIdxInBody = cfBody146.indexOf('const { applied, rejected, skipped } = foldResults(ledger, arr)');
+  ok(ki146Idx !== -1 && foldResultsIdxInBody !== -1 && ki146Idx < foldResultsIdxInBody, 'KI-E146: the unclaimed-drift sweep runs BEFORE foldResults is applied, not after');
+  await runMainGuardDriverTests('fold', { ok, eq });
+  ok(/for \(const d of readdirSync\(itemsRoot,\s*\{\s*withFileTypes:\s*true\s*\}\)\)/.test(cfBody146), 'KI-E146: claimedPaths is aggregated by scanning EVERY item dir, not just a single id — this is the genuinely new part vs cmdMainCheck (which is only ever asked about one id at a time)');
+  ok(/readJson\(join\(itemsRoot, d\.name, 'main-snapshot\.json'\)\)/.test(cfBody146), 'KI-E146: reads each item\'s OWN main-snapshot.json (the same claim-time snapshot KI-L65/KI-E50 already trust) rather than re-deriving claimed paths from the ledger or items[].files');
+  ok(/catch\s*\{\s*\/\*\s*no snapshot for this item/.test(cfBody146), 'KI-E146: a missing/unreadable snapshot for one item contributes nothing and does not abort the aggregation for the rest — matches cmdMainCheck\'s own per-item tolerance');
+  ok(cfBody146.includes('MAIN-DRIFT unclaimed (KI-E89/E146)'), 'KI-E146: the fold-time warning carries BOTH ids (distinct from cmdMainCheck\'s bare KI-E89 label) so a reader can tell which call site caught it');
+  ok(!cfBody146.includes('unlinkSync(') && !cfBody146.includes('rmSync(') && !/execSync\(['"]rm /.test(cfBody146), 'KI-E146: still never auto-repairs (KI-E89\'s own documented reason: cannot distinguish agent contamination from an operator\'s unrelated WIP) — detection only, no deletion path exists in this block');
+}
+
+// KI-E149 (ported from a host-mount session) — mechanical write-isolation for the two roles that
+// actually mutate a worktree's tracked source (fixer, test-author). Every prior main-tree-
+// contamination fix on the origin host was DETECTION after the fact; four live tests there
+// established that the Agent/Workflow tool's own `isolation:'worktree'` option mechanically
+// REJECTS an Edit/Write call targeting the shared main checkout, while leaving writes to any OTHER
+// git worktree (this item's own included), reads anywhere, and Bash-tool writes (tee/redirect/
+// heredoc) to ANY path completely unaffected — a real, disclosed gap, not a false sense of
+// completeness. See the KI-E149 KNOWN-ISSUES.md entry for the four tests themselves.
+{
+  const src149 = readFileSync(join(import.meta.dirname, '..', 'factory.js'), 'utf8');
+  // Source-text pins: the helper exists with the right condition, and BOTH the primary and
+  // fallback-model opts objects in call() get the flag — a fix that only isolated the primary path
+  // would silently stop protecting the fallback route the moment a primary model fell over (KI-D10).
+  ok(/function needsWriteIsolation\(role\)/.test(src149), 'KI-E149: the needsWriteIsolation(role) helper exists');
+  ok(/needsWriteIsolation\(role\)\s*\{\s*return \(role === 'fixer' \|\| role === 'test-author'\)/.test(src149), 'KI-E149: scoped to exactly the two roles that mutate worktree SOURCE — not every role (a probe/gate/judge never writes source and would only pay the isolated-worktree setup cost for nothing)');
+  ok(/A\.policies && A\.policies\.isolateWorktreeWrites === false/.test(src149), 'KI-E149: a host policy escape hatch exists — explicit false is the only way off, so an unset/missing policy defaults ON (this is a safety feature, not an opt-in)');
+  ok((src149.match(/if \(needsWriteIsolation\(role\)\) (opts|fb)\.isolation = 'worktree'/g) || []).length === 2, 'KI-E149: BOTH the primary opts AND the KI-D10 fallback opts get the flag in call() — a fix that missed the fallback would silently stop protecting it the moment a primary model degraded');
+  ok(/FILE-WRITE ISOLATION IS ACTIVE FOR YOU \(KI-E149\)/.test(src149), 'KI-E149: the role-conditional prompt hint exists, telling the isolated agent how to still reach its ARTIFACTS DIR (via Bash, since that path is outside the worktree the shared prefix already told every role about)');
+
+  // Behavioural: run the real pipeline (execSmoke) against SMOKE-CODE (a codeChange item — fixer
+  // and test-author both actually run) and inspect what call() really dispatched, not just what
+  // the source text claims it does (KI-L43: a source-text pin cannot catch a TDZ/shape bug in the
+  // branch it pins).
+  const { calls: calls149 } = await execSmoke(src149, smokeBatch());
+  const isolated149 = calls149.filter((c) => c.label === 'SMOKE-CODE:fixer' || c.label === 'SMOKE-CODE:test-author');
+  ok(isolated149.length > 0, 'KI-E149 exec-smoke: sanity — SMOKE-CODE actually dispatched fixer/test-author calls');
+  ok(isolated149.every((c) => c.isolation === 'worktree'), 'KI-E149 exec-smoke: every real fixer/test-author call carries opts.isolation === "worktree"');
+  ok(isolated149.every((c) => /FILE-WRITE ISOLATION IS ACTIVE FOR YOU \(KI-E149\)/.test(c.prompt)), 'KI-E149 exec-smoke: every isolated call actually SEES the hint in its composed prompt (not just a flag with no explanation reaching the agent)');
+  const notIsolated149 = calls149.filter((c) => c.label === 'SMOKE-CODE:planner' || /:gate-|:review-/.test(c.label));
+  ok(notIsolated149.length > 0, 'KI-E149 exec-smoke: sanity — the same lane also dispatched non-fixer/test-author calls to compare against');
+  ok(notIsolated149.every((c) => c.isolation === null), 'KI-E149 exec-smoke: planner/gate/review calls carry NO isolation — this is scoped to the two writer roles, not a blanket lockdown');
+  ok(notIsolated149.every((c) => !/FILE-WRITE ISOLATION IS ACTIVE FOR YOU/.test(c.prompt)), 'KI-E149 exec-smoke: non-isolated roles never see the hint either — a leaked hint on a role that is not actually isolated would be actively misleading');
+
+  // The escape hatch: an explicit host policy turns it OFF for every role, not just softens it.
+  const offBatch149 = smokeBatch();
+  offBatch149.policies = { ...offBatch149.policies, isolateWorktreeWrites: false };
+  const { calls: callsOff149 } = await execSmoke(src149, offBatch149);
+  const wouldBeIsolated149 = callsOff149.filter((c) => c.label === 'SMOKE-CODE:fixer' || c.label === 'SMOKE-CODE:test-author');
+  ok(wouldBeIsolated149.length > 0, 'KI-E149 exec-smoke: sanity — the OFF-policy lane still dispatched fixer/test-author calls');
+  ok(wouldBeIsolated149.every((c) => c.isolation === null), 'KI-E149 exec-smoke: isolateWorktreeWrites:false actually turns it off for the roles that would otherwise be isolated (the operator escape hatch really works, not just the source-text condition)');
+  ok(wouldBeIsolated149.every((c) => !/FILE-WRITE ISOLATION IS ACTIVE FOR YOU/.test(c.prompt)), 'KI-E149 exec-smoke: with the policy off, the hint does not leak into the prompt either — an agent is never told about a guardrail that is not actually armed');
+}
+
+// KI-E150 (ported from a host-mount session) — precise PER-ITEM token attribution. Prompted directly
+// by an owner question there ("how many tasks closed since Thursday, tokens per task?") that the
+// origin factory could not answer: KI-E23's budget.spent() already tracked real output tokens, but
+// only as ONE grand total for the whole Workflow run — every item sharing a batch was invisible
+// individually, and the per-item `cost` field only ever counted agent CALLS, never tokens.
+// budget.spent() is a SHARED, run-wide counter with no per-call breakdown exposed to this sandbox
+// (the Workflow runtime gives a script no other token signal at all) — under concurrent items (the
+// normal case, CONC>1), a naive snapshot-before/snapshot-after around one item's whole lifecycle
+// would double-count or steal tokens a DIFFERENT item spent during the same wall-clock window. The
+// fix: a shared "last claimed" checkpoint (lastSpentGlobal) that every successful agent() completion,
+// inside call()'s recordTokens(), reads and atomically advances (no `await` between the read and the
+// write, so no other item's completion can interleave inside that step — JS resolves one microtask
+// fully before the next runs) — correct under REAL concurrency, not just when items happen to run
+// sequentially.
+{
+  const src150 = readFileSync(join(import.meta.dirname, '..', 'factory.js'), 'utf8');
+  ok(/let lastSpentGlobal = /.test(src150), 'KI-E150: the shared token checkpoint exists at top-level (module) scope, outside runItem, so it persists across ALL concurrently-running items in the batch');
+  ok(/const recordTokens = function \(\) \{/.test(src150), 'KI-E150: the per-item recordTokens helper exists inside runItem, closing over that item\'s own res object');
+  ok(/const now = budget\.spent\(\)\s*\n\s*const delta = now - lastSpentGlobal\s*\n\s*lastSpentGlobal = now/.test(src150), 'KI-E150: the read-then-write is a single synchronous block with no await between reading the counter and advancing the checkpoint — the actual atomicity the whole design depends on');
+  for (const failureMode of ['null', 'throw']) {
+    let spent = 0, attempts = 0;
+    const batch = smokeBatch(); batch.items = [batch.items[1]]; batch.attempts = 2;
+    batch.items[0].routes = { ...((await import('../opencode/routing.mjs')).routesFor(batch.items[0])), testAuthor: { model: 'primary-fixture', fallback: { model: 'fallback-fixture' } } };
+    const run = await execSmoke(src150, batch, {
+      budget: { total: null, spent: () => spent, remaining: () => Infinity },
+      agentOverride: async (_prompt, opts) => {
+        await new Promise(r => setTimeout(r, 0)); spent += 10;
+        if (opts.label.endsWith(':test-author') && opts.model === 'primary-fixture') {
+          attempts++;
+          if (failureMode === 'throw') throw new Error('temporary fixture outage');
+          return null;
+        }
+      },
+    });
+    eq(attempts, 2, 'accounting: both primary ' + failureMode + ' attempts execute before fallback');
+    ok(run.calls.some(c => c.model === 'fallback-fixture'), 'accounting: fallback actually executes after ' + failureMode);
+    const charged = run.calls.filter(c => !/:progress:|:checkpoint$/.test(c.label)).length;
+    eq(run.result.results[0].tokensUsed, charged * 10, 'accounting: failed primary and successful fallback attempts each claim their token delta (' + failureMode + ')');
+    eq(run.result.attemptObservations.length, run.calls.length, 'accounting: every physical attempt, including checkpoint overhead, has an observation');
+  }
+
+  const lsrc150 = readFileSync(join(import.meta.dirname, 'ledger.mjs'), 'utf8');
+  ok(/tokensUsed: 0,/.test(lsrc150), 'KI-E150: a new ledger item defaults tokensUsed to 0 (discoverable field, matching cost\'s own {} default) rather than leaving it silently absent');
+  ok(/if \(typeof r\.tokensUsed === 'number'\) row\.tokensUsed = \(row\.tokensUsed \|\| 0\) \+ r\.tokensUsed;/.test(lsrc150), 'KI-E150: foldResults ACCUMULATES tokensUsed across attempts, same posture as the pre-existing cost accumulation — a relaunched item\'s lifetime total, not just its last attempt');
+
+  const dsrc150 = readFileSync(join(import.meta.dirname, '..', 'driver.mjs'), 'utf8');
+  ok(/tokensUsed: r\.tokensUsed \|\| undefined/.test(dsrc150), 'KI-E150: the item_folded telemetry event carries tokensUsed through — without this, the real per-item number would be computed and persisted to the ledger but invisible to telemetry-report/cost-history consumers');
+  ok(/function topTokenItems\(ledger, n\)/.test(dsrc150), 'KI-E150: a topTokenItems helper exists for the cost report\'s new top-10-by-tokens section');
+
+  // Behavioural: every agent() call advances a shared, deterministic counter by a FIXED amount. If the
+  // atomic-claim attribution had ANY cross-item contamination, a given item's tokensUsed would NOT
+  // exactly equal its own call count times that fixed amount — this discriminates a real bug, it is
+  // not just a "the grand total adds up" sanity check that a broken implementation could still pass.
+  const PER_CALL_TOKENS_150 = 1000;
+  let mockSpent150 = 0;
+  const budget150 = { total: null, spent: () => mockSpent150, remaining: () => Infinity };
+  // KI-E150: a purely-synchronous override lets makeLimiter's pump() dispatch every concurrent
+  // call's underlying "agent resolution" in one contiguous microtask burst — ALL of them increment
+  // mockSpent150 before ANY of them reaches its own onAttempt() claim, so whichever claim happens to
+  // be first in the resulting queue absorbs the whole burst. That never happens for real agent calls
+  // (genuinely different wall-clock completion times mean each call's resolve-then-claim chain drains
+  // fully before the next one starts) — crossing a real macrotask boundary here (a 0ms setTimeout)
+  // reproduces that same one-at-a-time draining instead of the mock's artificial same-tick pile-up.
+  const { result: result150, calls: calls150 } = await execSmoke(src150, smokeBatch(), {
+    budget: budget150,
+    agentOverride: () => new Promise((resolve) => {
+      setTimeout(() => { mockSpent150 += PER_CALL_TOKENS_150; resolve(undefined); }, 0);
+    }), // falls through to defaultAgentStub for the actual response shape
+  });
+  // KI-E150: checkpointProgress (KI-E137) / checkpointResult (KI-L40) also call tryAgent — their
+  // labels are `<id>:progress:<stage>` / `<id>:checkpoint`, so they'd otherwise inflate the "expected"
+  // count below even though claimTokensSilently deliberately keeps their spend OUT of any item's
+  // tokensUsed (same posture as sweep mode's separately-tracked cost). Exclude them from both the
+  // per-item expected tally and the grand-total reconciliation, or this test would fail for the wrong
+  // reason — asserting a real item's tokensUsed against an expected value inflated by infra overhead.
+  // (This repo has only checkpointResult/KI-L40 — checkpointProgress/KI-E137 was not ported here — so
+  // only the `:checkpoint` shape ever actually fires below; the `:progress:` half of the predicate is
+  // harmless dead weight, kept for byte-parity with the origin check rather than trimmed to what this
+  // repo currently exercises.)
+  const isCheckpointLabel150 = (label) => { const seg = label.split(':')[1]; return seg === 'progress' || seg === 'checkpoint'; };
+  const byItem150 = {};
+  for (const c of calls150) {
+    if (isCheckpointLabel150(c.label)) continue;
+    const id = c.label.split(':')[0]; byItem150[id] = (byItem150[id] || 0) + 1;
+  }
+  ok(Object.keys(byItem150).length > 1, 'KI-E150 exec-smoke: sanity — the smoke batch dispatched calls for MULTIPLE items sharing the run (the exact scenario the atomic-claim design exists for)');
+  const resultsById150 = Object.fromEntries((result150.results || []).map((r) => [r.id, r]));
+  let anyChecked150 = false;
+  for (const [id, callCount] of Object.entries(byItem150)) {
+    const r150 = resultsById150[id];
+    if (!r150) continue;
+    anyChecked150 = true;
+    eq(r150.tokensUsed, callCount * PER_CALL_TOKENS_150, 'KI-E150 exec-smoke: ' + id + '\'s tokensUsed exactly equals its OWN call count (' + callCount + ') times the per-call amount — no cross-item contamination under concurrent Promise.all execution');
+  }
+  ok(anyChecked150, 'KI-E150 exec-smoke: sanity — at least one item was actually checked against its own call count');
+  const checkpointCalls150 = calls150.filter((c) => isCheckpointLabel150(c.label)).length;
+  ok(checkpointCalls150 > 0, 'KI-E150 exec-smoke: sanity — the smoke batch actually exercised the checkpoint writers (otherwise the exclusion above is untested)');
+  const totalClaimed150 = (result150.results || []).reduce((a, r) => a + (r.tokensUsed || 0), 0);
+  eq(totalClaimed150, mockSpent150 - checkpointCalls150 * PER_CALL_TOKENS_150, 'KI-E150 exec-smoke: the SUM of every item\'s tokensUsed plus the checkpoint-writer overhead (deliberately discarded by claimTokensSilently, never attributed to any item) exactly equals the total tokens spent across the whole run — checkpoint overhead is the ONLY intentionally-unattributed spend, and nothing else is lost or double-counted');
+
+  // The default exec-smoke budget stub (spent() always 0, used by every OTHER test in this suite) must
+  // stay fully inert for this new field — no existing test's result-shape assertions should ever see a
+  // populated tokensUsed they were not written to expect.
+  const { result: resultDefault150 } = await execSmoke(src150, smokeBatch());
+  ok((resultDefault150.results || []).every((r) => r.tokensUsed === undefined), 'KI-E150 exec-smoke: with the default (non-incrementing) budget stub every OTHER test in this suite already relies on, tokensUsed stays undefined — this feature is fully inert until a host actually wires a real budget');
+}
+
+// KI-E137 (ported from a host-mount session) — INCREMENTAL PROGRESS CHECKPOINTING. checkpointResult
+// (KI-L40) persists ONLY the terminal outcome, chained via .then() AFTER runItem() fully resolves —
+// so a Workflow killed anywhere between `fix` and `integrate` (10-25+ agent calls: the whole pre-band
+// scan chain, then the entire opus gate band, then refute+re-audit) left reconstruct with NOTHING,
+// discarding every already-paid-for stage no matter how close to done it was.
+// The origin repo shipped this together with KI-E139 (content-hash-fenced gate-band reuse) in one
+// commit; landed here as two separate commits instead, since checkpointProgress's `extra` parameter
+// is optional and the post-preband call site cleanly upgrades from 2-arg to 3-arg once KI-E139 (below)
+// adds PACK_HASH_SCHEMA/the prebandHash probe.
+{
+  const fac137 = readFileSync(join(import.meta.dirname, '..', 'factory.js'), 'utf8');
+  ok(/async function checkpointProgress\(res, stage, extra\)/.test(fac137), 'KI-E137: checkpointProgress is defined as its own function, mirroring checkpointResult (KI-L40) — extra merges additional fields into the snapshot only, never onto res itself');
+  const cp137body = fac137.slice(fac137.indexOf('async function checkpointProgress'), fac137.indexOf('async function checkpointResult'));
+  ok(cp137body.includes("toState: 'IN_PROGRESS'"), 'KI-E137: a progress snapshot is explicitly stamped IN_PROGRESS — never left at res\'s default \'FAILED\' toState (set at construction), which would otherwise misread as a real failure on disk');
+  ok(cp137body.includes('schema: CHECKPOINT_SCHEMA'), 'KI-E137: reuses the SAME CHECKPOINT_SCHEMA as the terminal checkpoint — one write contract, not two');
+  ok(cp137body.includes("itemsDir(res.id) + '/progress.json'"), 'KI-E137: writes a SEPARATE file from result.json — never clobbers the terminal-checkpoint contract reconstruct/fold already depend on');
+  ok(cp137body.includes('KI-D8 provenance'), 'KI-E137: carries the SAME KI-D8 provenance framing as checkpointResult — this JSON is machine bookkeeping, never a human signature or official record');
+
+  // Structural order: each checkpoint call sits AFTER its milestone res.transitions.push(...) and
+  // BEFORE the next expensive phase begins — source-text position as a proxy for control-flow order.
+  const iCallPV = fac137.indexOf("checkpointProgress(res, 'post-verify')");
+  const iCallPP = fac137.indexOf("checkpointProgress(res, 'post-preband'");
+  const iCallPG = fac137.indexOf("checkpointProgress(res, 'post-gates')");
+  const iCallPR = fac137.indexOf("checkpointProgress(res, 'post-reaudit')");
+  ok(iCallPV > 0 && iCallPP > iCallPV && iCallPG > iCallPP && iCallPR > iCallPG, 'KI-E137: the four checkpoint call sites appear in pipeline order in the source (post-verify < post-preband < post-gates < post-reaudit)');
+  ok(iCallPG > fac137.indexOf("res.transitions.push('GATED')"), 'KI-E137: post-gates checkpoints AFTER GATED');
+  ok(iCallPR > fac137.indexOf("res.transitions.push('REAUDITED')"), 'KI-E137: post-reaudit checkpoints AFTER REAUDITED');
+
+  // Behavioural: EXECUTE the pipeline over the canonical 6-item synthetic batch (no overrides — every
+  // gate/probe stub is happy-path) and prove each checkpoint actually FIRES once per lane that reaches
+  // it, not merely present in the source (KI-L43's whole reason to exist — a TDZ/scope error in a
+  // newly added branch parses clean).
+  const { calls: c137 } = await execSmoke(fac137, smokeBatch(), {});
+  const byStage137 = (stage) => c137.filter((c) => new RegExp(':progress:' + stage + '$').test(c.label));
+  eq(byStage137('post-verify').length, 6, 'KI-E137 exec-smoke: post-verify fires once per lane in the 6-item batch (every lane\'s stub verify is green)');
+  eq(byStage137('post-preband').length, 6, 'KI-E137 exec-smoke: post-preband fires once per lane — every lane clears the pre-band scan chain on the happy-path stub');
+  eq(byStage137('post-gates').length, 6, 'KI-E137 exec-smoke: post-gates fires once per lane — every lane\'s gate band is all-APPROVED on the happy-path stub, none diverted to BLOCKED/FAILED before GATED');
+  eq(byStage137('post-reaudit').length, 6, 'KI-E137 exec-smoke: post-reaudit fires once per lane — refute+re-audit converge for every lane on the happy-path stub');
+
+  // Per-item RUNTIME order (stronger than the source-text position check above): for one representative
+  // FULL-band lane, the checkpoint calls interleave with the real milestone calls in the order the
+  // pipeline actually EXECUTED them — not just the order they happen to appear in the file.
+  const lane137 = c137.filter((c) => c.label.startsWith('SMOKE-CODE:'));
+  const firstIdx137 = (re) => lane137.findIndex((c) => re.test(c.label));
+  const iPV = firstIdx137(/^SMOKE-CODE:progress:post-verify$/);
+  const iPP = firstIdx137(/^SMOKE-CODE:progress:post-preband$/);
+  const iGateArch = firstIdx137(/^SMOKE-CODE:gate-architect$/);
+  const iGatePo = firstIdx137(/^SMOKE-CODE:gate-po$/);
+  const iPG = firstIdx137(/^SMOKE-CODE:progress:post-gates$/);
+  const iReaud = firstIdx137(/^SMOKE-CODE:(refuter|re-auditor)$/);
+  const iPR = firstIdx137(/^SMOKE-CODE:progress:post-reaudit$/);
+  const iInteg = firstIdx137(/^SMOKE-CODE:integrator$/);
+  ok([iPV, iPP, iGateArch, iGatePo, iPG, iReaud, iPR, iInteg].every((i) => i >= 0), 'KI-E137 exec-smoke (SMOKE-CODE lane): every expected milestone call is present in the recorded call trace');
+  ok(iPV < iPP && iPP < iGateArch && iGateArch < iGatePo && iGatePo < iPG && iPG < iReaud && iReaud < iPR && iPR < iInteg, 'KI-E137 exec-smoke (SMOKE-CODE lane): the 4 checkpoints interleave with the real pipeline calls in true RUNTIME call order — post-verify < post-preband < gate band < po gate < post-gates < refute/re-audit < post-reaudit < integrator');
+}
+
+// KI-E137 (read side, ported from a host-mount session) — lib/progress-checkpoint.mjs: parse/
+// validate/summarize a mid-pipeline progress.json, shared by cmdResume + cmdReconstruct so a killed
+// run's reached stage is visible instead of a bare "no checkpoint — must re-run". This module itself
+// stays read-only/advisory — it does not feed loadPriorAttempt or decide anything about reuse; KI-E139
+// (below) is what actually attaches its output to item.priorProgress and acts on it.
+{
+  const PC = await import('./progress-checkpoint.mjs');
+  const pdir137 = mkdtempSync(join(tmpdir(), 'factory-progresscheckpoint-'));
+
+  eq(PC.readProgressCheckpoint(join(pdir137, 'nope'), 'X', 1), null, 'KI-E137: a nonexistent item dir -> null, no throw');
+
+  const admissionDir = join(pdir137, 'admission'); mkdirSync(admissionDir);
+  const admission = { id: 'X', resultId: 'X#3', progressStage: 'admission', toState: 'IN_PROGRESS', gates: {} };
+  fsWrite(join(admissionDir, 'progress.json'), JSON.stringify(admission));
+  const admitted = PC.readProgressCheckpoint(admissionDir, 'X', 3);
+  eq(admitted, admission, 'admission checkpoint reads back as in-progress evidence before semantic work');
+  const admissionSummary = PC.summarizeProgress(admitted);
+  ok(admissionSummary?.includes("stage 'admission' reached") && admissionSummary.includes('no gate/scan verdicts recorded yet') && admissionSummary.includes('semantic work has not yet completed') && admissionSummary.includes('planning/test authoring, implementation, verification and reviews remain'), 'admission summary reports outstanding semantic work without inventing completed reviews');
+
+  const d1 = join(pdir137, 'd1'); mkdirSync(d1, { recursive: true });
+  fsWrite(join(d1, 'progress.json'), JSON.stringify({ id: 'X', resultId: 'X#3', progressStage: 'post-gates', gates: { 'gate:architect': 'APPROVED', 'gate:developer': 'APPROVED' } }));
+  const pr1 = PC.readProgressCheckpoint(d1, 'X', 3);
+  ok(pr1 && pr1.progressStage === 'post-gates', 'KI-E137: a fresh, matching progress.json is read back');
+  const sum1 = PC.summarizeProgress(pr1);
+  ok(/stage 'post-gates' reached/.test(sum1) && /gate:architect=APPROVED/.test(sum1) && /refute\+re-audit, integrate/.test(sum1) && /reuse requires fresh content\/contract identity/.test(sum1), 'KI-E137: summarizeProgress names stage, gates, remaining work and independent reuse validation');
+
+  eq(PC.readProgressCheckpoint(d1, 'X', 4), null, 'KI-E137: a progress.json for a DIFFERENT cycle (id#3 when asked for cycle 4) is stale — never reported as the current frontier (mirrors result.json\'s resultId fold-idempotency check, KI-B4)');
+  eq(PC.readProgressCheckpoint(d1, 'Y', 3), null, 'KI-E137: an id mismatch between the caller and the file\'s own `id` field -> null, never trusted on directory-name alone');
+
+  const d2 = join(pdir137, 'd2'); mkdirSync(d2, { recursive: true });
+  fsWrite(join(d2, 'progress.json'), '{ not valid json');
+  eq(PC.readProgressCheckpoint(d2, 'X', 3), null, 'KI-E137: malformed progress.json -> null, never a throw');
+
+  const d3 = join(pdir137, 'd3'); mkdirSync(d3, { recursive: true });
+  fsWrite(join(d3, 'progress.json'), JSON.stringify({ id: 'X', resultId: 'X#3', progressStage: 'some-future-stage', gates: {} }));
+  eq(PC.readProgressCheckpoint(d3, 'X', 3), null, 'KI-E137: an unrecognized progressStage (corrupt/future-version field) -> null, never guessed at');
+
+  const d4 = join(pdir137, 'd4'); mkdirSync(d4, { recursive: true });
+  fsWrite(join(d4, 'progress.json'), JSON.stringify({ id: 'X', resultId: 'X#3', progressStage: 'post-verify', gates: {} }));
+  const sum4 = PC.summarizeProgress(PC.readProgressCheckpoint(d4, 'X', 3));
+  ok(/no gate\/scan verdicts recorded yet/.test(sum4) && /pre-band scan chain, the gate band, refute\+re-audit, integrate/.test(sum4), 'KI-E137: post-verify reports remaining scans/reviews/integration, and an empty gate map never fabricates a tally');
+
+  eq(PC.summarizeProgress(null), null, 'KI-E137: summarizeProgress(null) -> null, never throws or fabricates a line');
+
+  // Wiring: both driver commands actually CALL the read/summarize pair on the no-final-checkpoint
+  // path (never printed alongside a real checkpointed result).
+  const drv137 = readFileSync(join(import.meta.dirname, '..', 'driver.mjs'), 'utf8');
+  ok(drv137.includes("import { readProgressCheckpoint, summarizeProgress } from './lib/progress-checkpoint.mjs';"), 'KI-E137: driver.mjs imports the read-side module');
+  ok(drv137.includes('readProgressCheckpoint(abs(join(cfg.paths.items, r.id)), r.id, cyc)'), 'KI-E137: cmdResume\'s per-item inflight line consults progress.json when there is no final checkpoint');
+  eq((drv137.match(/readProgressCheckpoint\(join\(itemsRoot, id\), id, cyc\)/g) || []).length, 2, 'KI-E137: cmdReconstruct consults progress.json in BOTH the zero-results and partial-results missing-item branches');
+  // KI-E139: `cyc` is DELIBERATELY optional — cmdGroup's KI-E121 CONTINUING re-claim stamps a brand
+  // NEW cycle number, so a strict fence would make gate-band reuse permanently unreachable from the
+  // documented, PREFERRED recovery route. Safety comes from runItem()'s own hash check downstream,
+  // not from this read, so id-only matching here is a deliberate design choice, not a loosened guard.
+  const prNoCyc = PC.readProgressCheckpoint(d1, 'X');
+  ok(prNoCyc && prNoCyc.progressStage === 'post-gates', 'KI-E139: omitting cyc matches on id ALONE (no cycle fence) — the shape cmdGroup\'s fresh re-claim needs, since it cannot know the OLD cycle number the checkpoint was written under');
+  eq(PC.readProgressCheckpoint(d1, 'Y'), null, 'KI-E139: even with cyc omitted, an id mismatch still returns null — dropping the cycle fence never means dropping the id check');
+}
+
+// KI-E139 (ported from a host-mount session) — GATE-BAND REUSE, content-hash-fenced. Building on
+// KI-E137's checkpoints: when a relaunch's item.priorProgress proves the gate band already reached a
+// resolved GATED state against a review-pack whose hash matches the JUST-regenerated one, the
+// (expensive) opus gate band is skipped and its recorded verdicts are adopted instead. The hash is
+// NEVER trusted from the prior attempt alone; a FRESH probe recomputes it right now, so a genuinely
+// changed (or stale/wrong) diff always falls through to a full, independent re-gate — proven below
+// for both the hit AND every miss shape, not assumed from the hit alone.
+{
+  const fac139 = readFileSync(join(import.meta.dirname, '..', 'factory.js'), 'utf8');
+  ok(fac139.includes("PACK_HASH_SCHEMA = { type: 'object'"), 'KI-E139: PACK_HASH_SCHEMA is defined');
+  ok(fac139.includes("item.priorProgress && ['post-gates', 'post-reaudit'].includes(item.priorProgress.progressStage)"), 'KI-E139: reuse requires the PRIOR attempt to have reached a RESOLVED gate outcome (post-gates or post-reaudit) — post-preband alone (gate band never confirmed complete) is not eligible');
+  const gateCallLabels139 = /^SMOKE-CODE:(gate-architect|gate-developer|gate-qa|gate-security|gate-po)$/
+  const soloSmokeCode139 = () => { const b = smokeBatch(); b.items = b.items.filter((it) => it.id === 'SMOKE-CODE'); return b }
+
+  // (1) POSITIVE: a prior attempt reached post-gates with the SAME hash the fresh probe will report
+  // -> the gate band is skipped entirely; the reused verdict is what the final result carries.
+  const b139pos = soloSmokeCode139()
+  const checkpoints139 = [];
+  await execSmoke(fac139, soloSmokeCode139(), { agentOverride: (prompt, opts) => {
+    if (opts.label.includes(':progress:')) checkpoints139.push(JSON.parse(prompt.split('CHECKPOINT-BEGIN\n')[1].split('\nCHECKPOINT-END')[0]));
+  } });
+  const produced139 = checkpoints139.find(p => p.progressStage === 'post-gates');
+  ok(produced139?.evidenceIdentity?.version === EVIDENCE_IDENTITY_VERSION && /^[a-f0-9]{64}$/.test(produced139.evidenceIdentity.hash), 'F09: actual post-gates checkpoint retains the current canonical evidence identity version and hash');
+  eq(checkpoints139.find(p => p.progressStage === 'post-reaudit')?.evidenceIdentity, produced139?.evidenceIdentity, 'F09: later checkpoint preserves identity rather than overwriting it away');
+  b139pos.items[0].priorProgress = produced139;
+  const r139pos = await execSmoke(fac139, b139pos, {})
+  eq(r139pos.calls.filter((c) => gateCallLabels139.test(c.label)).length, 0, 'KI-E139 exec-smoke (reuse HIT): zero gate-role calls dispatched — the expensive opus band is genuinely SKIPPED, not merely relabeled after the fact');
+  const res139pos = r139pos.result.results[0]
+  eq(res139pos.toState, 'CLOSED', 'KI-E139 exec-smoke (reuse HIT): the item still CLOSES end-to-end on the reused path (refute+re-audit+integrate still ran fresh, unchanged)');
+  ok(res139pos.gateBandReused === true, 'KI-E139 exec-smoke (reuse HIT): gateBandReused is recorded true on the result — a visible telemetry signal, never a silent shortcut');
+  eq(res139pos.gates['gate:architect'], 'APPROVED', 'KI-E139 exec-smoke (reuse HIT): the REUSED verdict is what ends up on the final result.gates a fold reads');
+
+  // (2) HASH MISMATCH: same eligible prior stage, but the hash does NOT match the fresh probe's
+  // report (a genuinely different diff since the checkpoint, OR a stale/corrupt one) -> never
+  // trusted; falls through to a full, independent re-gate exactly as an unreused item would.
+  const b139miss = soloSmokeCode139()
+  b139miss.items[0].priorProgress = { ...produced139, evidenceIdentity: { ...produced139?.evidenceIdentity, hash: 'f'.repeat(64) } };
+  const r139miss = await execSmoke(fac139, b139miss, {})
+  ok(r139miss.calls.filter((c) => gateCallLabels139.test(c.label)).length >= 4, 'KI-E139 exec-smoke (hash MISMATCH): a mismatched hash falls through to a FULL, independent re-gate — the prior (possibly stale, possibly wrong-diff) checkpoint is never trusted on its say-so alone');
+  ok(!r139miss.result.results[0].gateBandReused, 'KI-E139 exec-smoke (hash MISMATCH): gateBandReused is NOT set — the fresh gate band ran for real');
+
+  const b139oldVersion = soloSmokeCode139();
+  b139oldVersion.items[0].priorProgress = { ...produced139, evidenceIdentity: { ...produced139?.evidenceIdentity, version: EVIDENCE_IDENTITY_VERSION - 1 } };
+  const r139oldVersion = await execSmoke(fac139, b139oldVersion, {});
+  ok(r139oldVersion.calls.filter(c => gateCallLabels139.test(c.label)).length >= 4, 'F09: previous identity-version checkpoint must receive a fresh gate band even with matching hash');
+  ok(!r139oldVersion.result.results[0].gateBandReused, 'F09: previous identity version cannot authorize gate reuse');
+
+  // (3) PRIOR STAGE TOO EARLY: the prior attempt only reached post-preband — its OWN gate band never
+  // resolved (died mid-band, or is still running elsewhere) — so there is NOTHING to reuse
+  // regardless of hash: replaying an unresolved outcome would be replaying a guess, not a verdict.
+  const b139early = soloSmokeCode139()
+  b139early.items[0].priorProgress = checkpoints139.find(p => p.progressStage === 'post-preband');
+  const r139early = await execSmoke(fac139, b139early, {})
+  ok(r139early.calls.filter((c) => gateCallLabels139.test(c.label)).length >= 4, 'KI-E139 exec-smoke (prior stage too early): a post-preband-ONLY checkpoint (gate band never resolved by that attempt) is NOT reuse-eligible even with a matching hash — the full band runs for real');
+  ok(!r139early.result.results[0].gateBandReused, 'KI-E139 exec-smoke (prior stage too early): gateBandReused is NOT set');
+
+  // (4) NO item.priorProgress at all — the common case (every non-relaunch item, and every OTHER
+  // exec-smoke test in this file) — is unaffected: already proven by the KI-E137 block above
+  // (byStage137('post-gates').length === 6 with a plain smokeBatch() carrying no priorProgress
+  // anywhere), cited here for cross-reference rather than re-proven.
+}
+
+// KI-E140 (ported from a host-mount session) — TASK-LIVENESS REMINDER. The driver cannot check
+// whether a prior Workflow task is actually dead before a relaunch reuses its worktree path (only the
+// controller session holds a TaskOutput/TaskStop handle) — this is a best-effort recording +
+// surfacing mechanism, not a detector, so its tests are source-text (matching this file's established
+// convention for driver.mjs: no test anywhere in this file spawns driver.mjs as a live subprocess or
+// imports it directly — it is a bare CLI script with no exports and a top-level main(), so
+// source-text verification is the established, safe way this file tests driver.mjs logic).
+{
+  const drv140 = readFileSync(join(import.meta.dirname, '..', 'driver.mjs'), 'utf8');
+  ok(drv140.includes("case 'mark-launched': return cmdMarkLaunched(flags);"), 'KI-E140: mark-launched is wired into the command dispatch table');
+  ok(drv140.includes('function cmdMarkLaunched(flags)'), 'KI-E140: cmdMarkLaunched is defined');
+  const mlBody = drv140.slice(drv140.indexOf('function cmdMarkLaunched'), drv140.indexOf('function cmdMarkLaunched') + 1800);
+  ok(mlBody.includes("if (!ids.length || !taskId)") && mlBody.includes('no-op'), 'KI-E140: missing --ids or --taskId is a safe no-op with a clear message, never a throw — this runs right after a real Workflow launch and must never be the reason a controller loses track of what it just started');
+  ok(mlBody.includes('if (!existsSync(dir))') && mlBody.includes('SKIPPED'), 'KI-E140: an id with no state/items/<id>/ dir (not actually a claimed item) is skipped per-id, never a hard failure for the rest of the batch');
+  ok(mlBody.includes("writeJsonAtomic(join(dir, 'launch-meta.json'), meta)"), 'KI-E140: writes via the SAME atomic-write helper every other state file in this codebase uses, not a raw writeFileSync');
+  ok(mlBody.includes('launchedAt: now()'), 'KI-E140: stamps a real timestamp (Node has no KI-E2 Date restriction — that only applies inside factory.js\'s Workflow-runtime execution) for diagnostic value alongside the taskId/runId');
+
+  // The reader half, inside cmdResume's relaunch-candidate loop (KI-E41's MAIN-GUARD sibling).
+  ok(drv140.includes('KI-E140') && drv140.includes("launch-meta.json"), 'KI-E140: cmdResume reads launch-meta.json back');
+  const tlBlock = drv140.slice(drv140.indexOf('TASK-LIVENESS REMINDER'), drv140.indexOf('KI-E42 — killed-run artifact quarantine'));
+  ok(tlBlock.includes('if (!existsSync(metaPath)) continue;'), 'KI-E140: a missing launch-meta.json (no prior session recorded one, or it predates this convention) is silent — never a warning, since this is a best-effort aid this file cannot enforce, not a detector with a false-negative to worry about');
+  ok(tlBlock.includes('verify it is NOT still running') && tlBlock.includes('block:false'), 'KI-E140: the printed reminder names the EXACT check to run (TaskOutput with block:false) — not just "be careful"');
+  ok(tlBlock.includes("} catch (e)") && tlBlock.includes('never blocks the relaunch listing'), 'KI-E140: a read failure degrades to UNCHECKED and never blocks the relaunch line, matching KI-E41\'s own MAIN-GUARD posture exactly');
+}
+
+// KI-E151 (ported from a host-mount session) — cmdDecisionsDigest's `question` field rendered the
+// literal text "[object Object]" for a row whose wi.ownerDecision is a structured
+// {date, ruling, rationale, source} object rather than a plain string. Behavioral, not source-text:
+// extract the ACTUAL shipped expression and execute it via new Function against fixtures covering
+// both real shapes, so the test would catch a regression even if the fix were rewritten differently.
+{
+  const drv151 = readFileSync(join(import.meta.dirname, '..', 'driver.mjs'), 'utf8');
+  const marker = 'let question = ';
+  const start = drv151.indexOf(marker);
+  ok(start !== -1, 'KI-E151: cmdDecisionsDigest still declares `let question = ...`');
+  const stmt = drv151.slice(start + marker.length, drv151.indexOf(';', start));
+  const evalQuestion = new Function('wi', 'return (' + stmt + ')');
+  eq(evalQuestion({ ownerDecision: 'plain string ruling' }), 'plain string ruling', 'KI-E151: a plain-string ownerDecision passes through unchanged (zero behavior change for the common case)');
+  eq(evalQuestion({ ownerDecision: { date: '2026-08-03', ruling: 'ship it', rationale: 'x', source: 'owner' } }), 'ship it', 'KI-E151: a structured ownerDecision object extracts .ruling instead of stringifying the whole object');
+  eq(evalQuestion({ ownerDecision: { decision: 'fallback field', source: 'owner' } }), 'fallback field', 'KI-E151: falls back to .decision when .ruling is absent');
+  eq(evalQuestion({ ownerDecision: null }), '', 'KI-E151: a null/absent ownerDecision still yields empty string, not "null" or a throw');
+  ok(String(evalQuestion({ ownerDecision: { ruling: 'x' } })) !== '[object Object]', 'KI-E151: regression guard — the exact observed bug string never reappears for a structured ownerDecision');
+}
+
+// KI-E152 (ported from a host-mount session) — deterministic verify evidence surfaced in every
+// review-role prompt (edge-scan, gates, method-flow reviews, PO, refuter, re-auditor), so a reviewer
+// judging code quality has the runner's own build/targetedTest/suite result in front of it instead of
+// only a diff snapshot. Verified via exec-smoke (real prompt rendering), not a source-text pin, since
+// the whole point is what the AGENT actually SEES.
+{
+  const { execSmoke: esE152, smokeBatch: sbE152 } = await import('./_execsmoke.mjs');
+  const facSrcE152 = readFileSync(join(import.meta.dirname, '..', 'factory.js'), 'utf8');
+  const { calls: callsE152 } = await esE152(facSrcE152, sbE152(), {});
+  const hintedRoles = ['review-edgecase', 'gate-developer', 'gate-qa', 'gate-po', 'refuter', 're-auditor'];
+  for (const role of hintedRoles) {
+    const call = callsE152.find((c) => c.label === 'SMOKE-CODE:' + role);
+    ok(call, 'KI-E152: SMOKE-CODE (FULL band) dispatches ' + role);
+    const evidence = call?.prompt.match(/VERIFY EVIDENCE[^\n]*?: (\{[^\n]*\})\. (?:Any build|Cross-check)/);
+    let verified = null;
+    try { verified = evidence ? JSON.parse(evidence[1]) : null; } catch {}
+    ok(verified?.build === 'pass' && verified?.targetedTest === 'pass' && verified?.suite?.failed === 0, 'KI-E152: ' + role + '\'s actual prompt carries structured independent build/target/suite evidence');
+  }
+}
+
+// KI-E154 (ported from a host-mount session) — mtime-based stall detection: a Workflow can survive a
+// laptop sleep in the harness's own task tracker (status stays "running") while the item's own
+// directory sits frozen. stallSuspected is pure and disk-only; direct-import tested against real
+// fixtures rather than through cmdResume's console output.
+{
+  const drv154Src = readFileSync(join(import.meta.dirname, '..', 'driver.mjs'), 'utf8');
+  const fnStart = drv154Src.indexOf('function stallSuspected(');
+  ok(fnStart !== -1, 'KI-E154: stallSuspected is defined in driver.mjs');
+  const fnEnd = drv154Src.indexOf('\nfunction cmdResume', fnStart);
+  const fnSrc = drv154Src.slice(fnStart, fnEnd);
+  // Evaluate the real function body against live fixtures (mirrors the KI-E151 new-Function technique
+  // above) — needs readdirSync/statSync/join in scope, matching the module's own imports.
+  const { readdirSync: realReaddir154, statSync: realStat154, mkdtempSync: mkE154, writeFileSync: wfE154 } = await import('node:fs');
+  const stallSuspected = new Function('readdirSync', 'statSync', 'join', 'return (' + fnSrc.replace('function stallSuspected', 'function ') + ')')(realReaddir154, realStat154, join);
+  const dir154 = mkE154(join(tmpdir(), 'factory-stall-'));
+  eq(stallSuspected(dir154, null, 30), null, 'KI-E154: no recorded launchedAt -> cannot judge, never a false positive');
+  eq(stallSuspected(dir154, 'not-a-date', 30), null, 'KI-E154: an unparseable launchedAt -> cannot judge, never a throw');
+  const recentIso = new Date(Date.now() - 5 * 60000).toISOString(); // 5 minutes ago, within the 30min grace
+  const withinGrace = stallSuspected(dir154, recentIso, 30);
+  ok(withinGrace && withinGrace.suspected === false && withinGrace.ageMinutes < 30, 'KI-E154: within the grace period, never flagged regardless of file activity (too soon to judge)');
+  const oldIso = new Date(Date.now() - 60 * 60000).toISOString(); // 1 hour ago, past the 30min grace
+  eq(stallSuspected(dir154, oldIso, 30).suspected, true, 'KI-E154: past grace with ZERO files in the item dir -> suspected (matches the live 12+ hour stalled-Workflow incident)');
+  wfE154(join(dir154, 'test.json'), '{}'); // activity AFTER launch
+  eq(stallSuspected(dir154, oldIso, 30).suspected, false, 'KI-E154: any file newer than launchedAt (real run activity) -> not suspected');
+  const metaOnlyDir154 = mkE154(join(tmpdir(), 'factory-stall-metaonly-'));
+  wfE154(join(metaOnlyDir154, 'launch-meta.json'), '{}');
+  eq(stallSuspected(metaOnlyDir154, oldIso, 30).suspected, true, 'KI-E154: launch-meta.json itself (the controller\'s own bookkeeping write) is excluded from the activity scan — it would otherwise always mask genuine staleness');
+  eq(stallSuspected(join(dir154, 'does-not-exist'), oldIso, 30), null, 'KI-E154: an unreadable item dir -> cannot judge, never a false positive');
+
+  // Wiring: cmdResume's KI-E140 TASK-LIVENESS line calls stallSuspected and appends its verdict.
+  ok(drv154Src.includes("const stall = stallSuspected(abs(join(cfg.paths.items, id)), meta.launchedAt, 30)"), 'KI-E154: cmdResume computes stall evidence for every recorded launch-meta.json, alongside (never instead of) the TaskOutput reminder');
+  ok(drv154Src.includes('STALL SUSPECTED (KI-E154)'), 'KI-E154: a suspected stall is surfaced with an explicit, distinctly-labeled warning in the relaunch listing');
+}
+
+// KI-E156 (ported from a host-mount session) — PLAN-EXCLUSION ADHERENCE: a plan's explicit negative
+// statements ("no X edits needed") are just as binding as its positive commitments; nothing checked
+// the diff against what the plan said NOT to do. Adapted here to the single-shot fixer prompt (this
+// repo has no stepwise consolidation pass to attach the origin's version to) plus fixer.md item 12.
+{
+  const facText156 = readFileSync(join(import.meta.dirname, '..', 'factory.js'), 'utf8');
+  ok(facText156.includes('PLAN-EXCLUSION ADHERENCE (KI-E156)'), 'KI-E156: the single-shot fixer prompt carries the plan-exclusion-adherence check');
+  ok(facText156.includes("re-read plan.md\\'s approach/blastRadius for any explicit negative/exclusion statement"), 'KI-E156: the check explicitly names re-reading plan.md\'s negative/exclusion statements, not just its positive commitments');
+  const fixerMd156 = readFileSync(join(import.meta.dirname, '..', '..', 'agents', 'fixer.md'), 'utf8');
+  ok(fixerMd156.includes('**PLAN-EXCLUSION ADHERENCE (KI-E156') && fixerMd156.includes('negative/exclusion statement'), 'KI-E156: fixer brief requires checking negative plan commitments');
+}
+
+// KI-E157 (ported from a host-mount session) — (i) the PEER-OWNED SURFACES lock now states it
+// outranks a same-PR doc-sync mandate that might otherwise justify crossing it; (ii) fixer.md gains
+// the same never-scratch-in-worktree discipline runner.md already had.
+{
+  const facText157 = readFileSync(join(import.meta.dirname, '..', 'factory.js'), 'utf8');
+  ok(facText157.includes('this lock takes PRECEDENCE over any other rule in this prompt'), 'KI-E157(i): the PEER-OWNED SURFACES prompt states its precedence over a conflicting same-PR mandate');
+  const fixerMd157 = readFileSync(join(import.meta.dirname, '..', '..', 'agents', 'fixer.md'), 'utf8');
+  ok(/ARTIFACTS DIR for all artifacts\/transcripts\/scratch/.test(fixerMd157) && /never the worktree/.test(fixerMd157), 'KI-E157(ii): fixer brief directs transcripts and scratch output to artifacts, never the worktree');
+  ok(fixerMd157.includes('ARTIFACTS DIR'), 'KI-E157(ii): fixer.md\'s new discipline names the ARTIFACTS DIR as the correct redirect target for self-check transcripts');
+}
+
+// KI-E159 (ported from a host-mount session) — a BLOCKED/ESCALATED item's decision.md is generated
+// ONCE; a LATER review/gate pass in the SAME item directory can independently reverse the finding it
+// was built from, with nothing telling the human reading the queue. staleDecisionHint is pure and
+// disk-only; direct-import tested, plus wiring pins into both human-facing queue surfaces.
+{
+  const drv159Src = readFileSync(join(import.meta.dirname, '..', 'driver.mjs'), 'utf8');
+  const fnStart159 = drv159Src.indexOf('function staleDecisionHint(');
+  ok(fnStart159 !== -1, 'KI-E159: staleDecisionHint is defined in driver.mjs');
+  const fnEnd159 = drv159Src.indexOf('\nfunction cmdEscalationsSync', fnStart159);
+  const fnSrc159 = drv159Src.slice(fnStart159, fnEnd159);
+  const { readdirSync: rd159, statSync: st159, existsSync: ex159, mkdtempSync: mk159, writeFileSync: wf159, utimesSync: ut159 } = await import('node:fs');
+  const staleDecisionHint = new Function('readdirSync', 'statSync', 'existsSync', 'join', 'return (' + fnSrc159.replace('function staleDecisionHint', 'function ') + ')')(rd159, st159, ex159, join);
+  const dir159 = mk159(join(tmpdir(), 'factory-staledec-'));
+  eq(staleDecisionHint(dir159), '', 'KI-E159: no decision.md at all -> empty hint, never a throw');
+  wf159(join(dir159, 'decision.md'), '# Decision\nBLOCKED pending owner ruling.');
+  eq(staleDecisionHint(dir159), '', 'KI-E159: decision.md alone, no sibling review/gate files -> not stale');
+  wf159(join(dir159, 'gate-developer.md'), 'older, written before decision.md'); // written after decision.md in wall-clock order, so backdate its mtime to simulate the pre-decision case
+  const oldMtime = new Date(Date.now() - 60000);
+  ut159(join(dir159, 'gate-developer.md'), oldMtime, oldMtime);
+  eq(staleDecisionHint(dir159), '', 'KI-E159: a review/gate file OLDER than decision.md is not evidence of staleness');
+  wf159(join(dir159, 'review-edgecase.md'), 'written AFTER decision.md — the later pass that may have reversed the finding');
+  const hint159 = staleDecisionHint(dir159);
+  ok(hint159.includes('POSSIBLY STALE (KI-E159)') && hint159.includes('review-edgecase.md'), 'KI-E159: a review/gate file NEWER than decision.md is flagged by name, naming the file to re-read');
+
+  ok(drv159Src.includes("const staleHint = staleDecisionHint(abs(join(cfg.paths.items, id)))") && drv159Src.includes("staleHint ? '\\n- ' + staleHint : ''"), 'KI-E159: cmdEscalationsSync renders the stale-decision hint per item, appended alongside the KI-E36 delivered-in-HEAD hint');
+  ok(drv159Src.includes('stale: !!staleDecisionHint(') , 'KI-E159: cmdDecisionsDigest computes the same stale flag per row');
+  ok(drv159Src.includes('## Possibly stale decisions (KI-E159)'), 'KI-E159: the digest gains its own dedicated section for stale decisions, mirroring the KI-E36 delivered-in-HEAD section');
+}
+
+// KI-E160 (ported from a host-mount session) — cmdResume's relaunch line trusted a recorded launcher
+// script PATH, never whether that path's CURRENT content still corresponds to the ids being
+// relaunched — a later, unrelated `group` call sharing the same default (unlabeled) path can silently
+// overwrite it, so a copied relaunch line re-runs the WRONG items entirely. Behavioral: a real temp
+// directory standing in for state/, exercised via the actual driver CLI.
+{
+  const drv160Src = readFileSync(join(import.meta.dirname, '..', 'driver.mjs'), 'utf8');
+  ok(drv160Src.includes('STALE-LAUNCHER-CHECK (KI-E160)') || drv160Src.includes('STALE LAUNCHER (KI-E160)'), 'KI-E160: cmdResume\'s relaunch-line printer carries the stale-launcher check');
+  const runArgsDerivation = drv160Src.match(/const runArgsPath = abs\(script\)\.replace\([^;]+;/);
+  ok(runArgsDerivation, 'KI-E160: derives run-args.json from the relaunch script path, the SAME derivation --reuse already uses (KI-E69)');
+  ok(drv160Src.includes("staleIds = ids.filter((id) => !raIds.has(id))"), 'KI-E160: computes staleIds as exactly the relaunch ids NOT present in the CURRENT run-args.json items[]');
+  ok(drv160Src.includes('resume --reset-stale') && drv160Src.includes("group --ids"), 'KI-E160: the warning names the concrete recovery (reset + a freshly-labeled group call), not just "something is wrong"');
+  ok(drv160Src.includes('UNVERIFIED, never silently "clean"') || drv160Src.includes('UNVERIFIED, not confirmed fresh'), 'KI-E160: an unreadable run-args.json fails OPEN (a warning-layer check, never a hard block on the relaunch listing itself) — mirroring KI-E140\'s own posture for a read failure');
+}
+
+// KI-E180 (ported from a host-mount session) — CROSS-SERVICE VERIFY-SCOPE GAP. The runner's verify()
+// step is deliberately kept blind to fix.filesChanged (KI-L56's tiny context budget) and only ever
+// builds+tests the item's ONE primary solution — so a fix whose real touch-set spans MULTIPLE services
+// can have every service but the primary one go completely unverified, while the deterministic
+// verifyEvidenceHint (KI-E152) still reports a confident, correct-but-incomplete "build=pass,
+// targetedTest=pass, suite={failed:0}" that reviewers are told to trust. Adapted here: the origin's own
+// exec-smoke fixture intercepted a STEPWISE CONSOLIDATION step (KI-E117, confirmed absent in this repo
+// — see KI-E153/155/165/173/174/178) to inject the second service's touched file; this repo's fixer is
+// single-shot, so the same effect is produced by overriding the one SMOKE-CODE:fixer call directly to
+// return filesChanged spanning two real services.
+{
+  const src180 = readFileSync(join(import.meta.dirname, '..', 'factory.js'), 'utf8');
+
+  // (a) genuine gap: the fixer's filesChanged spans a second, real service (ProductsService) beyond
+  // the default smoke fixture's own target ("X") — but the runner's evidence only ever names the
+  // primary one. Item fails pre-band, before the gate band ever dispatches.
+  {
+    const gapOverride = (prompt, opts) => {
+      const label = (opts && opts.label) || '';
+      if (label === 'SMOKE-CODE:fixer') {
+        return { applied: true, filesChanged: ['X/src/Some.cs', 'ProductsService/src/ProductsService.Infrastructure/Consumers/SomeConsumer.cs'], summary: 'stub touching a second real service', scopeStop: false, divergence: null, note: 'stub' };
+      }
+      if (label === 'SMOKE-CODE:runner') {
+        return { build: 'pass', targetedTest: 'pass', suite: { passed: 2, failed: 0, skipped: 0 }, realInfraExercised: false, debris: [], evidence: 'FACTORY::BUILD::RESULT exit=0 (stub) — built X/X.sln, ran X.Tests', note: 'stub' };
+      }
+      if (label === 'SMOKE-CODE:evidence-identity') return { ...defaultAgentStub(opts), verification: { pass: false, reason: 'missing required suite invocation ProductsService/ProductsService.sln' } };
+      return undefined;
+    };
+    const { result: r180a, calls: c180a } = await execSmoke(src180, smokeBatch(), { agentOverride: gapOverride });
+    const byId180a = {}; for (const r of r180a.results) byId180a[r.id] = r;
+    eq(byId180a['SMOKE-CODE'] && byId180a['SMOKE-CODE'].toState, 'FAILED', 'KI-E180 exec-smoke: a fix touching TWO real services, with verify evidence naming only one, fails pre-band');
+    const note180a = (byId180a['SMOKE-CODE'] || {}).note || '';
+    ok(/machine verification incomplete/.test(note180a) && /ProductsService/.test(note180a), 'KI-E180: missing command evidence names the uncovered service and fails before review');
+    ok(!c180a.some((c) => c.label.startsWith('SMOKE-CODE:gate')), 'KI-E180 exec-smoke: the gate band never dispatches when the verify-scope gap survives — caught cheap, mechanically, before the expensive band');
+  }
+
+  // (b) no gap: the SAME second-service touch, but this time the runner's evidence explicitly names
+  // BOTH services (a runner that genuinely built+tested each touched service) — the item proceeds to a
+  // normal close, exactly as if only one service had ever been touched.
+  {
+    const noGapOverride = (prompt, opts) => {
+      const label = (opts && opts.label) || '';
+      if (label === 'SMOKE-CODE:progress-writer' && opts.schema?.properties?.expected) {
+        const targets = ['X/X.sln', 'ProductsService/ProductsService.sln'];
+        return { written: true, expected: { build: targets, filter: [{ target: 'X/X.Tests.csproj', filter: 'RegressionClass' }], suite: targets }, integrationExpected: { build: targets, filter: [], suite: targets } };
+      }
+      if (label === 'SMOKE-CODE:fixer') {
+        return { applied: true, filesChanged: ['X/src/Some.cs', 'ProductsService/src/ProductsService.Infrastructure/Consumers/SomeConsumer.cs'], summary: 'stub touching a second real service', scopeStop: false, divergence: null, note: 'stub' };
+      }
+      if (label === 'SMOKE-CODE:runner') {
+        return { build: 'pass', targetedTest: 'pass', suite: { passed: 4, failed: 0, skipped: 0 }, realInfraExercised: false, debris: [], evidence: 'FACTORY::BUILD::RESULT exit=0 (stub) — built X/X.sln AND ProductsService/ProductsService.sln, both suites green', note: 'stub' };
+      }
+      return undefined;
+    };
+    const { result: r180b, calls: c180b } = await execSmoke(src180, smokeBatch(), { agentOverride: noGapOverride });
+    const byId180b = {}; for (const r of r180b.results) byId180b[r.id] = r;
+    eq(byId180b['SMOKE-CODE'] && byId180b['SMOKE-CODE'].toState, 'CLOSED', 'KI-E180 exec-smoke: when verify evidence names every touched service, the item proceeds to a normal close');
+    const runnerPrompt = c180b.find(c => c.label === 'SMOKE-CODE:runner')?.prompt || '';
+    ok(runnerPrompt.includes('build "/tmp/exec-smoke-wt/SMOKE-CODE/ProductsService/ProductsService.sln"') && runnerPrompt.includes('suite "/tmp/exec-smoke-wt/SMOKE-CODE/ProductsService/ProductsService.sln"'), 'multi-target runner receives explicit build and suite commands for the second service');
+    eq(byId180b['SMOKE-CODE']?.verificationContract?.expected?.filter, [{ target: 'X/X.Tests.csproj', filter: 'RegressionClass' }], 'multi-target command contract preserves the independent regression project/filter');
+  }
+
+  // (c) denylist regression guard: the second touched path is under a generic top-level tooling
+  // directory (src/Shared/...), not a real second service. svcDirs must stay size 1 (the denylist
+  // strips "src"), so the check never fires here regardless of what evidence does or doesn't mention —
+  // this is the exact false-positive class a naive first-path-segment heuristic would hit on every fix
+  // that touches a shared library alongside its owning service.
+  {
+    const sharedLibOverride = (prompt, opts) => {
+      const label = (opts && opts.label) || '';
+      if (label === 'SMOKE-CODE:fixer') {
+        return { applied: true, filesChanged: ['X/src/Some.cs', 'src/Shared/Azathoth.Authorization/PolicyHelper.cs'], summary: 'stub touching a shared library', scopeStop: false, divergence: null, note: 'stub' };
+      }
+      return undefined;
+    };
+    const { result: r180c } = await execSmoke(src180, smokeBatch(), { agentOverride: sharedLibOverride });
+    const byId180c = {}; for (const r of r180c.results) byId180c[r.id] = r;
+    eq(byId180c['SMOKE-CODE'] && byId180c['SMOKE-CODE'].toState, 'CLOSED', 'KI-E180 exec-smoke: a second touched path under a generic top-level dir (src/) is denylisted, never fabricating a false "second service"');
+  }
+
+  // (d) default fixture regression guard: the plain, unmodified smokeBatch() fixture (single service,
+  // stub evidence that never names it literally) must NEVER trip this check — this is the exact
+  // regression this threshold design (svcDirs.size > 1, not uncovered.length alone) exists to prevent.
+  {
+    const { result: r180d } = await execSmoke(src180, smokeBatch());
+    const byId180d = {}; for (const r of r180d.results) byId180d[r.id] = r;
+    eq(byId180d['SMOKE-CODE'] && byId180d['SMOKE-CODE'].toState, 'CLOSED', 'KI-E180 exec-smoke: the default single-service smoke fixture is unaffected — no false positive on the common case');
+  }
+}
+
+// KI-E181 (ported from a host-mount session — PARTIAL PORT, see KNOWN-ISSUES.md) — the origin's
+// PREVENTION half (a filesChanged self-check in agents/fixer.md + a matching FIX_SCHEMA.description)
+// applies here because it feeds this repo's own real KI-E180 consumer of fix.filesChanged; the origin's
+// CURE half (a 3-branch KI-E178 retry-prompt rewrite) has no host here — this repo has zero per-step
+// phantom-manifest mechanism (confirmed by the pre-existing KI-E153/155/165/173/174/178 entry above) —
+// so there is no behavioral scenario to exercise. Source-text pins only, matching this file's own
+// established convention for a documentation/schema-only change (compare KI-O2, KI-E156's fixer.md pin).
+{
+  const fixerMd181 = readFileSync(join(import.meta.dirname, '..', '..', 'agents', 'fixer.md'), 'utf8');
+  ok(fixerMd181.includes('**`filesChanged` MEANS "I EDITED THIS" — NOTHING ELSE (KI-E181'), 'KI-E181: fixer brief defines actual edited-file manifest');
+  ok(/include every path YOU created\s+or modified/.test(fixerMd181) && /Exclude files merely read\/referenced\/re-verified/.test(fixerMd181), 'KI-E181: manifest requires all edits and excludes read-only references');
+
+  const facSrc181 = readFileSync(join(import.meta.dirname, '..', 'factory.js'), 'utf8');
+  const fixLit181 = facSrc181.slice(facSrc181.indexOf("const FIX_SCHEMA ="), facSrc181.indexOf("const FIX_SCHEMA =") + 2000);
+  ok(fixLit181.includes('description: "ONLY files this fix itself created or modified via a tool call.') && fixLit181.includes('KI-E181'), 'KI-E181: FIX_SCHEMA.filesChanged carries a description field naming what the field means and citing KI-E181, visible to the model at the structured-output level, not just in prose a model may skim');
+
+  const portSrc181 = readFileSync(join(import.meta.dirname, '..', 'opencode', 'schemas.mjs'), 'utf8');
+  const portLit181 = portSrc181.slice(portSrc181.indexOf('export const FIX_SCHEMA ='));
+  const descMatch181 = /description: (".*?")\s*}/s.exec(fixLit181);
+  ok(descMatch181 && portLit181.includes(descMatch181[1]), 'KI-E181: the filesChanged description is the exact same string in opencode/schemas.mjs as in factory.js — kept identical per the pre-existing Fix #20 schema-parity deepEqual gate (opencode/_selftest.mjs), verified directly here too rather than trusting that gate alone');
+}
+
+// KI-E183 (ported from a host-mount session, origin commit `057c83827`) — EGS-4-4's fixer role
+// itself errored ("Autocompact is thrashing: the context refilled to the limit within 3 turns of
+// the previous compact, 3 times in a row") after a fix step's filesChanged bundled the append-only
+// STANDARDS-DIVERGENCE-LEDGER.md alongside several other 900+-line docs, and agents/fixer.md's
+// ledger-entry instruction gave zero guidance on how much of that file needed reading to add one
+// entry safely — a natural invitation to read the whole thing, repeatedly. Ported near-verbatim
+// (prompt-guidance fix only, no factory.js change) — this repo's item 6 carried the identical
+// KI-E64-class stale filename (`STANDARDS-LEDGER.md`, missing "DIVERGENCE") that KI-E64 itself
+// fixed only in driver.mjs's graph-audit LEDGER_PATH constant, never in this prose; corrected in
+// the same edit so the new tail command actually names a file that exists.
+{
+  const fixerMd183 = readFileSync(new URL('../../agents/fixer.md', import.meta.url), 'utf8');
+  ok(fixerMd183.includes('Do NOT read this file in full to do so (KI-E183)'), 'KI-E183: the ledger-entry instruction now explicitly forbids a full read of the ledger file');
+  ok(fixerMd183.includes('tail -150 _bmad-output/tech-debt/STANDARDS-DIVERGENCE-LEDGER.md'), 'KI-E183: gives a concrete, cheap alternative (tail) to find the insertion point instead of reading the whole file, naming the REAL path (with "DIVERGENCE") rather than the stale KI-E64-class typo');
+  ok(fixerMd183.includes('heading index') && fixerMd183.includes('nearest anchor collisions'), 'KI-E183: compact brief retains actionable bounded-read guidance instead of incident narrative');
+  ok(fixerMd183.includes('`STANDARDS-DIVERGENCE-LEDGER.md` entry'), 'KI-E183: divergence instruction names the correct ledger file');
+  ok(!fixerMd183.includes('`STANDARDS-LEDGER.md`'), 'KI-E183 adaptation: no surviving reference to the stale (missing-DIVERGENCE) ledger filename in fixer.md');
+}
+
+// KI-E185 (ported from a host-mount session, origin commits `29f91a505` + same-session
+// self-correction `a775ffdd4` + registry-entry follow-up `5993820e8`, folded together as one unit
+// per the origin's own note that the fixup and registry entry only make sense applied alongside the
+// feature they correct/document) — a NEW class of pre-band probe: unlike every sibling lint here
+// (leftover-lint/comment-lint/ledger-anchor-lint/rootcause-lint, all text/AST-shape diff scans),
+// "does the persisted model match the migration history" can only be answered by real `dotnet ef`
+// tooling — 5 independent gate/review roles on the origin host each ran the same command by hand to
+// catch a persisted entity schema change that shipped with no migration and a stale ModelSnapshot.
+// Real behavioral coverage of the pure service-extraction regex (run directly, not re-derived from a
+// string), source-text pins for the build-test.sh subcommand and the factory.js dispatch wiring
+// (already carrying the origin's own self-correction — this port never had the unanchored-grep bug
+// live), and a real behavioral regression guard exercising the ACTUAL grep invocation build-test.sh
+// runs against both literal EF Core CLI message strings (ported from the origin's own follow-up
+// fix's regression guard, `a775ffdd4`) — not just a source-text pin on which grep form is present.
+{
+  const deriveEfMigrationServices = (files) => Array.from(new Set((files || [])
+    .map((f) => { const m = /^([A-Za-z0-9.]+)\/src\/\1\.(?:Core|Persistence|Infrastructure)\//.exec(f); return m ? m[1] : null })
+    .filter(Boolean)))
+  eq(deriveEfMigrationServices([
+    'SearchService/src/SearchService.Infrastructure/Messaging/Consumers/',
+    'NotificationService/src/NotificationService.Infrastructure/Messaging/',
+    'ProductsService/src/ProductsService.Infrastructure/Messaging/Consumers/NewProductPreferenceMatchHandler.cs',
+    '_bmad-output/tech-debt/STANDARDS-DIVERGENCE-LEDGER.md',
+  ]), ['SearchService', 'NotificationService', 'ProductsService'], 'KI-E185: extracts every distinct service from Infrastructure-layer paths, in first-seen order, and ignores a non-service doc path');
+  eq(deriveEfMigrationServices(['ProductsService/src/ProductsService.Core/Domain/Preferences/Models/ProcessedPreferenceEvent.cs']), ['ProductsService'], 'KI-E185: an ENTITY edit under .Core/Domain/ triggers the check even though the path never contains the word "Persistence" at all — the exact origin-host incident shape (item.files never named the entity file itself, only a sibling Infrastructure consumer)');
+  eq(deriveEfMigrationServices(['saas/I2pMailService/src/I2pMailService.Adapters/Persistence/Npgsql/SqlMigrationRunner.cs']), [], 'KI-E185: the AOT-profile raw-SQL runner (no EF, "Persistence" is a sub-folder of .Adapters, not the project-name layer) correctly does NOT trigger — {Service}.Adapters != {Service}.Persistence');
+  eq(deriveEfMigrationServices([]), [], 'KI-E185: no files -> no services, never throws');
+  eq(deriveEfMigrationServices(null), [], 'KI-E185: a null files array never throws');
+
+  const fsrc185 = readFileSync(join(import.meta.dirname, '..', 'factory.js'), 'utf8');
+  ok(fsrc185.includes('const EFMIGRATION_SCHEMA'), 'KI-E185: the probe result schema is defined');
+  ok(fsrc185.includes('EF-MIGRATION PROBE (KI-E185)'), 'KI-E185: the dispatch prompt is present and marked');
+  ok(fsrc185.includes("emResults.filter(function (r) { return r.verdict === 'dirty' })"), 'KI-E185: the dirty-verdict filter reads the exact string the build-test.sh subcommand emits');
+  ok(fsrc185.includes("return finish('FAILED', 'efmigration probe (KI-E185):"), 'KI-E185: a dirty verdict actually fails the item pre-band, not just an advisory note');
+  ok(fsrc185.includes("res.gates['probe:efmigration'] = emResults.length ? 'APPROVED' : 'SKIPPED'"), 'KI-E185: an empty/unreadable result set is announced SKIPPED, never silently read as clean (KI-E20/E41 posture)');
+
+  const btsrc185 = readFileSync(join(import.meta.dirname, '..', '..', 'verify', 'build-test.sh'), 'utf8');
+  ok(btsrc185.includes('efmigration)'), 'KI-E185: build-test.sh has the new subcommand');
+  ok(btsrc185.includes('dotnet ef migrations has-pending-model-changes'), 'KI-E185: the subcommand invokes the real EF tool, not a text lint');
+  ok(btsrc185.includes('FACTORY::EFMIGRATION::RESULT verdict=') && btsrc185.includes('FACTORY::SUMMARY::efmigration'), 'KI-E185: emits both the probe-specific result marker and the KI-E19 evidence-manifest summary line');
+  ok(btsrc185.includes("grep -qi '^Changes have been made to the model'"), 'KI-E185: the dirty-detection grep is anchored to line-start from the start (folding in the origin\'s own same-session self-correction, `a775ffdd4`) — an unanchored grep for "Changes have been made to the model" also matches the CLEAN message ("No changes have been made...", which contains it as a literal substring), which on the origin host reported verdict=dirty unconditionally regardless of actual EF state until caught by a live gate re-check');
+  ok(!btsrc185.includes("grep -qi 'Changes have been made to the model'"), 'KI-E185: no surviving UNANCHORED form of the dirty-detection grep — this port never shipped the origin\'s own transient bug');
+  // Real behavioral proof of the anchor — not just a source-text pin. Exercises the ACTUAL grep
+  // invocation build-test.sh runs, against both real EF Core CLI message strings verbatim (ported
+  // from the origin's own regression guard for its same-session self-correction, `a775ffdd4`).
+  if (hasUsableBash('KI-E185 real grep behavioral fixture (2 assertions)')) {
+    const dirtyMsg = 'Changes have been made to the model since the last migration. Add a new migration.';
+    const cleanMsg = 'No changes have been made to the model since the last migration.';
+    const matches = (line) => { try { execFileSync(bashPath, ['-c', 'grep -qi \'^Changes have been made to the model\''], { input: line + '\n' }); return true; } catch (error) { if (error.status === 1) return false; throw error; } };
+    ok(matches(dirtyMsg), 'KI-E185: the anchored grep matches the real dirty message verbatim');
+    ok(!matches(cleanMsg), 'KI-E185: the anchored grep does NOT false-match the real clean message (the exact bug the origin host\'s own unanchored version had: "No changes..." contains "changes..." as an unanchored substring)');
+  }
+
+  const fixerMd185 = readFileSync(new URL('../../agents/fixer.md', import.meta.url), 'utf8');
+  ok(fixerMd185.includes('Persisted-model self-check (KI-E185)') && fixerMd185.includes('Pending changes require correction'), 'KI-E185: fixer must detect and correct persisted-model drift');
+  ok(fixerMd185.includes('dotnet ef migrations has-pending-model-changes'), 'KI-E185: the self-check names the exact command, not a vague "check for migrations"');
+
+  const { STAGE_PARITY: SP185 } = await import('../opencode/stage-parity.mjs');
+  ok(typeof SP185.mechanical['efmigration-probe'] === 'string' && SP185.mechanical['efmigration-probe'].length >= 40, 'KI-E185: EF probe is now declared mechanical; focused runtime suite exercises its dirty-result failure');
+  const schemasSrc185 = readFileSync(new URL('../opencode/schemas.mjs', import.meta.url), 'utf8');
+  ok(schemasSrc185.includes('export const EFMIGRATION_SCHEMA'), 'KI-E185: opencode/schemas.mjs mirrors the new schema for byte/structure parity (Fix #20\'s deep-equal gate enforces the content matches factory.js exactly)');
+}
+
+const focusedSuites = [
+  { file: './_coretest.mjs', args: [] },
+  { file: './native-efficiency_test.mjs', args: [] },
+  { file: '../opencode/_build-lease-tests.mjs', args: [] },
+];
+for (const directory of ['./', '../', '../opencode/', '../../orchestrator/', '../../setup/', '../../verify/']) {
+  for (const name of readdirSync(new URL(directory, import.meta.url)).sort()) {
+    if (/\.test\.mjs$/.test(name)) focusedSuites.push({ file: directory + name, args: ['--test'] });
+  }
+}
+console.log(`\nself-test: ${focusedSuites.length} focused suites (explicit core/native/build-lease plus discovered *.test.mjs)`);
+let focusedPassed = 0, focusedFailed = 0;
+for (const suite of focusedSuites) {
+  let output = '', error = null;
+  try {
+    if (suite.file === './test-results.test.mjs') prepareOfflineDotnetFixture(testRoot);
+    output = execFileSync(process.execPath, [...suite.args, fileURLToPath(new URL(suite.file, import.meta.url))], {
+      encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 120000,
+      env: { ...process.env, GIT_OPTIONAL_LOCKS: '0' },
+    });
+  } catch (e) { error = e; output = String(e.stdout || '') + String(e.stderr || '') + '\n' + e.message; }
+  console.log(`\nfocused suite: ${suite.file}\n${output.trim()}`);
+  if (error) focusedFailed++; else focusedPassed++;
+}
+
+completed = true;
 console.log(`\nself-test: ${pass} passed, ${fail} failed`);
-process.exit(fail ? 1 : 0);
+console.log(`focused suites: ${focusedPassed} passed, ${focusedFailed} failed (reported separately; not counted as assertions)`);
+process.exit(fail || focusedFailed ? 1 : 0);

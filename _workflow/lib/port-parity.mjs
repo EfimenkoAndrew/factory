@@ -45,6 +45,26 @@ export function extractFactoryRoles(factorySrc) {
   return out;
 }
 
+// KI-E138 (ported from a host-mount session) — a DIFFERENT, narrower namespace than
+// extractFactoryRoles above: every DISTINCT key ever assigned into `res.gates[...]`. Some pipeline
+// gaps are not "a whole ROLE is missing" (the thing extractFactoryRoles/extractPortRoles compare)
+// but "a SPECIFIC call-site of an ALREADY-covered role is missing" — e.g. this repo's
+// `adjudicator:realinfra-override` (KI-E143C) dispatches the SAME `adjudicator` role a THIRD time,
+// for a genuinely distinct purpose, but a Set keyed on role literals can only ever record
+// `adjudicator` once and has no way to say "the first two call sites are ported, the third is not".
+// `adjudicator:realinfra-override` is exactly this shape: not a role, a gate KEY (colon-qualified,
+// deliberately un-parseable as a bare role literal) naming the SPECIFIC mechanism the manifest
+// entry is about. `parityGaps` below routes any colon-qualified declared key through THIS set
+// instead of the role set — the checkable existence-proof for "does this specific mechanism still
+// exist in factory.js" is whether its gate key is still written to, not whether some role exists.
+export function extractFactoryGateKeys(factorySrc) {
+  const out = new Set();
+  const re = /\bres\.gates\[\s*'([a-z0-9][a-z0-9:_-]*)'\s*\]\s*=/g;
+  let m;
+  while ((m = re.exec(String(factorySrc || ''))) !== null) out.add(m[1]);
+  return out;
+}
+
 // The port names each dispatched role in its `planNext` step descriptors (`{ role: '<name>', … }`).
 // `'gate-'` appears as a bare prefix literal because gate roles are built as `'gate-' + g`; it is
 // filtered out here rather than in every caller, since it is a template fragment, not a role.
@@ -65,21 +85,33 @@ export function namedConstantSource(src, name) {
   return m ? m[1].trim() : null;
 }
 
-// The forcing comparison. `manifest` is `{ mechanical: {role: why}, unported: {role: why} }`.
+// The forcing comparison. `manifest` is `{ mechanical: {role: why}, unported: {role: why} }`. A
+// declared key MAY be a bare role literal (`adjudicator`) or, since KI-E138, a colon-qualified GATE
+// KEY (`adjudicator:realinfra-override`) documenting a gap in one specific call-site of an
+// already-covered role — `factoryGateKeys` (extractFactoryGateKeys' output) is that key's own
+// existence-proof, since neither factoryRoles nor portRoles can express "a THIRD, distinct dispatch
+// of an existing role".
 // Returns four independently-actionable buckets; an empty result in all four is parity.
-export function parityGaps(factoryRoles, portRoles, manifest) {
+export function parityGaps(factoryRoles, portRoles, manifest, factoryGateKeys) {
   const mech = Object.keys((manifest && manifest.mechanical) || {});
   const unported = Object.keys((manifest && manifest.unported) || {});
   const declared = new Set([...mech, ...unported]);
   const fac = new Set(factoryRoles);
   const port = new Set(portRoles);
+  const gateKeys = new Set(factoryGateKeys || []);
+  const isGateKeyed = (r) => r.includes(':');
   return {
     // A canonical stage that is neither dispatched nor declared — the silent-fork class.
     undeclared: [...fac].filter((r) => !port.has(r) && !declared.has(r)).sort(),
     // Declared as not-dispatched, but the port DOES dispatch it — the manifest is lying (stale).
-    staleDeclared: [...declared].filter((r) => port.has(r)).sort(),
-    // Declared for a stage factory.js no longer has — dead manifest entry.
-    deadDeclared: [...declared].filter((r) => !fac.has(r)).sort(),
+    // A gate-keyed entry is NEVER eligible here: the port's role-literal extractor cannot express
+    // "I dispatch specifically the post-X call", so `port.has('adjudicator')` being true (because
+    // the port dispatches adjudicator's OTHER, already-mechanical call-site) would falsely retire it.
+    staleDeclared: [...declared].filter((r) => !isGateKeyed(r) && port.has(r)).sort(),
+    // Declared for a stage/mechanism factory.js no longer has — dead manifest entry. A gate-keyed
+    // entry is checked against gateKeys (does this SPECIFIC mechanism still exist), never against
+    // fac (whose bare-role granularity cannot see it at all — see extractFactoryGateKeys above).
+    deadDeclared: [...declared].filter((r) => (isGateKeyed(r) ? !gateKeys.has(r) : !fac.has(r))).sort(),
     // Declared twice with contradictory meanings.
     doubleDeclared: mech.filter((r) => unported.includes(r)).sort(),
   };

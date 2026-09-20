@@ -18,7 +18,14 @@
 import { readFileSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 
-const DEFAULTS = Object.freeze({ noNewComments: false, noSchemaChanges: false, failLaneOnMainDrift: false });
+// KI-E171 (ported from a host-mount session): shadowConsolidatedScan (KI-E169) shipped as a
+// config.json key WITHOUT being added here — this loader's merge only ever copies keys already
+// present in DEFAULTS (line below), so a flag can be set in every config file and still be silently
+// dropped on every real group/sweep launch, with exec-smoke coverage (which injects batch.policies
+// directly, bypassing this loader) structurally unable to catch the gap. Any future policy addition
+// MUST be added here in the SAME change, with a round-trip loadPolicies() assertion, not just
+// factory.js-side exec-smoke coverage of the flag's in-factory effect.
+const DEFAULTS = Object.freeze({ noNewComments: false, noSchemaChanges: false, failLaneOnMainDrift: false, shadowConsolidatedScan: false });
 
 function readJsonSafe(p) {
   try { return JSON.parse(readFileSync(p, 'utf8')); } catch { return null; }
@@ -35,6 +42,7 @@ export function loadPolicies(factoryRoot) {
     const pol = cfg && cfg.policies;
     if (!pol || typeof pol !== 'object') continue;
     for (const k of Object.keys(DEFAULTS)) if (k in pol) out[k] = !!pol[k];
+    if (typeof pol.isolateWorktreeWrites === 'boolean') out.isolateWorktreeWrites = pol.isolateWorktreeWrites;
   }
   return out;
 }
@@ -42,7 +50,8 @@ export function loadPolicies(factoryRoot) {
 // One-line render for driver status output ("noNewComments=on noSchemaChanges=off").
 export function renderPolicies(policies) {
   const p = { ...DEFAULTS, ...(policies || {}) };
-  return Object.keys(DEFAULTS).map((k) => `${k}=${p[k] ? 'on' : 'off'}`).join(' ');
+  return Object.keys(DEFAULTS).map((k) => `${k}=${p[k] ? 'on' : 'off'}`).join(' ') +
+    (Object.hasOwn(p, 'isolateWorktreeWrites') ? ` isolateWorktreeWrites=${p.isolateWorktreeWrites === false ? 'off' : 'on'}` : '');
 }
 
 // The canonical HOST POLICY prompt blocks. Single source for the driver's recover prompts and the

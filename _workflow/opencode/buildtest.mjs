@@ -12,6 +12,7 @@
 
 import { spawnSync } from 'node:child_process';
 import { writeFileSync, appendFileSync, existsSync } from 'node:fs';
+import { resolveBash } from '../lib/bash.mjs';
 // Re-export the REAL parsers driver.mjs's fold uses — imported directly (this module is a normal
 // Node script with full disk/require access, unlike factory.js's sandboxed runtime) so there is
 // ZERO risk of this port's transcript parsing drifting from what `driver.mjs fold` will actually
@@ -21,31 +22,19 @@ export { parseVerifyRaw, verdictFromParse, parseRedRaw, hasRealInfraMarker, touc
 // Same rationale: reuse the driver's own docker/dotnet probes instead of a hand-rolled duplicate.
 export { dockerAvailable, dotnetAvailable } from '../lib/preflight.mjs';
 
-const DEFAULT_BASH_CANDIDATES = [
-  process.env.OPENCODE_FACTORY_BASH,
-  'C:\\Program Files\\Git\\bin\\bash.exe',
-  'C:\\Program Files\\Git\\usr\\bin\\bash.exe',
-  'bash', // last resort — PATH resolution, works as-is on a real POSIX host
-].filter(Boolean);
-
-function resolveBash() {
-  for (const cand of DEFAULT_BASH_CANDIDATES) {
-    if (cand === 'bash') return cand; // can't existsSync a bare PATH lookup; try it last
-    if (existsSync(cand)) return cand;
-  }
-  return 'bash';
-}
-
 /**
  * Runs `verify/build-test.sh <subcommand> <args...>` via a real bash, capturing combined
  * stdout+stderr (the script's own `dotnet ... 2>&1` already folds stderr in for build/red/filter/
  * suite, but usage/exec errors go to stderr directly, so we capture both here too).
  * @returns {{code:number, output:string}}
  */
-export function runBuildTest(factoryRoot, subcommand, args, opts) {
-  const bash = resolveBash();
+export function runBuildTest(factoryRoot, subcommand, args, opts = {}, dependencies = {}) {
+  const spawn = dependencies.spawn || spawnSync;
+  const env = opts.env || process.env;
+  const bash = resolveBash({ env, platform: dependencies.platform || process.platform, spawn });
   const scriptPath = factoryRoot + '/verify/build-test.sh';
-  const r = spawnSync(bash, [scriptPath, subcommand, ...(args || [])], {
+  const r = spawn(bash, [scriptPath, subcommand, ...(args || [])], {
+    env,
     cwd: (opts && opts.cwd) || undefined,
     encoding: 'utf8',
     maxBuffer: 64 * 1024 * 1024,

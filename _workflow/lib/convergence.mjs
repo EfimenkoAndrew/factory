@@ -123,6 +123,37 @@ export function isNotConverging(cur, prev) {
 // Ordering note: applyConvergenceBonus overwrites `row.convergence` with the CURRENT summary at the
 // end of its loop, so this function cannot run after it and still see the prior round. It therefore
 // takes the prior summary explicitly, captured by the driver BEFORE the bonus pass.
+// KI-E167 (ported from a host-mount session) — HALF of every real multi-attempt exhaustion is
+// invisible to the mechanism below. gateFindingsSummary (and therefore isNotConverging) returns null
+// for ANY result whose gateDetails is empty — which is every failure that never reaches the gate band
+// at all: a build failure, a missing RED-proof/realInfra marker, worktree debris, main-tree
+// contamination, a refuted fix, a non-converged re-audit lens, a failed global-regression integrate.
+// Live audit on the origin host: of the items that burned >=3 full attempts before landing
+// ESCALATED/BLOCKED, over half exhausted their budget on exactly one of these pre-band-blind stages —
+// with stallRounds frozen the entire time because nothing above ever looks at them.
+//
+// failSignature gives these failures a coarse, deterministic fingerprint from the one field every
+// FAILED result already carries — `note` — without needing gateDetails at all. It intentionally
+// identifies WHICH CHECK failed, not the exact defect inside it (cut at the first ": " or " — "
+// separator, matching this file's own established note convention; falls back to a 60-char cap for a
+// note with neither separator). Two consecutive FAILED rounds on the SAME item with the SAME
+// signature is at least as strong a non-convergence signal as a flat gate-band finding count — the
+// fixer's change had NO effect on the actual blocking condition — so it feeds the IDENTICAL
+// `stallRounds` counter and `maxStallRounds` bound as the findings-based path below, rather than
+// adding a second knob a host would also have to learn and tune.
+export function failSignature(note) {
+  const s = String(note || '').trim();
+  if (!s) return null;
+  let cut = s.length;
+  const colon = s.indexOf(': ');
+  if (colon >= 0) cut = Math.min(cut, colon);
+  const dash = s.indexOf(' — ');
+  if (dash >= 0) cut = Math.min(cut, dash);
+  cut = Math.min(cut, 60);
+  if (cut <= 0) cut = Math.min(s.length, 60);
+  return s.slice(0, cut).trim().toLowerCase();
+}
+
 export function applyStallDetection(ledger, cfg, results, priorByItem) {
   const maxStall = typeof cfg?.maxStallRounds === 'number' ? cfg.maxStallRounds : 2;
   if (maxStall <= 0) return []; // 0 disables the mechanism entirely (host opt-out)
@@ -132,14 +163,34 @@ export function applyStallDetection(ledger, cfg, results, priorByItem) {
     const row = ledger.items[r.id];
     if (!row) continue;
     const cur = gateFindingsSummary(r);
-    if (!cur) continue; // pre-gate failure — not a judgeable trajectory, counter untouched
-    const prev = (priorByItem && priorByItem[r.id]) || null;
-    if (isNotConverging(cur, prev)) {
+    const sig = failSignature(r.note);
+    if (cur && cur.blockingGates) {
+      // the richer, already-working comparison — unchanged, and it always wins when gate-band data
+      // exists (this branch never second-guesses it with the coarser signature).
+      const prev = (priorByItem && priorByItem[r.id]) || null;
+      if (isNotConverging(cur, prev)) {
+        row.stallRounds = (row.stallRounds || 0) + 1;
+        row.stallReason = 'findings'; // KI-E167 — persisted so a LATER fold's escalateExhausted (which never sees this function's return value) still knows which evidence shape to report
+        if (row.stallRounds >= maxStall) stalled.push({ id: r.id, stallRounds: row.stallRounds, reason: 'findings', from: prev, to: cur });
+      } else {
+        row.stallRounds = 0; // any real progress clears the streak
+      }
+    } else if (sig && row.lastFailSignature && sig === row.lastFailSignature) {
+      // KI-E167 fallback: no gate-band data this round, but the SAME check failed the SAME way as the
+      // immediately-prior round (whatever kind of round that was). A genuinely incomparable round on
+      // its own still neither manufactures progress nor erases a real prior stall — it only ever ADDS
+      // a stall it can positively prove, exactly mirroring the findings path's conservatism.
       row.stallRounds = (row.stallRounds || 0) + 1;
-      if (row.stallRounds >= maxStall) stalled.push({ id: r.id, stallRounds: row.stallRounds, from: prev, to: cur });
+      row.stallReason = 'signature';
+      if (row.stallRounds >= maxStall) stalled.push({ id: r.id, stallRounds: row.stallRounds, reason: 'signature', signature: sig });
     } else {
-      row.stallRounds = 0; // any real progress clears the streak
+      row.stallRounds = 0;
+      row.stallReason = null;
     }
+    // Always advance to THIS round's signature (even null, even on a cur-truthy round) so the next
+    // comparison is against the immediately-preceding round — never a stale one from several rounds
+    // back, which is what "consecutive" means everywhere else in this file.
+    row.lastFailSignature = sig;
   }
   return stalled;
 }

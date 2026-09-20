@@ -1,0 +1,14 @@
+{
+  "models": {
+    "mechanical": "anthropic/claude-sonnet-4-6",
+    "standard": "anthropic/claude-sonnet-5",
+    "strong": "anthropic/claude-opus-4-8",
+    "planning": "anthropic/claude-fable-5",
+    "cheap": "anthropic/claude-haiku-4-5"
+  },
+  "guidance": {
+    "writer": "Execute only the supplied factory role and schema in the named worktree. Never mutate git, edit the ledger or delete STOP_REQUESTED.md. Do not launch nested agents. Return the structured result and dispatch identity requested by the caller.",
+    "reviewer": "Execute the supplied read-only role contract (planning, review or evidence handoff) in a fresh context. Do not edit product files, temporarily modify source, or write role artifacts even when an older brief asks. Return structured JSON; the runtime controller persists role artifacts. Live build/test, shell, network and infrastructure probes remain available subject to host permissions; use the prompt's build-lease wrapper for build commands. Never mutate git or launch nested agents.",
+    "probe": "Run the supplied bounded classification or evidence probe. Read files and run live shell/network probes when required and permitted by the host; use the prompt's build-lease wrapper for build commands. Do not amend product files or write role artifacts. Return the requested structured result; the runtime controller persists it. Never mutate git or launch nested agents."
+  }
+}

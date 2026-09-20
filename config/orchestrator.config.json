@@ -1,12 +1,18 @@
 {
-  "_comment": "Factory orchestrator policy (spine AD-7). backend: interactive (default — emits the Workflow launch line for the controlling Claude Code session and watches checkpoints) | claude-headless (spawns the claude CLI in print mode; seam is smoke-tested, burn-in pending — see spine Deferred) | dry (plan only, launches nothing). autoApply stays false by design: applying CLOSED worktrees needs 3-way-merge judgment and the human authors every commit (KI-E1).",
+  "_comment": "Factory orchestrator policy (spine AD-7). backend: interactive (default, native Workflow launch) | claude-headless (native CLI) | opencode (integrated server dispatcher, independent build leases) | dry (read-only scheduler suggestions). autoApply stays false: humans author commits (KI-E1).",
   "backend": "interactive",
   "maxCyclesPerRun": 1,
   "maxItemsPerLane": 3,
+  "modelConcurrency": 6,
+  "buildCapacity": 1,
+  "_buildCapacity": "OpenCode backend maps this to dispatcher buildConcurrency: filesystem leases cover Node mechanics and worker commands using build-lease.mjs. Native interactive/claude-headless backends report advisory only. Arbitrary shell commands are not intercepted.",
   "includeRealinfra": false,
   "watchIntervalMs": 60000,
   "laneTimeoutMinutes": 240,
   "autoApply": false,
+  "opencode": {
+    "config": "config/opencode-dispatch.local.json"
+  },
   "claudeHeadless": {
     "bin": "claude",
     "extraArgs": [],

@@ -18,8 +18,7 @@ Adversarial **separate-session** review of code-quality on THIS change. Routed s
   is the bar. Also FAIL on any PRE-EXISTING comment the diff edited/rephrased instead of leaving
   byte-for-byte untouched (even if the edit only added accurate detail) — a touched comment must be
   reverted to its original text, never improved; a byte-identical MOVE/re-indent is fine. This is
-  the SAME "fix-introduced defect" class KI-E51 already fixed for test-author's new test files —
-  you are the backstop for the identical class in production code. Under the policy, flag a new
+   binding in production and test code alike. Under the policy, flag a new
   comment even if the surrounding file has plenty of its own (untouched, pre-existing) ones — an
   established repo convention (e.g. a repo whose tests use `// Arrange`/`// Act`/`// Assert`
   markers) is never license to add a NEW instance. When NO such block is present, judge comments by

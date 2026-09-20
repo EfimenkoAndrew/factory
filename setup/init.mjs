@@ -15,9 +15,8 @@
 //      briefs in agents/ need NO host install — the driver inlines them at group time).
 //   4b. Installs copilot-assets/copilot-instructions.md into the host's
 //      .github/copilot-instructions.md (KI-O4) — skip with --no-copilot-assets.
-//   4c. Installs opencode-assets/root/** onto the host root (AGENTS.md, .opencode/ai-factory.md,
-//      .opencode/skill/ai-factory/) and MERGES opencode-assets/opencode.config.json into the
-//      host's own opencode.json (KI-O5) — skip with --no-opencode-assets.
+//   4c. Installs hash-managed controller assets and active AGENTS guidance; merges a
+//      version-selected OpenCode fragment — skip with --no-opencode-assets.
 //   5. --fresh: resets factory state (empty findings-graph, rebuilt
 //      ledger, emptied decision queue) so a NEW host starts from zero. Guarded by --yes.
 //   6. --hooks: installs the pre-push build-time audit gate (ci/install-hooks.sh).
@@ -32,7 +31,8 @@ import { execFileSync } from 'node:child_process';
 import { dirname, join, resolve, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { findRepoRoot, STOCK_MOUNT, toPosix } from '../_workflow/lib/rootfind.mjs';
-import { mergeOpencodeConfig, OPENCODE_CONFIG_CANDIDATES, parseJsonFile } from '../_workflow/lib/hostinstall.mjs';
+import { mergeOpencodeConfig, OPENCODE_CONFIG_CANDIDATES, parseJsonFile, selectOpencodeMajor, opencodeFragment, installManagedFile, installAgentsGuidance, writeAssetAtomic } from '../_workflow/lib/hostinstall.mjs';
+import { writeJsonAtomic } from '../_workflow/lib/ledger.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const FACTORY_ROOT = resolve(HERE, '..');
@@ -45,12 +45,16 @@ for (let i = 0; i < argv.length; i++) {
   const a = argv[i];
   if (!a.startsWith('--')) continue;
   const k = a.slice(2);
-  if (k === 'repo-root' && i + 1 < argv.length) { flags[k] = argv[++i]; } else { flags[k] = true; }
+  if (['repo-root', 'opencode-version', 'opencode-bin'].includes(k)) {
+    if (!argv[i + 1] || argv[i + 1].startsWith('--')) throw new Error('missing value for ' + a);
+    flags[k] = argv[++i];
+  } else { flags[k] = true; }
 }
 if (flags.help) {
-  console.log('usage: node setup/init.mjs [--fresh [--yes]] [--hooks] [--no-claude-assets] [--no-copilot-assets] [--no-opencode-assets] [--repo-root <path>]');
+  console.log('usage: node setup/init.mjs [--fresh [--yes]] [--hooks] [--no-claude-assets] [--no-copilot-assets] [--no-opencode-assets] [--repo-root <path>] [--opencode-version 1|2] [--opencode-bin <executable>]');
   process.exit(0);
 }
+selectOpencodeMajor(null, flags['opencode-version']);
 const say = (m) => console.log('[init] ' + m);
 const warn = (m) => console.log('[init] WARN  ' + m);
 let hardFail = false;
@@ -102,21 +106,23 @@ if (!existsSync(gk)) writeFileSync(gk, '');
 say('runtime dirs : state/{,items,normalized,worktrees} telemetry/data reports queue — present');
 
 // ---- 4. Claude Code assets (host .claude/skills) ------------------------------------
+const manifestPath = join(FACTORY_ROOT, 'state', 'controller-assets.json');
+let manifest = { version: 1, hostRoot: repoRoot, hashes: {} };
+try {
+  const prior = parseJsonFile(readFileSync(manifestPath, 'utf8'));
+  if (prior.version === 1 && prior.hostRoot === repoRoot && prior.hashes && typeof prior.hashes === 'object' && !Array.isArray(prior.hashes)) manifest = prior;
+} catch { /* no known hashes: preserve differing files */ }
 function copyTree(src, dst) {
   const copied = [];
   for (const name of readdirSync(src)) {
     const s = join(src, name); const d = join(dst, name);
+    if (d === join(repoRoot, 'AGENTS.md')) continue;
     if (statSync(s).isDirectory()) { mkdirSync(d, { recursive: true }); copied.push(...copyTree(s, d)); continue; }
     const body = readFileSync(s);
-    if (existsSync(d)) {
-      if (readFileSync(d).equals(body)) { continue; }
-      writeFileSync(d + '.factory-new', body);
-      warn(toPosix(relative(dst, d)) + ' exists with local edits — new version written alongside as *.factory-new (merge by hand)');
-      continue;
-    }
-    mkdirSync(dirname(d), { recursive: true });
-    writeFileSync(d, body);
-    copied.push(d);
+    const outcome = installManagedFile(d, body, manifest.hashes, toPosix(relative(repoRoot, d)));
+    writeJsonAtomic(manifestPath, manifest);
+    if (outcome === 'preserved') warn(toPosix(relative(repoRoot, d)) + ' has local edits or unknown installed hash — merge *.factory-new by hand');
+    else if (outcome !== 'unchanged') copied.push(d);
   }
   return copied;
 }
@@ -139,42 +145,62 @@ if (!standalone && !flags['no-copilot-assets']) {
 }
 
 // ---- 4c. OpenCode assets (host AGENTS.md + .opencode/ + opencode.json) — KI-O5 ------
-// Two halves with two ownership stories: opencode-assets/root/** are factory-owned FILES that
-// copyTree installs onto the host root (same no-clobber contract as 4/4b), while the host's
+// Two halves with two ownership stories: controller files upgrade by prior installed hash,
+// AGENTS guidance has a managed block, while the host's
 // opencode.json is THEIRS — it carries their model/provider/mcp settings — so the factory's
 // controller policy is MERGED into it. Rule order is load-bearing (opencode evaluates the LAST
 // matching permission pattern), which is why the merge lives in a selftest-pinned pure helper.
 if (!standalone && !flags['no-opencode-assets']) {
   const src = join(FACTORY_ROOT, 'opencode-assets');
+  const executable = flags['opencode-bin'] || 'opencode';
+  const version = tryRun(executable, ['--version'], { timeout: 10000 });
+  if (flags['opencode-bin'] && !version) throw new Error('cannot probe selected OpenCode executable');
+  const major = selectOpencodeMajor(version, flags['opencode-version']);
   const copied = copyTree(join(src, 'root'), repoRoot);
+  const guidance = installAgentsGuidance(join(repoRoot, 'AGENTS.md'), readFileSync(join(src, 'root', 'AGENTS.md'), 'utf8'), manifest.hashes);
+  writeJsonAtomic(manifestPath, manifest);
+  if (guidance === 'preserved') warn('AGENTS.md factory block has edits or unknown hash — merge AGENTS.md.factory-new to activate current guidance');
   say('opencode     : ' + (copied.length ? copied.map((p) => toPosix(relative(repoRoot, p))).join(', ') + ' installed' : 'AGENTS.md + .opencode/ up to date'));
-  const fragment = parseJsonFile(readFileSync(join(src, 'opencode.config.json'), 'utf8'));
-  const found = OPENCODE_CONFIG_CANDIDATES.map((c) => join(repoRoot, c)).find((p) => existsSync(p));
+  say('opencode CLI : ' + (version || 'not detected') + (major ? ' (config v' + major + ')' : ''));
+  const base = parseJsonFile(readFileSync(join(src, 'opencode.config.json'), 'utf8'));
+  const profiles = parseJsonFile(readFileSync(join(src, 'worker-profiles.json'), 'utf8'));
+  const fragment = major ? opencodeFragment(base, profiles, major) : base;
+  const configs = OPENCODE_CONFIG_CANDIDATES.map((c) => join(repoRoot, c)).filter((p) => existsSync(p));
+  const found = configs[0];
   const target = found || join(repoRoot, 'opencode.json');
   const rel2 = toPosix(relative(repoRoot, target));
-  const sidecar = () => writeFileSync(target + '.factory-new', JSON.stringify(fragment, null, 2) + '\n');
+  const sidecar = () => writeAssetAtomic(target + '.factory-new', JSON.stringify(fragment, null, 2) + '\n');
   let hostCfg = {};
   let parsed = true;
   if (found) { try { hostCfg = parseJsonFile(readFileSync(found, 'utf8')); } catch { parsed = false; } }
-  if (!parsed) {
-    // Same posture as install.sh's settings.local.json guard: an existing-but-unparseable config
-    // (jsonc comments, trailing commas, or genuinely broken) is never rewritten — a blind
-    // JSON.stringify would silently drop the host's comments or their whole file.
+  if (!major) {
+    warn('OpenCode version unknown — config unchanged; rerun with --opencode-version 1 or 2 after checking the installed binary');
+  } else if (configs.length > 1) {
+    sidecar();
+    warn('multiple OpenCode project configs found — merge the version-selected *.factory-new manually, preserving effective permissions across all layers');
+  } else if (!parsed) {
     sidecar();
     warn('REFUSING to touch ' + rel2 + ' — it is not strict JSON (comments / trailing commas?); the factory block was written alongside as ' + rel2 + '.factory-new — merge by hand');
   } else {
-    const merge = mergeOpencodeConfig(hostCfg, fragment);
+    const merge = mergeOpencodeConfig(hostCfg, fragment, major);
     if (merge.refused) {
       sidecar();
       warn('REFUSING to touch ' + rel2 + ' — ' + merge.refused + '; the factory block was written alongside as ' + rel2 + '.factory-new — merge by hand');
     } else if (merge.changed) {
       mkdirSync(dirname(target), { recursive: true });
-      writeFileSync(target, JSON.stringify(merge.config, null, 2) + '\n');
+      writeJsonAtomic(target, merge.config);
       say('opencode cfg : ' + rel2 + ' — ' + (merge.notes.join('; ') || 'updated'));
     } else {
       say('opencode cfg : ' + rel2 + ' up to date');
     }
   }
+  if (major === 2) {
+    const skill = join(repoRoot, '.opencode', 'skills', 'ai-factory', 'SKILL.md');
+    const outcome = installManagedFile(skill, readFileSync(join(src, 'root', '.opencode', 'skill', 'ai-factory', 'SKILL.md')), manifest.hashes, '.opencode/skills/ai-factory/SKILL.md');
+    writeJsonAtomic(manifestPath, manifest);
+    if (outcome === 'preserved') warn('v2 skill has local edits or unknown hash — merge *.factory-new');
+  }
+  say('OpenCode: quit and restart the client/server to activate configuration and worker profiles; verify model availability for the installed provider');
 }
 
 // ---- 5. --fresh: reset factory state ----------------------------------

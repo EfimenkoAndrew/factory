@@ -60,6 +60,7 @@ DRV = node <mount>/_workflow/driver.mjs
 DRV cycle [--until critical|high|dry --max N]   # or: DRV suggest / DRV group --ids a,b --conc 3
     → emits a batch: per-item worktrees + an inlined launcher at state/run-script*.js
 launch it: Workflow tool with {scriptPath: "<mount>/state/run-script*.js"} and NO args
+DRV mark-launched --ids <claimed-ids> --taskId <actual-task-id> --runId <actual-run-id>
     → the Workflow runs plan → red test → fix → verify → RED-proof probe → root-cause touch probe
       → edge-scan → acceptance-scan → plan-commitment/plan-step scan → comment-scan → leftover-scan
       → ledger-anchor scan → editorial → 5 role gates + review flows → refute → re-audit
@@ -74,17 +75,34 @@ CLOSED / FAILED / ESCALATED / BLOCKED deltas, cost if asked (`DRV cost`).
 
 ## Recovery
 
-- Workflow killed mid-band → `DRV reconstruct` rebuilds `results-cycle-<N>.json` from
-  per-item checkpoints, then `fold` it.
-- A cross-session Workflow "resume" is a COLD full re-band at full price (same-session only
-  cache) — budget it as a fresh run; relaunching the same run-script verbatim is the
-  sanctioned recovery, gates re-adjudicate the worktree.
-- An item stuck CLAIMED/ACTIVE with no live run → `DRV reset <id>` re-queues it.
-- After a PARTIAL fold, re-`group` — never Workflow-`resume`.
+1. Run `DRV resume` and inspect recorded task/run IDs with the original session's task
+   tools. An old mtime alone does not prove death. Never launch a second worker over live work.
+2. If terminal checkpoints exist, `DRV reconstruct`, inspect the reported IDs/cycle,
+   and fold the generated envelope. Fold finished work before deciding what to relaunch.
+3. For interrupted work, reopening the **original saved Claude session** (`claude --resume
+   <session-id>`) can retain Workflow replay. Use the installed Workflow authoring reference
+   for its resume call and actual run ID. Completed calls replay in start order; changed or
+   failed calls can invalidate the suffix. A new conversation does not inherit that replay.
+4. If original-session replay is unavailable, `DRV resume --reuse` prepares a launcher
+   using validated on-disk prior-attempt/progress artifacts. Inspect its main-drift, debris,
+   stale-ID and reuse diagnostics; launch only the emitted, current unresolved membership.
+   This is artifact reuse, not a promise of free model calls or universal gate reuse.
+5. After every actual launch record `DRV mark-launched --ids <actual-launched-ids>
+   --taskId <actual-task-id> --runId <actual-run-id>`; add `--continued` for same-claim
+   continuation. Keep the Claude session ID in the handoff too. Never substitute a PID or
+   session ID for a Workflow task/run ID. Partial folds do not justify resetting remaining
+   valid claims; follow `resume` diagnostics before any re-group.
+6. Use `DRV reset <id>` only after confirming no live worker and intentionally abandoning
+   the claim/reuse path. Re-group is a new scheduling decision, not the default recovery.
 - A FAILED/ESCALATED/BLOCKED item with a reviewer-converged remedy or owner ruling (KI-E34) → `DRV recover <id>` scaffolds the
   direct-recovery (dissent digest, delta re-gate prompts, evidence contract, `#Nr` fold
   skeleton) — the dominant close path, first-class (KI-E20). You apply the remedy in the
   worktree, run the re-gate prompts as separate agents, fill the skeleton, fold it.
+
+Prompt-cache hits are separate from Workflow replay and artifact reuse. Record observed
+usage (unknown stays unknown). Where the installed Claude Code supports it (2.1.242+),
+the owner can evaluate `subagentPromptCacheTtl: "1h"`; do not assume Workflow `agent()`
+accepts arbitrary SDK options or add paid warm-up calls.
 
 ## What goes to the human
 

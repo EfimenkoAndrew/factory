@@ -4,15 +4,9 @@
 // (lines ~104-217 of _workflow/factory.js as of this port — diff against that file if it changes).
 // Pure functions, no side effects, no model calls.
 //
-// IMPORTANT FIDELITY GAP (document honestly, do not paper over): factory.js's `agent(prompt, opts)`
-// can select a MODEL PER CALL (opus for hard gates, fable-5 for planner/adjudicator, haiku for cheap
-// probes, sonnet for the rest) because Claude Code's native Workflow runtime exposes that as an
-// `opts.model` parameter. OpenCode's `Task` tool has no equivalent — every subagent call runs on
-// whatever model backs the chosen `subagent_type` ("general"/"explore"), fixed for the whole
-// OpenCode session. The RT/FLOW_RT tables below are kept SOLELY as intended-routing metadata (for
-// `res.cost` bookkeeping / audit-trail honesty about what SHOULD have run on which tier) — the
-// orchocode session must record the ACTUAL model used (its own) in cost/telemetry, never silently
-// claim the intended tier ran. See KNOWN-ISSUES.md KI-O1 for the full writeup.
+// roleRoute applies the launch RT/FLOW_RT snapshot. server-api resolves explicit host provider/model
+// mappings and applies them to each fresh worker session. Manual Task routing remains host-owned;
+// actual-model accounting never assumes an intended model ran.
 
 // BMAD review-named skill -> the agent brief that encodes its methodology (agents/<role>.md).
 export const SKILL_ROLE = {
@@ -69,6 +63,16 @@ export function routesFor(item) {
     runner: RT.runner, gates: { architect: RT.gArch, developer: RT.gDev, qa: RT.gQa, security: RT.gSec, po: RT.gPo },
     refuter: RT.refuter, reauditor: RT.reauditor, integrator: RT.integrator, adjudicator: RT.adjudicator, decisionFramer: RT.decisionFramer, reviewFlows: flows,
   };
+}
+
+export function roleRoute(item, call, routing) {
+  const r = routesFor(item);
+  const keys = { planner: 'planner', 'test-author': 'testAuthor', fixer: 'fixer', refuter: 'refuter', 're-auditor': 'reauditor', integrator: 'integrator', adjudicator: 'adjudicator', 'decision-framer': 'decisionFramer' };
+  const flow = call.routeKey || Object.entries(SKILL_ROLE).find(([, role]) => role === call.role)?.[0];
+  const flowKey = call.routeKey || flowsFor(item).find(f => f.skill === flow)?.routeKey;
+  const selected = call.role.startsWith('gate-') ? r.gates[call.role.slice(5)] : flowKey ? r.reviewFlows[flowKey] : r[keys[call.role]];
+  const rtKeys = { planner: 'planner', 'test-author': item.fixType === 'mechanical' ? 'testMech' : 'testCrit', fixer: item.fixType === 'mechanical' ? 'fixerMech' : 'fixerCrit', 'gate-architect': 'gArch', 'gate-developer': 'gDev', 'gate-qa': 'gQa', 'gate-security': 'gSec', 'gate-po': 'gPo', refuter: 'refuter', 're-auditor': 'reauditor', integrator: 'integrator', adjudicator: 'adjudicator', 'decision-framer': 'decisionFramer' };
+  return routing?.FLOW_RT?.[flowKey] || routing?.RT?.[rtKeys[call.role]] || selected || { model: 'claude-haiku-4-5', effort: 'low' };
 }
 
 // Re-audit lens set (KI-C10): always 'code', plus theme-relevant lens(es), plus 'architecture' for CRITICAL.

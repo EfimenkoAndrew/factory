@@ -7,6 +7,11 @@
 // the runtime's own isolation:'worktree' uses). Integration copies files into the main
 // tree as UNSTAGED changes for the human to review and commit; it never stages.
 import { execFileSync } from 'node:child_process';
+import { collectEvidenceIdentity } from './evidence-identity.mjs';
+
+export function preflightWorktreeInputs(path, metadata, options = {}) {
+  return collectEvidenceIdentity(path, metadata, options);
+}
 
 function git(args, opts) {
   // trimEnd (NOT trim): `git status --porcelain` encodes the status in the first 2 columns, so an

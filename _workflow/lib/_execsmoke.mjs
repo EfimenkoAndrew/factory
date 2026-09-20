@@ -16,13 +16,20 @@
 // Build a schema-shaped stub reply for one agent() call. `blockedGate(label)` (optional) forces a
 // CHANGES_REQUIRED verdict for matching gate/review calls — used to exercise the dispute/adjudicate
 // lane without bespoke stubs per role.
+import { EVIDENCE_IDENTITY_VERSION } from './evidence-identity.mjs';
+
 export function defaultAgentStub(opts, blockedGate) {
   const s = (opts && opts.schema) || {};
   const p = s.properties || {};
   const req = s.required || [];
   const label = (opts && opts.label) || '';
-  if (p.written) return { written: true };
+  if (p.written) return p.expected ? { written: true, expected: { build: ['X/X.sln'], filter: [{ target: 'X/X.Tests.csproj', filter: 'RegressionClass' }], suite: ['X/X.sln'] }, integrationExpected: { build: ['X/X.sln'], filter: [], suite: ['X/X.sln'] } } : { written: true };
+  if (p.hash) return p.codeHash ? { version: EVIDENCE_IDENTITY_VERSION, hash: 'deadbeef'.repeat(8), codeHash: 'cafebabe'.repeat(8), shadowSnapshotHash: null, baseRevision: 'fixture-head', fileCount: 2, ...(p.request ? { request: Object.fromEntries(Object.entries(p.request.properties).map(([k, v]) => [k, v.enum[0]])) } : {}), redProof: { markerFound: true, exitCode: 1 }, rootCause: { nonTestCount: 1, files: ['X/src/Some.cs'], skipped: false }, verification: { pass: true, reason: 'fixture complete' }, integration: { pass: true, reason: 'fixture complete' } } : { hash: 'deadbeef'.repeat(8) };
+  if (p.markerFound) return { markerFound: true, ...(p.exitCode ? { exitCode: 1 } : {}), line: 'FACTORY::RED::1' };
+  if (p.clean) return { clean: true, ...(p.punts ? { punts: [] } : { findings: [] }) };
+  if (p.results) return { results: [] };
   if (p.covered !== undefined) return { covered: true, gaps: [] }; // KI-E18 AcceptanceScan probe (happy path)
+  if (p.acceptanceCovered) return { acceptanceCovered: true, planHonored: true, findingHonored: true };
   if (p.honored !== undefined) return { honored: true, gaps: [] }; // KI-E87/E101 PlanCommitment/PlanStep probe (happy path)
   if (p.count !== undefined) return { count: 0, hits: [] }; // KI-E59 CommentScan probe (happy path — zero new comments)
   // KI-E104 RootCauseTouch probe (happy path — the fix touched a real non-test file). Placed with its
@@ -61,8 +68,15 @@ export async function execSmoke(factorySrc, batch, options) {
   const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
   const calls = [];
   const agent = async (prompt, opts) => {
-    calls.push({ label: (opts && opts.label) || '', model: (opts && opts.model) || 'inherit' });
-    if (o.agentOverride) { const r = o.agentOverride(prompt, opts); if (r !== undefined) return r; }
+    calls.push({ label: (opts && opts.label) || '', model: (opts && opts.model) || 'inherit', isolation: (opts && opts.isolation) || null, schema: opts && opts.schema, prompt: String(prompt || ''), opts: structuredClone(opts) });
+    // KI-E150 (ported from a host-mount session): awaited (not just called) so a test's agentOverride
+    // MAY be async and cross a real macrotask boundary (e.g. a 0ms setTimeout) to simulate genuinely-
+    // staggered real agent-call completions — needed to test atomic-claim token attribution under
+    // concurrency without the false batching a purely-synchronous override creates (see the KI-E150
+    // exec-smoke test below). Transparent for every pre-existing synchronous override: awaiting a
+    // plain value just resolves it on the next microtask tick with the same value, so `r !== undefined`
+    // behaves identically.
+    if (o.agentOverride) { const r = await o.agentOverride(prompt, opts); if (r !== undefined) return r; }
     return defaultAgentStub(opts, o.blockedGate);
   };
   const parallel = async (thunks) => Promise.all((thunks || []).map((t) => Promise.resolve().then(t).catch(() => null)));
@@ -94,7 +108,7 @@ export function smokeBatch() {
   const wt = (id) => ({ path: '/tmp/exec-smoke-wt/' + id, branch: 'factory/' + id });
   const base = { target: 'X', layer: 'service', dependsOn: [], gateSet: [], autonomyTier: 'auto', source: 'smoke', solution: 'X/X.sln', peers: [] };
   return {
-    cycle: 0, concurrency: 2, attempts: 1, repoRoot: '.', templatesDir: '_bmad-output/ai-factory/agents', config: {}, dryRun: false,
+    runId: 'smoke-run-0', cycle: 0, concurrency: 2, attempts: 1, repoRoot: '.', templatesDir: '_bmad-output/ai-factory/agents', config: {}, dryRun: false,
     // PR#9 review — the smoke exercises the policy-ON lanes (comment probe + HOST POLICY prompt
     // blocks); a policy-OFF lane in the selftest passes a batch without this key and asserts the
     // probe is skipped (the shipped-engine default).
