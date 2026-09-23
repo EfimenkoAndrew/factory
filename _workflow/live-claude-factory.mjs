@@ -100,6 +100,11 @@ export function archiveProduct(root) {
   const extracted = spawnSync('tar', ['-xf', '-', '-C', worktree], { input: archive });
   if (extracted.status !== 0) throw new Error('Product archive extraction failed: ' + extracted.stderr);
   const gitEnv = { GIT_DIR: posix(git(['rev-parse', '--absolute-git-dir']).toString().trim()), GIT_WORK_TREE: worktree, GIT_OPTIONAL_LOCKS: '0' };
+  if (process.env.FACTORY_SELFTEST_NO_GIT_MUTATIONS === '1') {
+    const index = resolve(repo, git(['rev-parse', '--git-path', 'index']).toString().trim());
+    gitEnv.GIT_INDEX_FILE = root + '/fixture-index';
+    cpSync(index, gitEnv.GIT_INDEX_FILE);
+  }
   const diff = spawnSync('git', ['diff', 'HEAD', '--exit-code'], { cwd: worktree, env: { ...process.env, ...gitEnv }, encoding: 'utf8' });
   if (diff.status !== 0 || diff.stdout) throw new Error('Archived product differs from HEAD: ' + diff.stderr);
   const source = sourceSnapshot(worktree, gitEnv);

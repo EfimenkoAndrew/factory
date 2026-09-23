@@ -1,3 +1,6 @@
+import { aggregateCosts, COST_BASES } from './cost-accounting.mjs';
+import { severityKnown } from './review-decisions.mjs';
+
 export const OBSERVATION_VERSION = 1;
 
 const text = (v) => typeof v === 'string' && v.trim().length > 0;
@@ -25,6 +28,10 @@ const fields = {
     canonicalFindingId: null, adjudication: 'unresolved', independent: null, blind: null },
   reuse: { itemId: null, attemptId: null, stage: null, status: null, reason: null, savedCalls: null },
 };
+const extensions = {
+  dispatch: { costBasis: 'unknown', costParentDispatchId: null, costIncludesChildren: false },
+  finding: { severity: null },
+};
 
 export function canonicalJson(value) {
   if (Array.isArray(value)) return '[' + value.map(canonicalJson).join(',') + ']';
@@ -33,7 +40,7 @@ export function canonicalJson(value) {
 }
 
 export function makeObservation(input) {
-  const row = { version: OBSERVATION_VERSION, ...fields[input?.kind], ...input };
+  const row = { version: OBSERVATION_VERSION, ...fields[input?.kind], ...extensions[input?.kind], ...input };
   const errors = validateObservation(row);
   if (errors.length) throw new TypeError(errors.join('; '));
   return row;
@@ -46,7 +53,7 @@ export function validateObservation(row) {
   check(row.version === OBSERVATION_VERSION, 'unsupported observation version');
   for (const key of ['id', 'runId']) check(text(row[key]), key + ' required');
   if (!Object.hasOwn(fields, row.kind)) return [...errors, 'unknown observation kind'];
-  for (const key of Object.keys(row)) check(['version', 'id', 'runId', 'kind', ...Object.keys(fields[row.kind])].includes(key), 'unknown field ' + key);
+  for (const key of Object.keys(row)) check(['version', 'id', 'runId', 'kind', ...Object.keys(fields[row.kind]), ...Object.keys(extensions[row.kind] || {})].includes(key), 'unknown field ' + key);
   for (const key of Object.keys(fields[row.kind])) check(Object.hasOwn(row, key), key + ' must be explicit (null if unknown)');
   for (const key of ['itemId', 'attemptId', 'stage', 'role', 'runtimeVersion', 'sessionId', 'taskId', 'requestedModel', 'actualModel', 'effort', 'promptHash', 'evidenceHash', 'costSource', 'cacheSource', 'cacheScope', 'band', 'outcome', 'actor', 'sourceRef', 'reason']) {
     if (key in row) check(nullableText(row[key]), key + ' must be text or null');
@@ -58,6 +65,9 @@ export function validateObservation(row) {
   for (const key of ['fallback', 'delivered', 'independent', 'blind', 'lateDeterministicFailure']) if (key in row) check(row[key] === null || typeof row[key] === 'boolean', key + ' must be boolean or null');
   if (row.startedAt && row.completedAt) check(Date.parse(row.completedAt) >= Date.parse(row.startedAt), 'completion precedes start');
   if (row.kind === 'dispatch') {
+    if ('costBasis' in row) check(COST_BASES.includes(row.costBasis), 'invalid costBasis');
+    if ('costParentDispatchId' in row) check(nullableText(row.costParentDispatchId) && row.costParentDispatchId !== row.dispatchId, 'invalid costParentDispatchId');
+    if ('costIncludesChildren' in row) check(typeof row.costIncludesChildren === 'boolean', 'invalid costIncludesChildren');
     check(text(row.dispatchId), 'dispatchId required');
     check(row.retry === null || (Number.isInteger(row.retry) && row.retry >= 0), 'retry must be a zero-based integer or null');
     check(oneOf(row.bucket, ['item', 'shared-overhead']), 'invalid cost bucket');
@@ -75,6 +85,7 @@ export function validateObservation(row) {
     check(text(row.itemId) && text(row.actor) && text(row.sourceRef) && row.recordedAt !== null, 'acceptance needs explicit item, human actor, source reference and timestamp');
     check(oneOf(row.status, ['accepted', 'rejected', 'pending']), 'invalid acceptance status');
   } else if (row.kind === 'finding') {
+    if ('severity' in row) check(row.severity === null || severityKnown(row.severity), 'invalid finding severity');
     for (const key of ['itemId', 'snapshotId', 'role', 'findingId']) check(text(row[key]), key + ' required');
     check(oneOf(row.adjudication, ['valid', 'false-positive', 'unresolved']), 'invalid adjudication');
     check(nullableText(row.canonicalFindingId), 'canonicalFindingId must be text or null');
@@ -122,7 +133,7 @@ export function adaptNativeAttemptObservation(raw, context = {}) {
     bucket: overhead ? 'shared-overhead' : 'item' };
   for (const key of ['runtimeVersion', 'requestedModel', 'actualModel', 'effort', 'retry', 'fallback',
     'startedAt', 'completedAt', 'outcome', 'inputTokens', 'outputTokens', 'cacheReadTokens', 'cacheWriteTokens',
-    'promptHash', 'evidenceHash', 'costSource', 'measuredCost', 'attributionConfidence']) if (raw[key] !== undefined) row[key] = raw[key];
+    'promptHash', 'evidenceHash', 'costSource', 'measuredCost', 'attributionConfidence', 'costBasis', 'costParentDispatchId', 'costIncludesChildren']) if (raw[key] !== undefined) row[key] = raw[key];
   if (raw.measuredCost !== null && raw.measuredCost !== undefined) row.currency = context.currency ?? null;
   return makeObservation(row);
 }
@@ -171,7 +182,9 @@ function reconcileDispatches(rows, poisonedIds) {
 
 export function aggregateFindings(findings) {
   const canonical = new Map(), perRole = Object.create(null);
+  const severity = { LOW: 0, MEDIUM: 0, HIGH: 0, CRITICAL: 0, unknown: 0 };
   for (const f of findings) {
+    severity[severityKnown(f.severity) ? f.severity : 'unknown']++;
     const role = perRole[f.role] ||= { reported: 0, valid: 0, uniqueValid: 0, falsePositives: 0, unresolved: 0, blindAdjudicated: 0 };
     const key = JSON.stringify([f.itemId, f.snapshotId, f.canonicalFindingId || f.findingId]);
     if (!canonical.has(key)) canonical.set(key, { roles: new Set(), rows: [], outcomes: new Set() });
@@ -206,7 +219,7 @@ export function aggregateFindings(findings) {
     }
   }
   for (const p of Object.values(perRole)) p.falsePositiveRate = p.valid + p.falsePositives ? p.falsePositives / (p.valid + p.falsePositives) : null;
-  return { validFindings, perRole, overlap, conflictingAdjudications };
+  return { validFindings, perRole, overlap, conflictingAdjudications, reportedSeverity: severity };
 }
 
 export function aggregateObservations(input, options = {}) {
@@ -241,11 +254,19 @@ export function aggregateObservations(input, options = {}) {
   }
   const accepted = [...acceptance.values()].filter((r) => r.status === 'accepted' && r.delivered === true);
   const currency = options.currency || 'USD';
-  const measured = dispatches.filter((r) => !dispatchPending(r) && r.measuredCost !== null && r.currency === currency && r.usageScope === 'dispatch' && ['direct', 'shared'].includes(r.attributionConfidence));
-  const knownCost = measured.reduce((sum, r) => sum + r.measuredCost, 0);
+  const eligible = r => !dispatchPending(r) && (r.usageScope === 'dispatch'
+    || (r.usageScope === 'shared-counter-delta' && r.costIncludesChildren === true && r.attributionConfidence === 'shared'))
+    && ['direct', 'shared'].includes(r.attributionConfidence);
+  const accounting = aggregateCosts(dispatches, { eligible });
+  const excluded = new Set(accounting.excludedChildren);
+  const measured = dispatches.filter((r) => eligible(r) && r.measuredCost !== null && r.currency === currency
+    && !excluded.has(JSON.stringify([r.runId, r.dispatchId])));
+  const currencyGroups = accounting.groups.filter(g => g.currency === currency);
+  const knownCost = currencyGroups.length === 1 ? currencyGroups[0].measuredCost : currencyGroups.length ? null : 0;
   const costByBucket = { item: 0, 'shared-overhead': 0 };
   for (const r of measured) costByBucket[r.bucket] += r.measuredCost;
-  const complete = !!cohort?.lifetimeComplete && dispatches.length > 0 && measured.length === dispatches.length
+  if (currencyGroups.length > 1) for (const key of Object.keys(costByBucket)) costByBucket[key] = null;
+  const complete = !!cohort?.lifetimeComplete && accounting.complete && accounting.currency === currency
     && !invalid.length && !dedup.conflicts.length && !physical.conflicts.length
     && cohort.itemIds.every((id) => dispatches.some((r) => r.itemId === id));
   const reuse = { hits: 0, misses: 0, reasons: Object.create(null), savedCallsKnown: 0, unknownSavedCalls: 0 };
@@ -293,10 +314,12 @@ export function aggregateObservations(input, options = {}) {
       fallbacks: dispatches.filter((r) => r.fallback === true).length,
       sharedOverhead: dispatches.filter((r) => r.bucket === 'shared-overhead').length,
       checkpoints: dispatches.filter((r) => r.stage === 'checkpoint').length },
+    accounting,
     delivery: { accepted: accepted.length, explicitDecisions: acceptance.size, currency, knownCost, costByBucket, complete,
+      costBasis: accounting.costBasis, measurementComplete: accounting.measurementComplete,
       costPerAccepted: complete && accepted.length ? knownCost / accepted.length : null,
-      knownCostPerAccepted: accepted.length ? knownCost / accepted.length : null,
-      missingCostDispatches: dispatches.length - measured.length,
+      knownCostPerAccepted: accepted.length && knownCost !== null ? knownCost / accepted.length : null,
+      missingCostDispatches: dispatches.length - excluded.size - measured.length,
       escapedDefectsKnown: accepted.reduce((s, r) => s + (r.escapedDefects ?? 0), 0),
       escapedDefectsUnknown: accepted.filter((r) => r.escapedDefects === null).length,
       correctionMinutesKnown: [...acceptance.values()].reduce((s, r) => s + (r.correctionMinutes ?? 0), 0),
@@ -314,7 +337,8 @@ export function renderObservationReport(report) {
     `Cohort: ${report.cohort}. First-pass closes / all observed first-attempt items: **${report.firstPass.closed}/${report.firstPass.items} (${pct(report.firstPass.rate)})**. Unknown attempt ordinal: ${report.firstPass.unknownOrdinalItems}.`, '',
     `Physical dispatches: ${report.calls.physical}; terminal: ${report.calls.terminal}; incomplete/unknown: ${report.calls.incomplete}; retries: ${report.calls.retries}; fallbacks: ${report.calls.fallbacks}; shared overhead: ${report.calls.sharedOverhead}; checkpoints: ${report.calls.checkpoints}. Provider-internal retries are unknown unless supplied separately.`, '',
     `Requested / actual model pairs (null = unknown): ${JSON.stringify(report.modelPairs)}. A route alias never proves the actual model.`, '',
-    `Human-accepted delivered changes (explicit input): ${report.delivery.accepted}. All-in lifetime cost per accepted delivery: **${show(report.delivery.costPerAccepted)} ${report.delivery.currency}**. Known-cost subtotal: ${report.delivery.knownCost}; known subtotal / accepted: ${show(report.delivery.knownCostPerAccepted)} (partial coverage is a lower bound, never a complete cost).`, '',
+    `Human-accepted delivered changes (explicit input): ${report.delivery.accepted}. Lifetime cost per accepted delivery: **${show(report.delivery.costPerAccepted)} ${report.delivery.currency} (${report.delivery.costBasis ?? 'mixed bases'})**. Known-cost subtotal: ${show(report.delivery.knownCost)}; known subtotal / accepted: ${show(report.delivery.knownCostPerAccepted)}. Only invoice basis represents billed cost.`, '',
+    `Accounting by currency/basis and role/model/runtime: ${JSON.stringify(report.accounting)}. Measurement completeness is separate from accounting basis; unknown or mixed bases cannot yield a complete unqualified total.`, '',
     `Known cost by bucket: ${JSON.stringify(report.delivery.costByBucket)}. Queue milliseconds known: ${report.timing.queueMsKnown} (${report.timing.queueUnknown} dispatches unknown); execution milliseconds known: ${report.timing.executionMsKnown} (${report.timing.executionUnknown} dispatches unknown). Concurrent execution sums are not elapsed run time.`, '',
     `Escaped defects known: ${report.delivery.escapedDefectsKnown} (${report.delivery.escapedDefectsUnknown} accepted items unknown); correction minutes known: ${report.delivery.correctionMinutesKnown} (${report.delivery.correctionMinutesUnknown} decisions unknown).`, '',
     '| Role | Adjudicated valid | Exclusive valid | False positives | Unresolved | False-positive rate |',

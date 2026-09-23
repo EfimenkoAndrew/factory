@@ -6,14 +6,35 @@
 // lib/countclaims.mjs.
 // Output contract (machine-greppable):
 //   FACTORY::COUNTCLAIMS-MISS::<claim text>   one line per unevidenced count claim (added .md lines only)
-//   FACTORY::COUNTCLAIMS::<count>             always last; exit code 1 when count > 0, else 0
-// Best-effort: any internal error reports FACTORY::COUNTCLAIMS::0 (a lint aid must never block a fix).
+//   FACTORY::COUNTCLAIMS::<count>             completed checks only; exit 0 clean, 1 mismatch
+// Missing/unavailable evidence is advisory exit 2, never a numeric clean completion marker.
 import { lintItemCountClaims } from './lib/countclaims.mjs';
+import { readFileSync } from 'node:fs';
 
 const wt = process.argv[2] || '.';
 const itemDir = process.argv[3] || '';
-let missing = [];
-try { missing = lintItemCountClaims(wt, itemDir, 25) || []; } catch { missing = []; }
-for (const m of missing) console.log('FACTORY::COUNTCLAIMS-MISS::' + m);
-console.log('FACTORY::COUNTCLAIMS::' + missing.length);
-process.exit(missing.length ? 1 : 0);
+let report;
+try {
+  const options = { cap: 25 };
+  const args = process.argv.slice(4);
+  for (let i = 0; i < args.length; i++) {
+    const flag = args[i];
+    if (flag === '--legacy') options.legacy = true;
+    else if (flag === '--no-active-contract') options.noActiveContract = true;
+    else if (['--transcript', '--progress', '--claim', '--repo-root'].includes(flag)) {
+      const value = args[++i];
+      if (!value || value.startsWith('--')) throw new Error('missing value for ' + flag);
+      if (flag === '--transcript') (options.transcripts ||= []).push(value);
+      else if (flag === '--repo-root') options.repoRoot = value;
+      else options[flag.slice(2)] = JSON.parse(readFileSync(value, 'utf8'));
+    } else throw new Error('unknown countclaims argument: ' + flag);
+  }
+  report = lintItemCountClaims(wt, itemDir, options);
+} catch (e) { report = { status: 'unavailable', missing: [], sources: [], errors: [e.message] }; }
+for (const source of report.sources) console.log('FACTORY::COUNTCLAIMS-SOURCE::' + JSON.stringify(source));
+for (const m of report.missing) console.log('FACTORY::COUNTCLAIMS-MISS::' + m);
+for (const error of report.errors) console.log('FACTORY::COUNTCLAIMS-NOTE::' + JSON.stringify(error));
+console.log('FACTORY::COUNTCLAIMS-STATUS::' + report.status);
+const complete = ['clean', 'mismatch'].includes(report.status);
+if (complete) console.log('FACTORY::COUNTCLAIMS::' + report.missing.length);
+process.exit(complete ? report.missing.length ? 1 : 0 : 2);

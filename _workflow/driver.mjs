@@ -64,6 +64,8 @@ import { findComments } from './lib/comment-scan.mjs'; // KI-E59 — no-new-comm
 import { detectNarrativeVerdictContradiction, detectUnresolvedCaveatOnClose } from './lib/narrative-check.mjs'; // KI-E67 — narrative-vs-verdict contradiction detection aid at fold (WARN-only); KI-E74C — the mirror direction
 import { effectiveInfraRequirement } from './lib/effective-infra.mjs';
 import { eligibleItems, disjointItems, admitAttempt, lifecycleObservation, observe, observePhysical, observeAdmission, originalInfraRequirement, normalizedInfraResult, containedFile, verifyTranscript, verificationExpectations, verifyNativeReceipt, verifyFinalTranscript, verifyAttemptTranscript, verifyRecoveryTranscript, affectedVerificationTargets, invokedOpenCodeDispatch, worktreeGcGroups, usageIdentity, matchesClaim } from './lib/driver-integration.mjs';
+import { verifyPortableEvidence, sealRecoveryEvidence } from './lib/driver-integration.mjs';
+import { portableHash, openCodeContract, PORTABLE_EVIDENCE_VERSION } from './lib/portable-evidence.mjs';
 
 // KI-B1 (closed 2026-07-12): config-authoritative routing for every emitted batch — built from
 // config/model-routing.json via the SAME mapping the drift guard checks, injected into runArgs as
@@ -492,6 +494,9 @@ function cmdSelect(flags) {
 
 function cmdClaim(ids, flags = {}) {
   const cfg = loadConfig();
+  if (existsSync(abs(join(dirname(cfg.paths.ledger), 'STOP_REQUESTED.md'))) && !flags['stop-override']) {
+    console.log('refusing claim: graceful-stop drain in effect'); return;
+  }
   const engineMount = driverEngineMount(REPO_ROOT, FACTORY_ROOT);
   preflightProductGitlinks(REPO_ROOT, engineMount);
   const graph = loadGraph(abs(cfg.paths.graph));
@@ -518,6 +523,8 @@ function cmdClaim(ids, flags = {}) {
       launch.evidenceInputs = cfg.evidenceInputs || {};
       launch.engineMount = engineMount;
       for (const it of launch.items) Object.assign(it, { runId, claimId: ledger.items[it.id].claimId, claimAt: ledger.items[it.id].attemptIdentity.reservedAt, attemptNumber: ledger.items[it.id].attemptNumber });
+      sealLaunch(ledger, launch);
+      writeJsonAtomic(abs(cfg.paths.ledger), ledger);
       writeJsonAtomic(abs(cfg.paths.runArgs), launch);
       emitLauncherScript(cfg, launch);
     }
@@ -550,12 +557,68 @@ const FORWARD_PASS = new Set(['GREEN', 'BUILT', 'TESTED', 'GATED', 'REFUTE_OK', 
 // MANDATORY, not a fallback — absence of a transcript is a FAIL, not an agent-trust pass. A DOC/CONFIG item
 // (codeChange=false) keeps the owner-sanctioned no-machine-evidence fallback (it is verified by the grep/
 // acceptance assertion the runner reports, and produces no dotnet transcript).
+function portableContractFor(cfg, item, launchConfig = {}) {
+  const config = { ...readJson(join(FACTORY_ROOT, 'config/factory.config.json')),
+    ...(existsSync(join(FACTORY_ROOT, 'config/factory.config.local.json')) ? readJson(join(FACTORY_ROOT, 'config/factory.config.local.json')) : {}),
+    ...launchConfig, evidenceInputs: cfg.evidenceInputs || {} };
+  return openCodeContract({ item, config, policies: loadPolicies(FACTORY_ROOT), routing: injectedRouting(cfg),
+    briefs: readRoleBriefs(abs(cfg.paths.agents)), profiles: readRepoProfiles(join(abs(cfg.paths.agents), 'repo-profiles')) });
+}
+
+function sealLaunch(ledger, launch) {
+  for (const item of launch.items || []) {
+    const row = ledger.items[item.id];
+    if (row?.claimId === item.claimId && row.runId === launch.runId) row.launchHash = portableHash(launch);
+  }
+}
+
+function cmdBindRuntime(ids, flags) {
+  const cfg = loadConfig(), ledger = loadLedger(abs(cfg.paths.ledger)), row = ledger?.items[ids[0]];
+  if (flags.runtime !== 'opencode' || row?.state !== 'CLAIMED' || !flags.claim || row.claimId !== flags.claim) throw new Error('bind-runtime requires current CLAIMED item and supported runtime');
+  if (row.attemptIdentity?.mode === 'sweep' || row.attemptIdentity?.recovery) throw new Error('bind-runtime requires ordinary item claim');
+  const launch = readJson(abs(flags.launch || ''));
+  if (!row.launchHash || portableHash(launch) !== row.launchHash) throw new Error('launch differs from driver-owned claim snapshot');
+  const item = launch.items?.find(it => it.id === ids[0]);
+  if (!item || item.claimId !== row.claimId || item.runId !== row.runId || launch.runId !== row.runId) throw new Error('launch claim mismatch');
+  const wi = byId(loadGraph(abs(cfg.paths.graph)))[ids[0]];
+  const contract = portableContractFor(cfg, { ...wi, ...item }, launch.config);
+  if (portableHash(launch.briefs) !== portableHash(contract.briefs) || portableHash(launch.repoProfiles) !== portableHash(contract.profiles)
+    || portableHash(launch.policies) !== portableHash(contract.policies) || portableHash(launch.routing) !== portableHash(contract.routing)
+    || portableHash(launch.engineMount) !== portableHash(driverEngineMount(REPO_ROOT, FACTORY_ROOT))) throw new Error('launch reviewer/configuration context changed');
+  const binding = { version: PORTABLE_EVIDENCE_VERSION, runtime: 'opencode', claimId: row.claimId,
+    contractHash: portableHash(contract), contract, engineMount: launch.engineMount, launchConfig: launch.config, graphHash: portableHash(wi) };
+  if (row.runtimeEvidence && portableHash(row.runtimeEvidence) !== portableHash(binding)) throw new Error('claim already bound to a different runtime contract');
+  row.runtimeEvidence = binding;
+  writeJsonAtomic(abs(cfg.paths.ledger), ledger);
+  console.log('bound opencode portable evidence v1: ' + ids[0]);
+}
+
+function cmdSealRecovery(ids) {
+  const cfg = loadConfig(), ledger = loadLedger(abs(cfg.paths.ledger)), row = ledger?.items[ids[0]];
+  if (!row?.attemptIdentity?.recovery || row.recoveryVerification?.version !== 2) throw new Error('seal-recovery requires current prepared recovery');
+  const wi = byId(loadGraph(abs(cfg.paths.graph)))[ids[0]];
+  const itemDir = abs(join(cfg.paths.items, ids[0])), worktree = abs(row.worktree);
+  const proof = sealRecoveryEvidence({ result: { runId: row.runId, claimId: row.claimId }, row, itemDir, worktree, repoRoot: REPO_ROOT,
+    codeChange: row.recoveryVerification.codeChange, evidenceInputs: cfg.evidenceInputs || {}, engineMount: driverEngineMount(REPO_ROOT, FACTORY_ROOT) });
+  if (!proof.pass) throw new Error('seal-recovery: ' + proof.reason);
+  if (portableHash(wi) !== row.recoveryVerification.graphHash) throw new Error('recovery graph changed');
+  row.recoveryVerification.hashes = proof.hashes;
+  writeJsonAtomic(abs(cfg.paths.ledger), ledger);
+  console.log('recovery proof sealed: ' + ids[0]);
+}
+
 function deterministicVerifyOverride(cfg, ledger, wi, r) {
   const claims = (r.transitions || []).concat(r.toState ? [r.toState] : []);
-  if (!claims.some((s) => FORWARD_PASS.has(s))) return null;
+  if (!claims.some((s) => FORWARD_PASS.has(s) || s === 'ESCALATED')) return null;
   const id = r.id;
   const readIf = (f) => { const p = abs(join(cfg.paths.items, id, f)); return existsSync(p) ? decodeTranscript(readFileSync(p)) : null; }; // KI-E54: BOM-aware decode, not a hardcoded 'utf8' assumption
-  const codeChange = !!r.codeChange || (wi?.files || []).some(f => /\.cs$/i.test(f));
+  let codeChange = !!r.codeChange || (wi?.files || []).some(f => /\.cs$/i.test(f));
+  if (ledger.items[id]?.runtimeEvidence) {
+    try {
+      codeChange ||= (JSON.parse(readIf('test.json'))?.testFiles || []).some(f => /\.cs$/i.test(f));
+      codeChange ||= changedFiles(abs(ledger.items[id].worktree)).some(f => /\.cs$/i.test(f));
+    } catch { codeChange = true; }
+  }
   // Only target-bound pre-fix machine evidence authorizes suite failure identities.
   // Legacy reported counts remain diagnostic; they never grant a failure allowance.
   // KI-E43 reFix fence (review find): "the tree is still unfixed at RED time" holds ONLY on a first
@@ -611,8 +674,20 @@ function deterministicVerifyOverride(cfg, ledger, wi, r) {
   // global green — failing the item on the missing intermediate file was wrong; the red proof + integrate
   // green are conclusive.)
   const row = ledger.items[id] || {};
-  const recoveryProof = codeChange && (row.attemptIdentity?.recovery || r.recoveryVerification)
-    ? verifyRecoveryTranscript({ result: r, row, itemDir: abs(join(cfg.paths.items, id)), worktree: abs(row.worktree || r.worktree || ''), repoRoot: REPO_ROOT, baseline, evidenceInputs: cfg.evidenceInputs || {}, engineMount: driverEngineMount(REPO_ROOT, FACTORY_ROOT) }) : null;
+  if (row.runtimeEvidence?.runtime === 'opencode' && (row.runtimeEvidence.graphHash !== portableHash(wi)
+    || portableHash(row.runtimeEvidence.engineMount) !== portableHash(driverEngineMount(REPO_ROOT, FACTORY_ROOT)))) return fail('portable evidence trusted graph/engine mount changed');
+  const portableProof = verifyPortableEvidence({ result: r, row, itemDir: abs(join(cfg.paths.items, id)),
+    worktree: abs(row.worktree || ''), codeChange, baseline,
+    expectedContract: row.runtimeEvidence?.runtime === 'opencode'
+      ? portableContractFor(cfg, row.runtimeEvidence.contract.item, row.runtimeEvidence.launchConfig) : undefined });
+  if (portableProof && !portableProof.pass) return fail('portable evidence: ' + portableProof.reason);
+  if (row.recoveryVerification?.version === 2 && (row.recoveryVerification.graphHash !== portableHash(wi)
+    || row.recoveryVerification.codeChange !== codeChange
+    || portableHash(row.recoveryVerification.metadata.policies) !== portableHash(loadPolicies(FACTORY_ROOT))
+    || portableHash(row.recoveryVerification.metadata.reviewerContract.briefs) !== portableHash(readRoleBriefs(abs(cfg.paths.agents)))
+    || row.recoveryVerification.metadata.profile !== (readRepoProfiles(join(abs(cfg.paths.agents), 'repo-profiles'))[wi?.target] || ''))) return fail('recovery trusted graph/classification/reviewer contract changed');
+  const recoveryProof = (row.attemptIdentity?.recovery || r.recoveryVerification)
+    ? verifyRecoveryTranscript({ result: r, row, itemDir: abs(join(cfg.paths.items, id)), worktree: abs(row.worktree || r.worktree || ''), repoRoot: REPO_ROOT, baseline, codeChange, evidenceInputs: cfg.evidenceInputs || {}, engineMount: driverEngineMount(REPO_ROOT, FACTORY_ROOT) }) : null;
   if (recoveryProof && !recoveryProof.pass) return fail('recovery verification: ' + recoveryProof.reason);
   const nativeProof = !recoveryProof ? verifyNativeReceipt({ result: r, row, item: wi, itemDir: abs(join(cfg.paths.items, id)),
     worktree: abs(row.worktree || r.worktree || ''), repoRoot: REPO_ROOT, codeChange,
@@ -631,8 +706,8 @@ function deterministicVerifyOverride(cfg, ledger, wi, r) {
   const integrationProof = recoveryProof || (codeChange ? verifyAttemptTranscript({ ...proofArgs, phase: 'integrate' }) : null);
   if (initialProof && !initialProof.pass) return fail('initial verification: ' + initialProof.reason);
   if (integrationProof && !integrationProof.pass) return fail('integration verification: ' + integrationProof.reason);
-  const rawText = recoveryProof?.text || finalProof?.text || initialProof?.text || readIf('verify-raw.txt');
-  const intText = integrationProof?.text || readIf('integrate-raw.txt');
+  const rawText = portableProof?.text || recoveryProof?.text || finalProof?.text || initialProof?.text || readIf('verify-raw.txt');
+  const intText = portableProof ? portableProof.integrationText : integrationProof?.text || readIf('integrate-raw.txt');
   const vVerdict = rawText ? verdictFromParse(parseVerifyRaw(rawText), baseline, baselineOptions) : { pass: true, reason: 'no-machine-evidence' };
   const iVerdict = intText ? verdictFromParse(parseVerifyRaw(intText), baseline, baselineOptions) : { pass: true, reason: 'no-machine-evidence' };
   if (!vVerdict.pass) return fail('verify transcript: ' + annotateBaseline(vVerdict.reason));
@@ -821,6 +896,7 @@ function cmdFold(file, flags) {
     seenResults.add(identity);
     if (r.resultId && ledger.folded?.[r.resultId]) return false;
     const row = ledger.items[r.id];
+    if (row.attemptIdentity?.mode === 'sweep') { console.log('fold: sweep claim requires sweep-fold for ' + r.id); return false; }
     if (!matchesClaim(r, row)) { console.log('fold: claim identity mismatch for ' + r.id); return false; }
     r.runId ||= results.runId;
     if (r.runId && row?.runId && r.runId !== row.runId) {
@@ -1511,6 +1587,7 @@ function cmdResume(flags) {
           const regenPath = emitLauncherScript(cfg, runArgs, labelSlug);
           if (!regenPath) throw new Error('launcher regeneration failed; no fresh identity persisted');
           writeJsonAtomic(freshArgsPath, runArgs);
+          sealLaunch(draft, runArgs);
           Object.assign(ledger, draft);
           writeJsonAtomic(abs(cfg.paths.ledger), ledger);
           for (const id of ids) observeReservation(ledger.items[id], id);
@@ -2163,7 +2240,7 @@ function cmdGroup(flags) {
       // AGENTS.md") — it was beyond char 90 — and delivered 2 of 3 clauses; three gates then
       // CHANGES_REQUIRED'd it. Full-fidelity strings, sanitized only. fixHint rides along too (it
       // was omitted entirely in the compact-args era — compose rendered "(none)" for every item).
-      id: wi.id, target: wi.target, layer: wi.layer, title: trim(wi.title, 300), severity: wi.severity, theme: wi.theme,
+      id: wi.id, target: wi.target, layer: wi.layer, title: trim(wi.title, 300), severity: wi.severity, theme: wi.theme, band: bandFor(wi),
       fixType: wi.fixType, files: wi.files, dependsOn: wi.dependsOn || [], acceptance: trim(wi.acceptance, 2000),
       regressionTest: trim(wi.regressionTest, 1200), fixHint: trim(wi.fixHint, 1500), realInfra: !!wi.realInfra, gateSet: wi.gateSet, autonomyTier: wi.autonomyTier,
       reFix: ['FAILED', 'CONFLICT'].includes(ledger.items[wi.id].state), // Phase-6: re-run feeds prior gate feedback to test-author+fixer
@@ -2252,6 +2329,7 @@ function cmdGroup(flags) {
     items,
   };
   const runArgsRel = labelPath(cfg.paths.runArgs);
+  if (!flags.dry) { sealLaunch(ledger, runArgs); writeJsonAtomic(abs(cfg.paths.ledger), ledger); }
   writeJsonAtomic(abs(runArgsRel), runArgs);
   // KI-C1 fix: ALSO emit a self-contained LAUNCHER script that inlines the batch into the SCRIPT
   // channel (512KB cap), so a batch larger than the ~2KB `args` transport launches via
@@ -2523,6 +2601,8 @@ function cmdSweep(flags, rest) {
   preflightProductGitlinks(REPO_ROOT, engineMount);
   const runId = randomUUID();
   const wtRel = abs(join(cfg.paths.worktreesState, 'sweep-' + n)); // ABSOLUTE (CWD-robust) — see the group call-site note
+  if (Object.values(ledger.items).some(row => row.worktree && presolve(REPO_ROOT, row.worktree).toLowerCase() === wtRel.toLowerCase()
+    && ACTIVE.includes(row.state))) throw new Error('sweep worktree already has an active claim; drain the existing sweep first');
   addWorktree(wtRel, 'factory/sweep-' + n);
   preflightProductGitlinks(wtRel, engineMount);
   const designExists = existsSync(join(sweepsDir(cfg), 'sweep-' + n + '-design.md'));
@@ -2562,6 +2642,8 @@ function cmdSweep(flags, rest) {
       verificationTargets: [...new Set(compactSites.flatMap(s => s.verificationTargets))] },
   };
   writeJsonAtomic(join(sweepsDir(cfg), 'claim-' + runId + '.json'), runArgs);
+  for (const site of sites) ledger.items[site.findingId].launchHash = portableHash(runArgs);
+  writeJsonAtomic(abs(cfg.paths.ledger), ledger);
   writeJsonAtomic(join(sweepsDir(cfg), 'sweep-' + n + '-claim.json'), { runId });
   writeJsonAtomic(abs(cfg.paths.runArgs), runArgs);
   writeJsonAtomic(abs(cfg.paths.runArgs.replace(/(\.[^.\/]+)$/, '-' + sweepSlug + '$1')), runArgs);
@@ -2587,6 +2669,10 @@ function cmdSweepFold(file) {
     || abs(sw.worktree || '') !== abs(launch.worktree.path)) throw new Error('sweep-fold: claim/worktree/cycle mismatch');
   observePhysical(result, ledger.items, temit);
   const declared = launch.sweep.sites;
+  if (declared.some(site => {
+    const row = ledger.items[site.findingId];
+    return row?.claimId === site.claimId && (row.attemptIdentity?.mode !== 'sweep' || row.launchHash !== portableHash(launch));
+  })) throw new Error('sweep-fold: trusted launch/mode mismatch');
   const returned = new Map();
   for (const site of sw.sites || []) {
     if (returned.has(site.findingId) || !declared.some(s => s.findingId === site.findingId)) throw new Error('sweep-fold: duplicate or unclaimed site');
@@ -2727,24 +2813,28 @@ function cmdRecover(flags, rest) {
   Object.assign(skeleton, { resultId: id + '#' + cyc + 'r' + recoveryOrdinal, runId, claimId: identity.claimId, attemptNumber: identity.attemptNumber });
   const quote = value => "'" + String(value).replace(/'/g, "'\\''") + "'";
   let recoveryCommands = 'Documentation recovery: independently recheck acceptance against the current worktree.';
-  if (recoveryCode) {
+  {
+    if (!wtAbs) throw new Error('recover: fresh source proof requires a live worktree');
     const prefix = join(itemDir, 'verify-recovery-' + runId + '-' + identity.claimId);
-    const contract = { version: 1, transcript: prefix + '.txt', metadataFile: prefix + '-metadata.json',
+    const contract = { version: 2, codeChange: recoveryCode, graphHash: portableHash(wi), transcript: prefix + '.txt', metadataFile: prefix + '-metadata.json',
       beforeIdentity: prefix + '-before.json', afterIdentity: prefix + '-after.json', expected: recoveryExpected };
     row.recoveryVerification = contract;
     skeleton.recoveryVerification = { required: true, transcript: contract.transcript };
-    writeJsonAtomic(contract.metadataFile, { engineMount: driverEngineMount(REPO_ROOT, FACTORY_ROOT), inputs: cfg.evidenceInputs || {}, acceptance: wi.acceptance, policies: recPolicies, profile: repoProfiles[wi.target] || '',
-      reviewerContract: { version: 'driver-recovery-v1', briefs, targets: recoveryExpected }, context: { item: wi, runId, claimId: identity.claimId } });
+    contract.metadata = { engineMount: driverEngineMount(REPO_ROOT, FACTORY_ROOT), inputs: cfg.evidenceInputs || {}, acceptance: wi.acceptance, policies: recPolicies, profile: repoProfiles[wi.target] || '',
+      reviewerContract: { version: 'driver-recovery-v1', briefs, targets: recoveryExpected }, context: { item: wi, runId, claimId: identity.claimId } };
+    writeJsonAtomic(contract.metadataFile, contract.metadata);
     writeFileSync(contract.transcript, '', { flag: 'wx' });
     const collect = `node ${quote(join(FACTORY_ROOT, '_workflow/evidence-identity.mjs'))} ${quote(wtAbs)} ${quote(contract.metadataFile)}`;
     const commands = ['set -o pipefail', `${collect} > ${quote(contract.beforeIdentity)}`, `: > ${quote(contract.transcript)}`];
-    for (const sub of ['build', 'filter', 'suite']) for (const invocation of recoveryExpected[sub]) {
+    for (const sub of ['build', 'filter', 'suite']) for (const invocation of recoveryExpected?.[sub] || []) {
       const target = typeof invocation === 'string' ? invocation : invocation.target;
       commands.push(`bash ${quote(btAbs)} ${sub} ${quote(presolve(wtAbs, target))}${sub === 'filter' ? ' ' + quote(invocation.filter) : ''} 2>&1 | tee -a ${quote(contract.transcript)}`);
     }
+    if (!recoveryCode) commands.push('# Run the item regression assertion and capture its actual output in ' + quote(contract.transcript) + ' before collecting the after identity.');
     commands.push(`${collect} > ${quote(contract.afterIdentity)}`);
+    commands.push(`node ${quote(join(FACTORY_ROOT, '_workflow/driver.mjs'))} seal-recovery ${quote(id)}`);
     recoveryCommands = 'After the LAST remedy/source edit, run this complete fresh proof. Do not edit source afterward. Never copy historical transcripts.\n```bash\n' + commands.join('\n') + '\n```';
-  } else delete row.recoveryVerification;
+  }
   if (prior?.realInfraClassification) {
     skeleton.realInfraClassification = prior.realInfraClassification;
     skeleton.gates['adjudicator:realinfra-override'] = prior.gates?.['adjudicator:realinfra-override'];
@@ -3435,6 +3525,8 @@ function dispatch(cmd, flags, rest) {
     case 'status': return cmdStatus();
     case 'select': return cmdSelect(flags);
     case 'claim': return cmdClaim(rest, flags);
+    case 'bind-runtime': return cmdBindRuntime(rest, flags);
+    case 'seal-recovery': return cmdSealRecovery(rest);
     case 'reset': return cmdReset(rest);
     case 'fold': return cmdFold(rest[0], flags);
     case 'reconstruct': return cmdReconstruct(flags); // KI-L40 — rebuild results-cycle-<N>.json from per-item checkpoints after a kill
@@ -3473,7 +3565,7 @@ async function main() {
   // KI-B2/B3: a single advisory lock around every ledger-MUTATING command — a second concurrent driver
   // fails fast with a clear message instead of silently racing ledger.json. Read-only commands skip it.
   // 'controller' is lock-guarded too (its claim/release mutate controller.json under the same lock).
-  const MUTATING = new Set(['init', 'claim', 'reset', 'fold', 'group', 'cycle', 'sweep', 'sweep-fold', 'recover', 'merge-graph', 'gc', 'controller']);
+  const MUTATING = new Set(['init', 'claim', 'bind-runtime', 'seal-recovery', 'reset', 'fold', 'group', 'cycle', 'sweep', 'sweep-fold', 'recover', 'merge-graph', 'gc', 'controller']);
   const needsLock = MUTATING.has(cmd) || ['resume', 'reconstruct'].includes(cmd);
   let lockPath = null;
   if (needsLock) {

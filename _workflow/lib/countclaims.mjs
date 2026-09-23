@@ -7,7 +7,7 @@
 // SAME class mechanically: any "N/M passed" claim in ADDED .md lines must match a REAL
 // `Passed!|Failed! ... Failed: F, Passed: P, ..., Total: T` summary line (or the keyed
 // `FACTORY::SUMMARY::suite ... passed=P ...` marker) actually present in the item's OWN
-// verify-raw.txt/integrate-raw.txt evidence transcripts — the exact machine-authoritative source
+// explicitly selected current evidence transcripts — the exact machine-authoritative source
 // build-test.sh's own `suite` subcommand already produces. A claim with no matching evidence entry
 // is flagged; this does NOT judge whether the NUMBER is "good", only whether it is REAL.
 //
@@ -16,8 +16,11 @@
 // about what a test proves (that remains the review band's job — see KI-E181's retry-prompt fix for
 // the sibling "my own fix mischaracterized the code" failure mode, which this lint does not cover).
 import { execFileSync } from 'node:child_process';
-import { readFileSync, existsSync } from 'node:fs';
+import { readFileSync, realpathSync, statSync } from 'node:fs';
+import { resolve, relative, isAbsolute, basename } from 'node:path';
+import { createHash } from 'node:crypto';
 import { decodeTranscript } from './verify.mjs';
+import { classifyArtifact, verificationArtifactName } from './artifacts.mjs';
 
 // "N/M" immediately followed by whitespace + "passed" (the shape every real incident used:
 // "23/23 passed", "2258/2283 passed") OR "N/M" followed later on the SAME line by "passed"
@@ -66,7 +69,7 @@ export function extractEvidencePairs(text) {
   }
   for (const m of s.matchAll(KEYED_SUMMARY_RE)) {
     const failed = parseInt(m[1], 10), passed = parseInt(m[2], 10), skipped = m[3] ? parseInt(m[3], 10) : 0;
-    if (Number.isFinite(passed) && failed >= 0) pairs.add(passed + '/' + (passed + failed + skipped));
+    if (Number.isFinite(passed) && passed >= 0 && failed >= 0 && skipped >= 0) pairs.add(passed + '/' + (passed + failed + skipped));
   }
   return pairs;
 }
@@ -88,31 +91,146 @@ export function findUnevidencedCountClaims(addedLines, evidencePairs, cap = 10) 
   return missing;
 }
 
-// IO-wrapping entrypoint, mirroring doclint.mjs's lintWorktreeDocClaims exactly: added .md lines
-// (tracked diff + untracked new files) from the WORKTREE, evidence pairs from the ITEM'S OWN
-// verify-raw.txt/integrate-raw.txt (a sibling directory to the worktree, not inside it — the
-// evidence transcripts live under state/items/<id>/, never in the tracked tree). Returns [] on any
-// error — a detection aid must never block a fix. `itemDir` is optional; when omitted (or neither
-// evidence file exists) every count claim is unevidenced by definition, which is the CORRECT and
-// desired behavior — a count claim written before any real test run exists is exactly as
-// unverifiable, and exactly as worth flagging, as one that has since gone stale.
-export function lintItemCountClaims(worktree, itemDir, cap = 10) {
+const sha256 = bytes => createHash('sha256').update(bytes).digest('hex');
+const samePath = (a, b) => relative(resolve(a), resolve(b)) === '';
+function containedFile(root, path) {
+  const inside = (base, file) => {
+    const rel = relative(base, file);
+    if (!rel || rel === '..' || rel.startsWith('..\\') || rel.startsWith('../') || isAbsolute(rel)) throw new Error('path outside allowed directory: ' + path);
+  };
+  inside(resolve(root), resolve(path));
+  const physical = realpathSync(path);
+  inside(realpathSync(root), physical);
+  if (!statSync(physical).isFile()) throw new Error('not a regular file: ' + path);
+  return physical;
+}
+
+// The caller supplies the current trusted claim and checkpoint, never a directory-wide history.
+// Explicit refs are a caller-owned selection; when a checkpoint is supplied they must be an exact
+// subset of its current contract. A stale checkpoint cannot select legacy evidence by omission.
+export function resolveCountClaimTranscripts({ itemDir, transcripts, progress, claim, legacy = false, noActiveContract = false, repoRoot } = {}) {
+  const fail = reason => ({ status: 'unavailable', reason, references: [] });
+  const missing = reason => ({ status: 'missing-evidence', reason, references: [] });
   try {
-    const diff = execFileSync('git', ['-C', worktree, 'diff', 'HEAD', '--unified=0', '--', '*.md'], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
-    const added = diff.split('\n').filter((l) => l.startsWith('+') && !l.startsWith('+++')).map((l) => l.slice(1));
-    const untracked = execFileSync('git', ['-C', worktree, 'ls-files', '--others', '--exclude-standard', '--', '*.md'], { encoding: 'utf8' }).split('\n').filter(Boolean);
-    for (const f of untracked) {
-      try { added.push(...execFileSync('cat', [worktree + '/' + f], { encoding: 'utf8', maxBuffer: 8 * 1024 * 1024 }).split('\n')); } catch { /* per-file */ }
+    if (!itemDir) return missing('item artifact directory not supplied');
+    const p = progress?.res ? { ...progress.res, ...progress } : progress;
+    const identity = claim?.attemptIdentity || claim;
+    const active = !!(p || identity);
+    if (legacy && (!noActiveContract || active)) return fail('legacy fallback requires explicit no-active-contract and no claim/checkpoint');
+    if (identity && !p) return fail('current claim requires its checkpoint transcript contract');
+    if (p && (!identity || !identity.runId || !identity.claimId || !Number.isSafeInteger(identity.attemptNumber))) return fail('checkpoint requires trusted current claim identity');
+    if (p && ((p.id || p.itemId) !== (claim.id || identity.itemId)
+      || p.runId !== identity.runId || p.claimId !== identity.claimId || p.attemptNumber !== identity.attemptNumber)) return fail('checkpoint does not match current item/run/claim/attempt');
+    const since = identity ? Date.parse(identity.reservedAt || identity.startedAt || identity.claimAt) : null;
+    if (identity && !Number.isFinite(since)) return fail('current claim timestamp unavailable');
+    const pathFor = ref => {
+      if (typeof ref !== 'string' || !ref) throw new Error('invalid transcript reference');
+      return isAbsolute(ref) ? resolve(ref) : resolve(repoRoot && /[\\/]/.test(ref) ? repoRoot : itemDir, ref);
+    };
+    let allowed;
+    const add = (ref, hash) => {
+      if (hash !== undefined && !/^[0-9a-f]{64}$/.test(hash)) throw new Error('malformed transcript hash');
+      allowed.push({ path: pathFor(ref), ...(hash ? { sha256: hash } : {}) });
+    };
+    if (p) {
+      allowed = [];
+      if (p.initialVerification || p.finalVerification || p.integrationVerification || Object.hasOwn(p, 'nativeEvidenceVersion')
+        || p.evidenceIdentity?.request || p.runtime === 'native' || p.runtime === 'claude-workflow') {
+        if (Object.hasOwn(p, 'nativeEvidenceVersion') && p.nativeEvidenceVersion !== 1) return fail('unsupported native evidence version');
+        const passId = String(identity.runId).replace(/[^A-Za-z0-9._-]/g, '_') + '-' + String(identity.claimId).replace(/[^A-Za-z0-9._-]/g, '_');
+        const initial = p.initialVerification, final = p.finalVerification, integration = p.integrationVerification;
+        if (!initial || initial.passId !== passId || basename(pathFor(initial.transcript)) !== verificationArtifactName('initial', passId)) return fail('native initial reference does not match current claim');
+        const selected = final || initial;
+        if (final && (final.refreshed !== true || typeof final.codeChanged !== 'boolean' || !/^[0-9a-f]{64}$/.test(final.evidenceHash)
+          || final.evidenceHash !== p.evidenceIdentity?.hash
+          || (final.codeChanged ? basename(pathFor(final.transcript)) !== verificationArtifactName('final', final.evidenceHash)
+            : !samePath(pathFor(final.transcript), pathFor(initial.transcript))))) return fail('native final reference mismatch');
+        const requested = p.evidenceIdentity?.request?.verificationTranscript;
+        if (requested && !samePath(pathFor(requested), pathFor(selected.transcript))) return fail('native request transcript mismatch');
+        add(selected.transcript);
+        if (integration) {
+          if (integration.passId !== passId || basename(pathFor(integration.transcript)) !== verificationArtifactName('integrate', passId)) return fail('native integration reference does not match current claim');
+          add(integration.transcript);
+        }
+      } else if (p.portableEvidence && !p.evidence) {
+        const e = p.portableEvidence;
+        if (e.version !== 1 || e.runtime !== 'opencode' || e.runId !== identity.runId || e.claimId !== identity.claimId
+          || e.attemptNumber !== identity.attemptNumber || !e.identity?.hash) return fail('portable evidence claim mismatch');
+        for (const [kind, name] of [['verification', 'verify-raw.txt'], ['integration', 'integrate-raw.txt']]) {
+          const proof = e[kind];
+          if (kind === 'integration' && !proof) continue;
+          if (!proof?.complete || proof.identityHash !== e.identity.hash || proof.transcript !== name || !proof.rawHash) return fail('portable ' + kind + ' contract incomplete');
+          add(proof.transcript, proof.rawHash);
+        }
+      } else if (p.evidence) {
+        if (!p.evidence.complete || !p.content?.hash || p.evidence.hash !== p.content.hash || !p.evidence.rawHash) return fail('OpenCode current verification contract incomplete');
+        add('verify-raw.txt', p.evidence.rawHash);
+        if (p.integrationEvidence) {
+          if (!p.integrationEvidence.complete || p.integrationEvidence.hash !== p.content.hash || !p.integrationEvidence.rawHash) return fail('OpenCode current integration contract incomplete');
+          add('integrate-raw.txt', p.integrationEvidence.rawHash);
+        }
+      } else return missing('active checkpoint has no current transcript contract');
     }
-    if (!added.length) return [];
+    let references;
+    if (transcripts !== undefined) {
+      if (!Array.isArray(transcripts)) return fail('transcripts must be explicit references');
+      references = transcripts.map(ref => {
+        const path = pathFor(typeof ref === 'string' ? ref : ref?.path);
+        const match = allowed?.find(a => samePath(a.path, path));
+        if (allowed && !match) throw new Error('transcript is not in current checkpoint contract: ' + path);
+        const hash = typeof ref === 'object' ? ref.sha256 : undefined;
+        if (hash !== undefined && !/^[0-9a-f]{64}$/.test(hash)) throw new Error('malformed explicit transcript hash');
+        if (match?.sha256 && hash && match.sha256 !== hash) throw new Error('explicit transcript hash disagrees with checkpoint');
+        return { path, ...(hash ? { sha256: hash } : {}), ...match };
+      });
+    } else if (allowed) references = allowed;
+    else if (legacy) references = ['verify-raw.txt', 'integrate-raw.txt'].map(n => ({ path: pathFor(n), optional: true }));
+    else return missing('explicit current transcript references required');
+    if (!references.length) return missing('no current transcript references');
+    for (const ref of references) {
+      const artifact = classifyArtifact(basename(ref.path));
+      const name = basename(ref.path);
+      if (!artifact.canonical || ['archive', 'control'].includes(artifact.kind)
+        || !/^(?:verify-(?!red-raw\.txt$).+|integrate-raw)\.txt$/.test(name)) return fail('not a current machine transcript: ' + ref.path);
+      if (since !== null) ref.sinceMs = since;
+    }
+    return { status: 'ready', references, legacy };
+  } catch (e) { return fail(e.message); }
+}
+
+export function lintItemCountClaims(worktree, itemDir, options = {}, deps = {}) {
+  if (typeof options === 'number') options = { cap: options };
+  const report = { version: 1, status: 'unavailable', missing: [], sources: [], errors: [], evidenceStatus: 'unavailable' };
+  const command = deps.execFileSync || execFileSync;
+  try {
+    const diff = command('git', ['-C', worktree, 'diff', 'HEAD', '--unified=0', '--', '*.md'], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
+    const added = diff.split('\n').filter(l => l.startsWith('+') && !l.startsWith('+++')).map(l => l.slice(1));
+    const untracked = command('git', ['-C', worktree, 'ls-files', '-z', '--others', '--exclude-standard', '--', '*.md'], { encoding: 'utf8' }).split('\0').filter(Boolean);
+    for (const f of untracked) {
+      if (!/\.md$/i.test(f)) throw new Error('unexpected untracked Markdown path: ' + f);
+      added.push(...decodeTranscript(readFileSync(containedFile(worktree, resolve(worktree, f)))).split('\n'));
+    }
+    const selection = resolveCountClaimTranscripts({ ...options, itemDir });
+    if (selection.status !== 'ready') return { ...report, status: selection.status, evidenceStatus: selection.status, errors: [selection.reason] };
     const evidencePairs = new Set();
-    if (itemDir) {
-      for (const f of ['verify-raw.txt', 'integrate-raw.txt']) {
-        const p = itemDir.replace(/\/+$/, '') + '/' + f;
-        if (!existsSync(p)) continue;
-        try { for (const pair of extractEvidencePairs(decodeTranscript(readFileSync(p)))) evidencePairs.add(pair); } catch { /* per-file */ }
+    for (const ref of selection.references) {
+      try {
+        const path = containedFile(itemDir, ref.path);
+        if (ref.sinceMs !== undefined && statSync(path).mtimeMs < ref.sinceMs) throw new Error('transcript predates current claim: ' + ref.path);
+        const bytes = readFileSync(path);
+        if (ref.sha256 && sha256(bytes) !== ref.sha256) throw new Error('transcript hash mismatch: ' + ref.path);
+        const pairs = extractEvidencePairs(decodeTranscript(bytes));
+        report.sources.push({ path: ref.path, sha256: sha256(bytes), pairs: [...pairs] });
+        for (const pair of pairs) evidencePairs.add(pair);
+      } catch (e) {
+        if (e.code === 'ENOENT' && ref.optional) continue;
+        report.errors.push(e.message);
+        report.evidenceStatus = e.code === 'ENOENT' && report.evidenceStatus !== 'unavailable-error' ? 'missing-evidence' : 'unavailable-error';
       }
     }
-    return findUnevidencedCountClaims(added, evidencePairs, cap);
-  } catch { return []; }
+    if (report.errors.length) return { ...report, status: report.evidenceStatus === 'missing-evidence' ? 'missing-evidence' : 'unavailable', evidenceStatus: report.evidenceStatus === 'missing-evidence' ? 'missing-evidence' : 'unavailable' };
+    if (!evidencePairs.size) return { ...report, status: 'missing-evidence', evidenceStatus: 'missing-evidence', errors: ['selected transcripts contain no machine test counts'] };
+    report.missing = findUnevidencedCountClaims(added, evidencePairs, options.cap || 10);
+    return { ...report, status: report.missing.length ? 'mismatch' : 'clean', evidenceStatus: 'available' };
+  } catch (e) { return { ...report, errors: [e.message] }; }
 }

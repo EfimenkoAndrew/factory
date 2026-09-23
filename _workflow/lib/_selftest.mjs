@@ -2,7 +2,7 @@
 // Exercises the state machine, deps/locks READY computation, fold, and atomic I/O —
 // the Phase-0 acceptance surface that does not need the Workflow runtime.
 import { testRoot } from './_test-environment.mjs';
-import { prepareOfflineDotnetFixture } from './_offline-dotnet-fixture.mjs';
+import { selectTestSuite } from './_test-suites.mjs';
 import { resolveBash } from './bash.mjs';
 import { runGitFixture, runCheckoutCoverage } from './_git-fixture-tests.mjs';
 import { runMainGuardDriverTests } from './_mainguard-driver-tests.mjs';
@@ -42,6 +42,17 @@ import { costTelemetryReady, shimAvailable, dotnetAvailable } from './preflight.
 import { chmodSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { compose as composePort } from '../opencode/compose.mjs';
+
+let selectedSuite;
+try { selectedSuite = selectTestSuite(process.argv.slice(2)); }
+catch (error) { console.error(error.message); process.exit(2); }
+console.log(`self-test suite: ${selectedSuite}; isolated home/cache: ${testRoot}`);
+if (selectedSuite === 'portable') console.log('integration NOT REQUESTED (use --suite all for the full repository gate)');
+if (selectedSuite === 'integration') {
+  try { execFileSync(process.execPath, [fileURLToPath(new URL('./_offline-dotnet-check.mjs', import.meta.url))], { stdio: 'inherit', timeout: 300000 }); }
+  catch { process.exit(1); }
+  process.exit(0);
+}
 
 function portPrompt(role, item = {}) {
   return composePort(role, { id: 'CONTRACT', files: [], ...item }, null, {
@@ -1653,7 +1664,7 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
   // (e) the dead-code / dropped-field cleanups
   ok(!/import \{[^}]*\btouchedRootCause\b[^}]*\} from '\.\/buildtest\.mjs'/.test(rt112), 'KI-E112: the dead touchedRootCause import is gone (it was imported and never called)');
   ok(!/import \{[^}]*\bappendRaw\b[^}]*\} from '\.\/buildtest\.mjs'/.test(rt112), 'KI-E112: the dead appendRaw import is gone');
-  ok(rt112.includes('progress.item.verifyNote = caveats112.join'), 'KI-E112: the KI-E74B verify-note channel is now POPULATED — compose.mjs had rendered it since KI-E74B with nothing ever setting it (a dead render)');
+  ok(rt112.includes('progress.verifyNote = caveats112.join') && rt112.includes('...(progress.verifyNote ? { verifyNote: progress.verifyNote } : {})'), 'KI-E112: runtime caveats reach the composed review item without mutating its claim-bound contract');
   ok(portPrompt('gate-developer', { verifyNote: 'UNRESOLVED-CONTRACT-CAVEAT' }).includes('UNRESOLVED-CONTRACT-CAVEAT'), 'KI-E112: populated verify note reaches the actual reviewer prompt');
   ok(rt112.includes('if (integ.branch) progress.res.branch = integ.branch;'), 'KI-E112: the integrator\'s branch reaches the folded result — the hand-off the human is meant to commit (KI-E1)');
   ok(rt112.includes('function configuredGateSet()') && !rt112.includes('gateRolesFor(progress.item, progress.band, null)'), 'KI-E112: the host\'s configured gateSet is READ — both call sites passed null, silently ignoring a host that customised it');
@@ -2636,7 +2647,7 @@ gitFixture('KI-E35 splitDriftByStatus integration');
   ok(fsrc2.includes('COUNT-CLAIM SELF-CHECK (KI-E182)'), 'KI-E182: fixer briefed with the count-claim self-check');
   ok(fsrc2.includes('COUNT-CLAIM LINT (KI-E182)'), 'KI-E182: runner tees the count-claims lint for doc-touching items');
   ok((fsrc2.match(/\+ claimsHint \+ countClaimsHint/g) || []).length === 7, 'KI-E182: the count-claims hint rides EVERY one of the 7 fixer/amend dispatch sites the doc-claims hint already reaches (initial fix + 6 amend rounds)');
-  ok(fsrc2.includes('routine machine-state bookkeeping'), 'KI-D8: checkpoint preamble opens with the bookkeeping framing (4th mitigation)');
+  ok(fsrc2.includes('MECHANICAL CHECKPOINT RELAY. Persist engine-computed state; the driver independently validates fold evidence.'), 'KI-D8: checkpoint relay distinguishes persistence from independent evidence validation');
   // driver.mjs source contracts
   const dsrc = readFileSync(new URL('../driver.mjs', import.meta.url), 'utf8');
   ok(!dsrc.includes('if (!heavy && /edge-case/i.test(f.skill)) continue'), 'KI-E12: driver applicableReviewFlows agreement updated (edge-case for every code item)');
@@ -4434,7 +4445,8 @@ if (hasUsableBash('KI-E134 worktree-guard behavioral fixture (11 assertions)')) 
   ok(cp137body.includes("toState: 'IN_PROGRESS'"), 'KI-E137: a progress snapshot is explicitly stamped IN_PROGRESS — never left at res\'s default \'FAILED\' toState (set at construction), which would otherwise misread as a real failure on disk');
   ok(cp137body.includes('schema: CHECKPOINT_SCHEMA'), 'KI-E137: reuses the SAME CHECKPOINT_SCHEMA as the terminal checkpoint — one write contract, not two');
   ok(cp137body.includes("itemsDir(res.id) + '/progress.json'"), 'KI-E137: writes a SEPARATE file from result.json — never clobbers the terminal-checkpoint contract reconstruct/fold already depend on');
-  ok(cp137body.includes('KI-D8 provenance'), 'KI-E137: carries the SAME KI-D8 provenance framing as checkpointResult — this JSON is machine bookkeeping, never a human signature or official record');
+  const checkpointSmoke = await execSmoke(fac137, smokeBatch());
+  ok(checkpointSmoke.calls.filter(call => /:progress:|:checkpoint$/.test(call.label)).every(call => call.prompt.includes('MECHANICAL CHECKPOINT RELAY. Persist engine-computed state; the driver independently validates fold evidence.')), 'KI-E137: progress and terminal checkpoint workers share the mechanical provenance relay');
 
   // Structural order: each checkpoint call sits AFTER its milestone res.transitions.push(...) and
   // BEFORE the next expensive phase begins — source-text position as a proxy for control-flow order.
@@ -4959,8 +4971,10 @@ const focusedSuites = [
   { file: './native-efficiency_test.mjs', args: [] },
   { file: '../opencode/_build-lease-tests.mjs', args: [] },
 ];
+if (selectedSuite === 'all') focusedSuites.push({ file: './_offline-dotnet-check.mjs', args: [] });
 for (const directory of ['./', '../', '../opencode/', '../../orchestrator/', '../../setup/', '../../verify/']) {
   for (const name of readdirSync(new URL(directory, import.meta.url)).sort()) {
+    if (directory === '../' && name === 'live-opencode-code.test.mjs') continue;
     if (/\.test\.mjs$/.test(name)) focusedSuites.push({ file: directory + name, args: ['--test'] });
   }
 }
@@ -4969,9 +4983,8 @@ let focusedPassed = 0, focusedFailed = 0;
 for (const suite of focusedSuites) {
   let output = '', error = null;
   try {
-    if (suite.file === './test-results.test.mjs') prepareOfflineDotnetFixture(testRoot);
     output = execFileSync(process.execPath, [...suite.args, fileURLToPath(new URL(suite.file, import.meta.url))], {
-      encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 120000,
+      encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: suite.file === './_offline-dotnet-check.mjs' ? 300000 : 120000,
       env: { ...process.env, GIT_OPTIONAL_LOCKS: '0' },
     });
   } catch (e) { error = e; output = String(e.stdout || '') + String(e.stderr || '') + '\n' + e.message; }

@@ -162,7 +162,10 @@ function writerPayload(call) {
   return { path, json };
 }
 const renderedWriters = writerCalls.map(writerPayload);
-assert.deepEqual([...writerKinds].sort(), ['admission-input.json', 'evidence-input', 'progress.json', 'result.json', 'verification-contract-input.json']);
+assert.ok([...writerKinds].some(name => /^checkpoint-input-[0-9a-f]{64}\.json$/.test(name)));
+assert.ok(writerKinds.has('evidence-input'));
+assert.ok(writerKinds.has('verification-contract-input.json'));
+assert.ok(!writerKinds.has('progress.json') && !writerKinds.has('result.json'));
 const evidenceCalls = writerCalls.filter(c => c.label === 'SMOKE-CODE:evidence-identity');
 assert.ok(evidenceCalls.length >= 2, 'multiple native identity boundaries exercised');
 assert.equal(new Set(evidenceCalls.map(c => writerPayload(c).path)).size, evidenceCalls.length, 'each boundary has an immutable request-specific destination');
@@ -278,7 +281,7 @@ try {
   assert.equal(collectNativeEvidence(worktree, missingFile, requestDir).verification.pass, false, 'existing green legacy file cannot rescue missing attempt proof');
   const changedClaim = structuredClone(metadata); changedClaim.requestIdentity.claimId = 'other-claim';
   assert.throws(() => collectNativeEvidence(worktree, changedClaim, requestDir, { expectedDigest: request.digest }), /digest mismatch/);
-  const input = join(requestDir, 'metadata.json');
+  const input = join(requestDir, nativeEvidenceInputName(request.digest));
   const cli = fileURLToPath(new URL('../native-evidence.mjs', import.meta.url));
   writeFileSync(input, JSON.stringify(metadata));
   const invoke = flags => spawnSync(process.execPath, [cli, worktree, input, requestDir, ...flags], { encoding: 'utf8' });
@@ -742,7 +745,7 @@ assert.equal(first.calls.some(c => c.label.endsWith(':progress:post-test')), fal
 
 let siteStart;
 const durableSweep = await run(sw, (prompt, opts) => {
-  if (opts.label === 'sweep:apply:x') siteStart = JSON.parse(prompt.split('ADMISSION-BEGIN\n')[1].split('\nADMISSION-END')[0]);
+  if (opts.label === 'sweep:apply:x') siteStart = JSON.parse(prompt.split('CHECKPOINT-BEGIN\n')[1].split('\nCHECKPOINT-END')[0]);
 });
 assert.equal(siteStart.id, 'x');
 assert.equal(siteStart.progressStage, 'sweep-apply-started');

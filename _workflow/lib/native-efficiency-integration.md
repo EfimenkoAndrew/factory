@@ -12,7 +12,7 @@ A claim reservation is distinct from actual execution. `result.admission` and en
 version, itemId, runId, claimId, attemptNumber, status, attempted, reason
 ```
 
-`attempted` becomes true when the admission relay enters the concurrency limiter. Before any semantic worker runs, that relay invokes `native-evidence.mjs --persist-admission` to validate and atomically persist `progress.json`; an unsuccessful relay stops the lane. The record describes the relay already invoked, not a promised semantic invocation. An item stopped by the initial budget guard returns `status:'deferred'`, `attempted:false`, and `reason:'budget-before-start'`. No start timestamp is invented. Driver admission collection reconciles these signals and physical observations with the reserved claim.
+`attempted` becomes true when the admission relay enters the concurrency limiter. Before any semantic worker runs, that relay invokes `native-persist.mjs` with the engine-computed request digest to validate and atomically persist `progress.json`; an unsuccessful relay stops the lane. The record describes the relay already invoked, not a promised semantic invocation. An item stopped by the initial budget guard returns `status:'deferred'`, `attempted:false`, and `reason:'budget-before-start'`. No start timestamp is invented. Driver admission collection reconciles these signals and physical observations with the reserved claim. Exact payload writes, prelaunch scanning and installer hook requirements are documented in [native-artifact-integration.md](native-artifact-integration.md).
 
 Admission and later progress are available through per-item `progress.json`:
 
@@ -48,7 +48,7 @@ Build/suite targets and regression-filter targets are independent. FULL initial/
 The existing preparation relay combines contract derivation with fresh output creation:
 
 ```text
-node _workflow/prepare-verification.mjs <artifactDir> <passId> initial <contractInput.json>
+node _workflow/prepare-verification.mjs <artifactDir> <passId> initial <verification-contract-input.json> --expected-request <canonical-input-sha256>
 ```
 
 Input is `{item, test, worktree, band}`; the CLI supplies the artifact directory to contract derivation. Output is `{written, expected, integrationExpected, baseline}`. The structured baseline is captured from trusted pre-fix raw evidence with the reFix freshness fence. Results expose `verificationContract` and `verificationTargets` for diagnostics. Fold independently derives trusted expectations and baseline rather than treating returned values as authority.

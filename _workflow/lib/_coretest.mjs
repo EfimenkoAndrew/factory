@@ -15,6 +15,7 @@ import { lintCandidates, guardMechanical } from '../opencode/contracts.mjs';
 import { resolveBash } from './bash.mjs';
 import { runMainGuardDriverTests } from './_mainguard-driver-tests.mjs';
 import { EVIDENCE_IDENTITY_VERSION } from './evidence-identity.mjs';
+import { selectTestSuite } from './_test-suites.mjs';
 
 // Run: node _workflow/lib/_coretest.mjs. Read-only source loading; in-memory fixtures only.
 // Dedicated suites: lib/*.coretest.mjs or opencode/*.coretest.mjs, exporting async
@@ -39,6 +40,14 @@ async function suite(name, run) {
 }
 
 console.log('core-test: read-only/in-memory mode');
+await suite('explicit portable/integration suite selection', () => {
+  eq(selectTestSuite([]), 'portable', 'default suite never auto-enables SDK integration');
+  eq(selectTestSuite(['--integration']), 'all', 'integration alias requests the full repository gate');
+  for (const name of ['portable', 'integration', 'all']) eq(selectTestSuite(['--suite', name]), name, 'explicit suite ' + name);
+  let rejected = false;
+  try { selectTestSuite(['--suite', 'automatic']); } catch { rejected = true; }
+  ok(rejected, 'invalid suite cannot silently downgrade coverage');
+});
 for (const kind of ['main-check', 'fold']) {
   await suite('root-aware driver diagnostic: ' + kind, assertions => runMainGuardDriverTests(kind, assertions));
 }

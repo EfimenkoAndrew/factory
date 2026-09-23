@@ -274,6 +274,57 @@ test('partial currency/usage attribution never becomes all-in cost', () => {
   assert.throws(() => aggregateObservations(rows, { cohort: { id: 'missing-fields' } }), /cohort/);
 });
 
+test('typed cost bases separate measurement coverage from comparable totals and preserve legacy unknowns', () => {
+  const { rows, options } = observationFixture();
+  const d = rows.find(r => r.kind === 'dispatch');
+  for (const costBasis of ['invoice', 'list-equivalent', 'runtime-reported', 'unknown']) {
+    const report = aggregateObservations(rows.map(r => r === d ? { ...r, costBasis } : r), options);
+    assert.equal(report.delivery.measurementComplete, true);
+    assert.equal(report.delivery.complete, false);
+    assert.equal(report.delivery.knownCost, null);
+    assert.equal(report.delivery.costPerAccepted, null);
+    assert.equal(report.accounting.groups.length, 2);
+    assert.ok(report.accounting.byRole.some(g => g.role === 'fixer' && g.costBasis === costBasis));
+  }
+  const legacy = rows.map(r => {
+    const { costBasis, costParentDispatchId, costIncludesChildren, severity, ...old } = r;
+    return old;
+  });
+  assert.deepEqual(validateObservation(legacy.find(r => r.kind === 'dispatch')), []);
+  const report = aggregateObservations(legacy, options);
+  assert.equal(report.delivery.knownCost, 15);
+  assert.equal(report.delivery.complete, false);
+  assert.equal(report.accounting.groups[0].costBasis, 'unknown');
+  assert.equal(report.findings.reportedSeverity.unknown, 5);
+  assert.throws(() => makeObservation({ ...d, costBasis: 'probably billed' }), /costBasis/);
+});
+
+test('inclusive controller cost replaces linked worker costs with order-independent nonoverlap', () => {
+  const { rows, options } = observationFixture();
+  const workers = rows.filter(r => r.kind === 'dispatch').map(r => ({ ...r, costParentDispatchId: 'controller' }));
+  const parent = makeObservation({ kind: 'dispatch', id: 'controller', dispatchId: 'controller', runId: 'run-1',
+    bucket: 'shared-overhead', role: 'controller', actualModel: 'controller-model', runtimeVersion: 'runtime-1',
+    costIncludesChildren: true, measuredCost: 20, currency: 'USD', costBasis: 'synthetic', costSource: 'fixture',
+    outcome: 'completed', attributionConfidence: 'shared' });
+  const input = [...workers, parent, ...rows.filter(r => r.kind !== 'dispatch')];
+  const report = aggregateObservations(input, options);
+  assert.equal(report.delivery.knownCost, 20);
+  assert.equal(report.delivery.costPerAccepted, 20);
+  assert.equal(report.accounting.excludedChildren.length, 12);
+  assert.equal(report.accounting.byRole.length, 1);
+  assert.equal(report.accounting.byModel[0].actualModel, 'controller-model');
+  assert.equal(report.accounting.byRuntime[0].runtimeVersion, 'runtime-1');
+  assert.equal(aggregateObservations(input.toReversed(), options).delivery.knownCost, 20);
+  const shared = input.map(r => r === parent ? { ...r, usageScope: 'shared-counter-delta' } : r);
+  assert.equal(aggregateObservations(shared, options).delivery.costPerAccepted, 20);
+  assert.equal(aggregateObservations(input.map(r => r === parent ? { ...r, measuredCost: null } : r), options).delivery.complete, false);
+  for (const broken of [input.filter(r => r !== parent), input.map(r => r === parent ? { ...r, costIncludesChildren: false } : r),
+    input.map(r => r === parent ? { ...r, costParentDispatchId: workers[0].dispatchId } : r)]) {
+    assert.equal(aggregateObservations(broken, options).delivery.complete, false);
+    assert.ok(aggregateObservations(broken, options).accounting.conflicts.length);
+  }
+});
+
 test('acceptance revisions use instants; simultaneous conflicts do not count accepted delivery', () => {
   const { rows, options } = observationFixture();
   const accepted = rows.find((r) => r.id === 'human-accepts');
@@ -335,7 +386,7 @@ test('reviewer findings count canonical detections, exclusivity, false positives
 test('recovery is lifetime spend but never a first-pass close', () => {
   const { rows, options } = observationFixture();
   rows.push(makeObservation({ kind: 'item-attempt', id: 'recover', runId: 'run-2', itemId: 'item-1', attemptId: 'recovery', attemptNumber: 2, recovery: true, outcome: 'CLOSED' }));
-  rows.push(makeObservation({ kind: 'dispatch', id: 'recover-call', runId: 'run-2', itemId: 'item-1', attemptId: 'recovery', dispatchId: 'recover-call', outcome: 'completed', measuredCost: 4, currency: 'USD', costSource: 'fixture', attributionConfidence: 'direct' }));
+  rows.push(makeObservation({ kind: 'dispatch', id: 'recover-call', runId: 'run-2', itemId: 'item-1', attemptId: 'recovery', dispatchId: 'recover-call', outcome: 'completed', measuredCost: 4, currency: 'USD', costSource: 'fixture', costBasis: 'synthetic', attributionConfidence: 'direct' }));
   const r = aggregateObservations(rows, options);
   assert.equal(r.firstPass.closed, 1);
   assert.equal(r.delivery.knownCost, 19);
@@ -429,6 +480,23 @@ test('experiments include rejected/mixed cases and measured false negatives agai
   assert.equal(r.paired.challenger.cases, 3);
   assert.equal(r.automaticChanges, false);
   assert.match(renderExperimentReport(r), /not human-accepted delivered change/);
+});
+
+test('calibration totals and paired deltas cannot pool accounting bases', () => {
+  const { manifest, submissions, adjudications } = experimentFixture();
+  for (const s of submissions.filter(s => s.caseId === 'case-1')) s.costBasis = 'invoice';
+  const report = reportExperiment(manifest, submissions, adjudications);
+  assert.equal(report.arms.challenger.accounting.measurementComplete, true);
+  assert.equal(report.arms.challenger.costComplete, false);
+  assert.equal(report.arms.challenger.knownCostUSD, null);
+  assert.equal(report.arms.challenger.costPerBlindAccepted, null);
+  assert.equal(report.paired.challenger.knownCostDeltaUSD, null);
+  assert.equal(report.paired.challenger.costDeltas.length, 2);
+  for (const s of submissions) delete s.costBasis;
+  const legacy = reportExperiment(manifest, submissions, adjudications);
+  assert.equal(legacy.arms.challenger.costComplete, false);
+  assert.equal(legacy.arms.challenger.accounting.costBasis, 'unknown');
+  assert.equal(legacy.paired.challenger.costPairs, 0);
 });
 
 test('missing/error submissions and unknown adjudication stay in cohort denominators', () => {

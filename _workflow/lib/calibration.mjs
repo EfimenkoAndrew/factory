@@ -1,5 +1,7 @@
 import { createHash } from 'node:crypto';
 import { canonicalJson, aggregateFindings } from './observations.mjs';
+import { aggregateCosts, costBasis, COST_BASES } from './cost-accounting.mjs';
+import { validateDecision, severityKnown, reviewDecision, decisionMetrics } from './review-decisions.mjs';
 
 const fail = (condition, message) => { if (!condition) throw new TypeError(message); };
 const text = (v) => typeof v === 'string' && v.trim().length > 0;
@@ -65,8 +67,13 @@ function validateSubmissions(manifest, submissions) {
     fail(['completed', 'error', 'timeout'].includes(s.status), 'invalid submission status');
     fail(s.actualModel === null || text(s.actualModel), 'actualModel must be explicit, not inferred from arm');
     fail(nonnegative(s.measuredCost) && (s.measuredCost === null || (text(s.costSource) && /^[A-Z]{3}$/.test(s.currency))), 'cost needs value, source and currency (or explicit null)');
+    fail(s.costBasis === undefined || COST_BASES.includes(s.costBasis), 'invalid costBasis');
+    fail(validateDecision(s.decision), 'invalid versioned review decision');
     unique(s.findings, 'findingId', 'submission findings');
-    for (const f of s.findings) fail(text(f.role) && text(f.text), 'finding needs role and text');
+    for (const f of s.findings) {
+      fail(text(f.role) && text(f.text), 'finding needs role and text');
+      fail(f.severity == null || severityKnown(f.severity), 'invalid structured finding severity');
+    }
     for (const key of ['inputTokens', 'outputTokens', 'cacheReadTokens', 'cacheWriteTokens', 'extraReads', 'formatFailures', 'physicalCalls', 'reusedCalls']) fail(nonnegative(s[key]), key + ' must be explicit nonnegative number or null');
   }
 }
@@ -74,11 +81,14 @@ function validateSubmissions(manifest, submissions) {
 export function blindPacket(manifest, submissions) {
   validateFrozenExperiment(manifest);
   validateSubmissions(manifest, submissions);
-  return { version: 1, experimentDigest: manifest.digest,
-    instructions: 'Adjudicate independently. Do not consult the arm mapping. Canonicalize equivalent findings within each snapshot. Supply unresolved for unknowns; record accepted/rejected/mixed outcomes and a complete reference-finding set only when actually adjudicated.',
+  return { version: 2, experimentDigest: manifest.digest,
+    instructions: 'Adjudicate independently. Do not consult the arm mapping. Canonicalize equivalent findings within each snapshot. Supply unresolved for unknowns; record accepted/rejected/mixed review-quality outcomes and a complete reference-finding set only when actually adjudicated. Preserve candidate decisions separately from finding quality. Each truth row should include findingSeverities:[{canonicalFindingId,severity}] for its validFindingIds; independently assign LOW/MEDIUM/HIGH/CRITICAL or null if unknown. HIGH/CRITICAL is the decision-metric blocking threshold. Never infer severity from candidate prose or copy a reviewer severity as reference truth. Complete empty truth supports approval; incomplete or missing reference severity leaves decision accuracy unknown.',
     cases: manifest.cases.map((c) => ({ caseId: c.caseId, snapshotHash: c.snapshotHash, snapshot: c.snapshot,
       candidates: submissions.filter((s) => s.caseId === c.caseId).map((s) => ({ blindId: s.blindId,
-        status: s.status, findings: s.findings.map((f) => ({ findingId: f.findingId, text: f.text })) })).sort((a, b) => a.blindId.localeCompare(b.blindId)) })) };
+        status: s.status, decision: s.decision ? { version: s.decision.version, rawVerdict: s.decision.rawVerdict,
+          verdict: s.decision.verdict, rule: s.decision.rule,
+          ...(s.decision.sources ? { sources: s.decision.sources.map((r, i) => ({ role: 'reviewer-' + (i + 1), rawVerdict: r.rawVerdict })) } : {}) } : reviewDecision(),
+        findings: s.findings.map((f) => ({ findingId: f.findingId, text: f.text, severity: f.severity ?? null })) })).sort((a, b) => a.blindId.localeCompare(b.blindId)) })) };
 }
 
 export function reportExperiment(manifest, submissions, adjudications) {
@@ -103,6 +113,10 @@ export function reportExperiment(manifest, submissions, adjudications) {
     fail(manifest.cases.some((c) => c.caseId === a.caseId), 'truth references missing case');
     fail(typeof a.complete === 'boolean' && Array.isArray(a.validFindingIds) && a.validFindingIds.every(text)
       && new Set(a.validFindingIds).size === a.validFindingIds.length, 'truth needs completeness and unique validFindingIds');
+    if (a.findingSeverities !== undefined) {
+      unique(a.findingSeverities, 'canonicalFindingId', 'truth finding severities');
+      fail(a.findingSeverities.every(f => a.validFindingIds.includes(f.canonicalFindingId) && (f.severity === null || severityKnown(f.severity))), 'invalid reference severity');
+    }
   }
   for (const a of adjudications.findings) {
     const s = submissions.find((r) => r.blindId === a.blindId);
@@ -131,7 +145,7 @@ export function reportExperiment(manifest, submissions, adjudications) {
     const outcomes = adjudications.outcomes.filter((a) => rows.some((s) => s.blindId === a.blindId));
     const findings = rows.flatMap((s) => s.findings.map((f) => {
       const a = adjudications.findings.find((r) => r.blindId === s.blindId && r.findingId === f.findingId);
-      return { itemId: s.caseId, snapshotId: s.snapshotHash, role: f.role, findingId: f.findingId,
+      return { itemId: s.caseId, snapshotId: s.snapshotHash, role: f.role, findingId: f.findingId, severity: f.severity ?? null,
         canonicalFindingId: a?.canonicalFindingId ?? null, adjudication: a?.outcome || 'unresolved', blind: a?.blind ?? null };
     }));
     const valid = findings.filter((f) => f.adjudication === 'valid');
@@ -146,9 +160,10 @@ export function reportExperiment(manifest, submissions, adjudications) {
       falseNegatives += truth.validFindingIds.filter((id) => !valid.some((f) => f.itemId === c.caseId && f.canonicalFindingId === id)).length;
     }
     const accepted = outcomes.filter((r) => r.outcome === 'accepted').length;
-    const costs = rows.filter((s) => s.measuredCost !== null && s.currency === 'USD');
-    const knownCost = costs.reduce((sum, r) => sum + r.measuredCost, 0);
-    const costComplete = costs.length === manifest.cases.length;
+    const accounting = aggregateCosts(rows, { expected: manifest.cases.length });
+    const usdGroups = accounting.groups.filter(g => g.currency === 'USD');
+    const knownCost = usdGroups.length === 1 ? usdGroups[0].measuredCost : usdGroups.length ? null : 0;
+    const costComplete = accounting.complete && accounting.currency === 'USD';
     const metrics = {};
     for (const key of ['inputTokens', 'outputTokens', 'cacheReadTokens', 'cacheWriteTokens', 'extraReads', 'formatFailures', 'physicalCalls', 'reusedCalls']) {
       const known = rows.filter((r) => r[key] !== null);
@@ -158,7 +173,7 @@ export function reportExperiment(manifest, submissions, adjudications) {
       completed: rows.filter((s) => s.status === 'completed').length, accepted,
       rejected: outcomes.filter((r) => r.outcome === 'rejected').length, mixed: outcomes.filter((r) => r.outcome === 'mixed').length,
       unresolved: manifest.cases.length - outcomes.filter((r) => r.outcome !== 'unresolved').length,
-      knownCostUSD: knownCost, costComplete,
+      knownCostUSD: knownCost, costComplete, accounting, decisions: decisionMetrics(manifest.cases, rows, adjudications.truth),
       costPerBlindAccepted: costComplete && accepted ? knownCost / accepted : null,
       actualModelCoverage: rows.filter((r) => r.actualModel !== null).length,
       findings: aggregateFindings(findings), falseNegatives, referenceFindings, truthCases,
@@ -170,6 +185,7 @@ export function reportExperiment(manifest, submissions, adjudications) {
   const paired = Object.create(null);
   for (const arm of manifest.arms.filter((r) => r.id !== manifest.baselineArm)) {
     let cases = 0, acceptedDelta = 0, knownCostDeltaUSD = 0, costPairs = 0;
+    const costDeltas = new Map();
     for (const c of manifest.cases) {
       const base = submissions.find((r) => r.caseId === c.caseId && r.armId === manifest.baselineArm);
       const candidate = submissions.find((r) => r.caseId === c.caseId && r.armId === arm.id);
@@ -177,19 +193,26 @@ export function reportExperiment(manifest, submissions, adjudications) {
       const a = adjudications.outcomes.find((r) => r.blindId === candidate?.blindId);
       if (!a || !b || [a.outcome, b.outcome].includes('unresolved')) continue;
       cases++; acceptedDelta += Number(a.outcome === 'accepted') - Number(b.outcome === 'accepted');
-      if (base.measuredCost !== null && candidate.measuredCost !== null && base.currency === 'USD' && candidate.currency === 'USD') {
+      if (base.measuredCost !== null && candidate.measuredCost !== null && base.currency === 'USD' && candidate.currency === 'USD'
+        && costBasis(base) !== 'unknown' && costBasis(base) === costBasis(candidate)) {
         costPairs++; knownCostDeltaUSD += candidate.measuredCost - base.measuredCost;
+        const basis = costBasis(base);
+        const group = costDeltas.get(basis) || { currency: 'USD', costBasis: basis, pairs: 0, delta: 0 };
+        group.pairs++; group.delta += candidate.measuredCost - base.measuredCost; costDeltas.set(basis, group);
       }
     }
-    paired[arm.id] = { cases, acceptedDelta, costPairs, knownCostDeltaUSD };
+    paired[arm.id] = { cases, acceptedDelta, costPairs, knownCostDeltaUSD: costDeltas.size > 1 ? null : knownCostDeltaUSD,
+      costDeltas: [...costDeltas.values()] };
   }
-  return { version: 1, experimentId: manifest.experimentId, digest: manifest.digest, cohort: counts, arms, paired,
+  return { version: 2, experimentId: manifest.experimentId, digest: manifest.digest, cohort: counts, arms, paired,
     recommendation: 'collect-data-and-human-review', automaticChanges: false,
     limitations: [
       'Offline blind acceptance is not human-accepted delivered change or lifetime cost.',
       '30–50 stratified pilot items are a baseline, not evidence of rare-defect safety.',
       'Missing, rejected, mixed, timeout and error cases remain in cohort denominators.',
       'False negatives require independently adjudicated complete reference truth; unknown truth is excluded and counted.',
+      'Decision errors use complete independent reference truth with structured severity; HIGH/CRITICAL blocks. Review-quality acceptance is not a gate expectation. Missing verdict/severity stays unknown; prose is never parsed.',
+      'Cost totals are qualified by currency and accounting basis; list, runtime and synthetic costs are not invoices. Linked inclusive parents replace children.',
       'No automatic model, reviewer, routing, policy or evidence changes.',
     ] };
 }
@@ -203,6 +226,8 @@ export function renderExperimentReport(report) {
     ...Object.entries(report.arms).flatMap(([id, r]) => [
       `## ${id}: coverage and reviewer value`, '',
       `Actual model known: ${r.actualModelCoverage}/${r.cases}. Escaped defects known: ${r.escapedDefectsKnown}; unknown cases: ${r.escapedDefectsUnknown}. Correction minutes known: ${r.correctionMinutesKnown}.`, '',
+      `Decision metrics: ${JSON.stringify(r.decisions)}`, '',
+      `Accounting (currency/basis, role/model/runtime): ${JSON.stringify(r.accounting)}`, '',
       '| Metric | Known / cohort | Known subtotal |', '|---|---|---|',
       ...Object.entries(r.metrics).map(([key, m]) => `| ${key} | ${m.known}/${m.total} | ${m.subtotal} |`), '',
       '| Role | Valid | Exclusive valid | False positives | Unresolved |', '|---|---|---|---|---|',

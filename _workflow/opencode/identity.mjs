@@ -2,6 +2,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { readFileSync, lstatSync, readlinkSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { collectEvidenceIdentity, evidenceIdentity } from '../lib/evidence-identity.mjs';
+import { openCodeMetadata } from '../lib/portable-evidence.mjs';
 export { EVIDENCE_IDENTITY_VERSION } from '../lib/evidence-identity.mjs';
 export { writeJsonAtomic } from '../lib/ledger.mjs';
 
@@ -15,7 +16,7 @@ export function newIdentity(prefix) { return prefix + '-' + randomUUID(); }
 
 export function snapshotTree(worktree, contract, git, options = {}) {
   const { engineMount, briefs, ...collectorOptions } = options;
-  const metadata = { reviewerContract: engineMount ? { contractHash: contract, briefs } : contract || 'unspecified', context: { runtime: 'opencode' }, ...(engineMount ? { engineMount } : {}) };
+  const metadata = openCodeMetadata(contract || 'unspecified', { inputs: collectorOptions.inputs, engineMount, briefs });
   if (!git) {
     const identity = collectEvidenceIdentity(worktree, metadata, collectorOptions);
     return { ...identity, base: identity.baseRevision, codeHash: digest({ code: identity.codeHash, contract }) };

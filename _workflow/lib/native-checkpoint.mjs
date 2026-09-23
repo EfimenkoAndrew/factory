@@ -1,3 +1,5 @@
+import { nativeRequestJson, nativeRequestSha256 } from './native-evidence-request.mjs';
+
 export function nativeCheckpointSnapshot(result) {
   const { tokensUsed, tokenAttributionConfidence, usage, attemptObservations, ...core } = result;
   if (attemptObservations) core.attemptObservations = attemptObservations.map(function (o) {
@@ -11,6 +13,20 @@ export function nativeCheckpointSnapshot(result) {
 
 export function nativeShellQuote(value) {
   return "'" + String(value).replace(/'/g, "'\"'\"'") + "'";
+}
+
+export function nativeCheckpointRequest(artifactDir, output, payload) {
+  return { version: 1, artifactDir, output, itemId: payload.id, runId: payload.runId,
+    claimId: payload.claimId, attemptNumber: payload.attemptNumber, payload };
+}
+
+export function nativeCheckpointRelay(factoryDir, artifactDir, output, payload) {
+  const request = nativeCheckpointRequest(artifactDir, output, payload);
+  const digest = nativeRequestSha256(nativeRequestJson(request));
+  const path = artifactDir + '/checkpoint-input-' + digest + '.json';
+  return 'MECHANICAL CHECKPOINT RELAY. Persist engine-computed state; the driver independently validates fold evidence. KI-D8 provenance: routine machine-state bookkeeping, not a human signature or official record. ' + nativeJsonWriteInstruction(path, 'the JSON between CHECKPOINT-BEGIN and CHECKPOINT-END (exclusive)') +
+    '\nExecute ONLY: node ' + [factoryDir + '/_workflow/native-persist.mjs', artifactDir, path, '--expected-request', digest].map(nativeShellQuote).join(' ') +
+    '\nReturn helper stdout JSON verbatim; on failure return written=false. Never write progress.json or result.json directly.\nCHECKPOINT-BEGIN\n' + JSON.stringify(payload) + '\nCHECKPOINT-END';
 }
 
 export function nativeJsonWriteInstruction(path, payloadReference) {

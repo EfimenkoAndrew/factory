@@ -9,6 +9,7 @@ import { parseTrx, aggregateTrx } from './test-results.mjs';
 import { captureBaseline } from './baseline.mjs';
 import { completeCommand } from './stage-evidence.mjs';
 import { resolveBash } from './bash.mjs';
+import { writeFixtureProject } from './_offline-dotnet-fixture.mjs';
 
 const escape = value => value.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&apos;');
 function trx({ assembly = 'A.Tests', root = 'C:/work/first', framework = 'net8.0', names = ['Case("a&<b>", 2)'], outcomes = ['Failed'], prefix = '' } = {}) {
@@ -195,15 +196,14 @@ exit "$TEST_CODE"
   assert.equal(existsSync(readFileSync(location, 'utf8').trim()), false);
 });
 
-test('real offline dotnet fixture through shared Bash producer', { skip: !process.env.FACTORY_TEST_REAL_DOTNET }, t => {
+if (process.env.FACTORY_TEST_REAL_DOTNET === '1') test('real offline dotnet fixture through shared Bash producer', t => {
   const dir = temporary(t), work = join(dir, 'state', 'worktrees', 'fixture');
   mkdirSync(work, { recursive: true });
   const packages = process.env.FACTORY_TEST_NUGET_CACHE || join(homedir(), '.nuget', 'packages');
   for (const [name, version] of [['microsoft.net.test.sdk', '17.11.1'], ['xunit', '2.9.0'], ['xunit.runner.visualstudio', '2.8.2']]) {
     assert.ok(existsSync(join(packages, name, version)), 'offline package absent: ' + name);
   }
-  writeFileSync(join(work, 'NuGet.Config'), '<configuration><packageSources><clear/></packageSources></configuration>');
-  writeFileSync(join(work, 'Tests.csproj'), `<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>net8.0</TargetFramework><IsTestProject>true</IsTestProject><NuGetAudit>false</NuGetAudit></PropertyGroup><ItemGroup><PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.11.1"/><PackageReference Include="xunit" Version="2.9.0"/><PackageReference Include="xunit.runner.visualstudio" Version="2.8.2"/></ItemGroup></Project>`);
+  writeFixtureProject(work);
   writeFileSync(join(work, 'Tests.cs'), `using Xunit;
 namespace Fixture;
 public class Tests {

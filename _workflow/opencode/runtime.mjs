@@ -24,6 +24,11 @@
 import { readFileSync, writeFileSync, existsSync, mkdirSync, statSync, readdirSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { execFileSync } from 'node:child_process';
+import { exportPortableEvidence } from '../lib/portable-evidence.mjs';
+import { verificationExpectations, verifyTranscript } from '../lib/driver-integration.mjs';
+import { lintItemCountClaims } from '../lib/countclaims.mjs';
+import { assertArtifactTree } from '../lib/native-artifact-guard.mjs';
 import { validateNamed, SCHEMAS } from './schemas.mjs';
 import { digest, newIdentity, snapshotTree, withItemLock, writeJsonAtomic, isWriter, acceptSubmission, EVIDENCE_IDENTITY_VERSION } from './identity.mjs';
 import { completeCommand, lintCandidates, guardMechanical } from './contracts.mjs';
@@ -85,11 +90,17 @@ function resolveMainRepoRoot(worktreePath) {
 
 function progressPath(id) { return join(FACTORY_ROOT, 'state', 'items', id, 'opencode-progress.json'); }
 function loadProgress(id) {
+  assertArtifactTree(dirname(progressPath(id)));
   const p = readJson(progressPath(id));
   if (p.version === 2 && !p.fixture) {
     const { row } = findLedgerRow(id);
     const claim = (row.history || []).filter(h => h.to === 'CLAIMED').at(-1);
     if (row.claimId !== p.claimId || row.runId !== p.runId || row.attemptNumber !== p.attemptNumber || row.state !== 'CLAIMED') throw new Error('attempt no longer belongs to the active claim');
+    const contractHash = digest({ item: p.item, config: p.config, policies: p.policies, routing: p.routing, briefs: p.ctx.briefs, profiles: p.ctx.repoProfiles });
+    if (row.runtimeEvidence?.runtime !== 'opencode' || contractHash !== row.runtimeEvidence.contractHash || p.contractHash !== contractHash
+      || digest(p.launch?.engineMount) !== digest(row.runtimeEvidence.engineMount)
+      || digest(p.ctx.policies) !== digest(p.policies) || resolve(p.ctx.worktreePath) !== resolve(row.worktree)
+      || resolve(p.ctx.factoryRoot) !== resolve(FACTORY_ROOT) || p.band !== row.attemptIdentity.band) throw new Error('runtime context differs from trusted driver contract');
   }
   p.res.needsRealInfra = effectiveInfraRequirement(p.res, p.originalNeedsRealInfra === true || computeNeedsRealInfra(p.item, (p.item.files || []).some(f => /\.cs$/i.test(f))));
   return p;
@@ -131,10 +142,11 @@ function cmdInit(id, flags) {
     const { ledger, row } = findLedgerRow(id);
     if (!row.worktree) throw new Error(`ledger row for ${id} has no worktree — run driver.mjs group --ids ${id} --include-realinfra first`);
     worktreePath = row.worktree.replace(/\\/g, '/'); branch = row.branch;
-    cycle = defaultCycleFor(ledger.cycle, flags.cycle); // parity: driver.mjs cmdSelect/cmdGroup `cycle: ledger.cycle + 1` — see defaultCycleFor
+    cycle = flags.cycle ? defaultCycleFor(ledger.cycle, flags.cycle) : row.attemptIdentity?.cycle ?? defaultCycleFor(ledger.cycle);
     prevState = row.prevState; ledgerState = row.state;
     const claim = (row.history || []).filter(h => h.to === 'CLAIMED').at(-1);
     if (row.state !== 'CLAIMED' || !claim) throw new Error('init requires a live driver claim');
+    if (cycle !== row.attemptIdentity?.cycle) throw new Error('init cycle differs from current driver reservation');
     claimId = row.claimId;
     claimAtMs = Date.parse(claim.at);
     attemptNumber = row.attemptNumber;
@@ -145,6 +157,9 @@ function cmdInit(id, flags) {
     lifecycle = lifecycleForLaunch(row, launch, enriched);
     if (!enriched || launch.cycle !== cycle || resolve(enriched.worktree?.path || '') !== resolve(worktreePath) || enriched.worktree?.branch !== branch || statSync(launchPath).mtimeMs < Date.parse(claim.at)) throw new Error('launch does not match current claim/cycle/worktree');
     item = { ...item, ...enriched };
+    execFileSync(process.execPath, [join(FACTORY_ROOT, '_workflow', 'driver.mjs'), 'bind-runtime', id,
+      '--runtime', 'opencode', '--claim', claimId, '--launch', resolve(launchPath),
+      ...(flags.controller ? ['--controller', flags.controller] : [])], { stdio: 'pipe' });
   }
   const repoRoot = flags.fixture ? worktreePath : resolveMainRepoRoot(worktreePath);
   if (existsSync(progressPath(id))) {
@@ -152,6 +167,7 @@ function cmdInit(id, flags) {
     if (!claimId || prior.claimId === claimId) throw new Error('progress already exists for this claim; resume with next');
     writeJsonAtomic(join(dirname(progressPath(id)), 'attempts', (prior.attemptId || 'legacy') + '.json'), prior);
   }
+  if (existsSync(dirname(progressPath(id)))) assertArtifactTree(dirname(progressPath(id)));
   const band = bandFor(item);
   const filesHaveCs = (item.files || []).some((f) => /\.cs$/i.test(f));
   const codeChange = filesHaveCs; // refined again after Test phase if the test-author's testFiles[] adds .cs
@@ -204,6 +220,10 @@ function cmdInit(id, flags) {
   const profilesDir = join(ctx.templatesDir, 'repo-profiles');
   ctx.repoProfiles = launch.repoProfiles || (existsSync(profilesDir) ? Object.fromEntries(readdirSync(profilesDir).filter(n => n.endsWith('.md')).map(n => [n.slice(0, -3), readFileSync(join(profilesDir, n), 'utf8')])) : {});
   progress.contractHash = digest({ item, config: progress.config, policies: progress.policies, routing: progress.routing, briefs: ctx.briefs, profiles: ctx.repoProfiles });
+  if (!progress.fixture) {
+    const binding = findLedgerRow(id).row.runtimeEvidence;
+    if (binding?.contractHash !== progress.contractHash) throw new Error('runtime context differs from trusted driver contract');
+  }
   progress.content = contentFor(progress);
   progress.res.attemptId = progress.attemptId; progress.res.claimId = progress.claimId; progress.res.runId = progress.runId;
   progress.res.attemptNumber = attemptNumber;
@@ -540,7 +560,7 @@ function agentStep(progress, phaseKey, calls) {
       c.route = roleRoute(progress.item, c, progress.routing);
       c.inputHash = progress.content?.hash || digest(progress.item);
       c.queuedAt = Date.now(); c.retry = 0;
-      const composed = compose(c.role, progress.item, c.extra, progress.ctx, { outputSchema: c.schema, handoffOnly: c.role === 'integrator' });
+      const composed = compose(c.role, { ...progress.item, ...(progress.verifyNote ? { verifyNote: progress.verifyNote } : {}) }, c.extra, progress.ctx, { outputSchema: c.schema, handoffOnly: c.role === 'integrator' });
       const entrypoint = 'node "' + progress.ctx.factoryRoot + '/_workflow/opencode/build-lease.mjs" "' + progress.ctx.factoryRoot + '"';
       const prompt = composed.split('bash ' + progress.ctx.factoryRoot + '/verify/build-test.sh').join(entrypoint)
         + '\nBUILD CAPACITY CONTRACT: invoke all build/red/filter/suite/EF commands via ' + entrypoint + ' <subcommand> <args>. This runs the same verify script under the factory-wide build lease. Do not invoke dotnet/build-test.sh directly or spawn nested worker sessions.'
@@ -1229,6 +1249,18 @@ export function executeVerification(progress, target, filter, commands, baseline
   return { pass: true, output, runs };
 }
 
+export function executeExpectedVerification(progress, expected, baseline, run = runBuildTest) {
+  let output = '';
+  const runs = [];
+  for (const sub of ['build', 'filter', 'suite']) for (const invocation of expected[sub] || []) {
+    const target = resolve(progress.ctx.worktreePath, typeof invocation === 'string' ? invocation : invocation.target).replace(/\\/g, '/');
+    const check = executeVerification(progress, target, invocation.filter || null, [sub], baseline, run);
+    output += check.output; runs.push(...check.runs);
+    if (!check.pass) return { ...check, output, runs };
+  }
+  return { pass: true, output, runs };
+}
+
 function settlePhase(progress) {
   if (progress.pendingSet.failure) {
     progress.res.failureKind = 'agent-unavailable';
@@ -1263,6 +1295,15 @@ export function finalBarrier(progress, dir, deps = {}) {
   progress.barrierPasses = (progress.barrierPasses || 0) + 1;
   if (progress.barrierPasses > 6) { finish(progress, 'FAILED', 'final evidence mutation loop exhausted'); persist(progress.id, progress); return; }
   for (const [command, marker] of [['claims', 'CLAIMS'], ['countclaims', 'COUNTCLAIMS']]) {
+    if (command === 'countclaims' && !deps.run) {
+      const report = lintItemCountClaims(wt, dir, progress.fixture ? { transcripts: ['verify-raw.txt'] }
+        : { progress, claim: { ...findLedgerRow(progress.id).row, id: progress.id }, repoRoot: progress.ctx.repoRoot });
+      writeRaw(join(dir, 'countclaims-raw.txt'), JSON.stringify(report) + '\n');
+      if (report.status === 'mismatch' || report.status === 'unavailable') {
+        finish(progress, 'FAILED', 'final countclaims lint ' + report.status + ': ' + JSON.stringify(report.errors)); persist(progress.id, progress); return;
+      }
+      continue;
+    }
     const lint = run(progress.ctx.factoryRoot, command, [wt, dir]);
     writeRaw(join(dir, command + '-raw.txt'), lint.output);
     if (lint.code !== 0 || lastMarkerCount(lint.output, marker) !== 0) { finish(progress, 'FAILED', 'final ' + command + ' lint failed or unavailable'); persist(progress.id, progress); return; }
@@ -1270,8 +1311,8 @@ export function finalBarrier(progress, dir, deps = {}) {
   const drift = (deps.mainDrift || mainDrift)(progress, dir);
   writeJsonAtomic(join(dir, 'main-check.json'), drift);
   if (drift.unavailable || drift.dirty?.length) {
-    progress.item.verifyNote = 'MAIN-DRIFT: ' + JSON.stringify(drift);
-    if (progress.policies?.failLaneOnMainDrift) { finish(progress, 'FAILED', progress.item.verifyNote); persist(progress.id, progress); return; }
+    progress.verifyNote = 'MAIN-DRIFT: ' + JSON.stringify(drift);
+    if (progress.policies?.failLaneOnMainDrift) { finish(progress, 'FAILED', progress.verifyNote); persist(progress.id, progress); return; }
   }
   const changed = changedFilesFor(wt);
   if (debrisFiles(changed, progress.item.files).length || (progress.res.codeChange && !progress.verificationOnly && progress.res.rootCauseFiles.length && !nonTestChanged(changed).length)) {
@@ -1280,11 +1321,15 @@ export function finalBarrier(progress, dir, deps = {}) {
   const services = serviceRoots(changed);
   const extra = [];
   if (services.length > 1) for (const service of services) {
-    const solution = progress.config?.solutions?.[service] || join(service, service.split('/').at(-1) + '.sln');
-    const target = resolve(wt, solution).replace(/\\/g, '/');
-    if (!target.startsWith(resolve(wt).replace(/\\/g, '/') + '/')) throw new Error('cross-target solution outside worktree');
-    if (!existsSync(target)) throw new Error('cross-target evidence requires solution mapping for ' + service);
-    const check = executeVerification(progress, target, null, ['build', 'suite'], effectiveBaselineFor(progress, dir).baseline, run);
+    const mapping = progress.config?.solutions?.[service] || join(service, service.split('/').at(-1) + '.sln');
+    const solutions = Array.isArray(mapping) ? mapping : [typeof mapping === 'string' ? mapping : mapping.solution];
+    const targets = solutions.map(solution => {
+      const target = resolve(wt, solution).replace(/\\/g, '/');
+      if (!target.startsWith(resolve(wt).replace(/\\/g, '/') + '/')) throw new Error('cross-target solution outside worktree');
+      if (!existsSync(target)) throw new Error('cross-target evidence requires solution mapping for ' + service);
+      return target;
+    });
+    const check = executeExpectedVerification(progress, { build: targets, suite: targets }, effectiveBaselineFor(progress, dir).baseline, run);
     writeRaw(join(dir, 'verify-' + service.replace(/[^a-z0-9]/gi, '_') + '-raw.txt'), check.output);
     if (!check.pass) { finish(progress, 'FAILED', 'cross-target ' + check.reason); persist(progress.id, progress); return; }
     extra.push({ service, runs: check.runs });
@@ -1384,7 +1429,10 @@ function cmdMech(id, step, rest, flags) {
       throw new Error(`mech verify: codeChange=true (band=${band}) but no filter was given — a code item MUST run its targeted test with detailed-verbosity logging (build/suite-only evidence would silently read as "tests green" downstream, AND can never carry a realInfra Console marker regardless of band). Pass the dotnet --filter expression as the second arg.`);
     }
     const { baseline } = effectiveBaselineFor(progress, dir);
-    const checked = executeVerification(progress, target, filter, band === 'FULL' ? ['build', 'filter', 'suite'] : ['build', 'filter'], baseline);
+    const expected = verificationExpectations({ item: progress.item, test: progress.test, worktree: progress.ctx.worktreePath,
+      targets: progress.item.verificationTargets || [progress.item.solution || target], band,
+      redText: decodeTranscript(readFileSync(join(dir, 'verify-red-raw.txt'))) });
+    const checked = executeExpectedVerification(progress, expected, baseline);
     const combined = checked.output;
     writeRaw(join(dir, 'verify-raw.txt'), combined);
     if (!checked.pass) { finish(progress, 'FAILED', checked.reason); saveProgress(id, progress); return cmdNext(id); }
@@ -1429,7 +1477,7 @@ function cmdMech(id, step, rest, flags) {
       }
       progress.res.gates['mech:comment-scan'] = 'APPROVED';
     }
-    if (!progress.fixture) snapshotTree(progress.ctx.worktreePath, progress.contractHash);
+    contentFor(progress);
     const r = runBuildTest(progress.ctx.factoryRoot, 'leftovers', [progress.ctx.worktreePath]);
     writeRaw(join(dir, 'leftover-raw.txt'), r.output);
     // Anchored LAST-match marker parse (see lastMarkerCount): a hit line QUOTING the literal
@@ -1468,8 +1516,16 @@ function cmdMech(id, step, rest, flags) {
     const [rawTarget] = rest.length ? rest : [flags.target || progress.verifyTarget];
     if (!rawTarget) throw new Error('usage: mech <id> integrate -- <target.sln>');
     const target = resolveTarget(rawTarget);
-    const reusable = progress.evidence.runs?.some(r => r.sub === 'suite' && r.target === target && r.complete);
-    const check = reusable ? { pass: true, output: decodeTranscript(readFileSync(join(dir, 'verify-raw.txt'))), runs: progress.evidence.runs } : executeVerification(progress, target, null, ['build', 'suite'], effectiveBaselineFor(progress, dir).baseline);
+    const targets = progress.item.verificationTargets || [progress.item.solution || target];
+    const verificationText = decodeTranscript(readFileSync(join(dir, 'verify-raw.txt')));
+    const expected = { build: targets, suite: targets };
+    const filterExpected = verificationExpectations({ item: progress.item, test: progress.test, worktree: progress.ctx.worktreePath,
+      targets, band: progress.band, redText: decodeTranscript(readFileSync(join(dir, 'verify-red-raw.txt'))) }).filter;
+    const baselineForReuse = effectiveBaselineFor(progress, dir).baseline;
+    const reusable = verifyTranscript(verificationText, { worktree: progress.ctx.worktreePath,
+      expected: { ...expected, filter: filterExpected }, baseline: baselineForReuse, required: ['build', 'suite'] }).pass;
+    const check = reusable ? { pass: true, output: verificationText, runs: progress.evidence.runs }
+      : executeExpectedVerification(progress, expected, baselineForReuse);
     const combined = check.output;
     writeRaw(join(dir, 'integrate-raw.txt'), combined);
     const parsed = parseVerifyRaw(combined);
@@ -1502,6 +1558,8 @@ function cmdMech(id, step, rest, flags) {
   }
   if (step === 'checkpoint') {
     attachDispatchEvidence(progress, dir);
+    progress.res.runtime = 'opencode';
+    progress.res.portableEvidence = exportPortableEvidence(progress, dir);
     const resultPath = join(dir, 'result.json');
     writeJsonAtomic(resultPath, progress.res);
     try { JSON.parse(readFileSync(resultPath, 'utf8')); } catch (e) { throw new Error('checkpoint write failed self-verification: ' + e.message); }
@@ -1532,6 +1590,9 @@ function cmdFinalize(id) {
   const progress = loadProgress(id);
   if (!progress.checkpointed || progress.phase !== 'done') throw new Error('finalize requires current terminal checkpoint');
   if (progress.version === 2 && ['CLOSED', 'ESCALATED'].includes(progress.res.toState) && (contentFor(progress).hash !== progress.content.hash || !evidenceIntact(progress))) throw new Error('terminal evidence changed; call next to invalidate the review suffix');
+  if (progress.res.toState === 'CLOSED' && (!progress.integrationEvidence?.complete
+    || progress.integrationEvidence.hash !== progress.content.hash
+    || progress.integrationEvidence.rawHash !== digest(readFileSync(join(itemsDirFor(progress.ctx, id), 'integrate-raw.txt'))))) throw new Error('terminal integration evidence changed or incomplete');
   const p = join(FACTORY_ROOT, 'state', 'items', id, 'result.json');
   if (!existsSync(p)) throw new Error('no result.json for ' + id + ' at ' + p + ' — run `mech ' + id + ' checkpoint` first');
   const res = readJson(p);
@@ -1664,8 +1725,8 @@ function afterVerify(progress, combined) {
     if (flaky112.length) caveats112.push('FLAKE SUSPECT — test class(es) both PASSED and FAILED in this run: ' + flaky112.join(', ') + '. If that was not a fix-then-retry, the test is unstable and its green is not trustworthy.');
   } catch { /* advisory only */ }
   if (caveats112.length) {
-    progress.item.verifyNote = caveats112.join(' ');
-    log('⚠ verify caveats recorded for the review band: ' + progress.item.verifyNote);
+    progress.verifyNote = caveats112.join(' ');
+    log('⚠ verify caveats recorded for the review band: ' + progress.verifyNote);
   }
   saveProgress(progress.id, progress);
   progress.phase = 'edgescan';
