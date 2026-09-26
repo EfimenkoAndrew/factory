@@ -52,6 +52,7 @@ import { dirname, join, resolve, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { toPosix } from '../_workflow/lib/rootfind.mjs';
 import { pickLatestReleaseTag, compareSemver } from '../_workflow/lib/hostinstall.mjs';
+import { runInstallerGate } from './_installer-gate.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const SELF_ROOT = resolve(HERE, '..');
@@ -146,16 +147,7 @@ function resolveTarget() {
 }
 
 function runSelftest(mount) {
-  say('selftest gate: node _workflow/lib/_selftest.mjs');
-  try {
-    const out = run(process.execPath, [join(mount, '_workflow', 'lib', '_selftest.mjs')]);
-    say('selftest: ' + (out.split('\n').filter(Boolean).pop() || '').trim());
-    return true;
-  } catch (e) {
-    const out = String((e.stdout || '') + (e.stderr || '') || e.message);
-    console.error(out.split('\n').filter(Boolean).slice(-15).join('\n'));
-    return false;
-  }
+  return runInstallerGate(mount, { run, log: say });
 }
 
 // The init flags this run implies — the single place the three controller seams are toggled.

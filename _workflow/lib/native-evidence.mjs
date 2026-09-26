@@ -4,7 +4,7 @@ import { collectEvidenceIdentity } from './evidence-identity.mjs';
 import { parseRedRaw, decodeTranscript, nonTestChanged } from './verify.mjs';
 import { changedFiles } from './worktree.mjs';
 import { completeVerificationTranscript } from './stage-evidence.mjs';
-import { writeJsonAtomic } from './ledger.mjs';
+import { assertArtifactTree, writeArtifactAtomic } from './native-artifact-guard.mjs';
 import { createHash } from 'node:crypto';
 import { nativeRequestJson } from './native-evidence-request.mjs';
 
@@ -66,11 +66,11 @@ export function persistNativeAdmission(artifactDir, snapshot) {
       !snapshot.attemptObservations?.some(o => o.itemId === snapshot.id && o.runId === snapshot.runId && o.stage === snapshot.id + ':progress:admission' && o.outcome === 'started')) {
     throw new Error('invalid native admission snapshot');
   }
-  writeJsonAtomic(join(artifactDir, 'progress.json'), snapshot);
-  return { written: true };
+  return writeArtifactAtomic(artifactDir, 'progress.json', JSON.stringify(snapshot));
 }
 
 export function collectNativeEvidence(worktree, metadata, artifactDir, options = {}) {
+  if (!options.legacy) assertArtifactTree(artifactDir);
   if (!options.legacy) validateNativeMetadata(metadata);
   const request = { version: 1, digest: createHash('sha256').update(nativeRequestJson({ worktree, metadata, artifactDir })).digest('hex'), worktree, artifactDir,
     verificationTranscript: metadata.verificationTranscript ?? null, integrationTranscript: metadata.integrationTranscript ?? null };
@@ -110,6 +110,6 @@ export function collectNativeEvidence(worktree, metadata, artifactDir, options =
     shadowSnapshotHash = createHash('sha256').update(JSON.stringify([identity.hash, ...shadowInputs])).digest('hex');
   } catch {}
   const result = { ...identity, request, shadowSnapshotHash, verification, integration, redProof: { markerFound: red.hasData, exitCode: red.exit ?? 0 }, rootCause };
-  if (!options.legacy) writeJsonAtomic(join(artifactDir, 'native-evidence-' + request.digest + '.json'), { metadata, result });
+  if (!options.legacy) writeArtifactAtomic(artifactDir, 'native-evidence-' + request.digest + '.json', JSON.stringify({ metadata, result }, null, 2));
   return result;
 }

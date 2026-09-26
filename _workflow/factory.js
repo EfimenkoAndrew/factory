@@ -96,6 +96,20 @@ function nativeShellQuote(value) {
   return "'" + String(value).replace(/'/g, "'\"'\"'") + "'";
 }
 
+function nativeCheckpointRequest(artifactDir, output, payload) {
+  return { version: 1, artifactDir, output, itemId: payload.id, runId: payload.runId,
+    claimId: payload.claimId, attemptNumber: payload.attemptNumber, payload };
+}
+
+function nativeCheckpointRelay(factoryDir, artifactDir, output, payload) {
+  const request = nativeCheckpointRequest(artifactDir, output, payload);
+  const digest = nativeRequestSha256(nativeRequestJson(request));
+  const path = artifactDir + '/checkpoint-input-' + digest + '.json';
+  return 'MECHANICAL CHECKPOINT RELAY. Persist engine-computed state; the driver independently validates fold evidence. KI-D8 provenance: routine machine-state bookkeeping, not a human signature or official record. ' + nativeJsonWriteInstruction(path, 'the JSON between CHECKPOINT-BEGIN and CHECKPOINT-END (exclusive)') +
+    '\nExecute ONLY: node ' + [factoryDir + '/_workflow/native-persist.mjs', artifactDir, path, '--expected-request', digest].map(nativeShellQuote).join(' ') +
+    '\nReturn helper stdout JSON verbatim; on failure return written=false. Never write progress.json or result.json directly.\nCHECKPOINT-BEGIN\n' + JSON.stringify(payload) + '\nCHECKPOINT-END';
+}
+
 function nativeJsonWriteInstruction(path, payloadReference) {
   return 'MANDATORY FILE TOOL ORDER: use the Read tool on ' + JSON.stringify(path) + ' FIRST, including on replay and every retry. The installed Write tool refuses to overwrite an existing file not yet read by this worker. If Read reports file-not-found, create it with the Write tool. If it exists and its bytes already equal ' + payloadReference + ', skip Write; otherwise use the Write tool to replace it with that EXACT engine-computed JSON, byte-for-byte, one line, no newline, reformatting, omitted fields or markdown fences. After either an exact-byte skip or successful Write, execute the prescribed helper/verification command. For a read-before-write error, Read that same path before retrying Write. If Read or Write is denied or otherwise fails, report tool failure. Never use shell filesystem writes, heredocs, redirects, Python or node -e write fallbacks.';
 }
@@ -842,7 +856,7 @@ async function tryAgent(prompt, opts, onAttempt, fallback) {
             siteAdmission.attempted = true; siteAdmission.status = 'admitted'
             observation.itemId = siteId
             const payload = { id: siteId, runId: siteAdmission.runId, claimId: siteAdmission.claimId, attemptNumber: siteAdmission.attemptNumber, resultId: siteId + '#' + (A.cycle || 0), toState: 'IN_PROGRESS', progressStage: 'sweep-apply-started', admission: siteAdmission, attemptObservations: attemptObservations.filter(function (o) { return o.itemId === siteId }), gates: {}, artifacts: {}, worktree: (WT && WT.path) || (A.sweep && A.sweep.worktree && A.sweep.worktree.path) }
-            dispatchedPrompt += '\nDURABLE SITE ADMISSION — FIRST TOOL ACTION before reads/edits: write the EXACT JSON below to ' + itemsDir(siteId) + '/progress.json, then confirm it parses. This is observational IN_PROGRESS, not a completed apply or closure verdict. Preserve run/claim fields. If persistence fails, report it in note; never claim it succeeded. No source edits for this bookkeeping.\nADMISSION-BEGIN\n' + JSON.stringify(nativeCheckpointSnapshot(payload)) + '\nADMISSION-END'
+            dispatchedPrompt += '\nDURABLE SITE ADMISSION — before source reads/edits execute this persistence relay. If it fails, stop and report failure.\n' + nativeCheckpointRelay(FDIR, itemsDir(siteId), 'progress.json', nativeCheckpointSnapshot(payload))
           }
         }
         if (opts.phase === 'Checkpoint') {
@@ -853,7 +867,8 @@ async function tryAgent(prompt, opts, onAttempt, fallback) {
             const payload = JSON.parse(prompt.slice(start, end))
             if (admission) payload.admission = admission
             payload.attemptObservations = attemptObservations.filter(function (o) { return o.itemId === observation.itemId })
-            dispatchedPrompt = prompt.slice(0, start) + JSON.stringify(nativeCheckpointSnapshot(payload)) + prompt.slice(end)
+            const role = opts.label.includes(':progress:') ? 'progress-writer' : 'checkpoint-writer'
+            dispatchedPrompt = compose(role, { id: observation.itemId, worktree: { path: liveResults[observation.itemId] && liveResults[observation.itemId].worktree } }, nativeCheckpointRelay(FDIR, itemsDir(observation.itemId), role === 'progress-writer' ? 'progress.json' : 'result.json', nativeCheckpointSnapshot(payload)))
           }
         }
         if (identityRelay && a > 0) dispatchedPrompt = 'IDENTITY RELAY RETRY (one only): prior invocation did not produce valid collector JSON. Execute the exact Node command below and copy its stdout without interpretation. Do not rerun implementation, verification or reviews.\n' + dispatchedPrompt
@@ -974,7 +989,7 @@ async function runItem(item) {
   // OLD count standing in 3 prose locations, caught only by an expensive fresh gate-developer
   // dispatch instead of for free. Checked against THIS item's own verify-raw.txt/integrate-raw.txt —
   // the same evidence transcripts the fold itself reads — never against a guess.
-  const countClaimsHint = ' COUNT-CLAIM SELF-CHECK (KI-E182): if your change ADDS or EDITS any .md prose that quotes a test-count ("N/M passed"), run `' + BT + ' countclaims ' + wtPath + ' ' + itemsDir(id) + '` as one of your LAST actions — every FACTORY::COUNTCLAIMS-MISS line is a count your prose asserts that no test run recorded in this item\'s OWN verify-raw.txt/integrate-raw.txt evidence actually produced (a stale count left behind after a later test was added/removed, or an invented one). Fix the prose (re-derive the real count from a fresh `' + BT + ' suite` run, never from memory) until it reports FACTORY::COUNTCLAIMS::0; a line honestly narrating a SUPERSEDED count ("was N/M") is exempt.'
+  const countClaimsHint = ' COUNT-CLAIM SELF-CHECK (KI-E182): if your change ADDS or EDITS any .md prose that quotes a test-count ("N/M passed"), run `' + BT + ' countclaims ' + nativeShellQuote(wtPath) + ' ' + nativeShellQuote(itemsDir(id)) + ' --transcript ' + nativeShellQuote(RAW) + '` as one of your LAST actions. Only this attempt-bound transcript is current evidence. Missing/unavailable proof is not a clean result; the independent runner repeats the lint after verification. Fix unsupported prose using actual fresh counts, never historical transcripts or memory; a line honestly narrating a SUPERSEDED count ("was N/M") is exempt.'
   async function call(role, route, schema, extra, phaseName, observational) {
     const headroom = (A.budget && A.budget.checkpointReserve) || 5000
     const phaseCost = (A.budget && A.budget.phaseReserve && A.budget.phaseReserve[phaseName]) || 0
@@ -1294,7 +1309,7 @@ async function runItem(item) {
   // KI-E182 — the runner ALSO tees the count-claims lint into the machine transcript for doc-touching
   // items, run AFTER the suite command above so verify-raw.txt already carries this run's own fresh
   // counts — the exact evidence the lint checks prose claims against.
-  const countClaimsVerifyHint = docTouch ? ' COUNT-CLAIM LINT (KI-E182): also run `' + BT + ' countclaims ' + wtPath + ' ' + itemsDir(id) + ' 2>&1 | tee -a ' + RAW + '` — FACTORY::COUNTCLAIMS-MISS lines are "N/M passed" claims no evidenced test run in this item produced; report them in note (the fixer was briefed to leave this at FACTORY::COUNTCLAIMS::0).' : ''
+  const countClaimsVerifyHint = docTouch ? ' COUNT-CLAIM LINT (KI-E182): after verification run `' + BT + ' countclaims ' + nativeShellQuote(wtPath) + ' ' + nativeShellQuote(itemsDir(id)) + ' --transcript ' + nativeShellQuote(RAW) + ' 2>&1 | tee -a ' + nativeShellQuote(RAW) + '` — report mismatches or missing/unavailable current proof in note; unavailable is not clean.' : ''
   let verifyHint = (!codeChange
     ? 'DOC/CONFIG item — the fix touches NO .cs files, so do NOT run dotnet build/test. Run the regression-test check from the spec (the grep/script assertion) + confirm the acceptance. Report build="pass (n-a: no code change)", targetedTest per the grep, suite={"passed":0,"failed":0,"skipped":0}.'
     : (band === 'LIGHT'
@@ -1318,7 +1333,7 @@ async function runItem(item) {
   const contractPath = itemsDir(id) + '/verification-contract-input.json'
   const contractInput = { item: { files: item.files, solution: sln, verificationTargets: item.verificationTargets || [sln], verificationExpected: item.verificationExpected, reFix: !!item.reFix, claimAt: item.claimAt }, test: test, worktree: wtPath, band: band }
   const prepareExtra = codeChange ? ' ' + nativeJsonWriteInstruction(contractPath, 'the contract input JSON below') + '\nCONTRACT-INPUT-BEGIN\n' + JSON.stringify(contractInput) + '\nCONTRACT-INPUT-END\n' : ''
-  const initialPrepared = await call('progress-writer', { model: 'claude-haiku-4-5', effort: 'low' }, prepareSchema, 'Prepare this attempt initial verification output.' + prepareExtra + ' Run `node "' + FDIR + '/_workflow/prepare-verification.mjs" "' + itemsDir(id) + '" "' + initialPassId + '" initial' + (codeChange ? ' "' + contractPath + '"' : '') + '` and return its JSON verbatim. Existing transcript must be archived, never reused as fresh proof. On error return written=false; do not invent expected targets.', 'Verify')
+   const initialPrepared = await call('progress-writer', { model: 'claude-haiku-4-5', effort: 'low' }, prepareSchema, 'Prepare this attempt initial verification output.' + prepareExtra + ' Run `node "' + FDIR + '/_workflow/prepare-verification.mjs" "' + itemsDir(id) + '" "' + initialPassId + '" initial' + (codeChange ? ' "' + contractPath + '" --expected-request ' + nativeRequestSha256(nativeRequestJson(contractInput)) : '') + '` and return its JSON verbatim. Existing transcript must be archived, never reused as fresh proof. On error return written=false; do not invent expected targets.', 'Verify')
   if (!initialPrepared || initialPrepared.written !== true) return finish('FAILED', 'initial verification output preparation unavailable')
   const verificationContract = codeChange ? { expected: initialPrepared.expected, integrationExpected: initialPrepared.integrationExpected, baseline: initialPrepared.baseline || null } : null
   const commandLines = function (expected, output) {
@@ -1501,9 +1516,17 @@ async function runItem(item) {
     for (const key of Object.keys(request)) requestSchema.properties[key].enum = [request[key]]
     const boundSchema = { ...identitySchema, required: [...identitySchema.required, 'request'], properties: { ...identitySchema.properties, request: requestSchema } }
     const path = itemsDir(id) + '/' + nativeEvidenceInputName(request.digest)
-    const relayMetadata = JSON.stringify(metadata.reviewerContract.briefs).length > 16000
+    let relayMetadata = JSON.stringify(metadata.reviewerContract.briefs).length > 16000
       ? { ...metadata, reviewerContract: { ...metadata.reviewerContract, briefs: {} }, relayBriefs: { directory: metadata.reviewerContract.briefsDirectory, digest: nativeRequestSha256(nativeRequestJson(metadata.reviewerContract.briefs)) } }
       : metadata
+    const stagedContext = A.nativeEvidenceContexts && A.nativeEvidenceContexts[id]
+    if (stagedContext) {
+      const keys = ['acceptance', 'policies', 'profile', 'reviewerContract', 'inputs', 'engineMount']
+      const immutable = Object.fromEntries(keys.map(function (key) { return [key, metadata[key]] }))
+      if (stagedContext.version !== 1 || stagedContext.digest !== nativeRequestSha256(nativeRequestJson(immutable))) throw new Error('pre-staged native context mismatch')
+      relayMetadata = Object.fromEntries(Object.entries(metadata).filter(function (entry) { return !keys.includes(entry[0]) }))
+      relayMetadata.relayContext = stagedContext
+    }
     const identity = await call('evidence-identity', { model: 'claude-haiku-4-5', effort: 'low' }, boundSchema,
       'Boundary ' + boundary + '. MECHANICAL IDENTITY RELAY. ' + nativeJsonWriteInstruction(path, 'the metadata JSON on the final line') + ' Execute via Bash this exact command:\nnode ' + [FDIR + '/_workflow/native-evidence.mjs', wtPath, path, itemsDir(id), '--expected-request', request.digest].map(nativeShellQuote).join(' ') + '\nReturn the command stdout JSON as the structured result, all fields and values unchanged (including request, verification/reason, integration, redProof and rootCause). No git commands, source reads, inferred verdicts or substituted revision hashes. The helper computes version 3 SHA-256 identities; a git revision is not an identity. The request digest binds every supplied metadata field and path. A relayBriefs reference is hydrated by the Node helper from the exact directory only after checking its complete-content digest; do not expand it yourself. Do not reconstruct, shorten or omit any metadata. If the command fails or has no valid stdout, report tool failure; never fabricate a schema-shaped success or empty hashes.\n' + JSON.stringify(relayMetadata), 'Verify', observational)
     if (!nativeSchemaValid(identity, boundSchema) || nativeRequestJson(identity.request) !== nativeRequestJson(request)) {
@@ -2190,7 +2213,7 @@ async function runItem(item) {
       const prepared = await call('progress-writer', { model: 'claude-haiku-4-5', effort: 'low' }, CHECKPOINT_SCHEMA, 'Prepare an empty final verification output while preserving any previous transcript. Run ONLY `node "' + FDIR + '/_workflow/prepare-verification.mjs" "' + itemsDir(id) + '" "' + finalIdentity.hash + '"` and return its JSON verbatim. Never manufacture written=true on a failed invocation.', 'Verify')
       if (!prepared || prepared.written !== true) return finish('FAILED', 'final verification output preparation unavailable')
     }
-    const refreshHint = codeChanged ? verifyHint.split(RAW).join(verificationTranscript) : 'Only prose changed since the independently verified code snapshot. Re-run the item regression/acceptance check and doc claims/countclaims lints; do not repeat the full suite. Preserve the prior code build/suite fields only after confirming no code/config/test input changed. Prior verification: ' + JSON.stringify(verify) + packHint
+    const refreshHint = codeChanged ? verifyHint.split(RAW).join(verificationTranscript) : 'Only prose changed since the independently verified code snapshot. Re-run the item regression/acceptance check and doc claims/countclaims lints; do not repeat the full suite. Preserve the prior code build/suite fields only after confirming no code/config/test input changed. Prior verification: ' + JSON.stringify(verify) + countClaimsVerifyHint + packHint
     const fresh = await call('runner', R.runner, VERIFY_SCHEMA, 'FINAL INDEPENDENT POST-MUTATION VERIFICATION. Ignore fixer self-reports. ' + (codeChanged ? 'The engine prepared an EMPTY dedicated verification output ' + verificationTranscript + '; run every required command afresh into that file. Preserve earlier raw transcripts unchanged. Never copy old proof into this output. ' : '') + refreshHint + (needsRealInfra ? realInfraHint.split(RAW).join(verificationTranscript) : '') + mainCheckHint, 'Verify')
     if (!fresh) return finish('FAILED', 'runner UNAVAILABLE at final verification barrier')
     const newFailures = Array.isArray(fresh.newFailures) ? fresh.newFailures.length : Math.max(0, ((fresh.suite || {}).failed || 0) - res.baselineFailures.length)
@@ -2480,7 +2503,7 @@ function sweepCompose(role, sweep, wtPath, site, extra) {
     prefix.push('', 'HOST POLICY — NO DB/SCHEMA CHANGES (binding): this host forbids migrations and ANY persisted-schema change (new/renamed/removed table or column, even an additive nullable column on a shared entity). Implement the best fix within the EXISTING schema and record the residual gap in your summary as an accepted, documented trade-off — an expected bound, not a scope-stop.')
   }
   if (sweep._siteProgress && (role === 'runner' || (role === 'gate-architect' && !sweep._codeSweep))) {
-    lines.push('', 'DURABLE APPLY FRONTIER — FIRST TOOL ACTION: persist these engine-computed per-site IN_PROGRESS snapshots, one JSON object to each named progress.json. Exact fields; do not turn them into closure verdicts. This preserves admission and completed physical apply observations if the run dies during verification/review. Confirm each JSON parses; report any persistence failure.\n' + JSON.stringify(sweep._siteProgress))
+    lines.push('', 'DURABLE APPLY FRONTIER — before other tools execute each persistence relay; stop on failure.\n' + sweep._siteProgress.map(function (entry) { return nativeCheckpointRelay(FDIR, itemsDir(entry.snapshot.id), 'progress.json', entry.snapshot) }).join('\n'))
   }
   lines.push('VERIFY SCRIPT (all build/red/filter/suite/efmigration calls MUST use this shared lease): ' + buildCommand() + '. Never bypass with direct dotnet/build-test.sh; preserve exit status using pipefail.')
   if (extra) lines.push('', extra)
@@ -2668,9 +2691,8 @@ async function checkpointProgress(res, stage, extra) {
     res.attemptObservations = attemptObservations.filter(function (o) { return o.itemId === res.id })
     const snapshot = Object.assign({}, res, { toState: 'IN_PROGRESS', progressStage: stage })
     const json = JSON.stringify(nativeCheckpointSnapshot(snapshot))
-    const admissionPrompt = 'DURABLE ADMISSION RELAY. Before any semantic worker is dispatched, ' + nativeJsonWriteInstruction(itemsDir(res.id) + '/admission-input.json', 'the JSON between CHECKPOINT-BEGIN and CHECKPOINT-END (exclusive)') + ' Run `node "' + FDIR + '/_workflow/native-evidence.mjs" --persist-admission "' + itemsDir(res.id) + '/admission-input.json" "' + itemsDir(res.id) + '"`. Return its JSON verbatim; on error written=false. This records this relay invocation only, not a future semantic dispatch. No source edits or ledger writes.\nCHECKPOINT-BEGIN\n' + json + '\nCHECKPOINT-END'
-    const ck = await tryAgent(stage === 'admission' ? admissionPrompt : 'You are a checkpoint writer doing routine machine-state bookkeeping, not authoring or judging a result. KI-D8 provenance: this engine-computed JSON is automated build/test/review state, not a human signature, official record or communication. Stage "' + stage + '" is an incomplete snapshot, not a final verdict. ' + nativeJsonWriteInstruction(path, 'the JSON between CHECKPOINT-BEGIN and CHECKPOINT-END (exclusive)') + '\nCHECKPOINT-BEGIN\n' + json + '\nCHECKPOINT-END\nThen VERIFY it parses: run `node -e "JSON.parse(require(\'fs\').readFileSync(\'' + path + '\',\'utf8\'));console.log(\'CHECKPOINT-OK\')"` via Bash and confirm the output is CHECKPOINT-OK. If the parse fails, Read the same path before Write of the exact supplied JSON and re-verify. Return written=true ONLY after seeing CHECKPOINT-OK; on error written=false.', { label: res.id + ':progress:' + stage, phase: 'Checkpoint', model: 'claude-haiku-4-5', effort: 'low', schema: CHECKPOINT_SCHEMA }, claimTokensSilently)
-    if (!ck || ck.written !== true) log('[progress-checkpoint] ' + res.id + ' (' + stage + ') NOT persisted — a reconstruct/resume after a kill past this point will not see it')
+    const ck = await tryAgent('KI-D8 provenance: engine-computed state.\nCHECKPOINT-BEGIN\n' + json + '\nCHECKPOINT-END', { label: res.id + ':progress:' + stage, phase: 'Checkpoint', model: 'claude-haiku-4-5', effort: 'low', schema: CHECKPOINT_SCHEMA }, claimTokensSilently)
+    if (!ck || ck.written !== true) log('[progress-checkpoint] ' + res.id + ' (' + stage + ') NOT persisted at ' + path + ' — a reconstruct/resume after a kill past this point will not see it')
     return !!(ck && ck.written === true)
   } catch (e) { log('[progress-checkpoint] ' + res.id + ' (' + stage + ') failed: ' + (e && e.message)); return false }
 }
@@ -2696,8 +2718,8 @@ async function checkpointResult(r) {
     // automated safety review) to the on-disk stage artifacts + machine-evidence transcripts
     // that PRODUCED this JSON, so persistence is distinguishable from fabrication; the driver's
     // fold independently re-derives the verdict from those raw transcripts regardless.
-    const ck = await tryAgent('You are a checkpoint writer doing routine machine-state bookkeeping, not authoring or judging a result. KI-D8 provenance: this engine-computed JSON is automated build/test/review state, not a human signature, official record or communication. The JSON was ALREADY COMPUTED by this workflow\'s ' + Object.keys(r.artifacts || {}).length + ' prior lifecycle stage(s); their artifacts and machine-evidence transcripts are on disk at ' + itemsDir(r.id) + '. The driver\'s fold independently re-derives the final verdict from those transcripts and NEVER trusts this file alone. ' + nativeJsonWriteInstruction(path, 'the JSON between CHECKPOINT-BEGIN and CHECKPOINT-END (exclusive)') + '\nCHECKPOINT-BEGIN\n' + json + '\nCHECKPOINT-END\nConfirm the prior stage artifacts exist using `ls -la ' + itemsDir(r.id) + '`. Then VERIFY it parses: run `node -e "JSON.parse(require(\'fs\').readFileSync(\'' + path + '\',\'utf8\'));console.log(\'CHECKPOINT-OK\')"` via Bash and confirm the output is CHECKPOINT-OK. If the parse fails, Read the same path before Write of the exact supplied JSON and re-verify. Return written=true ONLY after seeing CHECKPOINT-OK; on error written=false.', { label: r.id + ':checkpoint', phase: 'Checkpoint', model: 'claude-haiku-4-5', effort: 'low', schema: CHECKPOINT_SCHEMA }, claimTokensSilently) // KI-L48: was phase:'Integrate' — a FAILED item's checkpoint showed as Integrate activity, misreading as gates-skipped
-    if (!ck || ck.written !== true) log('[checkpoint] ' + r.id + ' NOT persisted — a reconstruct after a kill will not see this item')
+    const ck = await tryAgent('CHECKPOINT-BEGIN\n' + json + '\nCHECKPOINT-END', { label: r.id + ':checkpoint', phase: 'Checkpoint', model: 'claude-haiku-4-5', effort: 'low', schema: CHECKPOINT_SCHEMA }, claimTokensSilently)
+    if (!ck || ck.written !== true) log('[checkpoint] ' + r.id + ' NOT persisted at ' + path + ' — a reconstruct after a kill will not see this item')
   } catch (e) { log('[checkpoint] ' + r.id + ' failed: ' + (e && e.message)) }
   r.attemptObservations = attemptObservations.filter(function (o) { return o.itemId === r.id })
   return r

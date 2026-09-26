@@ -141,7 +141,7 @@ try {
   const tree = join(temp, 'identity'); mkdirSync(tree); writeFileSync(join(tree, 'a.rst'), 'doc'); writeFileSync(join(tree, 'a.cs'), 'code');
   const git = args => args[0] === 'rev-parse' ? 'HEAD' : 'a.rst\0a.cs\0';
   const contract = { policy: true };
-  const shared = evidenceIdentity({ baseRevision: 'HEAD', reviewerContract: contract, context: { runtime: 'opencode' }, entries: [{ path: 'a.rst', content: 'doc', mode: 'file' }, { path: 'a.cs', content: 'code', mode: 'file' }] });
+  const shared = evidenceIdentity({ baseRevision: 'HEAD', inputs: {}, engineMount: null, reviewerContract: { contractHash: contract, briefs: {} }, context: { runtime: 'opencode' }, entries: [{ path: 'a.rst', content: 'doc', mode: 'file' }, { path: 'a.cs', content: 'code', mode: 'file' }] });
   const adapted = snapshotTree(tree, contract, git);
   assert.equal(adapted.hash, shared.hash);
   assert.equal(adapted.codeHash, digest({ code: shared.codeHash, contract }));

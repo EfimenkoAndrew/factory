@@ -124,9 +124,9 @@ resolve_target() {
 }
 
 run_selftest() { # $1 = mount
-  log "selftest gate: node _workflow/lib/_selftest.mjs"
+  log "selftest gate: node _workflow/lib/_selftest.mjs --suite portable; integration NOT REQUESTED"
   local out
-  if out="$(node "$1/_workflow/lib/_selftest.mjs" 2>&1)"; then
+  if out="$(node "$1/_workflow/lib/_selftest.mjs" --suite portable 2>&1)"; then
     log "selftest: $(printf '%s' "$out" | tail -1 | sed 's/^ *//')"
   else
     printf '%s\n' "$out" | tail -15 >&2

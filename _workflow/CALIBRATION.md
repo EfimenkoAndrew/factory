@@ -259,6 +259,90 @@ The native happy-path runner stub returns a clean suite (zero failed tests).
 
 ## Offline frozen-snapshot workflow
 
+### Decision preservation and accounting bases (report v2)
+
+`normalizeResponse` retains `decision:{version:1,rawVerdict,verdict,rule}` and
+structured finding `severity`, `file`, `line`, and `rule`. The optional decision
+contract accepts historical submissions without it as unknown. Legacy finding
+severity is null; no severity or verdict is extracted from prose. The independent
+blind packet carries decisions/severity, excludes arm/model/cost metadata, and
+replaces portfolio source-role labels with anonymous reviewer numbers. Free-text
+finding contents are preserved, not semantically anonymized.
+
+`reviewDecision`, `portfolioDecision`, and `decisionMetrics` are exported from
+`lib/review-decisions.mjs`. Portfolio decisions use conservative dissent: any
+`CHANGES_REQUIRED` blocks; all known `APPROVED` approves; otherwise unknown. Each
+source role's raw verdict remains available in submissions and per-role metrics.
+Missing legacy source decisions never become approval.
+
+`reportExperiment(...).arms[id].decisions` separates `falseApprove`, `falseBlock`,
+`inconsistent`, `dissent`, `scored`, and `unknown`, with per-case and portfolio-role
+details. Inconsistency compares the verdict to its own structured findings;
+accuracy compares to independent complete reference truth. The explicit metric
+policy is `HIGH-or-CRITICAL-blocks` (`criticalSeverity:["HIGH","CRITICAL"]`). It
+does not change production gate policy. Truth rows can optionally supply
+`findingSeverities:[{canonicalFindingId,severity}]`; every valid reference finding
+must have independently assigned known severity before a nonempty case can be
+scored. Complete empty truth supports approval. Review-quality `accepted` never
+means the underlying source should be approved. The severity assignments cannot
+be copied from candidates or inferred from findings prose.
+
+Observation v1 accepts optional `costBasis`, `costParentDispatchId`,
+`costIncludesChildren` and finding `severity`, preserving existing record readers.
+`costSource` remains the exact provenance label; `costBasis` is a typed value:
+`invoice`, `list-equivalent`, `runtime-reported`, `synthetic`, or `unknown`.
+Absent basis is unknown, even when the source label sounds like a bill. Synthetic
+fixtures explicitly declare their synthetic basis; they are never invoice proof.
+
+`lib/cost-accounting.mjs` exports `aggregateCosts(rows,{eligible,expected})`.
+Consumers must validate and reconcile immutable identities first. The returned
+`groups`, `byRole`, `byModel`, `byRuntime`, and `byBucket` always include currency,
+basis, source labels, record counts and measured subtotal. `measurementComplete`
+describes amount coverage; `basisComplete` requires one known comparable basis and
+currency. `complete` requires both. Mixed bases yield null unqualified totals;
+legacy unknown amounts remain visible but cannot establish complete billing cost.
+Only `invoice` means billed cost. Calibration paired USD deltas are also separated
+by basis; unknown or mismatched bases are not compared.
+
+For inclusive controller totals, set `costIncludesChildren:true` on the parent and
+`costParentDispatchId` on each covered child in the same run. The aggregator selects
+the highest parent once and excludes linked children, including cross-model/role
+children. It never subtracts or allocates a synthetic controller-only remainder.
+An explicitly shared inclusive counter may supply the parent amount; estimated
+deltas remain ineligible. Missing parents, cycles and noninclusive parents prevent
+completeness. Without explicit links, dispatch records assert nonoverlapping
+charges; arbitrary overlapping external totals cannot be detected. Breakdowns
+attribute selected parent totals, not fabricated worker amounts.
+
+`aggregateObservations(...).accounting` and
+`reportExperiment(...).arms[id].accounting` expose the same reporting interface.
+The observation Markdown renderer includes it; telemetry consumers may use that
+existing renderer without altering event or fold semantics.
+
+### Retained experiments: offline reconstruction
+
+```text
+node _workflow/live-benchmark.mjs recompute-retained DIRECTORY [NEW_PREFIX]
+```
+
+Default prefix: `decision-v2`. The command cross-checks retained finding identities,
+roles and text against original raw responses, restores exact verdicts and structured
+severity, preserves independent reference truth, projects unmeasured labor/escape
+fields to null, and writes new submissions, blind packet, JSON/Markdown report and
+cost summary using exclusive creation. Existing files are never overwritten. This
+command has no model calls. Per-batch usage is not allocated to individual cases.
+CLI `total_cost_usd` is explicitly list-equivalent, not an invoice; auxiliary models
+remain in the retained aggregate rather than being guessed as one actual model.
+
+Recomputed the retained `factory-review-benchmark-20260919-a` and
+`factory-review-heldout-20260919-a` directories under the OpenCode temporary root.
+Each now contains `decision-v2-report.json` / `.md` and companion files. All three
+arms retain every verdict. Per arm, independently scoreable cases are 2/6 and 6/12,
+respectively (complete empty truth); the other 4 and 6 cases have unknown reference
+severity. No false blocks on those scoreable clean cases and no own-finding verdict
+inconsistencies were observed. False-approval safety on defective cases remains
+unmeasured. Historical recall/quality results and original reports are preserved.
+
 ```text
 node _workflow/calibrate.mjs freeze input.json
 node _workflow/calibrate.mjs validate frozen.json

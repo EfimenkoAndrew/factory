@@ -40,11 +40,18 @@ git -C "$WORK/src" init -q
 git -C "$WORK/src" add -A
 git -C "$WORK/src" commit -qm "e2e base"
 git -C "$WORK/src" tag v0.0.1
-sed -i 's/^process.exit(fail ? 1 : 0);$/process.exit(1);/' "$WORK/src/_workflow/lib/_selftest.mjs"
+cp "$WORK/src/_workflow/lib/_selftest.mjs" "$WORK/good-selftest.mjs"
+cat > "$WORK/src/_workflow/lib/_selftest.mjs" <<'FACTORY_SELFTEST_FAILURE'
+console.error('FACTORY_E2E_INJECTED_SELFTEST_FAILURE');
+process.exit(73);
+FACTORY_SELFTEST_FAILURE
+rc=0; node "$WORK/src/_workflow/lib/_selftest.mjs" --suite portable >"$WORK/injection.log" 2>&1 || rc=$?
+ok "injected fixture really exits 73 with its marker" "$([ "$rc" = 73 ] && grep -q 'FACTORY_E2E_INJECTED_SELFTEST_FAILURE' "$WORK/injection.log" && echo 1 || echo 0)"
+[ "$rc" = 73 ] || exit 1
 git -C "$WORK/src" commit -qam "e2e broken selftest"
 git -C "$WORK/src" tag v0.0.2                                     # the rollback target
 git -C "$WORK/src" tag v0.0.4-rc1                                 # strict-filter decoy (newer, broken)
-git -C "$WORK/src" revert -n --no-edit HEAD >/dev/null 2>&1 || { git -C "$WORK/src" checkout v0.0.1 -- _workflow/lib/_selftest.mjs; }
+cp "$WORK/good-selftest.mjs" "$WORK/src/_workflow/lib/_selftest.mjs"
 git -C "$WORK/src" commit -qam "e2e good tip"
 git -C "$WORK/src" tag v0.0.3                                     # the real latest
 git clone -q --bare "$WORK/src" "$WORK/remote.git"
@@ -66,6 +73,7 @@ say "upgrade to the selftest-broken v0.0.2 (expect warn + rollback)"
 prev="$(git -C "$MOUNT" rev-parse HEAD)"
 rc=0; bash "$INSTALL" upgrade --repo "$WORK/remote.git" --host "$WORK/host1" --version v0.0.2 --yes >"$WORK/up1.log" 2>&1 || rc=$?
 ok "broken upgrade exits non-zero" "$([ $rc != 0 ] && echo 1 || echo 0)"
+ok "broken upgrade reached the injected selftest" "$(grep -q 'FACTORY_E2E_INJECTED_SELFTEST_FAILURE' "$WORK/up1.log" && echo 1 || echo 0)"
 ok "downgrade warning fired" "$(grep -q 'OLDER than installed' "$WORK/up1.log" && echo 1 || echo 0)"
 ok "rollback restored the previous ref" "$([ "$(git -C "$MOUNT" rev-parse HEAD)" = "$prev" ] && echo 1 || echo 0)"
 ok "up-to-date short-circuit" "$(bash "$INSTALL" upgrade --repo "$WORK/remote.git" --host "$WORK/host1" --yes 2>&1 | grep -q 'up to date' && echo 1 || echo 0)"
@@ -75,6 +83,7 @@ say "install pinned to the broken tag (expect cleanup of the partial mount)"
 git -C "$WORK" init -q host2; ( cd "$WORK/host2" && echo x > f && git add f && git commit -qm h )
 rc=0; bash "$INSTALL" install --repo "$WORK/remote.git" --host "$WORK/host2" --version v0.0.2 --no-telemetry --yes >"$WORK/install2.log" 2>&1 || rc=$?
 ok "broken install exits non-zero" "$([ $rc != 0 ] && echo 1 || echo 0)"
+ok "broken install reached the injected selftest" "$(grep -q 'FACTORY_E2E_INJECTED_SELFTEST_FAILURE' "$WORK/install2.log" && echo 1 || echo 0)"
 ok "partial mount was removed (re-run not blocked)" "$([ ! -d "$WORK/host2/_bmad-output/ai-factory" ] && echo 1 || echo 0)"
 
 # ---- unreachable remote dies loudly ----------------------------------------------------

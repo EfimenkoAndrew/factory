@@ -1,17 +1,19 @@
 import { randomUUID, createHash } from 'node:crypto';
-import { resolve, relative, isAbsolute, basename, dirname } from 'node:path';
+import { resolve, relative, isAbsolute, basename, dirname, join } from 'node:path';
 import { existsSync, readFileSync, realpathSync, statSync, readdirSync } from 'node:fs';
 import { computeReady } from './graph.mjs';
 import { unreadyItems } from './readiness.mjs';
 import { filesOverlapDirty } from './mainguard.mjs';
 import { completeCommand } from './stage-evidence.mjs';
-import { decodeTranscript } from './verify.mjs';
+import { decodeTranscript, parseRedRaw } from './verify.mjs';
 import { collectEvidenceIdentity, canonicalJson, EVIDENCE_IDENTITY_VERSION } from './evidence-identity.mjs';
 import { needsRealInfra } from '../opencode/routing.mjs';
 import { observationEvent, normalizeAttemptObservations } from './observations.mjs';
 import { normalizeHostPath } from './repo-path.mjs';
 import { nativeEvidenceRequest } from './native-evidence-request.mjs';
 import { validateNativeMetadata } from './native-evidence.mjs';
+import { portableHash, openCodeMetadata, PORTABLE_EVIDENCE_VERSION } from './portable-evidence.mjs';
+import { assertArtifactTree } from './native-artifact-guard.mjs';
 
 const hostPath = (value, base) => normalizeHostPath(value, { base });
 const samePath = (a, b) => hostPath(a) === hostPath(b);
@@ -44,6 +46,9 @@ export function disjointItems(items, max = Infinity, options = {}) {
 }
 
 export function admitAttempt(row, runId, { cycle, recovery = false, band = null, mode = 'run' } = {}) {
+  delete row.runtimeEvidence;
+  delete row.launchHash;
+  delete row.recoveryVerification;
   const attemptNumber = (row.observedAttemptNumber || 0) + 1;
   const identity = { runId, claimId: randomUUID(), attemptNumber, cycle, recovery, band, mode, reservedAt: new Date().toISOString(), startedAt: null, admitted: false };
   row.runId = runId; row.claimId = identity.claimId; row.attemptNumber = attemptNumber;
@@ -85,12 +90,69 @@ export function observeAdmission(result, row, emit, warn = console.warn) {
 
 export function matchesClaim(result, row) {
   if (!row?.claimId) return true;
+  if (row.attemptIdentity?.recovery) return result.claimId === row.claimId && result.runId === row.runId;
+  if (row.runtimeEvidence) return result.claimId === row.claimId && result.runId === row.runId
+    && result.attemptNumber === row.attemptNumber;
   if (result.driverClaimId && result.driverClaimId !== row.claimId) return false;
   if (!result.claimId || result.claimId === row.claimId) return true;
   const claim = (row.history || []).filter(h => h.to === 'CLAIMED').at(-1);
   const legacyPortId = createHash('sha256').update(canonicalJson({ id: result.id, at: claim?.at,
     worktreePath: row.worktree?.replace(/\\/g, '/'), cycle: row.attemptIdentity?.cycle })).digest('hex');
   return result.claimId === legacyPortId;
+}
+
+export function verifyPortableEvidence({ result, row, itemDir, worktree, codeChange, baseline = 0,
+  expectedContract, collect = collectEvidenceIdentity }) {
+  if (!row.runtimeEvidence && result.runtime !== 'opencode' && !Object.hasOwn(result, 'portableEvidence')) return null;
+  try {
+    assertArtifactTree(itemDir);
+    const binding = row.runtimeEvidence, proof = result.portableEvidence;
+    if (binding?.runtime !== 'opencode' || binding.version !== PORTABLE_EVIDENCE_VERSION) throw new Error('trusted current-claim runtime binding missing');
+    if (proof?.version !== PORTABLE_EVIDENCE_VERSION || proof.runtime !== 'opencode') throw new Error('portable evidence contract missing or unsupported');
+    if (!matchesClaim(result, row) || proof.claimId !== row.claimId || proof.runId !== row.runId
+      || proof.attemptNumber !== row.attemptNumber || binding.claimId !== row.claimId) throw new Error('portable evidence claim mismatch');
+    const contract = expectedContract || binding.contract;
+    if (portableHash(contract) !== binding.contractHash || proof.contractHash !== binding.contractHash) throw new Error('portable evidence trusted context changed');
+    if (result.band !== row.attemptIdentity.band || result.codeChange !== codeChange) throw new Error('portable evidence classification mismatch');
+    const metadata = openCodeMetadata(binding.contractHash, { inputs: contract.config.evidenceInputs,
+      engineMount: binding.engineMount, briefs: contract.briefs });
+    if (canonicalJson(metadata) !== canonicalJson(proof.metadata)) throw new Error('portable evidence collector metadata mismatch');
+    const current = collect(worktree, metadata);
+    const codeHash = portableHash({ code: current.codeHash, contract: binding.contractHash });
+    if (current.version !== EVIDENCE_IDENTITY_VERSION || ['version', 'hash', 'baseRevision', 'fileCount'].some(k => current[k] !== proof.identity?.[k])
+      || codeHash !== proof.identity.codeHash) throw new Error('portable evidence source identity is stale');
+    const textFor = (entry, name) => {
+      if (entry?.transcript !== name || entry.complete !== true || entry.identityHash !== current.hash) throw new Error('portable evidence incomplete ' + name);
+      const path = containedFile(itemDir, join(itemDir, name)), raw = readFileSync(path);
+      if (statSync(path).mtimeMs < Date.parse(row.attemptIdentity.reservedAt)) throw new Error('portable evidence predates claim: ' + name);
+      if (portableHash(raw) !== entry.rawHash) throw new Error('portable evidence transcript changed: ' + name);
+      return decodeTranscript(raw);
+    };
+    for (const name of ['test.json', 'verify-red-raw.txt', 'baseline-raw.txt']) {
+      const path = join(itemDir, name), expected = proof.auxiliary?.[name];
+      if (expected === undefined || (existsSync(path) ? portableHash(readFileSync(containedFile(itemDir, path))) : null) !== expected) throw new Error('portable auxiliary proof changed: ' + name);
+    }
+    const text = textFor(proof.verification, 'verify-raw.txt');
+    const test = JSON.parse(readFileSync(containedFile(itemDir, join(itemDir, 'test.json')), 'utf8'));
+    const redText = decodeTranscript(readFileSync(containedFile(itemDir, join(itemDir, 'verify-red-raw.txt'))));
+    const red = parseRedRaw(redText);
+    if (!red.hasData || (test.verificationOnly === true && !test.red ? red.exit !== 0 : !red.red)) throw new Error('portable evidence missing or wrong-polarity RED proof');
+    const integrated = (result.transitions || []).concat(result.toState || []).some(s => ['INTEGRATED', 'CLOSED'].includes(s));
+    const integrationText = integrated ? textFor(proof.integration, 'integrate-raw.txt') : null;
+    if (codeChange) {
+      const targets = row.verificationTargets || contract.item.verificationTargets || [];
+      const expected = verificationExpectations({ item: contract.item, test, worktree, targets, band: result.band, redText });
+      const check = verifyTranscript(text, { worktree, expected, baseline, required: result.band === 'LIGHT' ? ['build', 'filter'] : ['build', 'filter', 'suite'] });
+      if (!check.pass) throw new Error(check.reason);
+      if (integrated) {
+        const integrationExpected = { build: targets, suite: targets,
+          ...(proof.integration.rawHash === proof.verification.rawHash ? { filter: expected.filter } : {}) };
+        const check = verifyTranscript(integrationText, { worktree, expected: integrationExpected, baseline, required: ['build', 'suite'] });
+        if (!check.pass) throw new Error('integration: ' + check.reason);
+      }
+    } else if (!text.trim() || integrated && !integrationText.trim()) throw new Error('empty documentation proof');
+    return { pass: true, text, integrationText, current };
+  } catch (e) { return { pass: false, reason: e.message }; }
 }
 
 export function observe(row, emit, warn = console.warn) {
@@ -403,26 +465,33 @@ export function verifyAttemptTranscript({ result, row, item = {}, itemDir, workt
   } catch (e) { return { pass: false, reason: e.message }; }
 }
 
-export function verifyRecoveryTranscript({ result, row, itemDir, worktree, repoRoot, baseline = 0, evidenceInputs, engineMount, collect = collectEvidenceIdentity }) {
+export function verifyRecoveryTranscript(args) { return recoveryTranscript(args, false); }
+export function sealRecoveryEvidence(args) { return recoveryTranscript(args, true); }
+
+function recoveryTranscript({ result, row, itemDir, worktree, repoRoot, baseline = 0, codeChange = true, evidenceInputs, engineMount, collect = collectEvidenceIdentity }, sealing) {
   try {
     const contract = row.recoveryVerification;
     if (!contract || !row.attemptIdentity?.recovery || result.runId !== row.runId || result.claimId !== row.claimId) throw new Error('fresh recovery verification contract missing');
     const transcript = containedFile(itemDir, hostPath(contract.transcript, repoRoot));
     if (statSync(transcript).mtimeMs < Date.parse(row.attemptIdentity.reservedAt)) throw new Error('recovery transcript predates reservation');
     const text = decodeTranscript(readFileSync(transcript));
-    const verdict = verifyTranscript(text, { worktree, expected: contract.expected, required: ['build', 'filter', 'suite'], baseline });
+    const verdict = codeChange ? verifyTranscript(text, { worktree, expected: contract.expected, required: ['build', 'filter', 'suite'], baseline })
+      : { pass: !!text.trim(), reason: 'empty documentation recovery proof' };
     if (!verdict.pass) return verdict;
     const metadata = JSON.parse(readFileSync(containedFile(itemDir, contract.metadataFile), 'utf8'));
+    if (contract.metadata && canonicalJson(metadata) !== canonicalJson(contract.metadata)) throw new Error('recovery trusted metadata mismatch');
     if (evidenceInputs !== undefined && canonicalJson(metadata.inputs || {}) !== canonicalJson(evidenceInputs)) throw new Error('recovery verification input contract mismatch');
     if (engineMount !== undefined && canonicalJson(metadata.engineMount || null) !== canonicalJson(engineMount)) throw new Error('recovery verification engine mount mismatch');
     const beforePath = containedFile(itemDir, contract.beforeIdentity), afterPath = containedFile(itemDir, contract.afterIdentity);
+    const hashes = Object.fromEntries([['transcript', transcript], ['before', beforePath], ['after', afterPath]].map(([key, path]) => [key, portableHash(readFileSync(path))]));
+    if (contract.version === 2 && !sealing && canonicalJson(hashes) !== canonicalJson(contract.hashes)) throw new Error('recovery proof unsealed or changed; run seal-recovery');
     const before = JSON.parse(readFileSync(beforePath, 'utf8')), after = JSON.parse(readFileSync(afterPath, 'utf8'));
     if (statSync(beforePath).mtimeMs < Date.parse(row.attemptIdentity.reservedAt) || statSync(beforePath).mtimeMs > statSync(transcript).mtimeMs
       || statSync(afterPath).mtimeMs < statSync(transcript).mtimeMs) throw new Error('recovery identity does not bracket fresh verification');
     const current = collect(worktree, metadata);
     if (before.version !== EVIDENCE_IDENTITY_VERSION || after.version !== EVIDENCE_IDENTITY_VERSION || current.version !== EVIDENCE_IDENTITY_VERSION
       || !/^[a-f0-9]{64}$/.test(before.hash) || before.hash !== after.hash || current.hash !== after.hash) throw new Error('recovery verification snapshot changed');
-    return { pass: true, text, mtimeMs: statSync(transcript).mtimeMs };
+    return { pass: true, text, mtimeMs: statSync(transcript).mtimeMs, hashes };
   } catch (e) { return { pass: false, reason: e.message }; }
 }
 

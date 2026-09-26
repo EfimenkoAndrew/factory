@@ -654,7 +654,8 @@ try { rmSync(SELFTEST_ITEM_DIR, { recursive: true, force: true }); } catch { /* 
   run(['init', 'SELFTEST-ITEM-FINALIZE', '--fixture', FIXTURE]);
   writeFileSync(join(dir4, 'result.json'), JSON.stringify({ id: 'SELFTEST-ITEM-FINALIZE', resultId: 'SELFTEST-ITEM-FINALIZE#1', toState: 'CLOSED', transitions: ['CLOSED'], needsRealInfra: false }));
   writeFileSync(join(dir4, 'verify-raw.txt'), 'fixture evidence');
-  surgery('SELFTEST-ITEM-FINALIZE', o => { o.phase = 'done'; o.checkpointed = true; o.res = JSON.parse(readFileSync(join(dir4, 'result.json'), 'utf8')); o.evidence = { complete: true, ...o.content, rawHash: digest('fixture evidence') }; });
+  writeFileSync(join(dir4, 'integrate-raw.txt'), 'fixture integration evidence');
+  surgery('SELFTEST-ITEM-FINALIZE', o => { o.phase = 'done'; o.checkpointed = true; o.res = JSON.parse(readFileSync(join(dir4, 'result.json'), 'utf8')); o.evidence = { complete: true, ...o.content, rawHash: digest('fixture evidence') }; o.integrationEvidence = { complete: true, hash: o.content.hash, rawHash: digest('fixture integration evidence') }; });
   const fin = run(['finalize', 'SELFTEST-ITEM-FINALIZE']);
   assert(fin.code === 0, 'finalize succeeds given a checkpointed result.json: ' + fin.out);
   const outPath = join(FACTORY_ROOT, 'state', 'results-cycle-1-' + testId('SELFTEST-ITEM-FINALIZE') + '.json');

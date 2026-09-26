@@ -10,7 +10,7 @@
 #   build-test.sh suite   <test.csproj-or-sln>
 #   build-test.sh efmigration <api-project-dir> <persistence-project-relative-path> # KI-E185: EF Core pending-model-change lint (FACTORY::EFMIGRATION::<clean|dirty>) — real dotnet-ef invocation, not a text lint
 #   build-test.sh claims    <worktree-path>       # KI-E11: phantom doc-path lint (FACTORY::CLAIMS::<n>)
-#   build-test.sh countclaims <worktree-path> <item-dir> # KI-E182: stale/invented test-count-claim lint (FACTORY::COUNTCLAIMS::<n>)
+#   build-test.sh countclaims <worktree-path> <item-dir> --transcript <current-path> [...] # KI-E182
 #   build-test.sh leftovers <worktree-path>       # KI-D12: deferral/tech-debt lexicon lint (FACTORY::LEFTOVER::<n>) — engine-owned, runs BEFORE the local-override seam
 #   build-test.sh comments  <worktree-path>       # KI-E59: no-new-comments lint (FACTORY::COMMENT::<n>) — engine-owned, runs BEFORE the local-override seam
 #   build-test.sh ledger-anchor <worktree-path>   # KI-E91: STANDARDS-DIVERGENCE-LEDGER.md duplicate-anchor/false-tag-claim lint (FACTORY::LEDGER-ANCHOR::<n>) — engine-owned, runs BEFORE the local-override seam
@@ -252,11 +252,11 @@ case "$cmd" in
     # editorial/verify time) or during a manual recovery — same lib a future fold-time check would
     # use (single source of truth). Emits FACTORY::COUNTCLAIMS-MISS::<claim> per unevidenced "N/M
     # passed" claim + FACTORY::COUNTCLAIMS::<count>; exit 1 when count>0.
-    #   usage: build-test.sh countclaims <worktree-path> <item-artifacts-dir>
+    #   usage: build-test.sh countclaims <worktree-path> <item-artifacts-dir> --transcript <current-path> [...]
     wt="$target"; itemdir="$filter"
     if [ -z "$wt" ]; then echo "usage: build-test.sh countclaims <worktree> <item-artifacts-dir>" >&2; exit 64; fi
     SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
-    node "$SCRIPT_DIR/../_workflow/countclaims-lint.mjs" "$wt" "$itemdir"
+    node "$SCRIPT_DIR/../_workflow/countclaims-lint.mjs" "$wt" "$itemdir" "${@:4}"
     exit $?
     ;;
   pack)

@@ -68,45 +68,12 @@ export function emit(e) {
 export function emitMany(events) { let n = 0; for (const e of events || []) if (emit(e)) n++; return n; }
 
 // ---- deterministic stage-timeline backfill (AD-11) -----------------------------------------
-// Artifact filename -> lifecycle stage (factory phase names, lowercased). gate-*.md / review-*.md
-// map via stageForArtifact's pattern branch.
-export const STAGE_ARTIFACTS = [
-  ['plan.md', 'plan'], ['test.json', 'test'], ['verify-red-raw.txt', 'test'],
-  ['fix.json', 'fix'], ['verify.json', 'verify'], ['verify-raw.txt', 'verify'],
-  // KI-E71: leftover-raw.txt is the KI-D12 leftover-scan probe's OWN canonical artifact
-  // (factory.js: `res.artifacts['probe:leftover-scan'] = 'state/items/' + id + '/leftover-raw.txt'`)
-  // — every item that reaches that pre-band stage produces it, dead run or not.
-  ['leftover-raw.txt', 'probe:leftover-scan'],
-  ['adjudication.md', 'gates'], ['decision.md', 'gates'], ['refute.md', 'refute'],
-  ['reaudit.md', 'reaudit'], ['integrate.md', 'integrate'], ['integrate-raw.txt', 'integrate'],
-  ['mutation-proof.txt', 'integrate'], ['result.json', 'checkpoint'],
-];
-export function stageForArtifact(name) {
-  for (const [f, s] of STAGE_ARTIFACTS) if (name === f) return s;
-  if (/^gate-.*\.md$/.test(name) || /^review-.*\.md$/.test(name)) return 'gates';
-  return null;
-}
+// Versioned producer vocabulary shared with quarantine; archives are retained, not timed.
+import { stageForArtifact } from './artifacts.mjs';
+export { STAGE_ARTIFACTS, CONTROL_ARTIFACTS, stageForArtifact, nonCanonicalArtifacts } from './artifacts.mjs';
 
-// KI-E42 — killed-run artifact quarantine support. The canonical per-item artifact vocabulary is
-// exactly: the STAGE_ARTIFACTS filenames + the gate-*.md / review-*.md patterns (stageForArtifact)
-// + the driver-owned control files below. Anything ELSE left in state/items/<id>/ by a KILLED
-// attempt is agent improvisation and can mislead the relaunch's agents/reporters (cycle 47 live: a
-// stray RESULT.md claiming "false positive — already fixed, no action taken" from dead run #1 was
-// read mid-run #2; two gates burned findings on the debris). Pure classification over FILE names —
-// the driver owns directory filtering and the actual move (`resume --quarantine`).
-// KI-E137/KI-E140 (ported from a host-mount session): progress.json (incremental mid-pipeline
-// checkpoints) and launch-meta.json (recorded {taskId, runId} for the KI-E140 task-liveness reminder)
-// are control files a LIVE attempt still needs — caught live on the origin host: the very first
-// `resume` run after launch-meta.json existed flagged it as non-canonical debris, meaning the
-// documented `resume --quarantine` step would have swept away the ONE file the KI-E140 reminder
-// exists to surface, and a stale progress.json missing this entry would equally have silently broken
-// KI-E137's diagnostics and KI-E139's gate-band reuse the next time a real relaunch ran quarantine
-// first. progress.json's own omission here was a gap in this repo's own KI-E137 port, not caught
-// until KI-E140 (this same commit) needed launch-meta.json added alongside it — both close together.
-export const CONTROL_ARTIFACTS = ['feedback.md', 'last-failure.md', 'main-snapshot.json', 'review-pack.md', 'baseline-raw.txt', 'progress.json', 'launch-meta.json'];
-export function nonCanonicalArtifacts(names) {
-  return (names || []).filter((n) => !stageForArtifact(n) && !CONTROL_ARTIFACTS.includes(n));
-}
+// KI-E42/KI-E137/KI-E140: driver owns file filtering and moves; cached receipts and checkpoints
+// survive quarantine. Classification alone never proves freshness or contents.
 
 // ---- canonical stage vocabulary (AD-12) -----------------------------------------------------
 // ONE stage enum for every consumer. Agents emit --role (their exact brief name — they know it);
@@ -148,11 +115,14 @@ export function deriveStageTimeline(itemDir, opts = {}) {
   const byStage = new Map();
   try {
     if (!existsSync(itemDir)) return [];
-    for (const f of readdirSync(itemDir)) {
+    for (const entry of readdirSync(itemDir, { withFileTypes: true })) {
+      if (!entry.isFile()) continue;
+      const f = entry.name;
       const stage = stageForArtifact(f);
       if (!stage) continue;
       try {
         const st = statSync(join(itemDir, f));
+        if (!st.isFile()) continue;
         if (opts.sinceMs && st.mtimeMs < opts.sinceMs) continue;
         const row = byStage.get(stage);
         if (!row) byStage.set(stage, { stage, files: [f], firstMs: st.mtimeMs, mtimeMs: st.mtimeMs });

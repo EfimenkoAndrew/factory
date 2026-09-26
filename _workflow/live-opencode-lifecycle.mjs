@@ -141,6 +141,11 @@ export function prepareLifecycle(root) {
   const gitDir = execFileSync('git', ['-C', SOURCE, 'rev-parse', '--absolute-git-dir'], { encoding: 'utf8' }).trim();
   const env = { ...process.env, FACTORY_REPO_ROOT: root, FACTORY_TELEMETRY: '0', GIT_DIR: gitDir,
     GIT_WORK_TREE: workspace, GIT_OPTIONAL_LOCKS: '0', GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'core.excludesFile', GIT_CONFIG_VALUE_0: join(root, 'fixture-excludes') };
+  if (process.env.FACTORY_SELFTEST_NO_GIT_MUTATIONS === '1') {
+    const index = execFileSync('git', ['-C', SOURCE, 'rev-parse', '--git-path', 'index'], { encoding: 'utf8' }).trim();
+    env.GIT_INDEX_FILE = join(root, 'fixture-index');
+    cpSync(resolve(SOURCE, index), env.GIT_INDEX_FILE);
+  }
   const status = execFileSync('git', ['-C', workspace, 'status', '--porcelain', '-z', '--untracked-files=no'], { env, encoding: 'utf8' });
   for (const row of status.split('\0').filter(Boolean)) {
     assert(row.slice(0, 3) === ' M ', 'fixture-index-differs-from-head');

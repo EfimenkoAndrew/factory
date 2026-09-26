@@ -13,6 +13,7 @@ import { verifyFinalTranscript, verifyTranscript, verificationExpectations, veri
 import { aggregateObservations, makeObservation } from './lib/observations.mjs';
 import { EVIDENCE_IDENTITY_VERSION, collectEvidenceIdentity } from './lib/evidence-identity.mjs';
 import { verifyNativeReceipt } from './lib/driver-integration.mjs';
+import { sealRecoveryEvidence } from './lib/driver-integration.mjs';
 import { nativeEvidenceRequest } from './lib/native-evidence-request.mjs';
 import { eligibleItems, disjointItems, resolvedBuildCapacity } from './lib/driver-integration.mjs';
 import { computeReady } from './lib/graph.mjs';
@@ -37,7 +38,7 @@ function item(id, extra = {}) {
     regressionTest: 'Assert the documented value agrees with configuration.', ...extra };
 }
 
-function fixture(t, items = [item('A')]) {
+export function fixture(t, items = [item('A')]) {
   const root = fs.mkdtempSync(join(tmpdir(), 'driver-integration-'));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   const paths = Object.fromEntries(['ledger', 'graph', 'runArgs'].map(k => [k, join(root, 'state', k + '.json')]));
@@ -274,7 +275,7 @@ test('precedent lookup falls back to an older live artifact using configured pat
 });
 
 test('recovery persists fresh identities and structured classification, and recognizes unavailable integrator', t => {
-  const f = fixture(t); f.ledger.items.A.state = 'FAILED'; writeJsonAtomic(f.cfg.paths.ledger, f.ledger);
+  const f = fixture(t); f.ledger.items.A.state = 'FAILED'; f.ledger.items.A.worktree = f.root; writeJsonAtomic(f.cfg.paths.ledger, f.ledger);
   const key = 'adjudicator:realinfra-override';
   const ruling = { verdict: 'OVERRULED', headline: 'Pure logic', reasons: ['No provider semantics involved'] };
   writeJsonAtomic(join(f.cfg.paths.items, 'A/result.json'), { id: 'A', resultId: 'A#1', codeChange: false,
@@ -460,7 +461,7 @@ const nativeAttacks = {
 };
 for (const [name, attack] of Object.entries(nativeAttacks)) test('actual native override rejects ' + name, t => {
   const f = nativeReceiptFixture(t); assert.equal(f.check(), null);
-  attack(f); const rejected = f.check(); assert.ok(rejected, name); assert.match(rejected.reason, /native evidence|initial verification|integration verification/);
+  attack(f); const rejected = f.check(); assert.ok(rejected, name); assert.match(rejected.reason, /native evidence|portable evidence|initial verification|integration verification/);
 });
 
 test('native receipt checks supplied complete expected metadata and physical containment', t => {
@@ -481,9 +482,11 @@ test('direct Node and legacy results do not acquire native authority from a runt
   const ledger = f.readLedger(), dir = join(f.cfg.paths.items, 'A');
   fs.writeFileSync(join(dir, 'verify-red-raw.txt'), 'FACTORY::RED::1\n');
   const result = { id: 'A', codeChange: true, band: 'FULL', toState: 'CLOSED', runtime: 'opencode', evidenceIdentity: { version: 3, hash: 'a'.repeat(64) } };
-  assert.match(f.call('deterministicVerifyOverride', f.cfg, ledger, f.graph.items[0], structuredClone(result)).reason, /no machine/);
+  assert.match(f.call('deterministicVerifyOverride', f.cfg, ledger, f.graph.items[0], structuredClone(result)).reason, /runtime binding missing/);
   fs.writeFileSync(join(dir, 'verify-raw.txt'), transcript('app.sln'));
-  assert.equal(f.call('deterministicVerifyOverride', f.cfg, ledger, f.graph.items[0], structuredClone(result)), null);
+  assert.match(f.call('deterministicVerifyOverride', f.cfg, ledger, f.graph.items[0], structuredClone(result)).reason, /runtime binding missing/);
+  delete result.runtime;
+  assert.equal(f.call('deterministicVerifyOverride', f.cfg, ledger, f.graph.items[0], result), null);
 });
 
 test('code sweep independently parses commands instead of trusting green execution booleans', t => {
@@ -690,6 +693,9 @@ test('recovery commands and actual override require fresh proof despite inherite
   fs.writeFileSync(contract.transcript, raw);
   writeJsonAtomic(contract.afterIdentity, { version: EVIDENCE_IDENTITY_VERSION, hash });
   f.context.verifyRecoveryTranscript = args => verifyRecoveryTranscript({ ...args, collect: () => ({ version: EVIDENCE_IDENTITY_VERSION, hash }) });
+  f.context.sealRecoveryEvidence = args => sealRecoveryEvidence({ ...args, collect: () => ({ version: EVIDENCE_IDENTITY_VERSION, hash }) });
+  assert.match(f.call('deterministicVerifyOverride', f.cfg, ledger, f.graph.items[0], structuredClone(skeleton)).reason, /unsealed/);
+  f.call('cmdSealRecovery', ['A']); ledger = f.readLedger();
   assert.equal(f.call('deterministicVerifyOverride', f.cfg, ledger, f.graph.items[0], structuredClone(skeleton)), null);
   f.cfg.evidenceInputs = { includePaths: ['eng/changed.settings'] };
   assert.match(f.call('deterministicVerifyOverride', f.cfg, ledger, f.graph.items[0], structuredClone(skeleton)).reason, /input contract mismatch/);

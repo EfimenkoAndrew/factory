@@ -3,7 +3,9 @@ import { readFileSync, writeFileSync, mkdirSync, existsSync, statSync } from 'no
 import { execFileSync, spawnSync, spawn } from 'node:child_process';
 import { resolve, join, dirname } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { snapshotHash, blindId, blindPacket, validateFrozenExperiment } from './lib/calibration.mjs';
+import { snapshotHash, blindId, blindPacket, validateFrozenExperiment, reportExperiment, renderExperimentReport } from './lib/calibration.mjs';
+import { reviewDecision, portfolioDecision } from './lib/review-decisions.mjs';
+import { aggregateCosts } from './lib/cost-accounting.mjs';
 import { benchmarkCases, compactContract, responseContract } from './fixtures/live-benchmark.mjs';
 import { heldoutCases } from './fixtures/live-benchmark-heldout.mjs';
 
@@ -78,7 +80,7 @@ export function normalizeResponse(manifest, armId, response) {
     const output = result.cases.find(r => r.caseId === c.caseId);
     if (!['APPROVED', 'CHANGES_REQUIRED'].includes(output.verdict) || !Array.isArray(output.findings)) throw new Error('invalid review output');
     return { blindId: blindId(manifest, c.caseId, armId), caseId: c.caseId, armId, snapshotHash: c.snapshotHash,
-      status: 'completed', actualModel: response.actualModel ?? null,
+      status: 'completed', actualModel: response.actualModel ?? null, decision: reviewDecision(output.verdict),
       measuredCost: null, currency: null, costSource: null,
       inputTokens: null, outputTokens: null, cacheReadTokens: null, cacheWriteTokens: null,
       extraReads: null, formatFailures: null, physicalCalls: null, reusedCalls: null,
@@ -86,7 +88,8 @@ export function normalizeResponse(manifest, armId, response) {
         if (!['documentation', 'bounds', 'tenant', 'idempotency', 'secrets', 'other'].includes(f.rule)
           || !Object.hasOwn(c.snapshot.files, f.file) || !Number.isInteger(f.line) || f.line < 1 || f.line > c.snapshot.files[f.file].split('\n').length
           || !['HIGH', 'MEDIUM', 'LOW', 'CRITICAL'].includes(f.severity) || typeof f.text !== 'string' || !f.text.trim()) throw new Error('invalid finding evidence');
-        return { findingId: f.findingId, role: armId === 'compact' ? 'consolidated' : 'review-code', text: `${f.severity} ${f.file}:${f.line}: ${f.text}` };
+        return { findingId: f.findingId, role: armId === 'compact' ? 'consolidated' : 'review-code', severity: f.severity,
+          file: f.file, line: f.line, rule: f.rule, text: `${f.severity} ${f.file}:${f.line}: ${f.text}` };
       }),
     };
   });
@@ -115,6 +118,8 @@ export function collect(directory, originalPath, compactPath, edgePath) {
     for (const c of manifest.cases) {
       const original = submissions.find(s => s.caseId === c.caseId && s.armId === 'original-complete');
       const additional = edgeSubmissions.find(s => s.caseId === c.caseId);
+      additional.decision = portfolioDecision([{ role: 'review-code', rawVerdict: original.decision.rawVerdict },
+        { role: 'review-edgecase', rawVerdict: additional.decision.rawVerdict }]);
       additional.actualModel = original.actualModel === additional.actualModel ? original.actualModel : null;
       additional.findings = original.findings.map(f => ({ ...f, findingId: 'code-' + f.findingId })).concat(additional.findings.map(f => ({ ...f, role: 'review-edgecase', findingId: 'edge-' + f.findingId })));
       submissions.push(additional);
@@ -136,6 +141,46 @@ export function collect(directory, originalPath, compactPath, edgePath) {
   write(dir, 'measured-summary.json', summary);
   write(dir, 'adjudication.prompt.txt', 'Independently adjudicate this blind packet without consulting any other artifact. Return JSON only with version:1, experimentDigest, outcomes, findings, truth. Every row must name adjudicator (your actual model or unknown), blind:true and independent:true only if accurate. Outcomes rows: blindId,outcome (accepted/rejected/mixed/unresolved),escapedDefects:null,correctionMinutes:null. Judge acceptance of the REVIEW: accepted when all real defects were found and no false findings; mixed when partial; rejected when wrong. Findings rows: blindId,findingId,canonicalFindingId,outcome (valid/false-positive/unresolved). Truth rows: caseId,complete,validFindingIds. Independently establish all defects from each snapshot; use the same canonical identity for equivalent findings. The source fixtures were not repaired. Outcomes are review-quality judgments, not production delivery acceptance.\n' + readFileSync(join(dir, 'collected-blind.json'), 'utf8'));
   return summary;
+}
+
+export function recomputeRetained(directory, prefix = 'decision-v2') {
+  const dir = resolve(directory);
+  if (!/^[a-zA-Z0-9_-]+$/.test(prefix)) throw new Error('output prefix must be a plain filename stem');
+  const manifest = read(join(dir, 'frozen.json'));
+  const retained = read(join(dir, 'collected-submissions.json'));
+  const originals = normalizeResponse(manifest, 'original-complete', read(join(dir, 'original-complete.response.json')));
+  const compact = normalizeResponse(manifest, 'compact', read(join(dir, 'compact.response.json')));
+  const edge = existsSync(join(dir, 'edge-independent.response.json'))
+    ? normalizeResponse(manifest, 'original-separate', read(join(dir, 'edge-independent.response.json'))) : [];
+  const rebuilt = [...originals, ...compact];
+  for (const additional of edge) {
+    const original = originals.find(s => s.caseId === additional.caseId);
+    rebuilt.push({ ...additional, actualModel: original.actualModel === additional.actualModel ? original.actualModel : null,
+      decision: portfolioDecision([{ role: 'review-code', rawVerdict: original.decision.rawVerdict }, { role: 'review-edgecase', rawVerdict: additional.decision.rawVerdict }]),
+      findings: original.findings.map(f => ({ ...f, findingId: 'code-' + f.findingId }))
+        .concat(additional.findings.map(f => ({ ...f, role: 'review-edgecase', findingId: 'edge-' + f.findingId }))) });
+  }
+  const submissions = retained.map(old => {
+    const fresh = rebuilt.find(s => s.blindId === old.blindId);
+    if (!fresh || fresh.findings.length !== old.findings.length || old.findings.some(f =>
+      !fresh.findings.some(n => n.findingId === f.findingId && n.role === f.role && n.text === f.text))) throw new Error('retained findings do not match raw response');
+    return { ...old, decision: fresh.decision, findings: fresh.findings };
+  });
+  const adjudications = unmeasuredQualityProjection(read(join(dir, 'independent-adjudications-portfolio.json')));
+  const report = reportExperiment(manifest, submissions, adjudications);
+  report.recomputation = { method: 'Raw response verdict and structured severity restored; independent reference truth unchanged.',
+    inputs: ['frozen.json', 'collected-submissions.json', 'original-complete.response.json', 'compact.response.json',
+      ...(edge.length ? ['edge-independent.response.json'] : []), 'independent-adjudications-portfolio.json'],
+    paidCalls: 0, originalReportsPreserved: true };
+  const outputs = ['submissions.json', 'blind.json', 'report.json', 'report.md', 'cost-summary.json'];
+  if (outputs.some(name => existsSync(join(dir, prefix + '-' + name)))) throw new Error('recomputed outputs already exist');
+  write(dir, prefix + '-submissions.json', submissions);
+  write(dir, prefix + '-blind.json', blindPacket(manifest, submissions));
+  write(dir, prefix + '-report.json', report);
+  write(dir, prefix + '-report.md', renderExperimentReport(report));
+  write(dir, prefix + '-cost-summary.json', summarizeRun(dir));
+  return { directory: dir, outputs: outputs.map(name => prefix + '-' + name),
+    decisions: Object.fromEntries(Object.entries(report.arms).map(([id, r]) => [id, r.decisions])) };
 }
 
 export function parseClaudeResult(raw, durationMs) {
@@ -282,7 +327,10 @@ export function summarizeRun(directory) {
       durationMs: r.durationMs, internalTurns: r.internalTurns };
   });
   const total = key => rows.length && rows.every(r => Number.isFinite(r[key])) ? rows.reduce((s, r) => s + r[key], 0) : null;
-  const result = { version: 1, experimentDigest: read(join(dir, 'frozen.json')).digest,
+  const accounting = aggregateCosts(rows.map(r => ({ id: r.name, role: r.name, actualModel: r.actualModel,
+    runtimeVersion: null, measuredCost: r.providerReportedCostUSD ?? null, currency: 'USD',
+    costSource: 'claude-cli-total_cost_usd', costBasis: 'list-equivalent' })));
+  const result = { version: 2, experimentDigest: read(join(dir, 'frozen.json')).digest, accounting,
     scope: 'All provider modelUsage entries, including auxiliary models, across every saved call and rejected adjudication', rows,
     totals: Object.fromEntries(['physicalCalls', 'providerRequestCount', 'inputTokens', 'cacheWriteTokens', 'cacheReadTokens', 'totalInputTokens', 'outputTokens', 'providerReportedCostUSD', 'measuredCost'].map(key => [key, total(key)])),
     limitations: ['A CLI invocation can make several provider requests; provider request count is unknown.', 'Multiple modelUsage entries leave singular actual model unknown rather than inferred from requested model.', 'API-equivalent list cost is not a subscription bill.', 'Calls are synthetic benchmark work, not production deliveries.'], automaticChanges: false, realHumanAcceptance: null };
@@ -300,6 +348,7 @@ export function main(args) {
   if (args[0] === 'adjudicate-portfolio' && args.length === 4) return adjudicatePortfolio(...args.slice(1));
   if (args[0] === 'summary' && args.length === 2) return summarizeRun(args[1]);
   if (args[0] === 'quality-report' && args.length === 2) return qualityReport(args[1]);
+  if (args[0] === 'recompute-retained' && [2, 3].includes(args.length)) return recomputeRetained(...args.slice(1));
   if (args.length === 0 || args[0] === '--help') return 'node _workflow/live-benchmark.mjs prepare NEW_DIRECTORY [REQUESTED_MODEL]\nnode _workflow/live-benchmark.mjs collect DIRECTORY original.response.json compact.response.json [edge.response.json]\nnode _workflow/live-benchmark.mjs run-claude DIRECTORY CLAUDE_EXECUTABLE FROZEN_MODEL\nnode _workflow/live-benchmark.mjs {adjudicate|adjudicate-pair|adjudicate-portfolio|cache-repeat} DIRECTORY CLAUDE_EXECUTABLE FROZEN_MODEL\nnode _workflow/live-benchmark.mjs summary DIRECTORY\nprepare/collect/summary are offline. run-claude makes four real independent requests (three reviews in parallel, then blind adjudication); at most USD 1 CLI budget each, 180-second timeout each. Optional adjudication commands make one request each; cache-repeat makes two. See LIVE-BENCHMARK.md. Existing output files are never overwritten.';
   throw new Error('unknown command; use --help');
 }

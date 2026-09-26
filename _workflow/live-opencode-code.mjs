@@ -95,7 +95,7 @@ export function prepareCode(root) {
   writeJsonAtomic(join(fx.mount, 'config/factory.config.local.json'), { solution: TARGET, solutions: { Numeric: TARGET }, workerCommandHint: codeCommandHint(fx), workerRoleCommandHints: roleHints });
   const baseline = limitedBuildTest(fx.mount, 'suite', [slash(join(workspace, TARGET))], { cwd: workspace, env: fx.env });
   writeFileSync(join(root, 'before-suite.txt'), baseline.output);
-  check(baseline.code === 0 && /SUMMARY::suite exit=0 failed=0 passed=1/.test(baseline.output), 'pre-test-baseline-not-green');
+  check(baseline.code === 0 && /SUMMARY::suite exit=0 failed=0 passed=1/.test(baseline.output), 'pre-test-baseline-not-green\n' + baseline.output);
   fx.originalCode = digest(readFileSync(join(workspace, CODE)));
   writeJsonAtomic(join(root, 'before-fix.json'), { code: readFileSync(join(workspace, CODE), 'utf8'), hash: fx.originalCode, baseline: 'before-suite.txt', regressionExisted: false });
   const helperEnv = Object.fromEntries(Object.entries(fx.env).filter(([key]) => /^(NUGET_PACKAGES|DOTNET_|MSBUILD|GIT_|FACTORY_)/.test(key) || /^(APPDATA|LOCALAPPDATA|USERPROFILE|ProgramFiles|ProgramFiles\(x86\)|ProgramW6432|SystemRoot|SystemDrive|ALLUSERSPROFILE|PUBLIC)$/i.test(key)));

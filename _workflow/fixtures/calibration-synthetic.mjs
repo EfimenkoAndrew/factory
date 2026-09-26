@@ -3,7 +3,7 @@ import { freezeExperiment, blindId } from '../lib/calibration.mjs';
 
 export function observationFixture() {
   const rows = [];
-  const add = (kind, id, extra) => rows.push(makeObservation({ kind, id, runId: 'run-1', ...extra }));
+  const add = (kind, id, extra) => rows.push(makeObservation({ kind, id, runId: 'run-1', ...(kind === 'dispatch' ? { costBasis: 'synthetic' } : {}), ...extra }));
   for (let i = 0; i < 10; i++) {
     const itemId = 'item-' + i, attemptId = itemId + '-attempt-1';
     add('item-attempt', attemptId + '-start', { itemId, attemptId, attemptNumber: 1, phase: 'started' });
@@ -41,7 +41,7 @@ export function experimentFixture() {
         files: { ['src\\case-' + i + '.txt']: i === 0 ? 'guard present' : 'TODO guard missing' } } })) });
   const submissions = manifest.cases.flatMap((c, i) => manifest.arms.map((arm, j) => ({
     blindId: blindId(manifest, c.caseId, arm.id), caseId: c.caseId, armId: arm.id, snapshotHash: c.snapshotHash,
-    actualModel: j ? null : 'sonnet-4.6', status: 'completed', measuredCost: j ? 1 : 2, currency: 'USD', costSource: 'synthetic-bill',
+    actualModel: j ? null : 'sonnet-4.6', status: 'completed', measuredCost: j ? 1 : 2, currency: 'USD', costSource: 'synthetic-bill', costBasis: 'synthetic',
     inputTokens: 100, outputTokens: 20, cacheReadTokens: null, cacheWriteTokens: null,
     extraReads: 0, formatFailures: 0, physicalCalls: j ? 1 : 3, reusedCalls: 0,
     findings: i === 0 ? [] : (j === 1 && i === 1 ? [] : [{ findingId: 'f-' + i, role: j ? 'consolidated' : 'original', text: 'Required guard missing at line 1.' }]),
