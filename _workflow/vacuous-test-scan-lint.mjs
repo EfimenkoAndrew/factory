@@ -3,7 +3,7 @@
 // Cheap, EARLY prevention lint — catches a [Fact]/[Theory]/[SkippableFact] method whose only
 // reachable assertion is gated behind a conditional early `return;` (or that never asserts at all),
 // so it passes unconditionally regardless of whether the fix under test actually works. Motivating
-// incidents: ERIKA-H9 (4 test methods silently no-op'd on an unlocatable-path guard) and
+// incidents: a prior item (4 test methods silently no-op'd on an unlocatable-path guard) and
 // a sibling vacuous-test class (prior incident, though that one's root cause — scanning the wrong
 // interface — is semantic and out of this scanner's reach). Single source of truth:
 // lib/vacuous-test-scan.mjs (pure, unit-tested).

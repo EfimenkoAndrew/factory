@@ -4,7 +4,7 @@
 // bounded transcript to disk) so the per-test Docker/Testcontainers-unavailable failure count survives
 // into the keyed FACTORY::SUMMARY::suite marker as `dockerfail=<N>` — the count is computed from the
 // COMPLETE run, never from the display-trimmed artifact the driver reads back later (which, live-caught
-// on AUTH-H1 cycle 69, retains only bare "Error Message:" header lines with the actual exception text
+// on a prior item, retains only bare "Error Message:" header lines with the actual exception text
 // already stripped by the summary grep — the pairing this script's underlying function relies on cannot
 // work against that trimmed artifact at all). Single source of truth: the SAME
 // lib/verify.mjs#dockerEnvironmentalFailureCount the driver's fold-time fallback heuristic uses when a

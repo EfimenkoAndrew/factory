@@ -1,8 +1,8 @@
 // KI-E237 — ConcurrencyScan: detects a diff that adds/modifies a lock primitive, an EF
 // ChangeTracker call, or a subprocess/parallel construct inside a TEST file — the shared root
 // cause behind this session's own repeated real incidents (a real wave-1 fix leaving 2 NEW
-// critical races; CPS-H-11's split-brain fix itself lacking a self-reference guard AND its own
-// regression test being flaky; CONFIG-H12's outbox TOCTOU; MSG-CR-3's `Process.Start("chmod",...)`
+// critical races; one prior item's split-brain fix itself lacking a self-reference guard AND its own
+// regression test being flaky; another's outbox TOCTOU; a third's `Process.Start("chmod",...)`
 // race in the fix's OWN new regression test). Individual reviewers this session ran the affected
 // suite 9, 15, 18, 20, 25, or 30+ times, inconsistently, per their own judgment — this scan feeds a
 // uniform, mandatory repetition requirement (injected into the relevant gate/review prompts by

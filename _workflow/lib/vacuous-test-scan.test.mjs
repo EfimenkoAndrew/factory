@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { scanVacuousTests } from './vacuous-test-scan.mjs';
 
-test('a conditional early return before the only assertion is flagged (the ERIKA-H9 shape)', () => {
+test('a conditional early return before the only assertion is flagged (that shape)', () => {
   const src = `
 namespace Foo.Tests;
 public class ExtractionTests
@@ -195,7 +195,7 @@ public class TailReturnTests
   assert.deepEqual(findings, []);
 });
 
-test('real ERIKA-H9 regression shape: 4 sibling test methods, each guarded by an unlocatable-path early return before the real assertions', () => {
+test('real prior-item regression shape: 4 sibling test methods, each guarded by an unlocatable-path early return before the real assertions', () => {
   const src = `
 namespace ExampleService.Tests;
 public class C7EgressGateDispositionTests

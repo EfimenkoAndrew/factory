@@ -3,8 +3,8 @@
 // for cmdMainCheck/cmdFold (driver.mjs has no exports; this proves the REAL shipped function, not a
 // re-derived string, so a future edit to the real logic cannot silently drift from what this asserts).
 //
-// Root incident this guards against: three of four cycle-177 escalations (FLAGSVC-H-7, MEDIA-H12,
-// CONFIG-H11-SHARED) each had an already-complete, all-gates-APPROVED CLOSED result.json sitting
+// Root incident this guards against: three of four cycle-177 escalations (three sibling items)
+// each had an already-complete, all-gates-APPROVED CLOSED result.json sitting
 // unfolded while the ledger still showed FAILED/ESCALATED/orphaned-CLAIMED — nothing detected this
 // automatically; a human had to notice it by hand every time. This test pins the detection logic that
 // now catches it, and pins every guard that keeps it from ever firing on something it shouldn't.
@@ -79,19 +79,19 @@ test('result.id mismatch against the requested item id -> rejected defensively, 
   assert.deepEqual(result, []);
 });
 
-test('THE REAL INCIDENT SHAPE: ESCALATED + complete CLOSED + all gates APPROVED -> IS a candidate (FLAGSVC-H-7/MEDIA-H12 shape)', () => {
-  const ledger = ledgerWith({ 'FLAGSVC-H-7': { state: 'ESCALATED' } });
-  const result = run(ledger, () => closedResult('FLAGSVC-H-7'), null);
+test('THE REAL INCIDENT SHAPE: ESCALATED + complete CLOSED + all gates APPROVED -> IS a candidate (ITEM-X/ITEM-Y shape)', () => {
+  const ledger = ledgerWith({ 'ITEM-X': { state: 'ESCALATED' } });
+  const result = run(ledger, () => closedResult('ITEM-X'), null);
   assert.equal(result.length, 1);
-  assert.equal(result[0].id, 'FLAGSVC-H-7');
+  assert.equal(result[0].id, 'ITEM-X');
   assert.equal(result[0].result.toState, 'CLOSED');
 });
 
-test('an ORPHANED CLAIMED (admitted:false) with a clean matching result -> IS a candidate (CONFIG-H11-SHARED shape)', () => {
-  const ledger = ledgerWith({ 'CONFIG-H11-SHARED': { state: 'CLAIMED', attemptIdentity: { admitted: false, startedAt: null } } });
-  const result = run(ledger, () => closedResult('CONFIG-H11-SHARED'), null);
+test('an ORPHANED CLAIMED (admitted:false) with a clean matching result -> IS a candidate (ITEM-Z shape)', () => {
+  const ledger = ledgerWith({ 'ITEM-Z': { state: 'CLAIMED', attemptIdentity: { admitted: false, startedAt: null } } });
+  const result = run(ledger, () => closedResult('ITEM-Z'), null);
   assert.equal(result.length, 1);
-  assert.equal(result[0].id, 'CONFIG-H11-SHARED');
+  assert.equal(result[0].id, 'ITEM-Z');
 });
 
 test('BLOCKED and FAILED are also eligible states, same as ESCALATED', () => {
@@ -108,11 +108,11 @@ test('the --ids filter (only) restricts the scan to exactly the named items', ()
 
 test('multiple eligible items are all returned, each paired with its own result', () => {
   const ledger = ledgerWith({
-    'FLAGSVC-H-7': { state: 'ESCALATED' },
-    'MEDIA-H12': { state: 'ESCALATED' },
-    'CONFIG-H11-SHARED': { state: 'CLAIMED', attemptIdentity: { admitted: false, startedAt: null } },
-    'ERIKA-H8': { state: 'CLOSED' }, // already closed — must NOT reappear
+    'ITEM-X': { state: 'ESCALATED' },
+    'ITEM-Y': { state: 'ESCALATED' },
+    'ITEM-Z': { state: 'CLAIMED', attemptIdentity: { admitted: false, startedAt: null } },
+    'ITEM-W': { state: 'CLOSED' }, // already closed — must NOT reappear
   });
   const result = run(ledger, (id) => closedResult(id), null);
-  assert.deepEqual(result.map((r) => r.id).sort(), ['CONFIG-H11-SHARED', 'FLAGSVC-H-7', 'MEDIA-H12']);
+  assert.deepEqual(result.map((r) => r.id).sort(), ['ITEM-X', 'ITEM-Y', 'ITEM-Z']);
 });

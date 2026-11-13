@@ -2617,7 +2617,7 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
 // KI-E326 (2026-10-06) — CI workflows cancel superseded runs + dotnet.yml audits all solutions in ONE
 // looped job (was a 28-entry matrix), so CI can't starve the factory on the single self-hosted runner.
 {
-  for (const wf of ['dotnet.yml','customer-portal-ci-gates.yml','auth-service-ci.yml','crypto-payment-ci.yml','erika-mail-ci.yml','saas-console-conformance.yml']) {
+  for (const wf of ['dotnet.yml','customer-portal-ci-gates.yml','auth-service-ci.yml','crypto-payment-ci.yml','mail-service-ci.yml','saas-console-conformance.yml']) {
     const t = _tryReadGhWorkflow(wf);
     ok(!t || /concurrency:[\s\S]{0,400}cancel-in-progress: true/.test(t), `KI-E326: ${wf} cancels superseded runs (concurrency)`);
   }
@@ -2646,7 +2646,7 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
   const scc = _tryReadGhWorkflow('saas-console-conformance.yml');
   ok(!scc || !scc.includes('"5432:5432"') && scc.includes("job.services.postgres.ports['5432']"), 'KI-E328: conformance DB uses a dynamic host port, not fixed 5432');
   ok(!scc || scc.includes('7f454c46') && !/file "\$out" \| grep -q ELF/.test(scc), 'KI-E328: ELF check is file-util-free (magic bytes)');
-  for (const w of ['saas-console-conformance','auth-service-ci','crypto-payment-ci','erika-mail-ci']) {
+  for (const w of ['saas-console-conformance','auth-service-ci','crypto-payment-ci','mail-service-ci']) {
     const t = _tryReadGhWorkflow(`${w}.yml`);
     ok(!t || t.includes('DOTNET_USE_POLLING_FILE_WATCHER'), `KI-E328: ${w} uses polling file watchers (avoids inotify exhaustion)`);
   }
@@ -2655,7 +2655,7 @@ ok(!isFactoryWorktreePath('/repo/state/worktrees'), 'KI-L60: bare dir without an
 // KI-E329 (2026-10-06) — serialize container-heavy saas CI onto a dedicated `saas-ci` runner so their
 // Testcontainers don't saturate the shared Docker daemon (the KI-E328 4th wall: Docker.DotNet socket errors).
 {
-  for (const w of ['saas-console-conformance','auth-service-ci','crypto-payment-ci','erika-mail-ci']) {
+  for (const w of ['saas-console-conformance','auth-service-ci','crypto-payment-ci','mail-service-ci']) {
     const t = _tryReadGhWorkflow(`${w}.yml`);
     ok(!t || t.includes('runs-on: [self-hosted, saas-ci]') && !/runs-on: self-hosted\b/.test(t), `KI-E329: ${w} is pinned to the dedicated saas-ci runner (serial, no concurrent Docker load)`);
   }

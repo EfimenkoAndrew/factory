@@ -22,7 +22,7 @@ const SITE_RE = /(^|\/)(Program\.cs|[A-Za-z0-9]+InfrastructureRegistration\.cs)$
 // thousands of tracked paths across every service + the .claude/skills tree) — Node's execFileSync
 // default maxBuffer (1MB) is exceeded, throwing ENOBUFS. Caught below like any other error, but a
 // silently-swallowed ENOBUFS previously made this lint report a false "0 findings" on every run
-// (confirmed live against the CUSTPORTAL-M1/SHOPPORTAL-H12 worktrees before this fix — the exact
+// (confirmed live against two sibling items' worktrees before this fix — the exact
 // two items this lint exists to catch). Mirrors leftover-scan.mjs's own 64MB sizing.
 const GIT_OPTS = { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 };
 let findings = [];

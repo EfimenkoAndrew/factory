@@ -6,7 +6,7 @@
 // doc/data-flows/{Service}.md file in the same PR", and the review gates treat a stale doc as a
 // BLOCKING finding. Until now nothing checked it before the gate band.
 //
-// Cost of that, measured: cycle 81's EGS-1-2 was judged an "excellent, correct,
+// Cost of that, measured: a prior item (cycle 81) was judged an "excellent, correct,
 // independently-verified" fix that met every acceptance clause, and FAILED anyway — CHANGES_REQUIRED
 // "only because doc/data-flows/ServiceName.md §6.2/6.3/6.5 still documents the retired SQL
 // mechanisms". A full 5-opus gate panel plus refuter plus adjudicator, spent to discover a missing

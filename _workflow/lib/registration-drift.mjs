@@ -6,7 +6,7 @@
 // leftover-scan.mjs/comment-scan.mjs) that runs in seconds, immediately after a remedy is written
 // and BEFORE a single gate-agent token is spent reviewing it.
 //
-// Motivating incident: CUSTPORTAL-M1 / SHOPPORTAL-H12 (cycle 60r) each independently introduced
+// Motivating incident: two sibling items (cycle 60r) each independently introduced
 //   AddHostDataProtection(name, skipCertificateProtection)
 // where `skipCertificateProtection` was a bare local-variable identifier assigned from a
 // multi-operator expression (`IsEnvironment("Testing") || !File.Exists(...)`) — a shape that
@@ -79,8 +79,8 @@ export function normalizeShape(argsText) {
 // CONVENTION is only a meaningful signal for simple, non-lambda argument lists (string constants,
 // booleans, a single inline method call) — exactly the shape of the incident this module exists to
 // catch (`AddHostDataProtection("x", skipCertificateProtection)`, no lambda anywhere in it).
-// Live-verified: excluding `=>`-bearing calls drops CUSTPORTAL-M1's hit count from 7 to 1 and
-// SHOPPORTAL-H12's from 9 to 1 — in both cases the ONE surviving hit is the real incident.
+// Live-verified: excluding `=>`-bearing calls drops one prior item's hit count from 7 to 1 and
+// the other's from 9 to 1 — in both cases the ONE surviving hit is the real incident.
 const HAS_LAMBDA = /=>/;
 
 // Pure decision: given ONE modified file's path+text and a {path: text} map of every sibling

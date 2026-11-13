@@ -2,7 +2,7 @@
  * factory-pg.mjs — PostgreSQL telemetry store for the factory (KI-E385).
  *
  * Zero npm deps: all postgres calls go through
- *   kubectl -n azathoth exec postgres-0 -- psql -U postgres -d factory_telemetry
+ *   kubectl -n <namespace> exec postgres-0 -- psql -U postgres -d factory_telemetry
  * and all embedding calls go through
  *   docker exec -i factory-vectorizer python3 /embed.py
  *
@@ -17,7 +17,7 @@
 
 import { execFileSync, spawnSync } from 'node:child_process';
 
-const PG_NS        = 'azathoth';
+const PG_NS        = process.env.FACTORY_PG_NAMESPACE || 'default';
 const PG_POD       = 'postgres-0';
 const PG_USER      = 'postgres';
 const PG_DB        = 'factory_telemetry';

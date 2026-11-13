@@ -1,6 +1,6 @@
-// KI-E241 (2026-09-24, MSG-CR-3 follow-up — parent assigns the final KI-E number when
+// KI-E241 (2026-09-24, a prior item follow-up — parent assigns the final KI-E number when
 // integrating this alongside sibling in-flight forks' own new KI entries): shellcheck pre-band
-// probe. MSG-CR-3's 9-round
+// probe. That item's 9-round
 // defect chain was mostly pure bash pitfalls found the expensive way (gate/review agents, one at a
 // time) — a function invoked as `f "$x" || ...` silently disabling `set -e` inside it, then a
 // `Process.Start("chmod", ...)` racing the exec of the same file. This is the first probe in this
@@ -9,7 +9,7 @@
 // has-pending-model-changes` probe.
 //
 // IMPORTANT, verified empirically before shipping (the KI-E185 lesson: verify against REAL tool
-// output before trusting an assumption): shellcheck's DEFAULT check set does NOT flag the MSG-CR-3
+// output before trusting an assumption): shellcheck's DEFAULT check set does NOT flag that
 // masking-bug shape at all (`shellcheck --format=json` on both a broken and a fixed version of the
 // real pattern returns `[]`). The relevant check, SC2310 ("This function is invoked in an ||
 // condition so set -e will be disabled. Invoke separately if failures should cause the script to
@@ -26,7 +26,7 @@ export const SHELLCHECK_JSON_VERSION = 1;
 // A curated set of codes worth calling out by name in the summary — not because other codes don't
 // matter, but because these are the ones with a direct incident citation in this repo's own history.
 const NOTABLE_CODES = new Map([
-  [2310, 'function invoked under || disables set -e inside it (the MSG-CR-3 masking-bug class — verify the function captures $? and checks it explicitly before returning)'],
+  [2310, 'function invoked under || disables set -e inside it (that masking-bug class — verify the function captures $? and checks it explicitly before returning)'],
 ]);
 
 const SEVERITY_RANK = { error: 0, warning: 1, info: 2, style: 3 };

@@ -4,9 +4,9 @@
 // test actually works. Same posture as registration-drift.mjs (KI-E77): cheap, deterministic, no
 // dotnet, no LLM, advisory.
 //
-// Motivating incident: ERIKA-H9 -- 4 test methods silently no-op'd (reached their own end via an
+// Motivating incident: a prior item -- 4 test methods silently no-op'd (reached their own end via an
 // early `return;` on an "unlocatable path" guard) BEFORE the real assertions ran, producing a false
-// green in the real erika-mail-ci.yml CI job that actually hits the guard. This scan's early-return
+// green in the real CI job that actually hits the guard. This scan's early-return
 // check catches exactly that shape. a sibling incident (a test scanning the WRONG
 // interface, so the value it asserted on was structurally always empty) is a SEMANTIC error a text
 // scanner cannot detect -- explicitly out of scope here, left to gate/review agents.

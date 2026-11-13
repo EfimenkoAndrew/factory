@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { classifyShellcheckOutput, unavailableResult } from './shellcheck-lint.mjs';
 
 // Real `shellcheck --format=json --severity=style --enable=all` output, captured against an actual
-// script reproducing the MSG-CR-3 masking-bug shape (a function invoked as `f "$x" || ...` with no
+// script reproducing that masking-bug shape (a function invoked as `f "$x" || ...` with no
 // explicit $? capture inside it) — not hand-invented JSON. Confirms SC2310 ("This function is
 // invoked in an || condition so set -e will be disabled...") is the check that catches this class,
 // and that it ONLY appears with --enable=all (shellcheck's default check set returns [] on the
@@ -17,7 +17,7 @@ test('a genuinely clean script (real shellcheck output, empty array) verdicts cl
   assert.match(result.summary, /0 finding/);
 });
 
-test('the real MSG-CR-3 masking-bug shape is flagged, SC2310 marked notable', () => {
+test('the real masking-bug shape is flagged, SC2310 marked notable', () => {
   const result = classifyShellcheckOutput(MASKING_BUG_REAL_OUTPUT, { exitCode: 1 });
   assert.equal(result.verdict, 'findings');
   assert.equal(result.findings.length, 3);
@@ -25,7 +25,7 @@ test('the real MSG-CR-3 masking-bug shape is flagged, SC2310 marked notable', ()
   assert.ok(sc2310, 'SC2310 present in parsed findings');
   assert.equal(sc2310.level, 'info');
   assert.ok(sc2310.notable, 'SC2310 is marked as a notable, incident-cited class');
-  assert.match(sc2310.notable, /MSG-CR-3 masking-bug/);
+  assert.match(sc2310.notable, /that masking-bug/);
   // style-level noise (SC2250) must NOT be marked notable — only the incident-cited codes are.
   const style = result.findings.filter((f) => f.code === 2250);
   assert.equal(style.length, 2);

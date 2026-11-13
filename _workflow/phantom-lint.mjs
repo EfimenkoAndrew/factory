@@ -27,7 +27,7 @@
 // only in memory until result.json. Reading fix.json from disk would have made this probe silently
 // INERT for exactly the shape it matters most for (KI-E117 stepwise: "a stepwise run's manifest is
 // the UNION of per-step claims, so a phantom names the step that lied") — caught before shipping by
-// checking whether MEDIA-M4's own 7-step run had ever written one (it had not). Mirrors the
+// checking whether a prior item's own 7-step run had ever written one (it had not). Mirrors the
 // checkpointResult/checkpointProgress pattern instead: factory.js already HOLDS the authoritative
 // value (res.filesChanged) and hands it to an agent to persist verbatim via the Write tool, exactly
 // like every other cross-call handoff in this pipeline.
@@ -59,7 +59,7 @@ if (!Array.isArray(claimed)) {
 
 // KI-E271: clean-worktree fallback — if the worktree has no uncommitted changes but the fixer
 // DID claim files, check whether a prior session already committed the fix to the branch tip.
-// This handles the NOTIF-H6-SIBLINGS pattern: prior session commits → phantom probe sees an
+// This handles the prior-session-commits pattern: prior session commits → phantom probe sees an
 // empty `git status` → every claimed file would be misclassified as a phantom. Using the last
 // commit's diff as the effective "changed" set lets the probe verify correctly in that case.
 // Emits FACTORY::PHANTOM-COMMITTED-FALLBACK (machine-greppable) so the fold can see which
