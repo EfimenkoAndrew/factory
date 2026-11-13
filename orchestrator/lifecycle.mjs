@@ -10,6 +10,7 @@ export function groupArguments(cfg, { label, token, ids } = {}) {
   if (label) args.push('--label', label);
   if (ids) args.push('--ids', ids);
   if (cfg.includeRealinfra) args.push('--include-realinfra');
+  if (cfg.includeEscalate) args.push('--include-escalate'); // KI-E334: owner-approved escalate-tier dispatch
   if (token) args.push('--controller', token);
   return args;
 }
@@ -53,7 +54,12 @@ export function validCheckpoint(result, item, cycle, { mtimeMs, sinceMs, claim, 
   if (!['CLOSED', 'FAILED', 'BLOCKED', 'ESCALATED'].includes(result.toState)) return false;
   if (!Array.isArray(result.transitions) || result.transitions.at(-1) !== result.toState) return false;
   if (typeof result.worktree !== 'string' || !item.worktree?.path || resolve(result.worktree) !== resolve(item.worktree.path)) return false;
-  if (item.worktree.branch && result.branch !== item.worktree.branch) return false;
+  // KI-E453: a CLOSED result's branch legitimately diverges from the original per-item worktree
+  // branch — factory.js's integrate step (`if (integ.branch) res.branch = integ.branch`) lets the
+  // integrator overwrite it with the real KI-E303 accumulation destination (factory/current),
+  // which is the MORE useful value to record. Only non-CLOSED results (which never run integrate)
+  // must still match the original branch exactly.
+  if (item.worktree.branch && result.branch !== item.worktree.branch && result.toState !== 'CLOSED') return false;
   for (const key of ['claimId', 'attemptId']) if (item[key] !== undefined && result[key] !== item[key]) return false;
   return true;
 }

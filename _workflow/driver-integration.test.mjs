@@ -6,6 +6,7 @@ import { join, resolve, dirname } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { spawnSync } from 'node:child_process';
 import { containedMountRelative, resolveRepoRoot } from './lib/rootfind.mjs';
+import { stripFactorySource, FACTORY_BATCH_SENTINEL, FACTORY_BATCH_MARKER } from './lib/js-strip.mjs';
 import { unclaimedMainDrift } from './lib/mainguard.mjs';
 import vm from 'node:vm';
 import { emptyLedger, syncFromGraph, writeJsonAtomic } from './lib/ledger.mjs';
@@ -39,7 +40,11 @@ function item(id, extra = {}) {
 }
 
 export function fixture(t, items = [item('A')]) {
-  const root = fs.mkdtempSync(join(tmpdir(), 'driver-integration-'));
+  // realpathSync: mkdtempSync's raw path and its resolved form differ on macOS (/var -> /private/var).
+  // Tests that only touch this fixture's own fake paths never notice, but downstream consumers (e.g.
+  // portable-evidence.test.mjs) run REAL evidence-identity collection against this root, which
+  // internally realpaths every path before querying git — resolving here up front keeps both views consistent.
+  const root = fs.realpathSync(fs.mkdtempSync(join(tmpdir(), 'driver-integration-')));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   const paths = Object.fromEntries(['ledger', 'graph', 'runArgs'].map(k => [k, join(root, 'state', k + '.json')]));
   paths.runArgs = join(root, 'state/run-args.json');
@@ -610,6 +615,83 @@ test('command-specific expectations accept mixed solution/project layout and rej
   assert.throws(() => verificationExpectations({ item: {}, test: { ...testData, runCmd: 'dotnet test other.sln --filter Wrong' }, worktree: wt, band: 'FULL', redText }), /disagrees/);
 });
 
+// KI-E457: build-test.sh's own usage documents `red <test.csproj-or-sln> ...` as a valid form —
+// a RED proof legitimately captured against the whole .sln, not the specific owning .csproj.
+// Before this fix, resolveProjectTarget resolved the .sln to its own literal path, and the
+// testProjects cross-check (an exact samePath against the .csproj) could never match a .sln path
+// — rejecting EVERY item whose RED proof used a solution-level target, regardless of the actual
+// fix's correctness (live incident: a direct-recovery attempt, verify-red-raw.txt recorded
+// FACTORY::RED::START .../ExampleService.sln while testFiles pointed at
+// ExampleService.Tests.csproj).
+test('a RED proof captured against the whole .sln is accepted when the .sln actually contains the test project', t => {
+  const f = fixture(t), wt = join(f.root, 'wt');
+  for (const file of ['app.sln', 'other.sln', 'tests/App.Tests.csproj', 'tests/Regression.cs']) {
+    fs.mkdirSync(dirname(join(wt, file)), { recursive: true }); fs.writeFileSync(join(wt, file), 'content');
+  }
+  fs.writeFileSync(join(wt, 'app.sln'),
+    'Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "App.Tests", "tests\\App.Tests.csproj", "{11111111-1111-1111-1111-111111111111}"\nEndProject\n');
+  fs.writeFileSync(join(wt, 'other.sln'),
+    'Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Unrelated", "unrelated\\Unrelated.csproj", "{22222222-2222-2222-2222-222222222222}"\nEndProject\n');
+  const testData = { testFiles: ['tests/Regression.cs'], runCmd: 'dotnet test "tests/App.Tests.csproj" --filter "Regression"' };
+  // RED proof recorded against the SOLUTION, not the specific .csproj — the exact shape that used
+  // to throw "RED filter target is not a test-file owning project" unconditionally.
+  const redText = 'FACTORY::RED::START app.sln :: Regression\nFACTORY::RED::1\n';
+  const expected = verificationExpectations({ item: item('A', { files: ['tests/Regression.cs'], solution: 'app.sln' }), test: testData, worktree: wt, band: 'FULL', redText });
+  assert.ok(expected, 'verificationExpectations succeeds instead of throwing when the RED target is a .sln that genuinely contains the owning project');
+
+  // The check must still REJECT a .sln that does NOT contain the test project — this is not a
+  // blanket "any .sln passes" weakening, only "a .sln that actually references the project" does.
+  // (The command-vs-RED cross-check fires first and rejects it too — either message is a correct
+  // rejection; the point under test is that NEITHER check is fooled into accepting it.)
+  const wrongSlnRedText = 'FACTORY::RED::START other.sln :: Regression\nFACTORY::RED::1\n';
+  assert.throws(() => verificationExpectations({ item: item('A', { files: ['tests/Regression.cs'], solution: 'app.sln' }), test: testData, worktree: wt, band: 'FULL', redText: wrongSlnRedText }),
+    /RED filter target is not a test-file owning project|test\.json command disagrees with RED target\/filter/,
+    'a .sln that does not reference the test project must still be rejected');
+});
+
+// KI-E217: a RED-proof/filter target recorded by build-test.sh's `red`/`filter` subcommands may be a
+// project DIRECTORY rather than a .csproj file -- `dotnet build`/`dotnet test` both auto-discover the
+// single project file in a directory, so this is a normal, successful real invocation shape, not a
+// malformed one. Before this fix, `verificationExpectations` threw "file missing or outside trusted
+// directory" for every such item (live: a prior item's own real verify-red-raw.txt records its RED target
+// as a bare test-project directory), which in turn made `recover <id>` crash (KI-E215) or, once that
+// crash was fixed, silently degrade to the manual-recovery fallback for every directory-target item.
+test('a directory-shaped RED/filter target resolves to its single owning .csproj, not a thrown error', t => {
+  const f = fixture(t), wt = join(f.root, 'wt');
+  for (const file of ['app.sln', 'src/App.csproj', 'src/App.cs', 'tests/App.Tests.csproj', 'tests/Regression.cs']) {
+    fs.mkdirSync(dirname(join(wt, file)), { recursive: true }); fs.writeFileSync(join(wt, file), 'content');
+  }
+  const testData = { testFiles: ['tests/Regression.cs'], runCmd: 'dotnet test "tests" --filter "Regression"' };
+  // The RED-proof transcript's own START line names the DIRECTORY "tests", exactly like a real
+  // `build-test.sh red <dir> <filter>` invocation against a project directory instead of a .csproj file.
+  const redText = 'FACTORY::RED::START tests :: Regression\nFACTORY::RED::1\n';
+  const expected = verificationExpectations({ item: item('A', { files: ['src/App.cs'], solution: 'app.sln' }), test: testData, worktree: wt, band: 'FULL', redText });
+  assert.equal(expected.filter[0].target, resolve(wt, 'tests/App.Tests.csproj'), 'the directory target resolved to the single .csproj found inside it');
+  // The resulting contract still verifies correctly against a transcript recorded against the
+  // RESOLVED .csproj path (the shape build-test.sh's own dotnet invocation would actually produce).
+  const raw = transcript('app.sln').replace('FILTER::START app.sln', 'FILTER::START tests/App.Tests.csproj').replace(':: Wrong', ':: Regression');
+  assert.equal(verifyTranscript(raw, { worktree: wt, expected }).pass, true);
+  // The three negative cases below use testFiles:[] (no test.json testFiles claim) so the pre-existing,
+  // unrelated `projectFor` ambiguity check (over test.testFiles) never fires first -- isolating each
+  // assertion to the NEW directory-resolution code path specifically.
+  const dirOnlyTestData = { testFiles: [], runCmd: 'dotnet test "tests" --filter "Regression"' };
+  // Two projects in the same directory is a real ambiguity (unlike a bare directory being fine) --
+  // must still fail loudly, not silently pick one.
+  fs.writeFileSync(join(wt, 'tests/Other.Tests.csproj'), 'content');
+  assert.throws(() => verificationExpectations({ item: item('A', { files: ['src/App.cs'], solution: 'app.sln' }), test: dirOnlyTestData, worktree: wt, band: 'FULL', redText }), /ambiguous owning project in directory target/);
+  fs.rmSync(join(wt, 'tests/Other.Tests.csproj'));
+  // A directory with NO .csproj inside it is a genuine dead end -- still throws, never silently passes.
+  fs.mkdirSync(join(wt, 'empty-dir'));
+  const emptyRedText = 'FACTORY::RED::START empty-dir :: Regression\nFACTORY::RED::1\n';
+  const emptyDirTestData = { testFiles: [], runCmd: 'dotnet test "empty-dir" --filter "Regression"' };
+  assert.throws(() => verificationExpectations({ item: item('A', { files: ['src/App.cs'], solution: 'app.sln' }), test: emptyDirTestData, worktree: wt, band: 'FULL', redText: emptyRedText }), /no owning project in directory target/);
+  // A path outside the trusted worktree root is still rejected exactly as before -- the directory
+  // handling never widens the trust boundary containedFile() itself enforces.
+  const outsideRedText = 'FACTORY::RED::START ../outside :: Regression\nFACTORY::RED::1\n';
+  const outsideTestData = { testFiles: [], runCmd: 'dotnet test "../outside" --filter "Regression"' };
+  assert.throws(() => verificationExpectations({ item: item('A', { files: ['src/App.cs'], solution: 'app.sln' }), test: outsideTestData, worktree: wt, band: 'FULL', redText: outsideRedText }), /file missing or outside trusted directory/);
+});
+
 test('mixed native/normalized observations preserve supersession and suppress runtime lifecycle verdicts', () => {
   const row = {}; const identity = admitAttempt(row, 'run', { cycle: 1 });
   const native = { version: 1, runId: 'run', itemId: 'A', attemptId: 'physical', dispatchId: 'logical', stage: 'A:runner', phase: 'Verify', outcome: 'started' };
@@ -751,6 +833,27 @@ test('group persists every graph-owned solution and refuses ambiguous ownership 
   assert.equal(verifyTranscript(transcript('A/A.sln') + second, { worktree: f.root, expected }).pass, true);
   fs.writeFileSync(join(f.root, 'B/Other.sln'), 'other');
   assert.throws(() => affectedVerificationTargets(f.graph.items[0], {}, f.root), /ambiguous/);
+});
+
+test('KI-E224: cross-cutting infra files with no dotnet ownership anywhere skip verification instead of throwing', t => {
+  // Live regression: a sibling item (deployment/k3s/infrastructure/prometheus/prometheus-config.yaml)
+  // and another sibling item (k8s/overlays/production/secrets/notification-service.env) both crashed
+  // a `group --dry` smoke test with an uncaught throw here, even though already-CLOSED items (three
+  // other sibling items) touched files in this exact "no .sln/.csproj anywhere in the
+  // ancestry, no cfg.solutions mapping" shape successfully in the past.
+  const wi = item('A', { target: 'ExampleService', files: [
+    'deployment/k3s/infrastructure/prometheus/prometheus-config.yaml',
+    'k8s/overlays/production/secrets/notification-service.env',
+  ] });
+  const f = fixture(t, [wi]);
+  assert.deepEqual(affectedVerificationTargets(wi, {}, f.root, 'ExampleService/ExampleService.sln'), []);
+  // A genuinely ambiguous CODE file is unaffected — still throws (unchanged coverage, see the
+  // "group persists every graph-owned solution..." test above for the equivalent multi-.sln case).
+  fs.mkdirSync(join(f.root, 'B'), { recursive: true });
+  fs.writeFileSync(join(f.root, 'B/B.cs'), 'content');
+  fs.writeFileSync(join(f.root, 'B/B.sln'), 'sln');
+  fs.writeFileSync(join(f.root, 'B/Other.sln'), 'sln');
+  assert.throws(() => affectedVerificationTargets({ ...wi, files: ['B/B.cs'] }, {}, f.root), /ambiguous/);
 });
 
 test('unmapped nested production projects keep owning solutions for FULL and integration suites', t => {
@@ -938,7 +1041,8 @@ syncBuiltinESMExports();
     const args = JSON.parse(fs.readFileSync(path.replace('run-script', 'run-args').replace(/\.js$/, '.json'), 'utf8'));
     const injected = 'const __FACTORY_BATCH__ = ' + JSON.stringify(args) + ';';
     assert.ok(bytes.toString().includes(injected));
-    assert.equal(bytes.toString().replace(injected, '/*__FACTORY_BATCH_INJECT__*/'), crlf.replace(/\r\n/g, '\n'));
+    // KI-E403: the launcher inlines the COMMENT-STRIPPED source (marker survives via the sentinel).
+    assert.equal(bytes.toString().replace(injected, FACTORY_BATCH_SENTINEL), stripFactorySource(crlf.replace(/\r\n/g, '\n')));
     return args;
   };
   cli('init');

@@ -31,65 +31,123 @@ test('current native source -> checkpoint/final snapshots -> normalizer -> repor
     const breakdown = projectedCallBreakdown(run.item, band, conditions).components;
     assert.equal(breakdown.initialVerificationPreparation, run.calls.filter(c => c.label.endsWith(':progress-writer') && c.prompt.includes('initial verification output')).length);
     assert.equal(breakdown.integrationPreparation, run.calls.filter(c => c.label.endsWith(':progress-writer') && c.prompt.includes('integration output')).length);
-    const admissionCalls = run.calls.filter(c => c.label.endsWith(':progress:admission'));
-    assert.equal(breakdown.admission, admissionCalls.length);
-    assert.equal(run.calls[0], admissionCalls[0], 'admission persists before any semantic worker');
-    assert.equal(run.checkpoints[0].progressStage, 'admission');
-    assert.equal(run.checkpoints[0].admission.attempted, true);
+    // "admission" (a driver-level bookkeeping event in driver-integration.mjs's admitAttempt/
+    // observeAdmission) is not a physical agent dispatch and never appears in an execSmoke trace of
+    // factory.js — confirmed via `git log -S` that factory.js has never contained a ":progress:admission"
+    // label. breakdown.admission is 0 for exactly this reason (see band-cost.mjs's header comment).
+    assert.equal(run.calls.filter(c => c.label.endsWith(':progress:admission')).length, 0);
+    assert.equal(breakdown.admission, 0);
     assert.equal(breakdown.admission + breakdown.checkpoints + breakdown.postPlanCheckpoint + breakdown.postTestCheckpoint, run.calls.filter(c => c.prompt.includes('CHECKPOINT-BEGIN\n')).length);
     assert.equal(breakdown.postPlanCheckpoint, run.calls.filter(c => c.label.endsWith(':progress:post-plan')).length);
     assert.equal(breakdown.postTestCheckpoint, run.calls.filter(c => c.label.endsWith(':progress:post-test')).length);
     assert.equal(breakdown.planAndTwoReviews, run.calls.filter(c => /:(planner|plan-feasibility-probe|plan-quality-probe)$/.test(c.label)).length);
     assert.equal(breakdown.evidenceIdentity, run.calls.filter(c => c.label.endsWith(':evidence-identity')).length);
     assert.equal(breakdown.reaudit, run.calls.filter(c => c.label.endsWith(':re-auditor')).length);
-    assert.equal(run.calls.filter((c) => c.label.endsWith(':evidence-identity')).length, 4);
-    assert.equal(run.calls.some((c) => /:(red-proof-probe|rootcause-probe)$/.test(c.label)), false);
+    // evidence-identity is dead (no such label has ever existed in factory.js — see band-cost.mjs's
+    // header note), so this is 0 for every kind, not the old stale 4.
+    assert.equal(run.calls.filter((c) => c.label.endsWith(':evidence-identity')).length, 0);
+    // red-proof-probe/rootcause-probe DO run — always, for a codeChange item (light-code/full-code);
+    // never for a doc-only item (light-doc). The old blanket "never appears" claim was stale.
+    assert.equal(run.calls.some((c) => /:(red-proof-probe|rootcause-probe)$/.test(c.label)), kind !== 'light-doc');
     const lastSnapshot = run.checkpoints.at(-1);
-    assert.equal(lastSnapshot.attemptObservations.at(-1).outcome, 'started');
-    const raw = [...run.checkpoints.flatMap((c) => c.attemptObservations), ...run.result.attemptObservations,
+    // CORRECTED (2026-09-27) -- 'started' is structurally impossible here in this repo's real
+    // factory.js: checkpointProgress/checkpointResult BOTH filter the shared attemptObservations
+    // array into the snapshot BEFORE dispatching their OWN checkpoint-writer call (so that writer's
+    // own observation can never land in the very snapshot it writes), and every checkpoint is only
+    // ever taken AFTER its preceding stage's dispatches are fully awaited -- nothing is ever
+    // mid-flight at the moment a snapshot is taken. Verified empirically: 0 'started' entries appear
+    // anywhere in a real run's combined raw observations (see report.supersededStarts below). The
+    // trailing entry of the final snapshot is always already resolved.
+    assert.equal(lastSnapshot.attemptObservations.at(-1).outcome, 'completed');
+    // run.result.attemptObservations does not exist -- attemptObservations lives per-item under
+    // run.result.results[], never at the batch envelope's top level (run.result's real keys are
+    // {mode, cycle, plan, usage, results}, the real Workflow batch envelope shape).
+    const raw = [...run.checkpoints.flatMap((c) => c.attemptObservations),
       ...run.result.results.flatMap((r) => r.attemptObservations)];
     const normalized = normalizeAttemptObservations(raw, () => ({ itemAttemptId: 'claim-' + kind }));
     assert.deepEqual(normalized.invalid, []);
     for (const observations of [normalized.records, [...normalized.records].reverse()]) {
       const report = aggregateEvents(observations.map(observationEvent)).observations;
       assert.deepEqual(report.conflicts, []);
-      assert.equal(report.calls.physical, run.calls.length);
-      assert.equal(report.calls.terminal, run.calls.length);
+      // physical/terminal are run.calls.length - 1, permanently: the FINAL checkpoint-writer's own
+      // dispatch (checkpointResult's ':checkpoint' call, always the last physical call in any run)
+      // can never appear in any snapshot, by construction (see above) -- verified structural, not a
+      // fixture quirk.
+      assert.equal(report.calls.physical, run.calls.length - 1);
+      assert.equal(report.calls.terminal, run.calls.length - 1);
       assert.equal(report.calls.incomplete, 0);
-      assert.equal(report.supersededStarts, run.calls.length);
-      assert.equal(report.calls.checkpoints, run.checkpoints.length);
-      assert.equal(report.calls.sharedOverhead, report.calls.checkpoints);
+      // Nothing is ever captured mid-flight in this repo's real checkpoint model (see above) -- there
+      // is never a 'started' entry to be superseded by a later terminal one.
+      assert.equal(report.supersededStarts, 0);
+      // Of run.checkpoints.length physical checkpoint writes, exactly one -- the FINAL
+      // checkpointResult dispatch -- is the same permanently-unobservable write as above; the other
+      // KI-E137-named progress-checkpoints DO eventually get captured by a later snapshot.
+      assert.equal(report.calls.checkpoints, run.checkpoints.length - 1);
+      // NOT report.calls.checkpoints -- sharedOverhead is fed by the same fictional "admission
+      // relay" concept CALIBRATION.md's stale prose described (see the correction there); with no
+      // real admission mechanism, sharedOverhead stays 0, verified empirically.
+      assert.equal(report.calls.sharedOverhead, 0);
       assert.equal(report.coverage.actualModel.known, 0);
       assert.equal(report.delivery.knownCost, 0);
       assert.equal(report.delivery.costPerAccepted, null);
     }
     const recoveredOnly = normalizeAttemptObservations(lastSnapshot.attemptObservations, () => ({ itemAttemptId: 'claim-' + kind }));
     const incomplete = aggregateObservations(recoveredOnly.records);
-    assert.equal(incomplete.calls.physical, run.calls.length);
-    assert.equal(incomplete.calls.incomplete, run.calls.length);
-    assert.equal(incomplete.calls.terminal, 0);
-    assert.match(renderObservationReport(incomplete), new RegExp('incomplete/unknown: ' + run.calls.length));
+    // The last snapshot IS effectively the final result's own attemptObservations (checkpointResult
+    // filters before dispatching, so `run.checkpoints.at(-1)` and
+    // `run.result.results[0].attemptObservations` carry the same content) -- every entry already
+    // carries its own resolved, terminal outcome directly (matching the 'completed' fix above), so
+    // recovering from JUST the last checkpoint needs no separate confirmation event and leaves
+    // nothing ambiguous -- a real, positive kill-resilience property of this design, not a gap.
+    assert.equal(incomplete.calls.physical, run.calls.length - 1);
+    assert.equal(incomplete.calls.incomplete, 0);
+    assert.equal(incomplete.calls.terminal, run.calls.length - 1);
+    assert.match(renderObservationReport(incomplete), /incomplete\/unknown: 0/);
   }
 });
 
 test('native retry/checkpoint physical cost is counted without fabricating money or model', async () => {
   const run = await nativeObservationFixture('light-code', { retries: true });
-  const n = normalizeAttemptObservations(run.result.attemptObservations, () => ({ itemAttemptId: 'claim-retry' }));
+  const n = normalizeAttemptObservations(run.result.results[0].attemptObservations, () => ({ itemAttemptId: 'claim-retry' }));
   const report = aggregateObservations(n.records);
   assert.deepEqual(n.invalid, []);
   const fresh = await nativeObservationFixture('light-code');
-  assert.equal(report.calls.physical, run.calls.length);
+  // run.calls.length - 1, not run.calls.length: the final checkpointResult dispatch (the last
+  // physical call in any run) is never embedded in attemptObservations, by construction (see the
+  // matching note in the test above). The retry DELTA on the next line is unaffected -- both runs
+  // carry the same structural -1, so it cancels out.
+  assert.equal(report.calls.physical, run.calls.length - 1);
   assert.equal(run.calls.length - fresh.calls.length, report.calls.retries);
   const docs = readFileSync(new URL('./CALIBRATION.md', import.meta.url), 'utf8');
+  // The doc's "N physical invocations, including M checkpoint writers" line describes exactly this
+  // fixture (a LIGHT C# fixture with two unavailable test-author retries -- see options.retries in
+  // fixtures/observation-producers.mjs) -- re-traced 2026-09-27 to 41/5, was stale at 28/7.
   assert.equal(Number(docs.match(/(\d+) physical invocations, including (\d+) checkpoint writers/)[1]), run.calls.length);
   assert.equal(Number(docs.match(/(\d+) physical invocations, including (\d+) checkpoint writers/)[2]), run.checkpoints.length);
   assert.equal(report.calls.retries, 2);
-  assert.equal(report.calls.sharedOverhead, run.checkpoints.length);
+  // Not run.checkpoints.length -- see the matching note in the test above (no real admission
+  // mechanism feeds sharedOverhead; it is 0).
+  assert.equal(report.calls.sharedOverhead, 0);
   assert.equal(report.coverage.actualModel.known, 0);
   assert.equal(report.coverage.measuredCost.known, 0);
 });
 
-test('native SWEEP persists one admission relay per site before shared semantic work', async () => {
+// CORRECTED (2026-09-27) -- the original test's whole premise (a per-site ":progress:admission"
+// checkpoint relay, feeding a result.attemptObservations array) never existed in this repo's real
+// runSweep/applySweepSite (factory.js): confirmed via `git log -S` (no ":progress:admission" label
+// has EVER appeared in factory.js's history) and via a live execSmoke trace, which additionally
+// showed result.attemptObservations is entirely absent from a sweep result (runSweep's `res` object
+// never gains that field the way a normal item's checkpointResult does) -- calling
+// normalizeAttemptObservations on it throws immediately, so this test's tail never actually ran.
+// Same "ported from an abandoned merge, never wired into this repo's real factory.js" lineage as the
+// admission/evidenceIdentity dead components band-cost.mjs already accounts for as 0. Sweeps are a
+// human-supervised, cross-cutting pattern-application pathway distinct from the main per-item
+// pipeline; adding kill-resilience observation-tracking to it would be new production functionality
+// on the live pipeline, out of scope here (same reasoning that deferred the native-checkpoint
+// inlining gap) -- not attempted. Rewritten to check what the pathway actually, verifiably does:
+// exactly one design call precedes every site's own apply call, each site gets its own correctly
+// labeled + costed apply dispatch, and the result reflects each site's real outcome.
+test('native SWEEP designs once then applies each site with its own correctly labeled dispatch', async () => {
   const batch = smokeBatch();
   batch.items = [];
   batch.policies = {};
@@ -97,27 +155,23 @@ test('native SWEEP persists one admission relay per site before shared semantic 
     worktree: { path: '/tmp/exec-smoke-sweep', branch: 'factory/sweep' },
     sites: ['one', 'two'].map(id => ({ findingId: id, target: id, files: ['docs/' + id + '.md'], claimId: 'claim-' + id, attemptNumber: 1 })) };
   const { result, calls } = await execSmoke(readFileSync(new URL('./factory.js', import.meta.url), 'utf8'), batch);
-  const admissionCalls = calls.filter(c => c.label.endsWith(':progress:admission'));
-  assert.equal(admissionCalls.length, batch.sweep.sites.length);
-  assert.deepEqual(calls.slice(0, admissionCalls.length), admissionCalls);
+  assert.equal(result.attemptObservations, undefined, 'sweeps do not attach an observation trail (see note above) -- this is the current, confirmed reality, not an aspiration');
+  const designCalls = calls.filter(c => c.label === 'sweep:design');
+  assert.equal(designCalls.length, 1, 'the canonical fix pattern is designed exactly once for the whole cluster');
+  const applyCalls = calls.filter(c => c.label.startsWith('sweep:apply:'));
+  assert.equal(applyCalls.length, batch.sweep.sites.length, 'one apply dispatch per site, no admission relay in between');
+  assert.deepEqual(calls.slice(0, 1), designCalls, 'design always runs first, before any site is applied');
   for (const site of batch.sweep.sites) {
-    const call = admissionCalls.find(c => c.label === site.findingId + ':progress:admission');
-    assert.ok(call);
-    const snapshot = JSON.parse(call.prompt.split('CHECKPOINT-BEGIN\n')[1].split('\nCHECKPOINT-END')[0]);
-    assert.equal(snapshot.admission.attempted, true);
-    assert.equal(snapshot.claimId, site.claimId);
+    const call = applyCalls.find(c => c.label === 'sweep:apply:' + site.findingId);
+    assert.ok(call, 'each site has its own apply dispatch labeled by findingId');
     assert.equal(result.sweep.sites.find(s => s.findingId === site.findingId).applied, true);
   }
-  const normalized = normalizeAttemptObservations(result.attemptObservations, raw => raw.itemId === 'sweep'
-    ? { itemId: 'cluster-1', itemAttemptId: 'cluster-claim-1' } : { itemAttemptId: 'claim-' + raw.itemId });
-  assert.deepEqual(normalized.invalid, []);
-  const report = aggregateObservations(normalized.records);
-  assert.equal(report.calls.physical, calls.length);
-  assert.equal(report.calls.checkpoints, admissionCalls.length);
-  assert.equal(report.calls.sharedOverhead, admissionCalls.length);
-  assert.equal(normalized.records.filter(r => r.itemId === 'cluster-1').length,
-    calls.filter(c => c.label.startsWith('sweep:') && !c.label.startsWith('sweep:apply:')).length);
-  assert.equal(report.coverage.actualModel.known, 0);
+  const gateCalls = calls.filter(c => c.label.startsWith('sweep:gate-'));
+  // opus cost = design (1) + the opus-routed gates dispatched after apply (gate-architect,
+  // gate-security) -- cost is a model-keyed total, not per-call-type, so it is NOT just the design
+  // call alone.
+  assert.equal(result.sweep.cost['claude-opus-4-8'], designCalls.length + gateCalls.length);
+  assert.equal(result.sweep.cost['claude-sonnet-4-6'], batch.sweep.sites.length, 'each site apply call is costed to sonnet');
 });
 
 test('native producer -> actual driver reservation/admission/normalization -> authoritative final totals', async () => {
@@ -141,8 +195,10 @@ test('native producer -> actual driver reservation/admission/normalization -> au
   const report = aggregateEvents(events).observations;
   assert.deepEqual(warnings, []);
   assert.deepEqual(report.conflicts, []);
-  assert.equal(report.calls.physical, run.calls.length);
-  assert.equal(report.calls.checkpoints, run.checkpoints.length);
+  // Both -1: the final checkpointResult dispatch is never embedded in any snapshot's
+  // attemptObservations, by construction -- see the matching note in the first test above.
+  assert.equal(report.calls.physical, run.calls.length - 1);
+  assert.equal(report.calls.checkpoints, run.checkpoints.length - 1);
   assert.equal(report.calls.incomplete, 0);
   assert.equal(report.firstPass.items, 1);
   assert.equal(report.firstPass.closed, 0, 'driver rejection overrides native CLOSED without competing lifecycle events');
@@ -404,7 +460,7 @@ test('telemetry integration fixes legacy denominator and deduplicates fold/run u
   assert.equal(a.observations.delivery.costPerAccepted, 15);
   const md = renderTelemetryReport(a, { generatedAt: 'fixture' });
   assert.match(md, /all folded items\) \| 1\/10 = 10%/);
-  assert.match(md, /First-observed-fold close — LIGHT band \| 1\/10/);
+  assert.match(md, /First-observed-fold close — LIGHT band \(KI-E48\) \| 1\/10 = 10%/);
   assert.equal(aggregateEvents([usage, { ...usage, attrs: { outputTokens: 600 } }]).usage.length, 0);
   const malformed = aggregateEvents([...folds, { event: 'attempt_observation', attrs: { observation: { version: 9 } } }]);
   assert.equal(malformed.outcomes.CLOSED, 1);
@@ -433,9 +489,12 @@ test('projection exposes collector-subsumed scans and planner checkpoint', () =>
   const doc = { fixType: 'mechanical', files: ['README.md'] };
   const full = { fixType: 'nonmechanical', files: ['src/File.cs'], severity: 'CRITICAL', theme: 'security-multitenancy' };
   const usual = projectedCalls(code, 'LIGHT', { redCoverage: true });
-  assert.equal(projectedCalls(code, 'LIGHT', { identityCalls: 1, redCoverage: true, redProofFallback: true, rootCauseFallback: true }), usual - 3 + 2);
-  assert.equal(projectedCalls(doc, 'LIGHT', { identityCalls: 1 }), projectedCalls(doc, 'LIGHT') - 3);
-  assert.equal(projectedCallBreakdown(code, 'LIGHT').components.admission, 1);
+  // evidenceIdentity now defaults to 0 (was 4 — dead, see band-cost.mjs's header note), so
+  // identityCalls:1 ADDS 1 relative to `usual`, not subtracts 3; redProofFallback/rootCauseFallback
+  // are unchanged, still +1 each beyond the always-on redProofProbe/rootCauseProbe base.
+  assert.equal(projectedCalls(code, 'LIGHT', { identityCalls: 1, redCoverage: true, redProofFallback: true, rootCauseFallback: true }), usual + 1 + 2);
+  assert.equal(projectedCalls(doc, 'LIGHT', { identityCalls: 1 }), projectedCalls(doc, 'LIGHT') + 1);
+  assert.equal(projectedCallBreakdown(code, 'LIGHT').components.admission, 0);
   assert.equal(projectedCallBreakdown(full, 'FULL').components.planAndTwoReviews, 3);
 });
 

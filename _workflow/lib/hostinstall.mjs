@@ -1,28 +1,44 @@
 // Host-install pure helpers (KI-O5 — controller-asset installation, SETUP.md § 3).
 //
-// Two concerns, both pure and injectable so `setup/init.mjs` and `setup/install.mjs` stay thin
+// Three concerns, all pure/injectable-first so `setup/init.mjs` and `setup/install.mjs` stay thin
 // shells around selftest-covered logic (the pre-KI-O5 installers had ZERO behavioural coverage —
 // only `bash -n` parse pins, see KI-E52's selftest block):
 //
 //   1. mergeOpencodeConfig  — deep-merges the factory's OpenCode controller policy (an
-//      `instructions` entry + `permission` deny rules) into a HOST-OWNED `opencode.json`.
-//      Claude/Copilot assets are whole FILES the factory owns end to end, so `copyTree`'s
-//      byte-compare + `*.factory-new` no-clobber is enough for them. An OpenCode config is
-//      different in kind: it is the host's own file, carrying the host's own model/provider/mcp
-//      settings, so the factory has to merge INTO it rather than own it. Rule ORDER is load-
-//      bearing — opencode evaluates the LAST matching permission pattern — so the factory's deny
-//      rules are always re-appended at the END of each tool's rule object, never left wherever a
-//      previous install happened to put them (a plain `{...host, ...factory}` spread keeps an
-//      existing key in its ORIGINAL position, which would let a later broad host `git *` allow
-//      silently outrank a factory deny; that is the whole reason this is a real function and not
-//      an object spread at the call site).
+//      `instructions` entry + `permission`/`permissions` deny rules, plus, per host major version,
+//      a set of worker-profile `agent`/`agents` entries) into a HOST-OWNED `opencode.json`/
+//      `opencode.jsonc`. Claude/Copilot assets are whole FILES the factory owns end to end, so
+//      `copyTree`'s byte-compare + `*.factory-new` no-clobber is enough for them. An OpenCode config
+//      is different in kind: it is the host's own file, carrying the host's own model/provider/mcp
+//      settings, so the factory has to merge INTO it rather than own it. Rule ORDER is load-bearing
+//      — opencode evaluates the LAST matching permission pattern — so the factory's deny rules are
+//      always re-appended at the END of each tool's rule object, never left wherever a previous
+//      install happened to put them (a plain `{...host, ...factory}` spread keeps an existing key in
+//      its ORIGINAL position, which would let a later broad host `git *` allow silently outrank a
+//      factory deny; that is the whole reason this is a real function and not an object spread at
+//      the call site). OpenCode's config shape forked at major version 2 (`permission` object ->
+//      `permissions` rule array, `agent` -> `agents`) — `mergeOpencodeConfig`'s `major` parameter
+//      (ported from a host-mount session) selects the matching merge path and REFUSES a v1 config
+//      carrying v2 keys or vice versa rather than guessing.
 //
 //   2. pickLatestReleaseTag — the strict `vX.Y.Z` + semver-sort resolution `setup/install.sh`
 //      does with `grep -E | sort -V`, ported so the Node installer cannot drift from it
 //      (`sort -V` ranks `v1.0.0-rc1` ABOVE `v1.0.0` and a date-like `v20250101` above every real
 //      release, which is why the bash side greps strict-semver FIRST — same posture here).
 //
-// Zero npm dependencies. Filesystem installation helpers use an explicit host root.
+//   3. installManagedFile / installAgentsGuidance / writeAssetAtomic (ported from a host-mount
+//      session) — the factory-owned-whole-file install path (concern 1's "Claude/Copilot assets are
+//      whole FILES" case) as real, atomic, hash-tracked filesystem operations rather than a bare
+//      byte-compare left to the caller: a managed file created by an earlier install is UPDATED in
+//      place when the on-disk content still matches the LAST hash the factory itself installed
+//      (`hashes[key]`), and PRESERVED (written instead to a `.factory-new` sibling, never clobbering
+//      the host's own edit) the moment the on-disk content has drifted from that hash — the host
+//      edited the file since the last install, and that edit wins. `installAgentsGuidance` applies
+//      the same rule to a single delimited `<!-- ai-factory:begin/end -->` block inside a host-owned
+//      AGENTS.md the factory does not otherwise own.
+//
+// Filesystem installation helpers use an explicit host root — the pure merge/comparator logic above
+// still takes every input as a parameter and touches nothing on its own.
 import { createHash } from 'node:crypto';
 import { existsSync, readFileSync, mkdirSync, renameSync, writeFileSync, rmSync } from 'node:fs';
 import { dirname } from 'node:path';
@@ -33,14 +49,20 @@ import { parseOpenCodeVersion } from '../opencode/compatibility.mjs';
 // rather than silently rewritten without its comments.
 export const OPENCODE_CONFIG_CANDIDATES = ['.opencode/opencode.jsonc', '.opencode/opencode.json', 'opencode.jsonc', 'opencode.json'];
 
-// Tools whose factory rules are patterned. `permission` also accepts a BARE string at the top
-// level ("allow all"), which applies to EVERY tool — including ones the factory names no rules
-// for (read/glob/grep/list/task/...). Promoting that to the per-tool object form would silently
-// narrow the host's posture on those other tools, so mergeOpencodeConfig refuses it instead.
 function isPlainObject(v) { return !!v && typeof v === 'object' && !Array.isArray(v); }
+
+// v2's rule-array `effect` values. `FLAT_TOOLS` are v1 tools whose permission value is ALWAYS a bare
+// string (never a per-resource rule object) — `todowrite`/`question`/`webfetch`/`websearch`/
+// `doom_loop` have no resource dimension to pattern-match against, so treating one as a rule object
+// (the `PATTERNED_TOOLS`-style path every other tool takes) would silently accept a shape opencode
+// itself rejects.
 const ACTIONS = new Set(['allow', 'ask', 'deny']);
 const FLAT_TOOLS = new Set(['todowrite', 'question', 'webfetch', 'websearch', 'doom_loop']);
 const ruleObject = (value) => typeof value === 'string' ? { '*': value } : value || {};
+// A v1 `permission` object is only safely mergeable when every entry is either a bare action string
+// or a per-resource object whose OWN values are bare action strings — anything else (a nested object,
+// an unrecognized action) is a shape mergeOpencodeConfig has no safe rule for and must refuse rather
+// than guess at.
 function validPermissions(permission) {
   return permission === undefined || (isPlainObject(permission) && Object.entries(permission).every(([tool, rules]) =>
     ACTIONS.has(rules) || (!FLAT_TOOLS.has(tool) && isPlainObject(rules) && Object.values(rules).every((action) => ACTIONS.has(action)))));
@@ -60,6 +82,12 @@ export function parseJsonFile(text) { return JSON.parse(stripBom(text)); }
 
 // Re-append `factoryRules` at the END of `hostRules`, dropping any factory-owned key from its
 // previous position first. Returns a NEW object; neither input is mutated.
+//
+// Fix (ported from a host-mount session): a host `deny` on a key the factory ALSO rules on, or on a
+// wildcard/pattern key overlapping several factory keys, must never be silently outranked by a
+// factory `allow`/`ask` re-append landing AFTER it — opencode's last-match-wins evaluation would then
+// let the factory's rule win over an explicit host deny. Every host `deny` (bare or on a `?`/`*`
+// pattern key) is re-appended LAST, after the factory's own rules, so it remains the final word.
 export function appendRulesLast(hostRules, factoryRules) {
   const owned = new Set(Object.keys(factoryRules));
   const out = {};
@@ -87,7 +115,11 @@ export function appendInstructions(hostList, factoryList) {
 // Merge the factory's OpenCode policy fragment into a host config object.
 //
 //   hostCfg   parsed host opencode.json ({} / null for "no file yet")
-//   fragment  opencode-assets/opencode.config.json (parsed)
+//   fragment  opencode-assets/opencode.config.json (parsed), OR a `major`-matched fragment built by
+//             opencodeFragment() (worker profiles included)
+//   major     1 or 2 (ported from a host-mount session) — selects which OpenCode config generation
+//             this host runs; defaults to 1 (the pre-existing shape) for every caller that has not
+//             yet been updated to pass it explicitly
 //
 // Returns { config, changed, notes, refused }:
 //   config   the merged object (a NEW object — hostCfg is never mutated)
@@ -134,6 +166,9 @@ export function mergeOpencodeConfig(hostCfg, fragment, major = 1) {
 
   if (isPlainObject(fragment.permission)) {
     const perm = { ...(out.permission || {}) };
+    // Previously hardcoded to a `PATTERNED_TOOLS = ['bash', 'edit']` allowlist — now iterates
+    // whatever tools the fragment itself names, a strict widening (any fragment that only ever used
+    // bash/edit keys behaves identically; a fragment naming another patterned tool now merges too).
     for (const tool of Object.keys(fragment.permission)) {
       const value = fragment.permission[tool];
       if (FLAT_TOOLS.has(tool)) { perm[tool] = perm[tool] === 'deny' ? 'deny' : value; continue; }
@@ -156,6 +191,10 @@ export function mergeOpencodeConfig(hostCfg, fragment, major = 1) {
       perm[tool] = nextRules;
     }
     out.permission = perm;
+    // A host `deny` on a wildcard/pattern tool key (`git-*`, `terr?form`) is re-appended last against
+    // only its OWN deny entries — appendRulesLast above already handles the exact-key case; this
+    // covers the pattern-key case a per-tool loop keyed on `fragment.permission`'s own tool names
+    // cannot reach (the host's pattern key may not match any factory-named tool at all).
     for (const [tool, rules] of Object.entries(host.permission || {})) {
       if (!/[?*]/.test(tool) || !Object.values(ruleObject(rules)).includes('deny')) continue;
       delete perm[tool];
@@ -172,6 +211,11 @@ export function mergeOpencodeConfig(hostCfg, fragment, major = 1) {
       if (existing.tools && Object.values(existing.tools).includes(false)) return { config: host, changed: false, notes: [], refused: 'agent ' + id + ' has legacy disabled tools; migrate permissions explicitly' };
       const merged = mergeOpencodeConfig({ permission: existing.permission }, { permission: defaults.permission });
       if (merged.refused) return { config: host, changed: false, notes: [], refused: 'agent ' + id + ': ' + merged.refused };
+      // A deny already in effect on the top-level `out.permission` (host- or factory-declared) must
+      // also bind each worker agent — an agent-level permission object with no matching entry falls
+      // back to the top-level config in opencode, but a WORKER PROFILE that positively re-declares
+      // other rules for the same tool must not accidentally omit the deny by only inheriting it
+      // implicitly.
       for (const [tool, rules] of Object.entries(out.permission || {})) {
         const denies = Object.fromEntries(Object.entries(ruleObject(rules)).filter(([, effect]) => effect === 'deny'));
         if (!Object.keys(denies).length) continue;
@@ -189,10 +233,18 @@ export function mergeOpencodeConfig(hostCfg, fragment, major = 1) {
   return { config: out, changed: JSON.stringify(out) !== JSON.stringify(host), notes, refused: null };
 }
 
+// The OpenCode config-schema major version (1 or 2) a given `opencode --version`-style string output
+// implies, or null when unrecognized. Delegates entirely to `../opencode/compatibility.mjs` so the
+// runtime-compatibility table and the config-merge major-version selection can never independently
+// drift out of sync — one parser, two call sites.
 export function opencodeMajor(version) {
   return parseOpenCodeVersion(version)?.configMajor ?? null;
 }
 
+// Resolve which config major to install with, given the detected executable `output` (may be empty/
+// unavailable) and an operator-supplied `--opencode-version` `explicit` string ('1' | '2' | undefined).
+// Throws rather than silently guessing on any disagreement or unrecognized input — an operator who
+// gets this wrong installs a config shape the running opencode binary cannot read at all.
 export function selectOpencodeMajor(output, explicit) {
   if (explicit !== undefined && !['1', '2'].includes(explicit)) throw new Error('--opencode-version must be 1 or 2');
   const detected = opencodeMajor(output);
@@ -201,6 +253,11 @@ export function selectOpencodeMajor(output, explicit) {
   return explicit ? Number(explicit) : detected;
 }
 
+// v2's rule-array analogue of appendRulesLast: `host`/`factory` are `{action, resource, effect}[]`
+// arrays (opencode v2's `permissions` shape) rather than v1's per-tool rule objects. Same ordering
+// invariant — factory rules are appended after surviving host rules, then every host `deny` (on an
+// action+resource pair) is re-appended last so it cannot be silently outranked by a factory rule on
+// the SAME pair landing after it, exactly mirroring the v1 function's own final loop.
 export function appendPermissionRules(host = [], factory = []) {
   const valid = (r) => isPlainObject(r) && typeof r.action === 'string' && typeof r.resource === 'string' && ['allow', 'ask', 'deny'].includes(r.effect);
   if (!Array.isArray(host) || !Array.isArray(factory) || !host.every(valid) || !factory.every(valid)) throw new Error('permissions must be action/resource/effect rule arrays');
@@ -215,6 +272,9 @@ export function appendPermissionRules(host = [], factory = []) {
   return out;
 }
 
+// The OpenCode v2 merge path: `permission` (per-tool rule object) -> `permissions` (flat
+// action/resource/effect rule array), `agent` -> `agents`. Refuses a host config that still carries
+// v1 keys (same "migrate explicitly, never guess" posture as the v1 path's own v2-key refusal).
 function mergeOpencodeV2(hostCfg, fragment) {
   const host = hostCfg ?? {};
   const refuse = (refused) => ({ config: host, changed: false, notes: [], refused });
@@ -234,6 +294,12 @@ function mergeOpencodeV2(hostCfg, fragment) {
   } catch (e) { return refuse(e.message); }
 }
 
+// Build the per-major OpenCode config fragment for the factory's worker subagent profiles: one
+// `factory-{writer,reviewer,probe}-{tier}` entry per configured model tier, each with its own
+// bash/edit permission narrowing (git subcommands denied outright; edit denied entirely for
+// reviewer/probe roles, which must never write) — v1 emits an `agent`/`permission` shape, v2 emits
+// the `agents`/`permissions` rule-array shape via the same `rules()` translation `mergeOpencodeV2`
+// itself consumes.
 export function opencodeFragment(base, profiles, major) {
   if (![1, 2].includes(major)) throw new Error('OpenCode major must be 1 or 2');
   const rules = (permission) => Object.entries(permission).flatMap(([tool, values]) => Object.entries(typeof values === 'string' ? { '*': values } : values).map(([resource, effect]) => ({ action: tool === 'bash' ? 'shell' : tool === 'task' ? 'subagent' : tool, resource, effect })));
@@ -252,8 +318,16 @@ export function opencodeFragment(base, profiles, major) {
   return major === 1 ? { ...base, agent: workers } : { $schema: base.$schema, permissions: rules(base.permission), agents: workers };
 }
 
+// sha256 hex of an installed asset body — the identity `installManagedFile`/`installAgentsGuidance`
+// track per managed file so a re-install can tell "unchanged since we wrote it" (safe to overwrite)
+// apart from "the host edited this since we wrote it" (never clobber; write beside it instead).
 export const installedHash = (body) => createHash('sha256').update(body).digest('hex');
 
+// Write `body` to `path` atomically: write to a same-directory temp file, then rename over the
+// target. A rename is atomic on the SAME filesystem, so a reader never observes a partially-written
+// file. Windows can transiently refuse a rename over a file another process (an editor, a virus
+// scanner) has open — retried with a short backoff up to 4 times before giving up, POSIX is
+// retry-free since a same-directory rename there cannot fail on "target busy".
 export function writeAssetAtomic(path, body) {
   mkdirSync(dirname(path), { recursive: true });
   const tmp = path + '.tmp.' + process.pid;
@@ -268,6 +342,17 @@ export function writeAssetAtomic(path, body) {
   } finally { rmSync(tmp, { force: true }); }
 }
 
+// Install (or update) one factory-owned whole file at `path`, tracking its identity in `hashes[key]`
+// (the caller's persisted per-host installed-asset-hash map). Four outcomes:
+//   'created'   — no file existed yet; written, hash recorded.
+//   'updated'   — a file existed, its content still matched the LAST hash the factory installed
+//                 (`hashes[key]`, or, on a first-run map with no recorded hash, a file whose content
+//                 already matches the NEW body needs no separate branch — see 'unchanged' below);
+//                 safe to overwrite because nothing but the factory has touched it since.
+//   'unchanged' — the existing file's content already IS the new body; hash recorded, nothing written.
+//   'preserved' — the existing file's content differs from BOTH the new body and the last-installed
+//                 hash: the host edited it. Never clobbered — the new body is written to a
+//                 `path + '.factory-new'` sibling instead, and the host's own file is left alone.
 export function installManagedFile(path, body, hashes, key) {
   const current = existsSync(path) ? readFileSync(path) : null;
   const nextHash = installedHash(body);
@@ -284,6 +369,13 @@ export function installManagedFile(path, body, hashes, key) {
   return current ? 'updated' : 'created';
 }
 
+// installManagedFile's sibling for the ONE case a factory-owned whole file cannot cover: AGENTS.md,
+// a file the HOST owns end to end, into which the factory installs a single delimited
+// `<!-- ai-factory:begin -->...<!-- ai-factory:end -->` block rather than the whole file. Appends the
+// block (with a leading blank line separating it from any existing host content) when no block
+// exists yet; otherwise applies installManagedFile's exact same identity rule to the block's own
+// content — unchanged/updated/preserved — rather than to the whole file, and a malformed marker pair
+// (missing/reversed/duplicated) is ALSO treated as 'preserved' (never guessed at or auto-repaired).
 export function installAgentsGuidance(path, guidance, hashes) {
   const start = '<!-- ai-factory:begin -->';
   const end = '<!-- ai-factory:end -->';

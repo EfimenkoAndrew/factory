@@ -19,7 +19,12 @@ const temp = mkdtempSync(join(tmpdir(), 'factory-dispatch-e2e-'));
 const runtime = join(root, '_workflow/opencode/runtime.mjs');
 const sessions = new Map();
 let version, faulty = false, admissions = 0, active = 0, maxActive = 0;
-const models = { planning: 'claude-fable-5', strong: 'claude-opus-4-8', standard: 'claude-sonnet-5' };
+// mechanical and standard both resolve to claude-sonnet-4-6 in worker-profiles.json as of the
+// sonnet-5->sonnet-4-6 routing fix; resolveRoute's tier lookup (server-api.mjs) is a first-match
+// search over that object's insertion order, and 'mechanical' is listed before 'standard' there,
+// so every sonnet-4-6 dispatch now resolves to the mechanical tier's profile name, never standard's
+// — both entries stay here so either name resolves against this fake server.
+const models = { planning: 'claude-fable-5', strong: 'claude-opus-4-8', standard: 'claude-sonnet-4-6', mechanical: 'claude-sonnet-4-6' };
 const definitions = () => Object.entries(models).map(([tier, model]) => version === 'v1'
   ? { name: 'factory-reviewer-' + tier, mode: 'subagent', model: { providerID: 'host', modelID: model + '-override' } }
   : { id: 'factory-reviewer-' + tier, name: 'factory-reviewer-' + tier, mode: 'subagent', model: { providerID: 'host', id: model + '-override' } });
@@ -78,7 +83,13 @@ const run = args => exec(process.execPath, [runtime, ...args], { env: { ...proce
 try {
   await new Promise(r => server.listen(0, '127.0.0.1', r));
   const url = 'http://127.0.0.1:' + server.address().port;
-  assert.deepEqual(parseDispatchArgs(['--url', url, '--ids', 'A,B', '--version', '2']), { config: { url, version: 'v2' }, ids: ['A', 'B'] });
+  // An explicit --config to an empty fixture keeps this hermetic — parseDispatchArgs falls back to
+  // reading the HOST's real config/opencode-dispatch.local.json when --config is omitted (by design,
+  // for real dispatch usage), so a host with that file actually present would otherwise pollute the
+  // parsed config here with real content instead of the plain { url, version } this test expects.
+  const emptyConfigFixture = join(temp, 'empty-dispatch-config.json');
+  writeFileSync(emptyConfigFixture, '{}');
+  assert.deepEqual(parseDispatchArgs(['--url', url, '--ids', 'A,B', '--version', '2', '--config', emptyConfigFixture]), { config: { url, version: 'v2' }, ids: ['A', 'B'] });
   for (version of ['v1', 'v2']) {
     sessions.clear(); admissions = 0; maxActive = 0; active = 0;
     const ids = [0, 1].map(n => 'DISPATCH-E2E-' + version + '-' + process.pid + '-' + n);
@@ -138,6 +149,16 @@ try {
   const p = { role: 'fixer', route: { model: 'claude-sonnet-4-6' } };
   assert.equal(resolveRoute(p, {}, [{ name: 'factory-writer-mechanical', model: { providerID: 'host', modelID: 'custom' } }], 'v1').agent, 'factory-writer-mechanical');
   assert.throws(() => resolveRoute(p, {}, [], 'v1'), /profile missing/);
+  // KI-E256 max-reasoning-effort (2026-09-27) — no prior test in this file exercised the
+  // config.models[...] override path through resolveRoute at all (the two assertions above only
+  // exercise the installed-definitions path). This mirrors applyCheapTierProvider's exact deepseek
+  // substitute shape (dispatcher.mjs) to prove override.variant genuinely reaches route.variant —
+  // not just that the config object has the right field (already covered in _selftest.mjs), but that
+  // resolveRoute itself reads and threads it end-to-end, which is what actually reaches the v2
+  // session-creation body (server-api.mjs create()).
+  const cheapOverrideConfig = { models: { 'claude-haiku-4-5': { providerID: 'opencode-go', modelID: 'deepseek-v4.1-flash', agent: 'build', variant: 'max' } } };
+  const cheapDispatch = { role: 'leftover-scan-probe', route: { model: 'claude-haiku-4-5', effort: 'low' } };
+  assert.deepEqual(resolveRoute(cheapDispatch, cheapOverrideConfig, null, 'v2'), { agent: 'build', providerID: 'opencode-go', modelID: 'deepseek-v4.1-flash', variant: 'max' }, 'KI-E256: max-reasoning-effort override must resolve end-to-end through resolveRoute, not just sit unread in config');
   const tree = join(temp, 'identity'); mkdirSync(tree); writeFileSync(join(tree, 'a.rst'), 'doc'); writeFileSync(join(tree, 'a.cs'), 'code');
   const git = args => args[0] === 'rev-parse' ? 'HEAD' : 'a.rst\0a.cs\0';
   const contract = { policy: true };
@@ -170,7 +191,7 @@ try {
   assert.throws(() => withBuildSlot(leaseRoot, () => { const e = new Error('timeout'); e.unsettled = true; throw e; }), /timeout/);
   assert.throws(() => withBuildSlot(leaseRoot, () => {}, 2), /slot timeout/, 'unsettled build retains capacity');
   const retained = join(leaseRoot, 'state/opencode-build-slots/0');
-  const dead = await exec(process.execPath, ['-e', 'console.log(process.pid)']);
+  const dead = await exec(process.execPath, ['-e', 'process.stdout.write(String(process.pid))']);
   writeFileSync(join(retained, 'owner.json'), JSON.stringify({ pid: Number(dead.stdout.trim()) }));
   assert.throws(() => withBuildSlot(leaseRoot, () => {}, 100), /process-tree inspection/, 'dead controller does not prove child build stopped');
   console.log('Dispatch end-to-end: v1/v2 real runtime, profiles, multi-item bounds, terminal failure/resume, observations and shared identity passed');

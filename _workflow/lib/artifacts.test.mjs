@@ -18,7 +18,7 @@ test('producer inventory and accepted historical forms are retained as data', ()
     nativeReceiptArtifactName(hash), evidenceInputArtifactName(hash), checkpointInputArtifactName(hash),
     'verify-recovery-recovery-123-claim-456.txt', 'verify-recovery-recovery-123-claim-456-metadata.json',
     'verify-recovery-recovery-123-claim-456-before.json', 'verify-recovery-recovery-123-claim-456-after.json',
-    'verify-ProductsService-raw.txt', 'verify-src_ProductsService-raw.txt', 'efmigration-ProductsService-raw.txt',
+    'verify-SomeService-raw.txt', 'verify-src_SomeService-raw.txt', 'efmigration-SomeService-raw.txt',
     stageArtifactName('refute_reaudit', 're-auditor:edge-case'), stageArtifactName('native_checks', 'red-coverage-probe'),
     stageArtifactName('gates_regate', 'review-adversarial'), stageArtifactName('plan_review', 'plan-feasibility-probe'),
     stageArtifactName('shadow_scan', 'consolidated-scan-shadow'), stageArtifactName('plan-steps-nudge', 'planner'),

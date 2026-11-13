@@ -219,8 +219,49 @@ export async function driveItems(ids, config, api = new OpenCodeServer(config)) 
   }));
 }
 
+// KI-E256 (2026-09-27) — a one-field switch for the "cheap" tier's provider, so trying/reverting an
+// alternative does not require hand-editing the nested models[] override shape each time. `deepseek`
+// was validated live against a representative leftover-scan-style classification task (8/8 correct,
+// including two deliberately tricky cases: a lexeme inside a string literal, and a comment explaining
+// a real constraint vs. an actual deferral) before being added here — this is not a speculative
+// option. `claude` (the default, including when the field is absent) makes this a no-op: the real
+// claude-haiku-4-5 profile/model resolves exactly as it always has. ALWAYS wins over any pre-existing
+// config.models['claude-haiku-4-5'] entry when set to a non-claude value — the whole point of a
+// one-field switch is that it does not require also clearing an old explicit override.
+// `mimo` (opencode-go/mimo-v2.6-flash) was ALSO validated live, same task, same 8/8 result — but is
+// deliberately NOT offered as a selectable value yet (owner directive 2026-09-27: "only DeepSeek V4.1
+// Flash from opencode for now"). Re-add a `mimo` entry here if that scope is lifted; the evidence to
+// justify it already exists (see KI-E256 in KNOWN-ISSUES.md).
+//
+// `variant: 'max'` (owner directive 2026-09-27: "use max reasoning efforts in the factory DeepSeek
+// V4.1 Flash") pins the request-level `reasoningEffort` to the model's highest of its 3 named
+// variants (low/high/max — `opencode api model.list`, opencode-go/deepseek-v4.1-flash.variants).
+// Flows end-to-end through `resolveRoute` (route.variant) into the v2 session-creation body's
+// `model.variant` field (server-api.mjs) -- v2-only; a v1 dispatch config would need its own wiring
+// (send() never re-sends model/variant per-message on v1 either, so this is moot today). Note for
+// the record: the KI-E256 validation experiment already tried `#max` against this same task and saw
+// no observable difference vs. the (then-)unspecified default, and higher effort trades against the
+// exact high-parallelism motivation for using a flash-tier model here (slower/pricier calls -> fewer
+// usefully-concurrent ones) -- this is a deliberate owner choice made with that evidence in hand, not
+// a new finding that max helps.
+const CHEAP_TIER_SUBSTITUTES = {
+  claude: null, // no substitution -- the real haiku profile/model resolves as it always has
+  deepseek: { providerID: 'opencode-go', modelID: 'deepseek-v4.1-flash', agent: 'build', variant: 'max' },
+};
+
+function applyCheapTierProvider(config) {
+  const choice = config.cheapTierProvider;
+  if (!choice || choice === 'claude') return config;
+  if (!Object.prototype.hasOwnProperty.call(CHEAP_TIER_SUBSTITUTES, choice)) throw new Error('cheapTierProvider: unknown value "' + choice + '" -- expected one of: ' + Object.keys(CHEAP_TIER_SUBSTITUTES).join(', '));
+  const substitute = CHEAP_TIER_SUBSTITUTES[choice];
+  if (!substitute) return config;
+  config.models = config.models || {};
+  config.models['claude-haiku-4-5'] = substitute;
+  return config;
+}
+
 export function parseDispatchArgs(argv) {
-  if (!argv[0]?.startsWith('--')) return { config: read(argv[0]), ids: argv.slice(1) };
+  if (!argv[0]?.startsWith('--')) return { config: applyCheapTierProvider(read(argv[0])), ids: argv.slice(1) };
   const flags = {};
   for (let i = 0; i < argv.length; i += 2) {
     if (!['--config', '--url', '--ids', '--version'].includes(argv[i]) || !argv[i + 1] || argv[i + 1].startsWith('--')) throw new Error('unknown/incomplete dispatch option: ' + argv[i]);
@@ -230,7 +271,7 @@ export function parseDispatchArgs(argv) {
   const config = flags.config ? read(flags.config) : existsSync(defaultPath) ? read(defaultPath) : {};
   if (flags.url) config.url = flags.url;
   if (flags.version) config.version = flags.version.startsWith('v') ? flags.version : 'v' + flags.version;
-  return { config, ids: (flags.ids || '').split(',').filter(Boolean) };
+  return { config: applyCheapTierProvider(config), ids: (flags.ids || '').split(',').filter(Boolean) };
 }
 
 export async function prepareDispatchConfig(config, { env = process.env, fetchImpl = fetch } = {}) {

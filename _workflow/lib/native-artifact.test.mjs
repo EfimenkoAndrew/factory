@@ -64,7 +64,7 @@ try {
   assert.equal(readFileSync(join(nested, 'CLAUDE.md'), 'utf8'), 'owner file retained');
   rmSync(nested, { recursive: true });
   const linked = join(dir, 'alias'); symlinkSync(root, linked, process.platform === 'win32' ? 'junction' : 'dir');
-  assert.throws(() => assertArtifactTree(dir), /unsafe/); rmSync(linked);
+  assert.throws(() => assertArtifactTree(dir), /unsafe/); rmSync(linked, { recursive: true });
   const metadata = { acceptance: '{accept}', policies: {}, profile: '', reviewerContract: { briefs: { role: '{nested {brief}}' } }, inputs: {}, engineMount: null };
   const ref = stageNativeContext(dir, metadata), stagedTime = statSync(ref.path).mtimeMs;
   assert.deepEqual(stageNativeContext(dir, metadata), ref); assert.equal(statSync(ref.path).mtimeMs, stagedTime);

@@ -61,7 +61,11 @@ test('complete real briefs, especially previously truncated fixer tail, reach co
 test('actual native compose delivers loaded oversized brief and required fixer tail without filesystem access', () => {
   const source = readFileSync(new URL('../factory.js', import.meta.url), 'utf8');
   const start = source.indexOf('function compose(role, item, extra) {');
-  const end = source.indexOf('\nfunction buildCommand(', start);
+  // factory-sync: upstream's factory.js has buildCommand() immediately after compose(); this
+  // mount's function order has always been compose() -> planFor() instead (buildCommand is
+  // defined earlier in the file, used by compose() but not declared adjacent to it) -- anchor on
+  // the function that actually follows compose() here, not upstream's.
+  const end = source.indexOf('\nfunction planFor(', start);
   assert.ok(start >= 0 && end > start, 'locate actual native compose');
   const huge = briefs.fixer + '\n' + 'x'.repeat(40000) + '\nNATIVE-MANDATORY-TAIL';
   const loaded = readRoleBriefs('/virtual', { readdirSync: () => ['fixer.md'], readFileSync: () => huge });
@@ -78,6 +82,43 @@ test('actual native compose delivers loaded oversized brief and required fixer t
   assert.ok(prompt.includes('/_workflow/opencode/build-lease.mjs'));
   for (const needle of ['SIBLING-PATTERN SWEEP', 'DEAD-CODE SELF-CHECK', 'CANCELLATIONTOKEN CHAIN SELF-CHECK',
     'PLAN-EXCLUSION ADHERENCE', 'Deviating from the plan', 'fix.json', 'NATIVE-MANDATORY-TAIL', 'NATIVE-PHASE-TAIL']) assert.ok(prompt.includes(needle));
+});
+
+test('KI-E237: concurrency-touching-diff mandate injects for the 4 verifying roles only, never absent-flag or off-target', () => {
+  const source = readFileSync(new URL('../factory.js', import.meta.url), 'utf8');
+  const start = source.indexOf('function compose(role, item, extra) {');
+  const end = source.indexOf('\nfunction planFor(', start);
+  assert.ok(start >= 0 && end > start, 'locate actual native compose');
+  const sandbox = vm.createContext({
+    A: { briefs, repoProfiles: {}, policies: {} }, REPO: ctx.repoRoot,
+    WT: { path: ctx.worktreePath }, FDIR: root, TPLDIR: ctx.templatesDir,
+    itemsDir: () => root + '/state/items/A', needsWriteIsolation: () => false,
+    buildCommand: () => 'stub', commonPromptPrefix, isMinimalPromptRole, selectRoleProfile,
+  });
+  vm.runInContext(source.slice(start, end), sandbox);
+  // NOTE: gate-developer/gate-qa/review-code/review-edgecase's OWN static briefs (agents/*.md) now
+  // permanently mention the phrase "CONCURRENCY-TOUCHING DIFF (KI-E237)" too (their own self-check
+  // instruction, present in EVERY prompt for these roles regardless of item.touchesConcurrency) — so
+  // a bare `.includes('CONCURRENCY-TOUCHING DIFF')` cannot distinguish "the dynamic injection fired"
+  // from "the role's static brief always says this". Assert on text that ONLY the dynamic injection
+  // itself contains (its own opening clause + trailing colon), never the brief's self-check sentence.
+  const DYNAMIC_INJECTION_MARKER = 'this diff adds or modifies a lock/shared-mutable-state/subprocess-based-test construct';
+  const flagged = { ...item, touchesConcurrency: true, concurrencyHits: ['Foo.cs::lock-or-shared-state::lock (_gate) {'] };
+  const unflagged = { ...item, touchesConcurrency: false };
+  for (const role of ['gate-developer', 'gate-qa', 'review-code', 'review-edgecase']) {
+    const on = sandbox.compose(role, flagged, null);
+    assert.ok(on.includes('CONCURRENCY-TOUCHING DIFF (KI-E237): ' + DYNAMIC_INJECTION_MARKER), role + ': flagged item gets the dynamic mandate injection');
+    assert.ok(on.includes('lock-or-shared-state'), role + ': mandate echoes the actual detected hit');
+    const off = sandbox.compose(role, unflagged, null);
+    assert.ok(!off.includes(DYNAMIC_INJECTION_MARKER), role + ': unflagged item gets NO dynamic injection (its static brief self-check line is unaffected and stays present either way)');
+  }
+  // Roles that don't independently re-run the suite must never get the dynamic injection — even on a
+  // flagged item (none of their briefs carry the KI-E237 self-check line either, so a bare substring
+  // check is unambiguous here too, but use the same precise marker for consistency).
+  for (const role of ['gate-architect', 'gate-security', 'planner', 'fixer']) {
+    const prompt = sandbox.compose(role, flagged, null);
+    assert.ok(!prompt.includes(DYNAMIC_INJECTION_MARKER), role + ': never gets the mandate, even when the item is flagged');
+  }
 });
 
 const profile = '# Profile\r\nPREAMBLE\r\n## General\r\nGENERAL\r\n'
@@ -173,8 +214,11 @@ test('review uses pack before targeted verification without a mandatory full pre
   assert.ok(prompt.includes('/review-pack.md FIRST'));
   assert.ok(!prompt.includes('WORKTREE STATE CHECK:'));
   assert.ok(!prompt.includes('diff HEAD` before'));
+  // factory-sync: opencode/compose.mjs's KI-D7 review-etiquette line was updated to match
+  // factory.js's exact text (parity fix, verified against the opencode _selftest.mjs's own
+  // schema-parity-style checks) -- the needle below tracks the new exact wording.
   for (const required of ['VERIFY-CAVEAT', 'independently spot-verify', 'CURRENT WORKTREE', 'omitted/truncated',
-    'Re-check verdict-dependent', 'PEER-OWNED SURFACES', 'takes PRECEDENCE', ctx.worktreePath + '/Service/CONTEXT.md']) assert.ok(prompt.includes(required));
+    're-verify the exact worktree state your verdict DEPENDS on', 'PEER-OWNED SURFACES', 'takes PRECEDENCE', ctx.worktreePath + '/Service/CONTEXT.md']) assert.ok(prompt.includes(required));
 });
 
 test('handoff-only is explicit, fail-closed on stale evidence, and retains mandatory output contract', () => {

@@ -1,12 +1,15 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { driverEngineMount, preflightProductGitlinks } from './driver-evidence.mjs';
 
 test('only the actual installed engine gitlink is excluded; product gitlinks require initialization', t => {
-  const root = mkdtempSync(join(tmpdir(), 'driver-evidence-'));
+  // realpathSync: mkdtempSync's raw path and its resolved form differ on macOS (/var -> /private/var),
+  // and driverEngineMount/preflightProductGitlinks both realpath their inputs before querying git.index()
+  // — matching that here keeps this fixture's git.index() keys reachable by the same paths production code computes.
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'driver-evidence-')));
   t.after(() => rmSync(root, { recursive: true, force: true }));
   const factory = join(root, 'tools/factory');
   mkdirSync(factory, { recursive: true });

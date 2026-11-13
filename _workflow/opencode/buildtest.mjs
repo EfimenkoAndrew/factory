@@ -18,7 +18,9 @@ import { resolveBash } from '../lib/bash.mjs';
 // ZERO risk of this port's transcript parsing drifting from what `driver.mjs fold` will actually
 // apply. Do NOT re-derive these by hand — that was tried and produced subtly wrong regexes
 // (missing the keyed-SUMMARY-overrides-heuristic ordering and the dotnet Passed!/Failed! line).
-export { parseVerifyRaw, verdictFromParse, parseRedRaw, hasRealInfraMarker, touchedRootCause, debrisFiles, nonTestChanged, isTestPath, flakeSuspects, effectiveBaseline, decodeTranscript } from '../lib/verify.mjs';
+// KI-E486 (host-local) adds phantomManifest/pathToken — the mechanical PhantomManifest probe
+// (see runtime.mjs's afterVerify guard (d)); the rest of this list is the shared parser set.
+export { parseVerifyRaw, verdictFromParse, parseRedRaw, hasRealInfraMarker, touchedRootCause, debrisFiles, nonTestChanged, isTestPath, flakeSuspects, effectiveBaseline, decodeTranscript, phantomManifest, pathToken } from '../lib/verify.mjs';
 // Same rationale: reuse the driver's own docker/dotnet probes instead of a hand-rolled duplicate.
 export { dockerAvailable, dotnetAvailable } from '../lib/preflight.mjs';
 

@@ -146,7 +146,7 @@ export function prepareLifecycle(root) {
     env.GIT_INDEX_FILE = join(root, 'fixture-index');
     cpSync(resolve(SOURCE, index), env.GIT_INDEX_FILE);
   }
-  const status = execFileSync('git', ['-C', workspace, 'status', '--porcelain', '-z', '--untracked-files=no'], { env, encoding: 'utf8' });
+  const status = execFileSync('git', ['-C', workspace, 'status', '--porcelain', '-z', '--untracked-files=no'], { env, encoding: 'utf8', maxBuffer: 32 * 1024 * 1024 });
   for (const row of status.split('\0').filter(Boolean)) {
     assert(row.slice(0, 3) === ' M ', 'fixture-index-differs-from-head');
     const path = row.slice(3);
@@ -154,7 +154,7 @@ export function prepareLifecycle(root) {
     const content = execFileSync('git', ['-C', workspace, 'cat-file', '--filters', 'HEAD:' + path], { env, maxBuffer: 4 * 1024 * 1024 });
     writeFileSync(join(workspace, path), content);
   }
-  execFileSync('git', ['-C', workspace, 'diff', 'HEAD', '--exit-code'], { env, encoding: 'utf8' });
+  execFileSync('git', ['-C', workspace, 'diff', 'HEAD', '--exit-code'], { env, encoding: 'utf8', maxBuffer: 32 * 1024 * 1024 });
   const original = digest(readFileSync(join(workspace, 'README.md')));
   return { root, workspace, mount, dir, env, item, original };
 }

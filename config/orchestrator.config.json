@@ -7,15 +7,90 @@
   "buildCapacity": 1,
   "_buildCapacity": "OpenCode backend maps this to dispatcher buildConcurrency: filesystem leases cover Node mechanics and worker commands using build-lease.mjs. Native interactive/claude-headless backends report advisory only. Arbitrary shell commands are not intercepted.",
   "includeRealinfra": false,
+  "includeEscalate": false,
+  "_includeEscalate": "ESCALATED items need human judgment before re-dispatch — auto-running them risks wasted full-pipeline runs with 0 closures. Re-enable only for a specific targeted dispatch with --include-escalate flag.",
   "watchIntervalMs": 60000,
   "laneTimeoutMinutes": 240,
   "autoApply": false,
+  "autoCommit": {
+    "enabled": false,
+    "_comment": "Server-mode only. Set enabled:true on a dedicated server to auto-commit CLOSED worktrees after each fold. Relaxes KI-E1 ('the human authors every commit') intentionally.",
+    "pushAfterCommit": false,
+    "signoff": "Co-Authored-By: AI Implementation Factory <factory@localhost>"
+  },
+  "escalationWebhook": null,
+  "_escalationWebhook": "Set to a Slack-compatible webhook URL to receive a POST when new items hit ESCALATED state. null disables.",
+  "autoFix": {
+    "enabled": true,
+    "_comment": "Auto-reset FAILED items whose last-failure.json indicates a classifiable build/test error (csharp-compile, typescript-compile, msbuild-error, build-failed, test-failure, dotnet-error). maxRetries caps the per-item reset count to prevent infinite retry loops. Infrastructure failures (infraSuspect:true) are left to the driver's own infra-retry path. Set enabled:false to disable.",
+    "maxRetries": 2
+  },
+  "hillClimb": {
+    "enabled": true,
+    "_comment": "KI-E278: hill-climbing run quality optimizer. Tracks close rate (fitness = closed/dispatched) per run. When fitness stagnates below plateauMinFitness for plateauRunsToTrigger consecutive runs, activates exploration mode: the next run deliberately selects items with the oldest lastScheduledCycle (items not tried recently), escaping local-maximum scheduling ruts. After one exploration run the mode resets. explorationRatio controls what fraction of the lane capacity is filled with exploration picks (vs the scheduler's default). See state/hill-climb.json for live state.",
+    "fitnessWindow": 5,
+    "plateauMinFitness": 0.25,
+    "plateauRunsToTrigger": 3,
+    "explorationRatio": 0.5
+  },
+  "bandit": {
+    "enabled": true,
+    "_comment": "KI-E279: UCB1 multi-armed bandit item selection. Each item is scored by closedRate + C*sqrt(ln(totalDispatches+1)/(dispatched+1)) where C=explorationConstant. Provides principled exploration/exploitation balance. Defers to hillClimb when exploration mode is active (hillClimb plateau-escape takes priority). State in state/bandit.json.",
+    "explorationConstant": 1.41
+  },
+  "retrospective": {
+    "enabled": true,
+    "_comment": "Periodic health report generator. Every runsPerRetro lanes, generates a markdown health report in queue/retrospective-<timestamp>.md with ledger state counts, close rate, and hill-climb fitness window. State in state/retrospective.json.",
+    "runsPerRetro": 5
+  },
+  "curriculum": {
+    "enabled": true,
+    "_comment": "Curriculum learning. For never-tried (cold-start) items, replaces the uniform UCB1 exploration bonus with a difficulty-aware one: C*(1-estimatedDifficulty). Easier items get more exploration budget so the factory tries simple wins first. Difficulty is estimated from title word count, file count, and hard keyword matches. No extra state file — operates through bandit.json."
+  },
+  "simulatedAnnealing": {
+    "enabled": true,
+    "_comment": "Simulated annealing. Temperature T decays as T=T0*coolingRate^runCount. Each lane, with probability T, one selected item is swapped for a random READY item not in the selection — injecting controlled exploration that fades as the factory matures. State in state/simulated-annealing.json.",
+    "initialTemperature": 0.3,
+    "coolingRate": 0.95
+  },
+  "promptEvolution": {
+    "enabled": true,
+    "_comment": "Prompt evolution. A/B tests two promptTemplate variants; after runsToEvaluate combined runs, kills the lower-close-rate variant and mutates the winner with a guidance phrase from a built-in library. Continuously evolves the worker prompt toward higher close rates. State in state/prompt-evolution.json.",
+    "runsToEvaluate": 10
+  },
+  "itemTiming": {
+    "enabled": true,
+    "_comment": "Dynamic timeouts. Records wall-clock elapsed milliseconds for each completed lane (last 100 samples). Computes P95+20% as recommendedTimeoutMinutes surfaced in the retrospective report, helping operators tune laneTimeoutMinutes. State in state/item-timing.json."
+  },
+  "configOptimizer": {
+    "enabled": true,
+    "_comment": "Config meta-optimizer. Every runsPerCycle lanes, perturbs one knob (rotating through bandit.explorationConstant, hillClimb.plateauMinFitness, hillClimb.explorationRatio, simulatedAnnealing.coolingRate) by +-perturbFraction, bounded to each knob's own sane range. Measures fitness over the next measureWindow runs vs the prior window and keeps or reverts. Modifies the live cfg in-memory only — never writes back to orchestrator.config.json. State in state/config-optimizer.json.",
+    "runsPerCycle": 10,
+    "measureWindow": 3,
+    "perturbFraction": 0.1
+  },
+  "recalibrate": {
+    "enabled": true,
+    "_comment": "Auto-recalibrate when stuck in a deep rut. When runsBelow consecutive runs all produce fitness < fitnessThreshold (deeper than hillClimb plateau), resets SA temperature to T0, boosts bandit exploration 1.5x for recoveryRuns lanes, and resets config-optimizer phase for a clean baseline. Manual: node orchestrate.mjs recalibrate. State in state/recalibrate.json.",
+    "runsBelow": 5,
+    "fitnessThreshold": 0.1,
+    "recoveryRuns": 3
+  },
   "opencode": {
     "config": "config/opencode-dispatch.local.json"
   },
   "claudeHeadless": {
     "bin": "claude",
-    "extraArgs": [],
+    "extraArgs": ["--dangerously-skip-permissions"],
+    "_extraArgs": "KI-E277: the claude-headless backend runs fully unattended (no human at the terminal to answer a tool-approval prompt) — without this flag the worker would stall forever on the first prompt. Safety rests on the Workflow script's own constraints (no mutating git, worktree-scoped file access, agents only — KI-E1/KI-E2), not on interactive approval. Only applies to the claude-headless backend; the default interactive backend is unaffected.",
     "promptTemplate": "Operate as the AI-factory worker plane. Launch the Workflow tool on the script at {runScript} with NO args, wait for it to complete, then reply DONE. Do not run any git commands. Do not edit any file outside the per-item worktrees the script names."
-  }
+  },
+  "confidenceThresholds": {
+    "_comment": "Calibration gating thresholds (Kadavath et al. 2022). A probe whose confidence falls below its threshold is treated as uncertain and its negative verdict is skipped rather than triggering a costly plan revision or hard abort. Values here are the canonical reference; factory.js hardcodes the same defaults inline.",
+    "planFeasibility": 0.80,
+    "planQuality": 0.80,
+    "phantomManifest": 0.90
+  },
+  "weeklyTokenLimit": 0,
+  "_weeklyTokenLimit": "Estimated weekly output-token budget, used by logBatchTokenUsage() to show week-to-date consumption as a percentage so the operator can see which batches eat the weekly limit. 0 disables the percentage display. Set this to YOUR account's actual weekly limit to enable it — there is no universal default."
 }

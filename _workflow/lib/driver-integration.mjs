@@ -4,6 +4,7 @@ import { existsSync, readFileSync, realpathSync, statSync, readdirSync } from 'n
 import { computeReady } from './graph.mjs';
 import { unreadyItems } from './readiness.mjs';
 import { filesOverlapDirty } from './mainguard.mjs';
+import { ACTIVE } from './ledger.mjs';
 import { completeCommand } from './stage-evidence.mjs';
 import { decodeTranscript, parseRedRaw } from './verify.mjs';
 import { collectEvidenceIdentity, canonicalJson, EVIDENCE_IDENTITY_VERSION } from './evidence-identity.mjs';
@@ -25,14 +26,40 @@ export function resolvedBuildCapacity(cfg = {}, flags = {}) {
   return limit;
 }
 
+// KI-E246 (2026-09-24) — `disjointItems` below only catches a file collision WITHIN one `group` call's
+// own candidate list; it has no visibility into an item ALREADY claimed by a separately-launched,
+// still-running Workflow (a batch from an earlier `group` call this same session, or a concurrent
+// controller-sanctioned second Workflow). Until this session, exactly one Workflow ever ran at a time,
+// so that gap was inert; a live incident (manually cross-checking a 4-item "highly concurrent" pick by
+// eye against 3 already-in-flight items' files before this fix existed) found it the hard way — a prior item's
+// own 12-file cross-cutting footprint would have silently re-claimed files two OTHER already-running
+// Workflows' worktrees were independently mutating, with nothing catching it until a human diffed two
+// conflicting `factory/<id>` branches for the same file by hand. Mirrors the EXISTING KI-E14 dirty-tree
+// overlap check exactly (same `filesOverlapDirty` primitive, same `--force-dirty-overlap` escape hatch)
+// but sources its "locked" set from every ledger row currently in an ACTIVE state (CLAIMED and beyond)
+// rather than from `git status`.
+export function activeClaimedFiles(graph, ledger) {
+  const items = graph.items || graph.findings || [];
+  const byId = new Map(items.map((i) => [i.id, i]));
+  const paths = [];
+  for (const row of Object.values(ledger.items || {})) {
+    if (!row || !ACTIVE.includes(row.state)) continue;
+    const item = byId.get(row.id);
+    if (item && Array.isArray(item.files)) paths.push(...item.files);
+  }
+  return { paths, dirs: [] };
+}
+
 export function eligibleItems(graph, ledger, cfg, flags = {}, { docker = false, dirty = { paths: [], dirs: [] }, repoRoot } = {}) {
   const ready = computeReady(graph, ledger, { maxItemRetries: cfg.maxItemRetries, target: flags.target || null,
     themes: flags.themes ? String(flags.themes).split(',') : null, includeEscalate: !!flags['include-escalate'], repoRoot });
+  const claimed = activeClaimedFiles(graph, ledger);
   return ready.filter(w => (!flags.layer || w.layer === flags.layer)
     && !(w.ownerDecision != null && w.ownerDecisionResolved !== true) && w.fixType !== 'owner-decision'
     && (!needsRealInfra(w, (w.files || []).some(f => /\.cs$/i.test(f))) || (flags['include-realinfra'] && (docker || flags['force-realinfra'])))
     && (flags['force-unready'] || !unreadyItems([w]).length)
-    && (flags['force-dirty-overlap'] || !filesOverlapDirty(w.files, dirty, { repoRoot }).length));
+    && (flags['force-dirty-overlap'] || !filesOverlapDirty(w.files, dirty, { repoRoot }).length)
+    && (flags['force-dirty-overlap'] || !filesOverlapDirty(w.files, claimed, { repoRoot }).length));
 }
 
 export function disjointItems(items, max = Infinity, options = {}) {
@@ -101,6 +128,16 @@ export function matchesClaim(result, row) {
   return result.claimId === legacyPortId;
 }
 
+// KI-E138 (ported from a host-mount session) — the "native execution"/portable-evidence reuse path
+// (native-context.mjs / native-persistence.mjs / portable-evidence.mjs — see those files' own
+// headers). ACTIVELY called by `driver.mjs`'s `deterministicVerifyOverride` (this same engine sync)
+// for every opencode-runtime result — `result.runtime === 'opencode'` is enough to reach this
+// function even before `row.runtimeEvidence` exists, so it throws "trusted current-claim runtime
+// binding missing" unless the opencode-runtime port (`_workflow/opencode/*`) actually populates
+// `row.runtimeEvidence`/`result.portableEvidence` on its own dispatches. Confirm that population
+// exists (and matches this function's exact contract shape) before relying on any real opencode
+// dispatch passing verification — this was ported as a faithful copy of upstream's function; the
+// opencode-side producer of the evidence it consumes was NOT independently re-verified by this merge.
 export function verifyPortableEvidence({ result, row, itemDir, worktree, codeChange, baseline = 0,
   expectedContract, collect = collectEvidenceIdentity }) {
   if (!row.runtimeEvidence && result.runtime !== 'opencode' && !Object.hasOwn(result, 'portableEvidence')) return null;
@@ -220,7 +257,23 @@ export function affectedVerificationTargets(item, cfg, repoRoot, primary) {
     }
     if (!found && projectAmbiguous) throw new Error('ambiguous owning build target for ' + file);
     if (!found) found = projectFallback;
-    if (!found) throw new Error('no unambiguous build ownership for ' + file + '; configure solutions');
+    // KI-E224: reaching here means the file matched NO cfg.solutions mapping AND the directory-walk
+    // found no .sln/.csproj ANYWHERE between it and repoRoot AND it doesn't fall under the item's own
+    // target-prefix primary fallback — i.e. every existing resolution strategy has ALREADY exhaustively
+    // confirmed this file is nowhere near a dotnet-buildable tree. That is real, strong evidence it
+    // needs no dotnet verification at all (a cross-cutting k8s manifest / prometheus rule / secrets
+    // .env sits outside every service's directory by design — that IS the "shared infra" shape), not
+    // an operator-configuration gap: `cfg.solutions` is checked FIRST (above) and still takes priority
+    // for any path an operator genuinely wants mapped. Live: a prior item's
+    // deployment/k3s/infrastructure/prometheus/prometheus-config.yaml and another sibling item's
+    // k8s/overlays/production/secrets/notification-service.env both crashed `group --dry` (meant to be
+    // a free, zero-agent smoke test) with an uncaught throw here — a regression versus already-CLOSED
+    // items (several sibling items) that touched files in this exact
+    // "no dotnet ownership anywhere" shape successfully before this function's current strict-throw
+    // form existed. A genuinely ambiguous CODE file never reaches this line — it throws earlier
+    // (line ~144/159, MULTIPLE candidates found) — so there is no remaining case here that silently
+    // hiding a real problem would risk; skip it (no verification target added) instead of crashing.
+    if (!found) continue;
     targets.add(found);
   }
   return [...targets].sort();
@@ -300,8 +353,59 @@ export function verificationExpectations({ item = {}, test = {}, worktree, targe
     }
     throw new Error('no owning project for ' + file);
   };
+  // KI-E216: a RED-proof/filter target recorded by build-test.sh's `red`/`filter` subcommands may be
+  // a project DIRECTORY rather than a .csproj file -- `dotnet build`/`dotnet test` both auto-discover
+  // the single project file in a directory, so a directory target is a completely normal, successful
+  // real invocation (see verify/build-test.sh), not a malformed one. containedFile() itself must stay
+  // strict (every OTHER caller in this file passes a specific artifact FILE and a directory there
+  // would be a real bug), so resolve a directory target to its owning .csproj FIRST, then validate
+  // that resolved file path the same way an explicit file target always was.
+  const resolveProjectTarget = rawPath => {
+    const abs = hostPath(rawPath, worktree);
+    let stat;
+    try { stat = statSync(abs); } catch { throw new Error('file missing or outside trusted directory: ' + rawPath); }
+    if (!stat.isDirectory()) return containedFile(worktree, rawPath);
+    // NOTE: deliberately scan/resolve from `abs` (NOT a realpathSync'd form) — containedFile() below
+    // does its own realpath-based containment double-check internally; pre-canonicalizing here first
+    // would make the constructed candidate's string representation diverge from `worktree`'s own
+    // (non-canonical) representation whenever the worktree root itself sits behind a symlink (e.g.
+    // macOS's /var -> /private/var), tripping containedFile()'s FIRST, non-realpath relative() check
+    // even though the path is genuinely inside the trusted root.
+    const projects = readdirSync(abs).filter(n => /\.csproj$/i.test(n));
+    if (projects.length === 1) return containedFile(worktree, resolve(abs, projects[0]));
+    throw new Error((projects.length ? 'ambiguous' : 'no') + ' owning project in directory target: ' + rawPath);
+  };
+  // KI-E457: a RED-proof/filter target recorded by build-test.sh's `red`/`filter` subcommands may
+  // legitimately be a .sln (build-test.sh's own usage comment documents `red <test.csproj-or-sln>
+  // ...` as a valid form — see verify/build-test.sh). resolveProjectTarget resolves a .sln FILE to
+  // its own literal path (the directory-vs-file branch above only fires for a directory target),
+  // so comparing that literal .sln path against a specific test project's .csproj path via
+  // samePath() alone can never match — a false "RED filter target is not a test-file owning
+  // project" rejection for every item whose RED proof was captured against a solution rather than
+  // a single project (observed live, a direct-recovery attempt: verify-red-raw.txt recorded
+  // FACTORY::RED::START .../ExampleService.sln, structurally identical in shape to an exact-match
+  // failure that has nothing to do with the item's actual fix). Parses the .sln's own
+  // Project("{GUID}") = "Name", "relative\path.csproj", "{GUID}" lines (the standard .sln project-
+  // reference format) and resolves each to an absolute path, so "target is this solution" can be
+  // checked as "target is (or belongs to) this solution" without weakening the check for the
+  // common, exact-.csproj-match case at all.
+  const solutionProjectsCache = new Map();
+  const projectsInSolution = slnPath => {
+    if (solutionProjectsCache.has(slnPath)) return solutionProjectsCache.get(slnPath);
+    let list = [];
+    try {
+      const text = readFileSync(slnPath, 'utf8');
+      const slnDir = dirname(slnPath);
+      list = [...text.matchAll(/^Project\([^)]*\)\s*=\s*"[^"]*"\s*,\s*"([^"]+\.csproj)"/gm)]
+        .map(m => hostPath(resolve(slnDir, m[1].replace(/\\/g, '/'))));
+    } catch { /* unreadable or malformed .sln — projectsInSolution() yields [], falls through to the existing exact-match check */ }
+    solutionProjectsCache.set(slnPath, list);
+    return list;
+  };
+  const targetMatchesProject = (target, project) =>
+    samePath(target, project) || (/\.sln$/i.test(target) && projectsInSolution(target).includes(hostPath(project)));
   const testProjects = [...new Set((test.testFiles || []).filter(f => /\.cs$/i.test(f)).map(projectFor))];
-  const red = [...redText.matchAll(/^FACTORY::(?:TEST::FILTER|RED)::START (.+) :: (.+)\r?$/gm)].map(m => ({ target: containedFile(worktree, m[1].trim()), filter: m[2].trim() }));
+  const red = [...redText.matchAll(/^FACTORY::(?:TEST::FILTER|RED)::START (.+) :: (.+)\r?$/gm)].map(m => ({ target: resolveProjectTarget(m[1].trim()), filter: m[2].trim() }));
   if (!red.length) throw new Error('no RED filter provenance');
   const tokens = String(test.runCmd || '').match(/"[^"]*"|'[^']*'|[^\s]+/g)?.map(t => t.replace(/^(["'])(.*)\1$/, '$2')) || [];
   let command = null;
@@ -313,11 +417,11 @@ export function verificationExpectations({ item = {}, test = {}, worktree, targe
     command = { target: tokens[dotnet + 2], filter: flag >= 0 ? tokens[flag + 1] : null };
   }
   if (command) {
-    command.target = containedFile(worktree, command.target || '');
-    if (!command.filter || !red.some(r => samePath(r.target, command.target) && r.filter === command.filter)) throw new Error('test.json command disagrees with RED target/filter');
+    command.target = resolveProjectTarget(command.target || '');
+    if (!command.filter || !red.some(r => targetMatchesProject(r.target, command.target) && r.filter === command.filter)) throw new Error('test.json command disagrees with RED target/filter');
   }
   if (!testProjects.length && !command) throw new Error('test.json lacks independently resolvable project provenance');
-  if (testProjects.length && red.some(r => !testProjects.some(p => samePath(p, r.target)))) throw new Error('RED filter target is not a test-file owning project');
+  if (testProjects.length && red.some(r => !testProjects.some(p => targetMatchesProject(r.target, p)))) throw new Error('RED filter target is not a test-file owning project');
   const filters = red.filter((r, i) => red.findIndex(other => other.target === r.target && other.filter === r.filter) === i);
   const solutions = (targets.length ? targets : [item.solution].filter(Boolean)).map(t => containedFile(worktree, t));
   const builds = band === 'LIGHT'
@@ -465,6 +569,27 @@ export function verifyAttemptTranscript({ result, row, item = {}, itemDir, workt
   } catch (e) { return { pass: false, reason: e.message }; }
 }
 
+// KI-E7x-era contract (v1, implicit): `verifyRecoveryTranscript` re-derives the transcript/before/
+// after hashes fresh at fold time and compares them to each other (before.hash === after.hash ===
+// current.hash) — no separate seal step, no `contract.hashes` to match. Still fully supported: every
+// contract this host has ever written omits `version` (so `contract.version === 2` below is false)
+// and takes the exact same path it always has.
+//
+// New (ported from a host-mount session): a `contract.version === 2` recovery ADDITIONALLY requires a
+// prior `sealRecoveryEvidence` call to have recorded `contract.hashes` — the transcript/before/after
+// content hashes at the moment they were sealed — and the fold-time verify (`sealing: false`) must
+// reproduce those EXACT hashes, not merely re-derive internally-consistent ones. This closes a gap
+// the v1 check cannot: v1 proves "transcript/before/after agree with EACH OTHER right now", which
+// says nothing about whether they were re-generated (all mutually consistent, but the WRONG run)
+// between capture and fold. `sealRecoveryEvidence` is the same function with `sealing: true`, which
+// skips that comparison (nothing to compare against yet) and returns `hashes` for the caller to
+// persist onto `row.recoveryVerification.hashes` before ever running the real fold-time verify.
+// Also new: an explicit `codeChange` parameter (default true, matching every prior caller's implicit
+// assumption) — a documentation-only recovery (`codeChange: false`) skips the build/filter/suite
+// transcript check entirely and only requires the transcript file to be non-empty, mirroring the
+// same doc-only carve-out `verifyPortableEvidence`/`verifyNativeReceipt` already use elsewhere in
+// this file, and an optional `contract.metadata` trusted-copy cross-check (defence in depth against
+// the metadata FILE drifting after the contract itself was written).
 export function verifyRecoveryTranscript(args) { return recoveryTranscript(args, false); }
 export function sealRecoveryEvidence(args) { return recoveryTranscript(args, true); }
 

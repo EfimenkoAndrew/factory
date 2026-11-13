@@ -16,10 +16,10 @@
 //   graph tooling, the controller lease, and worktree management). The dispatch table in
 //   main() at the bottom of this file is the source of truth.
 
-import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync, statSync, renameSync } from 'node:fs';
+import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync, statSync, renameSync, unlinkSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
-import { randomUUID } from 'node:crypto';
-import { dirname, join, basename, relative, resolve as presolve } from 'node:path';
+import { randomUUID, createHash } from 'node:crypto';
+import { dirname, join, basename, relative, resolve as presolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { resolveRepoRoot, containedMountRelative, swapMountPrefix, toPosix, STOCK_MOUNT } from './lib/rootfind.mjs';
 import {
@@ -31,19 +31,20 @@ import {
 import { loadGraph, computeReady, waitingOnDeps, byId } from './lib/graph.mjs';
 import { unreadyItems } from './lib/readiness.mjs';
 import { bandFor } from './lib/band.mjs';
+import { stripFactorySource, FACTORY_BATCH_MARKER, FACTORY_BATCH_SENTINEL } from './lib/js-strip.mjs'; // KI-E403 — launcher channel comment stripping
 import { projectBatch, renderProjection } from './lib/band-cost.mjs';
 import { loadRouting, resolve as routeResolve, concurrencyFor } from './lib/router.mjs';
 import { addWorktree, removeWorktree, pruneStaleBranch, listWorktrees, changedFiles, pruneWorktrees, isFactoryWorktreePath, parseComposeLs, strayComposeProjects } from './lib/worktree.mjs';
 import { acquireLock, releaseLock } from './lib/lock.mjs';
-import { parseVerifyRaw, verdictFromParse, debrisFiles, parseRedRaw, hasRealInfraMarker, touchedRootCause, effectiveBaseline, decodeTranscript, flakeSuspects, isPhantomBaseline, annotateBaselineReason } from './lib/verify.mjs';
+import { parseVerifyRaw, verdictFromParse, debrisFiles, parseRedRaw, hasRealInfraMarker, touchedRootCause, effectiveBaseline, decodeTranscript, flakeSuspects, isPhantomBaseline, annotateBaselineReason, phantomManifest, pathToken } from './lib/verify.mjs'; // phantomManifest/pathToken: KI-E471 host-mount-local P11 phantom-manifest check (deterministicVerifyOverride)
 import { captureBaseline } from './lib/baseline.mjs';
-import { EVIDENCE_IDENTITY_VERSION } from './lib/evidence-identity.mjs';
+import { EVIDENCE_IDENTITY_VERSION, collectEvidenceIdentity } from './lib/evidence-identity.mjs';
 import { resolvedBuildCapacity } from './lib/driver-integration.mjs';
 import { driverEngineMount, preflightProductGitlinks } from './lib/driver-evidence.mjs';
 import { preflight, dockerAvailable } from './lib/preflight.mjs';
 import { classifyFilesEntry, buildBasenameIndex, acceptanceSurfaceGaps } from './lib/graphaudit.mjs';
 import { renderFeedback, mergeFeedbackHistory } from './lib/feedback.mjs';
-import { dissentersFrom, roleForGateKey, recoveryFoldSkeleton, priorCycleOf, missingStageFrom } from './lib/recover.mjs'; // KI-E20 — the direct-recovery scaffold; KI-E81 — missing-stage auto-detection
+import { dissentersFrom, roleForGateKey, recoveryFoldSkeleton, priorCycleOf, missingStageFrom, staleRecoveryGates, hashFileList } from './lib/recover.mjs'; // KI-E20 — the direct-recovery scaffold; KI-E81 — missing-stage auto-detection; KI-E461/KI-E465 — host-mount-local recovery gate-freshness override
 import { applyConvergenceBonus, effectiveRetryBound, applyStallDetection, isStalled } from './lib/convergence.mjs';
 import { clusterBySimilarity, sharedLabel, perCliqueBatchPatterns, bestClosedPrecedent, sig as simSig, similarSigs } from './lib/similarity.mjs';
 import { loadController, isStale as controllerStale, claimController, verifyController, releaseController, DEFAULT_TTL_MINUTES } from './lib/controller.mjs';
@@ -56,13 +57,14 @@ import { loadPolicies, renderPolicies, POLICY_TEXT } from './lib/policy.mjs'; //
 // never throws, never blocks a command, and never feeds a fold verdict. FACTORY_TELEMETRY=0 disables.
 import { emit as temit, deriveStageTimeline, readEvents, aggregateEvents, renderTelemetryReport, continuedRunsMd, telemetryFile, GAP_FENCE_MS, nonCanonicalArtifacts, isRecoveryResultId, isDirectRecoveryFold } from './lib/telemetry.mjs';
 import { parseTokenUsageVector, buildTokenUsageQuery, tokenUsageSummary } from './lib/token-usage.mjs'; // KI-E66 — cache-hit-rate bridge
-import { loadPriorAttempt, priorAttemptStages } from './lib/prior-attempt.mjs'; // KI-E69 — cross-session plan/test/fix reuse on relaunch
+import { loadPriorAttempt, priorAttemptStages, loadStepwiseResume, neverGateReviewed, PLAN_REUSE_CAP } from './lib/prior-attempt.mjs'; // KI-E69 — cross-session plan/test/fix reuse on relaunch; KI-E496 — host-mount-local stepwise partial-progress resume
 import { readProgressCheckpoint, summarizeProgress } from './lib/progress-checkpoint.mjs'; // KI-E137 — incremental mid-pipeline checkpoint read/summarize (resume/reconstruct diagnostics)
 import { lintWorktreeDocClaims } from './lib/doclint.mjs'; // F2 — phantom doc-path detection aid at fold (WARN-only)
 import { findLeftovers } from './lib/leftover-scan.mjs'; // KI-D12 — deferral/tech-debt lexicon detection aid at fold (WARN-only)
 import { findComments } from './lib/comment-scan.mjs'; // KI-E59 — no-new-comments detection aid at fold (WARN-only)
 import { detectNarrativeVerdictContradiction, detectUnresolvedCaveatOnClose } from './lib/narrative-check.mjs'; // KI-E67 — narrative-vs-verdict contradiction detection aid at fold (WARN-only); KI-E74C — the mirror direction
 import { effectiveInfraRequirement } from './lib/effective-infra.mjs';
+import { progressMd, burndownMd, costMd, costSnapshot, topTokenItems, readCostHistory, recordCostSnapshot, writeReports as _writeReports } from './lib/report-gen.mjs'; // report generation extracted (KI-E364 split)
 import { eligibleItems, disjointItems, admitAttempt, lifecycleObservation, observe, observePhysical, observeAdmission, originalInfraRequirement, normalizedInfraResult, containedFile, verifyTranscript, verificationExpectations, verifyNativeReceipt, verifyFinalTranscript, verifyAttemptTranscript, verifyRecoveryTranscript, affectedVerificationTargets, invokedOpenCodeDispatch, worktreeGcGroups, usageIdentity, matchesClaim } from './lib/driver-integration.mjs';
 import { verifyPortableEvidence, sealRecoveryEvidence } from './lib/driver-integration.mjs';
 import { portableHash, openCodeContract, PORTABLE_EVIDENCE_VERSION } from './lib/portable-evidence.mjs';
@@ -162,186 +164,9 @@ function parseFlags(argv) {
   return { flags: f, rest };
 }
 
-// ---- report generation --------------------------------------------------------
-function progressMd(cfg, ledger, graph) {
-  const counts = countByState(ledger);
-  const total = Object.values(ledger.items).length;
-  const closed = counts.CLOSED || 0;
-  const order = [...FORWARD, ...OFFRAMPS];
-  const rows = order.filter((s) => counts[s]).map((s) => `| ${s} | ${counts[s]} |`).join('\n');
-  const wait = waitingOnDeps(graph, ledger);
-  const inflight = Object.values(ledger.items).filter((r) => ACTIVE.includes(r.state));
-  const esc = Object.values(ledger.items).filter((r) => r.state === 'ESCALATED' || r.state === 'BLOCKED');
-  const recentClosed = Object.values(ledger.items).filter((r) => r.state === 'CLOSED')
-    .sort((a, b) => (b.updatedAt || '').localeCompare(a.updatedAt || '')).slice(0, 10);
-  return [
-    '# Factory PROGRESS',
-    '',
-    `_Generated ${now()} · cycle ${ledger.cycle} · ${total} item(s) · ${closed} CLOSED (${total ? Math.round((closed / total) * 100) : 0}%)_`,
-    '',
-    '## State counts',
-    '',
-    '| State | Count |',
-    '|---|---|',
-    rows || '| (none) | 0 |',
-    '',
-    `## In-flight (${inflight.length})`,
-    inflight.length ? inflight.map((r) => `- \`${r.id}\` — ${r.state}${r.worktree ? ' @ ' + r.worktree : ''}`).join('\n') : '_none_',
-    '',
-    `## Escalated / Blocked (${esc.length}) → see queue/decisions.md`,
-    esc.length ? esc.map((r) => `- \`${r.id}\` — ${r.state}${r.note ? ': ' + r.note : ''}`).join('\n') : '_none_',
-    '',
-    `## Waiting on deps (${wait.length})`,
-    wait.length ? wait.map((w) => `- \`${w.id}\` ⟵ ${w.unmet.join(', ')}`).join('\n') : '_none_',
-    '',
-    `## Recently CLOSED (${recentClosed.length})`,
-    recentClosed.length ? recentClosed.map((r) => `- \`${r.id}\` (${r.updatedAt})`).join('\n') : '_none_',
-    '',
-  ].join('\n');
-}
-
-function burndownMd(cfg, ledger, graph) {
-  const items = byId(graph);
-  const bySev = { CRITICAL: { total: 0, closed: 0 }, HIGH: { total: 0, closed: 0 }, MEDIUM: { total: 0, closed: 0 }, LOW: { total: 0, closed: 0 } };
-  for (const [id, row] of Object.entries(ledger.items)) {
-    const wi = items[id]; if (!wi) continue;
-    const b = bySev[wi.severity]; if (!b) continue;
-    b.total++; if (row.state === 'CLOSED') b.closed++;
-  }
-  const rows = Object.entries(bySev).map(([s, b]) => `| ${s} | ${b.total} | ${b.closed} | ${b.total - b.closed} |`).join('\n');
-  return [
-    '# Burn-down',
-    '',
-    `_Generated ${now()} · cycle ${ledger.cycle}_`,
-    '',
-    '| Severity | Total | CLOSED | Remaining |',
-    '|---|---|---|---|',
-    rows,
-    '',
-    '> CRITICAL→0 and a strictly-monotonic-down finding count are the factory success signals (PLAN.md §11).',
-    '',
-  ].join('\n');
-}
-
-function costSnapshot(ledger) {
-  const byModel = {};
-  for (const row of Object.values(ledger.items)) for (const [m, t] of Object.entries(row.cost || {})) byModel[m] = (byModel[m] || 0) + t;
-  const total = Object.values(byModel).reduce((a, b) => a + b, 0);
-  const closed = Object.values(ledger.items).filter((r) => r.state === 'CLOSED').length;
-  const opus = Object.entries(byModel).filter(([m]) => /opus/i.test(m)).reduce((a, [, t]) => a + t, 0);
-  // KI-E150 (ported from a host-mount session) — real per-item token totals (factory.js's
-  // concurrency-safe budget.spent() attribution), distinct from byModel/total above which only ever
-  // counted agent CALLS, never tokens. Summed only over CLOSED items with a real tokensUsed figure —
-  // an item folded before this change, or one whose only work was sweep-mode/pre-band-only, may have
-  // no tokensUsed at all; excluded rather than silently counted as 0, so totalTokens/tokensPerClosed
-  // don't understate the true average.
-  const closedWithTokens = Object.values(ledger.items).filter((r) => r.state === 'CLOSED' && typeof r.tokensUsed === 'number' && r.tokensUsed > 0);
-  const totalTokens = closedWithTokens.reduce((a, r) => a + r.tokensUsed, 0);
-  return { cycle: ledger.cycle, byModel, total, closed, callsPerClosed: closed ? Math.round(total / closed * 10) / 10 : null, opusShare: total ? Math.round(opus / total * 100) / 100 : 0, totalTokens, closedWithTokens: closedWithTokens.length, tokensPerClosed: closedWithTokens.length ? Math.round(totalTokens / closedWithTokens.length) : null };
-}
-
-// KI-E150 — the N most token-expensive CLOSED items (real per-item totals, not call counts). Bounded
-// so this stays a report, not a full ledger dump; sorted desc so the costliest work is always visible
-// first regardless of how many items have a recorded tokensUsed.
-function topTokenItems(ledger, n) {
-  return Object.entries(ledger.items)
-    .filter(([, r]) => r.state === 'CLOSED' && typeof r.tokensUsed === 'number' && r.tokensUsed > 0)
-    .sort((a, b) => b[1].tokensUsed - a[1].tokensUsed)
-    .slice(0, n)
-    .map(([id, r]) => ({ id, tokensUsed: r.tokensUsed }));
-}
-
-function readCostHistory(cfg) {
-  const p = join(abs(cfg.paths.reports), 'cost-history.jsonl');
-  if (!existsSync(p)) return [];
-  return readFileSync(p, 'utf8').split('\n').filter(Boolean).map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
-}
-
-// Append a per-cycle cost snapshot (last-write-wins per cycle) — the trend source for the cost report.
-// Called on cost-changing events (fold) + the explicit `cost` command. This is OBSERVABILITY only —
-// there is NO budget gate / governor (owner direction 2026-06-27).
-function recordCostSnapshot(cfg, ledger) {
-  mkdirSync(abs(cfg.paths.reports), { recursive: true });
-  const p = join(abs(cfg.paths.reports), 'cost-history.jsonl');
-  const lines = existsSync(p) ? readFileSync(p, 'utf8').split('\n').filter(Boolean) : [];
-  const snap = JSON.stringify({ at: now(), ...costSnapshot(ledger) });
-  let prevCycle = null;
-  if (lines.length) { try { prevCycle = JSON.parse(lines[lines.length - 1]).cycle; } catch { /* ignore */ } }
-  if (prevCycle === ledger.cycle) lines[lines.length - 1] = snap; else lines.push(snap);
-  writeFileSync(p, lines.join('\n') + '\n');
-}
-
-function costMd(ledger, history) {
-  const s = costSnapshot(ledger);
-  const rows = Object.entries(s.byModel).sort((a, b) => b[1] - a[1]).map(([m, t]) => `| ${m} | ${t} | ${s.total ? Math.round(t / s.total * 100) : 0}% |`).join('\n');
-  // Marginal column (2026-07-12): the cumulative Calls/closed average HIDES a failing recent cycle —
-  // cycle 31's marginal cost was 24 calls/close while the cumulative read 13.5. Δ is vs the previous
-  // history row; "n/+0" flags a cycle that spent calls and closed nothing (the loudest signal here).
-  const hs = history || [];
-  const marginalOf = (h) => {
-    const i = hs.indexOf(h);
-    const prev = i > 0 ? hs[i - 1] : null;
-    const dCalls = h.total - (prev ? prev.total : 0);
-    const dClosed = h.closed - (prev ? prev.closed : 0);
-    if (dClosed > 0) return String(Math.round((dCalls / dClosed) * 10) / 10);
-    return dCalls > 0 ? `${dCalls}/+0` : '—';
-  };
-  const trend = hs.slice(-10).map((h) => `| ${h.cycle} | ${h.total} | ${h.closed} | ${h.callsPerClosed ?? '—'} | ${marginalOf(h)} | ${Math.round((h.opusShare || 0) * 100)}% |`).join('\n');
-  // KI-E150 (ported from a host-mount session) — real per-item token totals now exist (factory.js's
-  // concurrency-safe budget.spent() attribution, ledger.mjs's foldResults accumulation). Rendered
-  // alongside the pre-existing call-count table rather than replacing it — call counts are still the
-  // "who did the work" model-routing signal; tokens answer "how expensive was it", a genuinely
-  // different question this report couldn't answer at all before. closedWithTokens can be less than
-  // closed: an item folded before this change, or whose only work was sweep-mode/pre-band-only
-  // (checkpoint-writer bookkeeping calls are deliberately NOT attributed — see the KI-E150
-  // KNOWN-ISSUES.md entry), has no tokensUsed to include.
-  const top = topTokenItems(ledger, 10);
-  const topRows = top.map((t) => `| ${t.id} | ${t.tokensUsed.toLocaleString()} |`).join('\n');
-  return [
-    '# Cost report — agent calls by model (routing evidence)',
-    '',
-    `_Generated ${now()} · cycle ${ledger.cycle}_`,
-    '',
-    '_Counts are routed agent-calls per model (the faithful "who did the work" signal) — model routing',
-    'evidence, not a spend total. Real per-item TOKEN totals (KI-E150) are tracked separately below; a',
-    'per-cycle whole-run token total (KI-E23) is still recorded in the cycle report. This report is',
-    'OBSERVABILITY, not a governor — there is no budget gate (owner direction 2026-06-27)._',
-    '',
-    '| Model | Agent calls | Share |',
-    '|---|---|---|',
-    rows || '| (none recorded) | 0 | 0% |',
-    `| **Total** | **${s.total}** | **100%** |`,
-    '',
-    '## Efficiency',
-    '',
-    `- **Closed findings:** ${s.closed}`,
-    `- **Agent-calls / closed finding:** ${s.callsPerClosed ?? '— (none closed yet)'}`,
-    `- **Opus share of calls:** ${Math.round(s.opusShare * 100)}% _(PLAN §4 goal: opus reserved for hard reasoning + the 3 hard gates + refute)_`,
-    `- **Tokens / closed finding:** ${s.tokensPerClosed ? s.tokensPerClosed.toLocaleString() : '— (no per-item token data yet)'} _(KI-E150 — real total ${s.totalTokens.toLocaleString()} across ${s.closedWithTokens} of ${s.closed} closed item(s) with recorded tokensUsed)_`,
-    '',
-    '## Top 10 closed items by tokens (KI-E150)',
-    '',
-    '| Item | Tokens |',
-    '|---|---|',
-    topRows || '| _(no per-item token data yet)_ |  |',
-    '',
-    '## Per-cycle trend',
-    '',
-    '| Cycle | Calls | Closed | Calls/closed (cum) | Marginal Δcalls/Δclosed | Opus % |',
-    '|---|---|---|---|---|---|',
-    trend || '| _(no history yet)_ |  |  |  |  |  |',
-    '',
-    '> Goal (PLAN.md §4/§11): haiku/sonnet do the volume; opus only the hard parts; cost/closed-finding trends down.',
-    '',
-  ].join('\n');
-}
-
-function writeReports(cfg, ledger, graph) {
-  writeFileSync(abs(cfg.paths.progress), progressMd(cfg, ledger, graph));
-  mkdirSync(abs(cfg.paths.reports), { recursive: true });
-  writeFileSync(abs(cfg.paths.burndown), burndownMd(cfg, ledger, graph));
-  writeFileSync(join(abs(cfg.paths.reports), 'cost-latest.md'), costMd(ledger, readCostHistory(cfg)));
-}
+// ---- report generation (extracted to lib/report-gen.mjs, KI-E364) -------------
+// Local wrappers bind the driver's `abs` resolver so call-sites stay unchanged.
+function writeReports(cfg, ledger, graph) { _writeReports(cfg, ledger, graph, abs); }
 
 // Does a review flow apply to this item? (config reviewFlows[*].appliesWhen vs files[])
 function flowApplies(appliesWhen, wi) {
@@ -362,11 +187,12 @@ function flowApplies(appliesWhen, wi) {
 function applicableReviewFlows(cfg, wi) {
   const rf = cfg.reviewFlows || {};
   const out = [];
-  for (const band of ['method', 'editorial']) {
+  for (const band of ['method', 'editorial', 'nfr']) {
     for (const f of (rf[band] || [])) {
       // Kept in AGREEMENT with factory.js flowsFor: code-review + adversarial + test-review run for
       // every item, and the edge-case hunter runs for EVERY code item too (KI-E12, owner directive
-      // 2026-07-19 — it executes EARLY, pre-band, inside the factory's EdgeScan stage).
+      // 2026-07-19 — it executes EARLY, pre-band, inside the factory's EdgeScan stage). KI-E249: the
+      // 'nfr' band (review.nfr) runs for every code item too, advisory-only (blocking:false in config).
       if (flowApplies(f.appliesWhen, wi)) out.push({ skill: f.skill, routeKey: f.routeKey, band, blocking: !!f.blocking, order: f.order || 0 });
     }
   }
@@ -465,6 +291,7 @@ function cmdSelect(flags) {
       gateSet: cfg.gateSet, hardGates: cfg.hardGates,
       realInfraThemes: cfg.realInfraThemes, blastRadius: cfg.blastRadius,
       auditRoot: cfg.auditRoot, solution: flags.solution || null,
+      includeEscalate: !!(cfg.includeEscalate || flags['include-escalate']), // KI-E348: thread flag to factory.js step-8 gate
     },
     templatesDir: cfg.paths.agents,
     // PR#9 review — the legacy select lane now carries the same brief/profile/policy payload as
@@ -485,6 +312,16 @@ function cmdSelect(flags) {
     }),
   };
   writeJsonAtomic(abs(cfg.paths.runArgs), runArgs);
+  // KI-E355: pre-claim selected items immediately so a second `select` (or a fast-fail dispatch
+  // that exits before factory.js reaches its own claim step) cannot re-select the same items and
+  // waste tokens on duplicate factory runs for the same issue.
+  for (const wi of picked) {
+    if (transition(ledger, wi.id, 'CLAIMED', 'select-pre-claim')) {
+      admitAttempt(ledger.items[wi.id], runArgs.runId, { cycle: ledger.cycle + 1, band: bandFor(byId(graph)[wi.id]) });
+      temit({ source: 'driver', event: 'transition', item: wi.id, cycle: ledger.cycle, outcome: 'CLAIMED' });
+    }
+  }
+  writeJsonAtomic(abs(cfg.paths.ledger), ledger);
   const runScriptPath = emitLauncherScript(cfg, runArgs);
   console.log(`select: ${picked.length}/${ready.length} schedulable item(s) -> ${cfg.paths.runArgs}`);
   if (runScriptPath) console.log(`  launcher: Workflow({scriptPath: "${runScriptPath}"})`);
@@ -503,7 +340,7 @@ function cmdClaim(ids, flags = {}) {
   const ledger = loadLedger(abs(cfg.paths.ledger));
   let n = 0;
   const runId = randomUUID();
-  const eligible = new Set(disjointItems(eligibleItems(graph, ledger, cfg, {}, { repoRoot: REPO_ROOT, dirty: dirtyMainPaths(REPO_ROOT), docker: dockerAvailable() }).filter(w => ids.includes(w.id)), Infinity, { repoRoot: REPO_ROOT }).map(w => w.id));
+  const eligible = new Set(disjointItems(eligibleItems(graph, ledger, cfg, flags, { repoRoot: REPO_ROOT, dirty: dirtyMainPaths(REPO_ROOT), docker: dockerAvailable() }).filter(w => ids.includes(w.id)), Infinity, { repoRoot: REPO_ROOT }).map(w => w.id));
   for (const id of eligible) if (ledger.items[id]?.worktree) preflightProductGitlinks(abs(ledger.items[id].worktree), engineMount);
   for (const id of ids) {
     if (!eligible.delete(id)) continue;
@@ -545,18 +382,68 @@ function cmdReset(ids) {
   console.log(`reset ${n}/${ids.length} to READY`);
 }
 
-// Forward states that imply the run claimed a passing build + green test — the ones a deterministic
-// verify can contradict. A FAILED/BLOCKED/ESCALATED result has nothing to override.
-const FORWARD_PASS = new Set(['GREEN', 'BUILT', 'TESTED', 'GATED', 'REFUTE_OK', 'REAUDITED', 'INTEGRATED', 'CLOSED']);
+// KI-E463 (2026-08-09) — reopen a wrongly-CLOSED item. `canTransition` (lib/ledger.mjs) deliberately
+// gives CLOSED zero outbound edges — TERMINAL means terminal for the AUTOMATIC pipeline (fold must
+// never silently resurrect a done item). But "the automatic pipeline can never reopen CLOSED" and
+// "a human operator can NEVER correct a wrongly-CLOSED item" are two different invariants, and only
+// the first one is actually load-bearing. The live case that surfaced the gap: two sibling items both
+// closed CLEAN on a "no-dissent" recovery fold whose gate map was silently
+// carried forward without a fresh re-gate (KI-E461's root cause) — the ledger said CLOSED, the truth
+// was an undocumented standards-evolution divergence shipped unreviewed (see
+// state/items/{id}/STANDARDS-EVOLUTION-VIOLATION.md). `transition()`/`canTransition()` stay
+// UNCHANGED (the automatic fold path's terminal guarantee is not weakened one bit) — this is a
+// SEPARATE, explicitly human-invoked, lease-gated, `--force`-gated, reason-audited escape hatch;
+// the driver remains the single writer (state/ledger.json is still never hand-edited — this command
+// IS the driver performing the edit, under an explicit owner instruction, with a permanent record of
+// why in the row's own history[]).
+// KI-E463 follow-up (same day): `--to <STATE>` defaults to READY (a genuine restart) but accepts
+// FAILED/ESCALATED/BLOCKED too — the direct-recovery shape (a remedy is ALREADY applied in the
+// worktree; the item only needs a fresh re-verify + re-gate, not a fresh planner/test-author/fixer
+// pass) requires landing on FAILED so `driver.mjs recover <id>` becomes usable immediately
+// afterward. Discovered live: two sibling items both already carried a verified fix by
+// the time they were reopened — reopening straight to READY would have forced them through the
+// FULL fresh pipeline (planner+test-author+fixer) for work that was already correctly done.
+const REOPEN_TARGETS = new Set(['READY', 'FAILED', 'ESCALATED', 'BLOCKED']);
+function cmdReopen(ids, flags) {
+  if (!ids.length) { console.error('usage: reopen <id> [<id>...] --reason "<why>" --force [--to READY|FAILED|ESCALATED|BLOCKED] --controller <token>'); process.exitCode = 1; return; }
+  const reason = (flags.reason || '').trim();
+  if (!reason) { console.error('reopen REFUSED: --reason "<why>" is required — this bypasses the ledger\'s CLOSED-is-terminal guarantee, so the audit trail is mandatory, not optional.'); process.exitCode = 1; return; }
+  if (!flags.force) { console.error('reopen REFUSED: pass --force to confirm — CLOSED has no ordinary transition out (by design; see canTransition in lib/ledger.mjs), so this is a deliberate one-off correction, not a routine command.'); process.exitCode = 1; return; }
+  const to = flags.to ? String(flags.to).toUpperCase() : 'READY';
+  if (!REOPEN_TARGETS.has(to)) { console.error(`reopen REFUSED: --to ${flags.to} is not a valid target (one of ${[...REOPEN_TARGETS].join('/')})`); process.exitCode = 1; return; }
+  const cfg = loadConfig();
+  const graph = loadGraph(abs(cfg.paths.graph));
+  const ledger = loadLedger(abs(cfg.paths.ledger));
+  let n = 0;
+  const froms = new Set();
+  for (const id of ids) {
+    const row = ledger.items[id];
+    if (!row) { console.error(`reopen: skipping "${id}" — no such item in the ledger`); continue; }
+    // READY is accepted too (not just CLOSED): redirecting a just-reopened item onto --to FAILED
+    // (to unlock cmdRecover's direct-recovery scaffolding for a remedy already sitting in the
+    // worktree) without a wasteful second CLOSED round-trip. Never accepts an ACTIVE state — this
+    // stays a terminal/just-reopened-only correction, not a generic force-transition tool.
+    if (!['CLOSED', 'READY'].includes(row.state)) { console.error(`reopen: skipping "${id}" — state is ${row.state}, not CLOSED/READY (use 'reset' or 'recover' for an active state)`); continue; }
+    const from = row.state;
+    row.state = to;
+    row.attempts = 0; // fresh retry budget — a reopen is a genuine restart, not a continuation of the prior (wrongly-closed) attempt count
+    row.gates = {}; // the prior gate map is superseded by definition (that is WHY this is being reopened) — never let a stale verdict linger to be misread as still current
+    row.history.push({ from, to, at: now(), note: `REOPENED (manual, owner-authorized): ${reason}` });
+    row.updatedAt = now();
+    n++;
+    froms.add(from);
+    temit({ source: 'driver', event: 'transition', item: id, cycle: ledger.cycle, outcome: to, attrs: { reopened: true, from, reason: reason.slice(0, 200) } });
+  }
+  ledger.updatedAt = now();
+  writeJsonAtomic(abs(cfg.paths.ledger), ledger);
+  writeReports(cfg, ledger, graph);
+  console.log(`reopen: ${n}/${ids.length} item(s) moved ${[...froms].join('/') || '?'} -> ${to} (reason: ${reason})`);
+}
 
-// KI-D3/D1 + flow-review P1/P2/P3/P6/P9 — deterministic fold-time authority. If a forward/CLOSED result is
-// contradicted by the machine evidence the doing-agents teed, REWRITE the result to FAILED in place (the
-// agent's prose is overruled). Returns an override record or null. Mutates `r`.
-//
-// The load-bearing change (flow review, 2026-06-27): for a CODE item (`r.codeChange`) the machine evidence is
-// MANDATORY, not a fallback — absence of a transcript is a FAIL, not an agent-trust pass. A DOC/CONFIG item
-// (codeChange=false) keeps the owner-sanctioned no-machine-evidence fallback (it is verified by the grep/
-// acceptance assertion the runner reports, and produces no dotnet transcript).
+// Upstream portable-evidence / opencode-runtime-binding subsystem (factory/efficiency-hardening) —
+// a launch is hashed at claim/group time (sealLaunch) so a later opencode runtime dispatch can prove
+// its reviewer/policy/routing/engine-mount context is IDENTICAL to what the driver actually claimed
+// (bind-runtime), and a recovery's own evidence contract can be sealed the same way (seal-recovery).
 function portableContractFor(cfg, item, launchConfig = {}) {
   const config = { ...readJson(join(FACTORY_ROOT, 'config/factory.config.json')),
     ...(existsSync(join(FACTORY_ROOT, 'config/factory.config.local.json')) ? readJson(join(FACTORY_ROOT, 'config/factory.config.local.json')) : {}),
@@ -598,8 +485,12 @@ function cmdSealRecovery(ids) {
   if (!row?.attemptIdentity?.recovery || row.recoveryVerification?.version !== 2) throw new Error('seal-recovery requires current prepared recovery');
   const wi = byId(loadGraph(abs(cfg.paths.graph)))[ids[0]];
   const itemDir = abs(join(cfg.paths.items, ids[0])), worktree = abs(row.worktree);
+  let baselineText = null;
+  const baselinePath = abs(join(cfg.paths.items, ids[0], 'baseline-raw.txt'));
+  if (existsSync(baselinePath)) baselineText = decodeTranscript(readFileSync(baselinePath));
+  const baseline = captureBaseline(baselineText, { worktree });
   const proof = sealRecoveryEvidence({ result: { runId: row.runId, claimId: row.claimId }, row, itemDir, worktree, repoRoot: REPO_ROOT,
-    codeChange: row.recoveryVerification.codeChange, evidenceInputs: cfg.evidenceInputs || {}, engineMount: driverEngineMount(REPO_ROOT, FACTORY_ROOT) });
+    codeChange: row.recoveryVerification.codeChange, evidenceInputs: cfg.evidenceInputs || {}, engineMount: driverEngineMount(REPO_ROOT, FACTORY_ROOT), baseline });
   if (!proof.pass) throw new Error('seal-recovery: ' + proof.reason);
   if (portableHash(wi) !== row.recoveryVerification.graphHash) throw new Error('recovery graph changed');
   row.recoveryVerification.hashes = proof.hashes;
@@ -607,6 +498,18 @@ function cmdSealRecovery(ids) {
   console.log('recovery proof sealed: ' + ids[0]);
 }
 
+// Forward states that imply the run claimed a passing build + green test — the ones a deterministic
+// verify can contradict. A FAILED/BLOCKED/ESCALATED result has nothing to override.
+const FORWARD_PASS = new Set(['GREEN', 'BUILT', 'TESTED', 'GATED', 'REFUTE_OK', 'REAUDITED', 'INTEGRATED', 'CLOSED']);
+
+// KI-D3/D1 + flow-review P1/P2/P3/P6/P9 — deterministic fold-time authority. If a forward/CLOSED result is
+// contradicted by the machine evidence the doing-agents teed, REWRITE the result to FAILED in place (the
+// agent's prose is overruled). Returns an override record or null. Mutates `r`.
+//
+// The load-bearing change (flow review, 2026-06-27): for a CODE item (`r.codeChange`) the machine evidence is
+// MANDATORY, not a fallback — absence of a transcript is a FAIL, not an agent-trust pass. A DOC/CONFIG item
+// (codeChange=false) keeps the owner-sanctioned no-machine-evidence fallback (it is verified by the grep/
+// acceptance assertion the runner reports, and produces no dotnet transcript).
 function deterministicVerifyOverride(cfg, ledger, wi, r) {
   const claims = (r.transitions || []).concat(r.toState ? [r.toState] : []);
   if (!claims.some((s) => FORWARD_PASS.has(s) || s === 'ESCALATED')) return null;
@@ -647,17 +550,19 @@ function deterministicVerifyOverride(cfg, ledger, wi, r) {
   const baselineCount = effectiveBaseline(r.baselineFailures, baselineParse);
   const baselineOptions = { worktree: abs(ledger.items[id]?.worktree || r.worktree || '') };
   const baseline = captureBaseline(baselineText, baselineOptions);
-  // KI-E163 (ported from a host-mount session) — defense-in-depth for KI-E162's upstream fix.
+  // KI-E490 (2026-09-12, a prior item's incident) — defense-in-depth for KI-E489's upstream fix.
   // `baseline` reads as 0 for two very different reasons that are indistinguishable in the number
   // alone: a REAL measurement (a baseline run genuinely found zero pre-existing failures) or a
   // PHANTOM default (nothing was EVER captured or reported, so effectiveBaseline's Math.max(0,0)
-  // silently reads identically to "measured clean"). A phantom 0 is exactly what let a deterministic
-  // override deterministically FAIL an item repeatedly on failures independently reproduced on a
-  // completely clean checkout with zero relation to the item's own diff, on the origin host. KI-E162
-  // closes the upstream gap (a reFix round now captures a baseline when none exists) — but a prompt
-  // instruction is not a guarantee an agent follows it every time, on every item shape. This is the
-  // downstream half: even when the prompt-side fix does not take, the override's own message stops
-  // presenting a phantom 0 with the same unqualified confidence as a real measurement.
+  // silently reads identically to "measured clean"). A phantom 0 is EXACTLY what let that item be
+  // deterministically FAILED three times on failures independently reproduced on a completely clean
+  // master checkout with zero relation to the item's diff. KI-E489 closes the upstream gap (a reFix
+  // round now captures a baseline when none exists) — but a prompt instruction is not a guarantee an
+  // agent follows it every time, on every item shape. This is the downstream half: even when the
+  // prompt-side fix does not take, the override's own message stops presenting a phantom 0 with the
+  // same unqualified confidence as a real measurement, so a human reading the escalation queue (or a
+  // future session investigating a repeat) sees the caveat immediately instead of having to
+  // rediscover it from scratch the way this incident required.
   const baselineIsPhantom = isPhantomBaseline(baselineCount, r.baselineFailures, baselineParse);
   const annotateBaseline = (reason) => annotateBaselineReason(reason, baselineIsPhantom);
   const fail = (reason) => {
@@ -746,7 +651,7 @@ function deterministicVerifyOverride(cfg, ledger, wi, r) {
     // KI-E132: r.verificationOnly is a copy captured when this checkpoint was produced — it goes STALE
     // when an item is re-claimed for a later re-verification round whose fresh test.json/verify-red-raw.txt
     // overwrite the very files this check reads, without ever updating the embedded r object (itself often
-    // reconstructed from an EARLIER, now-superseded checkpoint — live: PAYMENTS-M4/MARKETING-M3/RISK-M3,
+    // reconstructed from an EARLIER, now-superseded checkpoint — live: several sibling items,
     // cycle 82, each a fully-13-gates-APPROVED item re-claimed for a redundant "is this still fixed?" pass
     // whose legitimate exit=0 confirmation then read as "vacuous test" against the stale embedded flag).
     // Re-derive from the on-disk test.json — the SAME freshness tier as verify-red-raw.txt below — and
@@ -820,6 +725,26 @@ function deterministicVerifyOverride(cfg, ledger, wi, r) {
     return fail('fix changed NO non-test source file (diff touched only tests) — the test was greened but the root cause was not fixed');
   }
 
+  // P11 (KI-E471) — PHANTOM MANIFEST: every file the fix CLAIMS it changed must actually appear in the
+  // worktree diff. P9 above only asks whether SOME non-test file changed, so a fixer that claimed three
+  // files and touched one sails through it — the exact partial-work-reported-as-complete signature
+  // (KI-E93/E94/E96, and the 2026-08-09 haiku batch's three false "COMPLETE" reports). Free: `changed`
+  // is already computed for debris/P9. Deliberately conservative — suffix-tolerant matching in both
+  // directions, skipped entirely for a gone worktree, and it only fires on a claim with no plausible
+  // counterpart at all, because a false FAIL costs a whole re-band. KI-E470 makes this sharper still:
+  // a stepwise run's manifest is the UNION of per-step claims, so a phantom names the step that lied.
+  if (codeChange && r.verificationOnly !== true && changed && Array.isArray(r.filesChanged) && r.filesChanged.length) {
+    const phantoms = phantomManifest(changed, r.filesChanged);
+    if (phantoms.length) {
+      // KI-E134: phantoms carries the ORIGINAL claimedFiles entries (possibly {path,change} objects,
+      // per pathToken's object-shape handling above) — display the extracted path, never a bare
+      // String(entry) that renders an object as "[object Object]".
+      return fail('phantom manifest (KI-E471): fix.json claims ' + phantoms.length + ' file(s) it never changed — ' + phantoms.map((p) => pathToken(p) || JSON.stringify(p)).join(', ')
+        + (r.fixSteps ? ' [stepwise run of ' + r.fixSteps + ' step(s): one of them reported work it did not do]' : '')
+        + '. The worktree diff touched: ' + (changed.length ? changed.slice(0, 12).join(', ') : '(nothing)'));
+    }
+  }
+
   // P6 — integrate transcript existence: a code item that reached INTEGRATED/CLOSED must have teed it (the
   // green + contradiction checks already ran above via iVerdict; this asserts the transcript is actually there).
   if (codeChange && r.integrateRaw && (r.toState === 'INTEGRATED' || r.toState === 'CLOSED' || claims.includes('INTEGRATED'))) {
@@ -843,12 +768,11 @@ function escalateExhausted(ledger, cfg) {
     // never disagree: the retry budget is spent, OR the trajectory has stalled (consecutive rounds
     // with no reduction in blocking findings — spending the remaining band is near-certain waste).
     const stalled = isStalled(cfg, row);
-    // KI-E167 (ported from a host-mount session) — the stall may have been detected via the original
-    // gate-band finding-count trend OR the pre-band failure-signature fallback (row.stallReason,
-    // persisted by applyStallDetection since neither this function nor its caller sees that
-    // function's per-call return value) — phrase the escalation note to match the evidence that
-    // actually fired, instead of always claiming "blocking findings did not shrink" for a trajectory
-    // that may never have reached the gate band at all.
+    // KI-E167: the stall may have been detected via the original gate-band finding-count trend OR the
+    // pre-band failure-signature fallback (row.stallReason, persisted by applyStallDetection since
+    // neither this function nor its caller sees that function's per-call return value) — phrase the
+    // escalation note to match the evidence that actually fired, instead of always claiming "blocking
+    // findings did not shrink" for a trajectory that may never have reached the gate band at all.
     const stallNote = stalled
       ? (row.stallReason === 'signature'
         ? `auto-escalated: NO-PROGRESS on ${row.stallRounds} consecutive round(s) — the SAME pre-band failure ("${row.lastFailSignature}") repeated verbatim with no gate-band data to compare — after ${row.attempts} attempt(s); another band is near-certain waste — needs a human`
@@ -861,6 +785,74 @@ function escalateExhausted(ledger, cfg) {
     }
   }
   return out;
+}
+
+// KI-E461 (2026-08-09) — recovery gate-freshness override. Sibling check to deterministicVerifyOverride
+// above, same fold pass, same "rewrite the result to FAILED in place" contract — but where that check
+// catches a false GREEN claim, this one catches a TRUE green claim that never got independently
+// reviewed. Live case: a "no-dissent" recovery (deterministic-override failure — a stale test, a flaky
+// suite) legitimately carries its gates map FORWARD unchanged when the remedy touches nothing the
+// prior gates didn't already see. But a prior item (cycle 60r) applied a REAL code remedy
+// (AddHostDataProtection(..., skipCertificateProtection) with a shape that has no precedent
+// anywhere else in the repo) under exactly that carried-forward path — the fold succeeded because
+// every machine-evidence check passed (build clean, suite green) and the gates map was 100% APPROVED,
+// but not one of those approvals had ever looked at the new code. gate-architect.md already carries
+// the relevant checklist item ("a standards-evolution.md ledger entry + call-site tag exist IN THIS
+// DIFF, else it fails here") — the gap was never a missing check, it was the recovery mechanism
+// skipping the gate entirely. This override closes that: a recovery fold with codeChange=true must
+// show a gate:developer verdict (and gate:architect, when the item's own gate set carries one) whose
+// on-disk verdict file postdates the worktree's latest code change — a carried-forward or missing
+// verdict file fails the fold, in place, before it ever reaches CLOSED.
+function recoveryGateFreshnessOverride(cfg, ledger, wi, r) {
+  const isRecovery = typeof r.resultId === 'string' && /#\d+r\d*$/.test(r.resultId);
+  if (!isRecovery || !r.codeChange) return null;
+  const claims = (r.transitions || []).concat(r.toState ? [r.toState] : []);
+  if (!claims.some((s) => FORWARD_PASS.has(s))) return null; // nothing forward-claimed to override
+  const id = r.id;
+  const wtRel = r.worktree || (ledger.items[id] && ledger.items[id].worktree);
+  if (!wtRel) return null; // no worktree recorded — nothing to compare mtimes against
+  const wtAbs = presolve(REPO_ROOT, wtRel);
+  if (!existsSync(wtAbs)) return null; // gc'd worktree — deterministicVerifyOverride's own transcript checks are the only evidence left
+  let changed = [];
+  try { changed = changedFiles(wtAbs); } catch { return null; }
+  if (!changed.length) return null; // nothing changed in the tree — no remedy to have skipped review
+  let latestWorktreeMtime = 0;
+  for (const f of changed) {
+    try { const m = statSync(join(wtAbs, f)).mtimeMs; if (m > latestWorktreeMtime) latestWorktreeMtime = m; } catch { /* deleted/renamed file — skip */ }
+  }
+  if (!latestWorktreeMtime) return null;
+  const itemDir = abs(join(cfg.paths.items, id));
+  const gateFileMtimes = {};
+  for (const gk of ['gate:developer', 'gate:architect']) {
+    const role = roleForGateKey(gk);
+    try { gateFileMtimes[role] = statSync(join(itemDir, role + '.md')).mtimeMs; } catch { gateFileMtimes[role] = null; }
+  }
+  // KI-E465: content-addressed fallback — read whatever stamp survived from the last time this
+  // gate genuinely passed freshness, and hash the CURRENT changed-file content the same way.
+  const stampFile = join(itemDir, '.gate-freshness.json');
+  let stamps = {};
+  try { stamps = JSON.parse(readFileSync(stampFile, 'utf8')); } catch { stamps = {}; }
+  const currentEntries = changed.map((f) => { try { return { path: f, content: readFileSync(join(wtAbs, f), 'utf8') }; } catch { return { path: f, content: null }; } });
+  const currentHash = hashFileList(currentEntries);
+  const problems = staleRecoveryGates(r.gates, gateFileMtimes, latestWorktreeMtime, stamps, currentHash);
+  if (problems.length) {
+    r.transitions = ['FAILED']; r.toState = 'FAILED';
+    r.note = 'deterministic fold-time override (KI-E461 — recovery gate freshness): ' + problems.join('; ') + (r.note ? ' [agent claimed: ' + r.note + ']' : '');
+    return { id, reason: 'stale-recovery-gates: ' + problems.join('; ') };
+  }
+  // Freshness held (by mtime or by the KI-E465 content fallback) — stamp the CURRENT content hash
+  // for every gate role this item's gates map actually carries, so a LATER recovery attempt on
+  // this same item (another infra death, another aborted relaunch) can skip a redundant
+  // gate-developer/gate-architect re-dispatch when the content genuinely hasn't changed.
+  try {
+    const nextStamps = { ...stamps };
+    for (const gk of ['gate:developer', 'gate:architect']) {
+      if (!r.gates || !r.gates[gk]) continue;
+      nextStamps[roleForGateKey(gk)] = currentHash;
+    }
+    writeFileSync(stampFile, JSON.stringify(nextStamps, null, 2));
+  } catch { /* best-effort — never blocks the fold on a stamp write failure */ }
+  return null;
 }
 
 function cmdFold(file, flags) {
@@ -988,6 +980,10 @@ function cmdFold(file, flags) {
   // Deterministic verify BEFORE the fold so a false-pass is rewritten to FAILED before it is recorded.
   const overrides = [];
   for (const r of arr) { const ov = deterministicVerifyOverride(cfg, ledger, items[r.id], r); if (ov) overrides.push(ov); }
+  // KI-E461 — recovery gate-freshness override: a second, independent pass over the SAME results.
+  // Skips anything the check above already flipped to FAILED (its own FORWARD_PASS guard excludes
+  // FAILED), so this never double-processes an already-rejected result.
+  for (const r of arr) { const ov = recoveryGateFreshnessOverride(cfg, ledger, items[r.id], r); if (ov) overrides.push(ov); }
   // KI-L31 — feedback.md: the AUTHORITATIVE reFix feedback, projected deterministically from the
   // structured verdicts each result RETURNED (gateDetails). One writer (this fold), regenerated per
   // attempt — the reFix loop no longer depends on N reviewer agents remembering to write their
@@ -1001,9 +997,9 @@ function cmdFold(file, flags) {
       const dir = abs(join(cfg.paths.items, r.id));
       if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
       const fbPath = join(dir, 'feedback.md');
-      // KI-E166 (ported from a host-mount session) — preserve prior-cycle feedback instead of
-      // silently discarding a still-open finding the instant a LATER cycle fails for a different
-      // reason — see lib/feedback.mjs's own comment for the incident this closes.
+      // KI-E166: preserve prior-cycle feedback instead of silently discarding a still-open finding
+      // the instant a LATER cycle fails for a different reason — see lib/feedback.mjs's own comment
+      // for a prior sweep incident this closes.
       let priorFb = null;
       try { if (existsSync(fbPath)) priorFb = readFileSync(fbPath, 'utf8'); } catch { /* best-effort — no prior file readable is the same as none existing */ }
       writeFileSync(fbPath, mergeFeedbackHistory(fb, priorFb));
@@ -1160,16 +1156,17 @@ function cmdFold(file, flags) {
       if (committedDrift.length) console.log(`  ℹ COMMITTED DELIVERY ${r.id} (KI-E35): item files changed in main via HUMAN commits during the run window (clean per git status) — likely the operator committed this item's output; verify intent, no repair needed:\n` + committedDrift.map((d) => `      ${d.file} (${d.was} -> ${d.now})`).join('\n'));
     } catch { /* detection aid only */ }
   }
-  // KI-E146 (ported from a host-mount session) — the KI-E89 unclaimed-drift sweep, run here for the
-  // first time. Every prior invocation site was `cmdMainCheck`, a command an operator has to remember
-  // to run manually; `fold` runs automatically every single cycle and, until now, never looked for
-  // this class at all — the per-item loop just above can only ever check a path some item's OWN
-  // snapshot declared, so a stray NEW file an agent creates ad-hoc (never in any files[]) is invisible
-  // to it by construction. Live cost of the gap on the origin host: a stray file left by one item sat
-  // unreported through that cycle's own fold, then poisoned an entire SEPARATE, unrelated batch's
-  // main-check sweep the NEXT cycle (KI-E144) — a whole cycle of silence in between during which
-  // nobody had reason to run `main-check` by hand. This closes the "just happened not to look" window
-  // by surfacing it at the ONE checkpoint that always runs, not the one that sometimes does.
+  // KI-E146 — the KI-E89 unclaimed-drift sweep, run here for the first time. Every prior invocation
+  // site was `cmdMainCheck`, a command an operator has to remember to run manually; `fold` runs
+  // automatically every single cycle and, until now, never looked for this class at all — the
+  // per-item loop just above can only ever check a path some item's OWN snapshot declared, so a
+  // stray NEW file an agent creates ad-hoc (never in any files[]) is invisible to it by construction.
+  // Live cost of the gap, this session: a stray `SomeService/.../SomeRegressionTests.cs`
+  // left by a prior item (cycle 92) sat unreported through that cycle's own fold, then poisoned
+  // an entire SEPARATE, unrelated 6-item batch's main-check sweep the NEXT cycle (KI-E144) — a whole
+  // cycle of silence in between during which nobody had reason to run `main-check` by hand. This
+  // closes the "just happened not to look" window by surfacing it at the ONE checkpoint that always
+  // runs, not the one that sometimes does.
   // Deliberately still NEVER auto-repaired, same as `cmdMainCheck`'s own posture (KI-E89's header
   // comment is explicit about why: an unclaimed path could be agent contamination OR an operator's
   // own unrelated work-in-progress sitting in the same tree, and there is no snapshot to prove which
@@ -1187,10 +1184,11 @@ function cmdFold(file, flags) {
     }
     const unclaimed = unclaimedMainDrift(dirtyMainPaths(REPO_ROOT), MAIN_MOUNT_REL, claimedPaths, { repoRoot: REPO_ROOT });
     if (unclaimed.length) {
-      // KI-E177 (ported from a host-mount session) — an unclaimed path that byte-matches this
-      // fold's OWN item worktrees is overwhelming evidence of leaked contamination, not operator
-      // WIP. Still never auto-repaired (KI-E89's posture is unchanged) — this only upgrades the
-      // signal so a human is not left to manually re-derive the diff-check by hand.
+      // KI-E177 — an unclaimed path that byte-matches this fold's OWN item worktrees is overwhelming
+      // evidence of leaked write-isolation contamination, not operator WIP (an operator's real file
+      // would need to coincidentally match both the exact path AND the exact bytes of a factory
+      // item's worktree copy). Still never auto-repaired (KI-E89's posture is unchanged) — this only
+      // upgrades the signal so a human is not left to manually re-derive the diff-check by hand.
       const debris = matchWorktreeDebris(REPO_ROOT, unclaimed, arr.map((r) => r.id), abs(cfg.paths.worktreesState));
       const matched = debris.filter((d) => d.matchedItem);
       const truly = debris.filter((d) => !d.matchedItem).map((d) => d.path);
@@ -1228,7 +1226,7 @@ function cmdFold(file, flags) {
     if (row?.attemptIdentity && applied.some(a => a.id === r.id)) row.attemptIdentity.completedAt ||= now();
   }
   writeJsonAtomic(abs(cfg.paths.ledger), ledger);
-  recordCostSnapshot(cfg, ledger); // per-cycle cost snapshot for the trend (observability, not a gate)
+  recordCostSnapshot(cfg, ledger, abs); // per-cycle cost snapshot for the trend (observability, not a gate)
   writeReports(cfg, ledger, graph);
   cmdEscalationsSync(cfg, ledger, true);
   // KI-E7 telemetry (spine AD-2/AD-11): the authoritative fold record + the deterministic
@@ -1295,27 +1293,77 @@ function cmdFold(file, flags) {
   if (escalated.length) console.log('  auto-escalated (retry-bound exhausted -> queue):', escalated.join(', '));
   if (skipped.length) console.log('  skipped (already folded, idempotent):', skipped.map((s) => s.resultId).join(', '));
   if (rejected.length) console.log('  rejected:', JSON.stringify(rejected));
+  // KI-E228: a hand-authored (or pre-KI-E223 cmdRecover-scaffolded) recovery-fold's transitions[]
+  // always starts at CLAIMED, which canTransition only allows from FAILED/CONFLICT/READY — an
+  // ESCALATED- or BLOCKED-origin row rejects EVERY hop with a wall of confusing bad-transition
+  // lines unless `reset <id>` ran first (the fix KI-E223 gave to cmdRecover's own scaffold; this
+  // hint generalizes it to any hand-run fold of a recovery file, which has no such auto-reset).
+  const blockedOriginIds = [...new Set(rejected
+    .filter((r) => r.reason === 'bad-transition' && r.to === 'CLAIMED' && (r.from === 'BLOCKED' || r.from === 'ESCALATED'))
+    .map((r) => `${r.id} (${r.from})`))];
+  if (blockedOriginIds.length) console.log(`  hint (KI-E228): ${blockedOriginIds.join(', ')} — row is still in its origin state, so CLAIMED (where every recovery-fold transitions[] starts) is an illegal first hop. Run \`driver.mjs reset <id>\` first (KI-E223), then retry this SAME fold file. If the retry then says "no new current results (already folded or stale)", the resultId was already consumed by an earlier rejected/escalating attempt — bump its suffix (e.g. #118r1 -> #118r2) in the fold JSON and retry again.`);
+  // KI-E455: feed the self-improvement learning trackers from THIS fold unless the caller is
+  // orchestrate.mjs's own normal per-lane loop (which already does this itself — see backfillTrackers's
+  // doc comment for the full rationale).
+  backfillTrackers(flags, applied);
 }
 
-// KI-E140 (ported from a host-mount session) — record what launched, for the ONE thing the driver
-// structurally cannot check itself: whether a PRIOR attempt's Workflow task is actually dead before a
-// NEW one relaunches into the SAME worktree path. Only the controller session holds a
+// KI-E455 — dependency-injected (mirrors reconcileClosedCandidates's pattern in this same file) so
+// it is unit-testable without a real subprocess or filesystem. Feeds zero-closure-stop, hillClimb,
+// bandit, simulated annealing, prompt evolution, config optimizer, recalibrate, and post-batch-
+// failure-analysis from a just-applied fold. orchestrate.mjs's own normal per-lane loop already
+// calls these same functions itself right after runLane returns — its fold invocation (line ~491)
+// passes --skip-tracker-update to avoid double-counting. Every OTHER caller (a manual `driver.mjs
+// fold`, `reconstruct`+`fold`, `recover`+`seal-recovery`+fold, `reconcile-closed`'s internal fold)
+// gets this by default, closing the gap where a manual-recovery path silently never fed the learning
+// algorithms (first observed 2026-11-08: a a recovery folded two sibling items cleanly but
+// hillClimb/bandit/SA/retrospective/zero-closure-streak never saw it). Spawned as a subprocess (not
+// a dynamic `import()` of orchestrate.mjs) because that file's CLI dispatch runs unconditionally at
+// module top level with no "only run as main" guard — importing it directly would execute that
+// dispatch as a side effect. Best-effort: a tracker-backfill failure is logged and swallowed, never
+// surfaces as a fold failure to the caller. Returns true if a backfill was attempted (regardless of
+// its own success/failure), false if skipped (flag set, or nothing was applied this fold).
+function backfillTrackers(flags, applied, deps = {}) {
+  const {
+    writeJsonAtomic: writeJson = writeJsonAtomic, unlinkSync: unlink = unlinkSync,
+    execFileSync: execFile = execFileSync, randomUUID: uuid = randomUUID, join: pathJoin = join,
+    factoryRoot = FACTORY_ROOT, log = (s) => console.log(s),
+  } = deps;
+  if (flags['skip-tracker-update'] || !applied.length) return false;
+  const payloadPath = pathJoin(factoryRoot, 'state', `.tracker-backfill-${uuid()}.json`);
+  try {
+    writeJson(payloadPath, { ids: applied.map((r) => r.id), applied });
+    const bf = execFile('node', [pathJoin(factoryRoot, 'orchestrator', 'orchestrate.mjs'), 'backfill-trackers', payloadPath], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+    log(String(bf).trim());
+  } catch (e) {
+    log(`  tracker-backfill error (non-fatal, KI-E455): ${(e && e.message) || e}`);
+  } finally {
+    try { unlink(payloadPath); } catch { /* best-effort cleanup */ }
+  }
+  return true;
+}
+
+// KI-E140 — record what launched, for the ONE thing the driver structurally cannot check itself:
+// whether a PRIOR attempt's Workflow task is actually dead before a NEW one relaunches into the SAME
+// worktree path (KI-E474 CONTINUING reuses it across attempts). Only the controller session holds a
 // TaskOutput/TaskStop handle on its own launches — the driver is a separate Node process with no
 // visibility into the harness's task registry — so this command exists purely so the controller can
 // hand the driver something to remember and SURFACE later (cmdResume's KI-E140 reminder), instead of
-// relying on the controller's own memory across a session boundary. Best-effort, read-nothing,
-// writes-only: a bad flag combination logs and no-ops rather than throwing, since this command sits
-// on the hot path right after a real Workflow launch and must never be the reason a controller loses
-// track of what it just started.
-// KI-E176 (ported from a host-mount session) — durable log of every CONTINUED run: a Workflow
-// stopped mid-flight (a deliberate operator pause, a crash, a laptop sleep) and relaunched into
-// the SAME claim/worktree (KI-E140's own relaunch line), as opposed to an independent fresh
-// attempt from a new `group`. The controller declares this explicitly via `--continued` at
-// mark-launched time — only the controller session actually knows it chose to relaunch rather
-// than re-claim, so this is not something the driver can infer from ledger state alone (a
-// stranded CLAIMED row looks identical either way). Renders the accumulated history
-// (continuedRunsMd, lib/telemetry.mjs) to reports/continued-runs.md on every logged continuation
-// so the operator always has an up-to-date record with no separate report command needed.
+// relying on the controller's own memory across a session boundary (the exact thing that goes missing
+// — this session's own CONTINUE_PROMPT handoff for a prior item's 3rd attempt named a taskId that no
+// later session had any way to rediscover without the operator's handoff notes). Best-effort,
+// read-nothing, writes-only: a bad flag combination logs and no-ops rather than throwing, since this
+// command sits on the hot path right after a real Workflow launch and must never be the reason a
+// controller loses track of what it just started.
+// KI-E176 (2026-09-14) — durable log of every CONTINUED run: a Workflow stopped mid-flight (a
+// deliberate operator pause, a crash, a laptop sleep) and relaunched into the SAME claim/worktree
+// (KI-E140's own relaunch line), as opposed to an independent fresh attempt from a new `group`. The
+// controller declares this explicitly via `--continued` at mark-launched time — only the controller
+// session actually knows it chose to relaunch rather than re-claim, so this is not something the
+// driver can infer from ledger state alone (a stranded CLAIMED row looks identical either way).
+// Renders the accumulated history (continuedRunsMd, lib/telemetry.mjs) to reports/continued-runs.md
+// on every logged continuation so the operator always has an up-to-date record with no separate
+// report command needed.
 function cmdMarkLaunched(flags) {
   const cfg = loadConfig();
   const ids = (flags.ids || '').split(',').map((s) => s.trim()).filter(Boolean);
@@ -1458,26 +1506,32 @@ function cmdResume(flags) {
         if (committed.length) console.log(`    ℹ MAIN-GUARD ${id} (KI-E41/KI-E35): item files changed in main via HUMAN commits since claim (clean per git status) — verify the relaunch is still meaningful against the new main:\n` + committed.map((d) => `        ${d.file}`).join('\n'));
       } catch (e) { console.log(`    MAIN-GUARD ${id} SKIPPED (${e && e.message}) — treat as UNCHECKED, not clean (KI-E41; never blocks the relaunch listing)`); }
     }
-    // KI-E140 (ported from a host-mount session) — TASK-LIVENESS REMINDER. A relaunch issued before a
-    // JUST-killed attempt's task is confirmed torn down risks two live attempts racing the SAME
-    // worktree path. The driver cannot check this itself — only the controller session holds a
-    // TaskOutput/TaskStop handle — so this is a REMINDER, mechanically surfaced instead of left to
-    // memory: if the controller recorded {runId, taskId} to state/items/<id>/launch-meta.json right
-    // after ITS OWN prior launch, print it here so the relaunch line is never copied without a
-    // liveness check. Read-only; a missing file (nothing recorded, or an old session that predates
-    // this convention) is silent, never a warning — this is a best-effort aid for controller
-    // behaviour this file cannot enforce, not a detector with a false-negative to worry about.
+    // KI-E140 — TASK-LIVENESS REMINDER. KI-E485's leading (unproven) root-cause hypothesis for a
+    // worktree drifting via a mutation path no probe explains is a stray/duplicate runItem() for the
+    // SAME id, from an incompletely-terminated PRIOR attempt whose task the controller never confirmed
+    // dead before relaunching into the SAME worktree path (KI-E474 CONTINUING reuses it across
+    // attempts). This session verified live that a Workflow task does NOT appear to survive the
+    // session that spawned it (TaskOutput on a prior attempt's task id returned "No task found" after
+    // a session boundary) — reassuring for the cross-session case, but the within-session case (a
+    // relaunch issued before a JUST-killed attempt's task is confirmed torn down) remains exactly the
+    // window KI-E485 could not rule out. The driver cannot check this itself — only the controller
+    // session holds a TaskOutput/TaskStop handle — so this is a REMINDER, mechanically surfaced
+    // instead of left to memory: if the controller recorded {runId, taskId} to
+    // state/items/<id>/launch-meta.json right after ITS OWN prior launch (SKILL.md § Recovery), print
+    // it here so the relaunch line is never copied without a liveness check. Read-only; a missing
+    // file (nothing recorded, or an old session that predates this convention) is silent, never a
+    // warning — this is a best-effort aid for controller behaviour this file cannot enforce, not a
+    // detector with a false-negative to worry about.
     for (const id of relaunchIds) {
       try {
         const metaPath = abs(join(cfg.paths.items, id, 'launch-meta.json'));
         if (!existsSync(metaPath)) continue;
         const meta = readJson(metaPath);
         if (meta && meta.taskId) {
-          // KI-E154 (ported from a host-mount session): disk-only evidence the driver CAN compute
-          // itself, alongside (never instead of) the TaskOutput check below — a stale "running" status
-          // in the harness's own tracker (the live incident this was built for: 12+ hours reported
-          // running, zero file activity in the item dir the entire time) is exactly the case this
-          // catches that TaskOutput alone would miss.
+          // KI-E154: disk-only evidence a driver CAN compute itself, alongside (never instead of) the
+          // TaskOutput check below — a stale "running" status in the harness's own tracker (the live
+          // incident this was built for: 12+ hours reported running, zero file activity in the item
+          // dir the entire time) is exactly the case this catches that TaskOutput alone would miss.
           const stall = stallSuspected(abs(join(cfg.paths.items, id)), meta.launchedAt, 30);
           const stallNote = stall && stall.suspected
             ? ` STALL SUSPECTED (KI-E154): launched ${stall.ageMinutes}min ago with ${stall.newestActivityAgeMinutes === null ? 'zero file activity since' : `nothing newer than ${stall.newestActivityAgeMinutes}min ago`} in state/items/${id}/ — past the ${stall.grace}min grace period a real run almost always has written SOMETHING by now (this is disk evidence, not a liveness proof; still confirm with TaskOutput before relaunching).`
@@ -1543,9 +1597,12 @@ function cmdResume(flags) {
             const claimHist = ((row && row.history) || []).filter((h) => h.to === 'CLAIMED');
             const claimMs = claimHist.length ? Date.parse(claimHist[claimHist.length - 1].at) : 0;
             const itemDir = abs(join(cfg.paths.items, id));
-            // KI-E158(i) (ported from a host-mount session) — a rejected attempt never reuses
-            // test/fix; see lib/prior-attempt.mjs's own comment for the incident this fixes.
-            const pa = loadPriorAttempt(itemDir, claimMs || undefined, it.reFix);
+            // KI-E158(i): same reFix guard as cmdGroup's call site — a rejected attempt never reuses
+            // test/fix (see lib/prior-attempt.mjs's own comment for the incident). `changed`
+            // is passed as undefined here (unlike cmdGroup's call site) — this relaunch path does not
+            // already have a worktree-diff read in scope at this point; the reFix guard above is a
+            // hard disable regardless, so the omission only affects the (non-reFix) KI-E474 proof.
+            const pa = loadPriorAttempt(itemDir, claimMs || undefined, undefined, it.reFix);
             delete it.priorAttempt;
             const stages = priorAttemptStages(pa);
             if (stages.length) { it.priorAttempt = pa; reusedAny = true; console.log(`    KI-E69: ${id} will REUSE {${stages.join(', ')}} from its already-on-disk attempt — verify onward still runs fresh`); }
@@ -1587,7 +1644,6 @@ function cmdResume(flags) {
           const regenPath = emitLauncherScript(cfg, runArgs, labelSlug);
           if (!regenPath) throw new Error('launcher regeneration failed; no fresh identity persisted');
           writeJsonAtomic(freshArgsPath, runArgs);
-          sealLaunch(draft, runArgs);
           Object.assign(ledger, draft);
           writeJsonAtomic(abs(cfg.paths.ledger), ledger);
           for (const id of ids) observeReservation(ledger.items[id], id);
@@ -1599,19 +1655,22 @@ function cmdResume(flags) {
     for (const [oldScript, newScript] of freshLaunches) {
       const ids = relaunch.get(oldScript); relaunch.delete(oldScript); relaunch.set(newScript, ids);
     }
-    // KI-E160 (ported from a host-mount session, live incident) — `script` is recorded ONCE, at claim
-    // time — the shared, UNLABELED default path (state/run-script.js/run-args.json) can be, and was,
-    // overwritten by a LATER, completely unrelated `group` call before this item was ever relaunched.
-    // The relaunch line below used to be printed unconditionally, trusting the recorded PATH with no
-    // check that its CURRENT on-disk content still corresponds to `ids` — so a stale recommendation
-    // looked identical to a fresh one, and a copied-and-launched stale line silently re-ran WHATEVER
-    // items the script currently held instead of the intended one. Fix: before printing each relaunch
-    // line, read the script's sibling run-args.json (same derivation --reuse above already uses) and
-    // verify every id in `ids` is still actually present in its items[]. A mismatch prints a loud STALE
-    // LAUNCHER warning naming exactly which ids are missing and the resume --reset-stale + group
-    // --label recovery, instead of a relaunch line that looks identical to a trustworthy one. Fail-open
-    // on an unreadable run-args (UNVERIFIED, never silently "clean") — this is a warning layer, never a
-    // hard block, since resume must never refuse to print anything.
+    // KI-E160 (2026-09-12, live incident): `script` is recorded ONCE, at claim time — the shared,
+    // UNLABELED default path (state/run-script.js/run-args.json) can be, and was, overwritten by a
+    // LATER, completely unrelated `group` call before this item was ever relaunched. The relaunch line
+    // below used to be printed unconditionally, trusting the recorded PATH with no check that its
+    // CURRENT on-disk content still corresponds to `ids` — so a stale recommendation looked identical
+    // to a fresh one. Live cost: a prior item's claim recorded `state/run-script.js`; a later 6-item
+    // cycle-95 `group` call (unlabeled) overwrote that same default path; the printed relaunch line was
+    // copied and launched, silently RE-RUNNING the 6 already-folded cycle-95 items from scratch instead
+    // of that item — ~4 hours and 16.8M tokens for zero new work, discovered only because the
+    // resulting task-notification's OWN payload didn't match the item it was supposedly for. Fix: before
+    // printing each relaunch line, read the script's sibling run-args.json (same derivation --reuse
+    // above already uses) and verify every id in `ids` is still actually present in its items[]. A
+    // mismatch prints a loud STALE LAUNCHER warning naming exactly which ids are missing and the
+    // resume --reset-stale + group --label recovery, instead of a relaunch line that looks identical
+    // to a trustworthy one. Fail-open on an unreadable run-args (UNVERIFIED, never silently "clean") —
+    // this is a warning layer, never a hard block, since resume must never refuse to print anything.
     for (const [script, ids] of relaunch) {
       let staleIds = [];
       try {
@@ -1772,13 +1831,18 @@ function deliveredInHeadHint(graphItems, id, r) {
   } catch { return ''; }
 }
 
-// KI-E159 (ported from a host-mount session) — a BLOCKED/ESCALATED item's decision.md is generated
-// ONCE, from whatever probe/gate flagged it at that moment — but a LATER pass in the same pipeline
-// run can independently REVERSE the finding decision.md was built from, and nothing regenerates
-// decision.md or un-blocks the item when that happens. A stale decision.md steers a human toward
-// ruling on a finding a later review/gate file already reversed on disk. Deliberately a SURFACING fix
-// only, never auto-unblocking: a false positive on an auto-unblock would be worse than the staleness
-// itself, so this only tells the human reading the queue to re-check the newer file before ruling.
+// KI-E159 (a live item, cycle 95): a BLOCKED/ESCALATED item's decision.md is generated ONCE,
+// from whatever probe/gate flagged it at that moment — but a LATER pass in the SAME pipeline run
+// (e.g. a review-edgecase.md re-scan after an earlier edge-scan) can independently REVERSE the
+// finding decision.md was built from, and nothing regenerates decision.md or un-blocks the item when
+// that happens. Live: that same item's edge-scan HIGH ("one corrupted-amount saga now throws and
+// aborts the whole sweep") was factually false (the code path it worried about sits inside a
+// catch-all that never rethrows) — the item's OWN later review-edgecase.md pass already reversed it
+// on disk, explicitly marked as reversing the prior round's finding — but decision.md stayed frozen
+// at the earlier, wrong verdict, steering a human toward expanding scope to fix a defect that no
+// longer exists on the record. Deliberately a SURFACING fix only, never auto-unblocking: a false
+// positive on an auto-unblock would be worse than the staleness itself, so this only tells the human
+// reading the queue to re-check the newer file before ruling.
 function staleDecisionHint(itemDir) {
   try {
     const decPath = join(itemDir, 'decision.md');
@@ -1848,8 +1912,8 @@ function cmdReport(which) {
   const graph = loadGraph(abs(cfg.paths.graph));
   const ledger = loadLedger(abs(cfg.paths.ledger));
   if (which === 'progress') { writeFileSync(abs(cfg.paths.progress), progressMd(cfg, ledger, graph)); console.log('wrote', cfg.paths.progress); }
-  else if (which === 'burndown') { writeFileSync(abs(cfg.paths.burndown), burndownMd(cfg, ledger, graph)); console.log('wrote', cfg.paths.burndown); }
-  else if (which === 'cost') { recordCostSnapshot(cfg, ledger); const md = costMd(ledger, readCostHistory(cfg)); writeFileSync(join(abs(cfg.paths.reports), 'cost-latest.md'), md); console.log(md); }
+  else if (which === 'burndown') { writeReports(cfg, ledger, graph); console.log('wrote', cfg.paths.burndown, '+ effectiveness-latest.md'); }
+  else if (which === 'cost') { recordCostSnapshot(cfg, ledger, abs); const md = costMd(ledger, readCostHistory(cfg, abs)); writeFileSync(join(abs(cfg.paths.reports), 'cost-latest.md'), md); writeReports(cfg, ledger, graph); console.log(md); }
 }
 
 // Per-cycle report (reports/cycle-NN.md) from the ledger + item artifacts.
@@ -1896,7 +1960,24 @@ function solutionFor(target) {
       for (const s of arr) if (s && s.solution) _svcMap[String(s.solution).split('/')[0]] = s.solution;
     } catch { /* services.json optional */ }
   }
-  return _svcMap[target] || (target + '/' + target + '.sln');
+  if (_svcMap[target]) return _svcMap[target];
+  // KI-E250 (2026-09-26, live, a shared-library item): for a target with no scripts/services.json entry (a shared
+  // library like a shared OTP helper, referenced from OTHER services' solutions but with no .sln of its own),
+  // the naive "<target>/<target>.sln" guess is frequently just WRONG — and unlike every other value
+  // this function can return, nothing downstream ever re-checks it exists before trusting it as
+  // `primary`: affectedVerificationTargets's own fallback (driver-integration.mjs, "if (!found &&
+  // primary...)") calls containedFile() directly on it, which crashes the ENTIRE group/sweep command
+  // via an uncaught realpathSync ENOENT the moment the guess is wrong — not a graceful "no target
+  // found" the way every other exhausted-resolution path in that function already is (KI-E224 fixed
+  // the sibling case, "found nothing ANYWHERE, not even a guess"; this is "guessed something, but the
+  // guess doesn't exist"). Verify the guess is real before returning it — a target truly missing both
+  // a services.json entry AND a same-named .sln returns null, which affectedVerificationTargets's own
+  // directory-walk (the SAME function, lines above the primary-fallback) already handles gracefully:
+  // it still finds the real owning solution(s) via the file's own directory ancestry (e.g. that item's
+  // the library's own files resolve via two sibling services' .sln files, the
+  // solutions that actually reference the shared library), it just can't shortcut to it via `primary`.
+  const guess = target + '/' + target + '.sln';
+  return existsSync(presolve(REPO_ROOT, guess)) ? guess : null;
 }
 
 // Phase-4 scale-out scheduler: pick a batch of READY items (deps + locks + layer order), create a
@@ -1925,11 +2006,10 @@ function cmdSuggest(flags) {
   const lines = [];
   const say = (s) => { lines.push(s); console.log(s); };
   say(`suggest: ${ready.length} schedulable item(s) -> ${clusters.length} similarity cluster(s) of size >= ${min}`);
-  // KI-E88 (2026-08-24, ported from a host-mount session, adapted to this repo's cluster-based
-  // suggest — the origin session's mixed-batch-fallback target this feature was built for does not
-  // exist here): band-mix surfacing — a FULL-band item runs ~4x the gate panel of LIGHT, so item
-  // COUNT alone gives zero signal for what a batch actually costs. Whole-pool line here; a per-
-  // cluster tally is appended to each cluster's own header below.
+  // KI-E88 (2026-08-24): band-mix surfacing — a FULL-band item runs ~4x the gate panel of LIGHT, so
+  // item COUNT alone gives zero signal for what a batch actually costs. Whole-pool line here; a
+  // per-cluster tally is appended to each cluster's own header below, and the mixed-batch fallback
+  // (RUN_PROMPT §1) further down gets its own slice-specific tally.
   const wholeLight = ready.filter((wi) => bandFor(wi) === 'LIGHT').length;
   say(`  band mix (KI-E88, cost signal — FULL runs ~4x the gate panel of LIGHT): ${wholeLight} LIGHT / ${ready.length - wholeLight} FULL across the whole pool`);
   // KI-E110 — put a NUMBER on that "~4x". The band mix gives the shape; this gives the size, in the
@@ -1996,6 +2076,37 @@ function cmdSuggest(flags) {
       say(`  -> node ${MOUNT_REL}/_workflow/driver.mjs group --ids ${batch.map((w) => w.id).join(',')} --conc ${flags.conc || cfg.concurrency?.default || 6}`);
     }
   }
+  // KI-E466 (2026-08-20): RUN_PROMPT §1 says "only fall back to a mixed batch when no cluster covers
+  // the priority items" — but nothing printed the actual candidate list for that fallback, so the
+  // controller had to hand-roll a node -e query against the graph+ledger. That hand-rolled query is
+  // exactly where the autonomyTier filter is easy to drop: `eligibleItems` (above, feeding `ready`)
+  // already excludes autonomyTier:escalate/blocked and unmet-deps items, but a query that only checks
+  // `ledger.items[id].state === 'READY'` silently re-includes them, and `group --ids` then rejects
+  // them one by one with no per-id reason in the WARN line. Live-caught 2026-08-20: an 18-id
+  // hand-picked mixed batch (built with exactly that state-only recipe — the same recipe
+  // CONTINUE_PROMPT_2026-08-16.md's own re-derivation snippet uses) saw 15/18 rejected, 11 of them
+  // simply autonomyTier:escalate (never auto-batchable — RUN_PROMPT §1: "escalate-tier items are
+  // owner-in-loop"), the other 4 on unmet dependsOn. `ready` here is already the exact array `group`
+  // itself claims from (autonomyTier=auto, deps closed, realInfra-filtered, re-queueable state) — so
+  // printing it, severity-bucketed, with a ready-made `group --ids` line, gives the fallback path
+  // real tooling instead of a hand-rolled query. `--mixed-max` overrides the default cap (24, ~2.5x a
+  // typical 8-10 item small-batch target per RUN_PROMPT's own over-request guidance — `group`'s own
+  // within-batch file-lock / KI-E14 dirty-overlap / KI-E29 dependency checks still apply at claim time,
+  // exactly as for a hand-picked list).
+  const mixedMax = flags['mixed-max'] ? parseInt(flags['mixed-max'], 10) : 24;
+  say(`\nmixed-batch fallback (RUN_PROMPT §1 — use when no cluster above covers your priority): ${ready.length} schedulable item(s) already filtered to autonomyTier=auto, deps met, no active file-lock`);
+  const bySev = {};
+  for (const wi of ready) (bySev[wi.severity] || (bySev[wi.severity] = [])).push(wi.id);
+  for (const sev of ['CRITICAL', 'HIGH', 'MEDIUM', 'LOW', 'INFO']) {
+    if (bySev[sev] && bySev[sev].length) say(`  ${sev} (${bySev[sev].length}): ${bySev[sev].join(', ')}`);
+  }
+  // KI-E88 — band-mix surfacing for the slice the printed `group --ids` line would actually claim
+  // (the WHOLE-pool mix + the KI-E110 agent-call projection are already printed at the top of
+  // `suggest`), so a batch-size pick is an informed cost decision rather than a guess.
+  const picked88 = ready.slice(0, mixedMax);
+  const pickedLight = picked88.filter((wi) => bandFor(wi) === 'LIGHT').length;
+  if (picked88.length) say(`  band mix of the first ${picked88.length} (the group --ids line below): ${pickedLight} LIGHT / ${picked88.length - pickedLight} FULL`);
+  if (ready.length) say(`  -> node ${MOUNT_REL}/_workflow/driver.mjs group --ids ${ready.slice(0, mixedMax).map((w) => w.id).join(',')}`);
   try {
     const rp = abs(join(dirname(cfg.paths.ledger), '..', 'reports', 'similar-batches.md'));
     mkdirSync(dirname(rp), { recursive: true });
@@ -2009,14 +2120,92 @@ function cmdSuggest(flags) {
 // batch into a self-contained run-script so any batch size launches via Workflow({scriptPath}) with NO
 // args (512KB script cap). Returns the ABSOLUTE script path, or null when the emit failed (the args
 // path stays valid as fallback).
+// KI-E480 — the Workflow script channel is capped at 512KB and the launcher inlines factory.js PLUS
+// the whole batch, so batch size and the KI-E474 reuse payload compete for the same budget. Before
+// this, exceeding it produced an opaque host-side rejection AFTER the items were already claimed and
+// their worktrees created — the batch simply could not start, and the operator was left holding a
+// claimed, unlaunchable cycle. Live: a 14-item batch with reuse emitted 505,914 B (a 3.5% margin),
+// and an earlier one hit 558KB and was refused outright.
+//
+// Reuse payload is by construction the SHEDDABLE part: dropping an item's `priorAttempt` costs it a
+// re-derived plan/test/fix (expensive, but the item still RUNS and can still close), whereas an
+// oversize script costs the whole batch. So shed it largest-first until the script fits, announcing
+// each drop — never silently, because a quietly cold item looks identical to a KI-E474 miss.
+const LAUNCHER_CAP = 512 * 1024;
+// BYTES, not characters. The cap is a byte limit and the engine's own source is full of multi-byte
+// punctuation (em-dashes, arrows, ⚠) — measuring with String.length silently UNDER-counts by
+// thousands, so the shed loop stops early and still emits an over-cap script. Caught live: a shed
+// run that dropped 10 payloads and landed at 524,517 B against a 524,288 B cap, because `.length`
+// said it had already fit.
+const bytes = (v) => Buffer.byteLength(typeof v === 'string' ? v : JSON.stringify(v), 'utf8');
+// KI-E261 (2026-09-28) — a SECOND sheddable tier, added after a live regression: a shared-library item+
+// a prior item fit as a 2-item batch on its FIRST attempt (cycle 131/132) but no longer fit even
+// as a 2-item batch on reattempt (cycle 133/134) with ALL priorAttempt reuse already shed — traced to
+// factory.js's OWN source growing 16,153 B this same session (KI-E253/E257/E259/E261's new mechanisms
+// + their documentation), which is inlined verbatim into every launcher and directly eats into the
+// SAME 512KB budget batch data competes for. `priorAttempt` alone was no longer enough headroom.
+// `precedent` (KI-E63) is the next-safest thing to shed: it is PURE acceleration (a gate-APPROVED
+// sibling's evidence, read only if `item.precedent` is truthy — compose() already treats its absence
+// as a silent no-op) — losing it costs a slower plan/gate pass, never a wrong one. `batchPattern`
+// (KI-E62 similarity-clique tracking) is next: also purely a consistency nicety, and only non-empty
+// for multi-item batches sharing a change-shape in the first place.
+// Deliberately NEVER shed: `docMap` (KI-E61 — every prior main-tree-contamination incident this
+// factory ever caught hit exactly the doc/data-flows/CONTEXT/AGENTS ambiguity this field exists to
+// resolve; shedding it would silently reopen a previously-fixed real incident class, not just slow
+// something down) and `peers` (KI-L32 — the cross-worktree collision-avoidance lock; shedding it in a
+// multi-item batch lets a fixer silently redo a sibling's work, a correctness/collision risk, not a
+// performance one). Both stay in every launcher unconditionally, batch size be damned.
+const SHEDDABLE_TIERS = [
+  { field: 'priorAttempt', note: 'that item re-derives its plan/test/fix' },
+  { field: 'precedent', note: 'that item loses its gate-APPROVED sibling precedent (KI-E63) — still runs, just without the acceleration' },
+  { field: 'batchPattern', note: 'that item loses its similarity-clique tag (KI-E62) — still runs, siblings just are not explicitly told to match its shape' },
+];
+function shedReuseToFit(runArgs, fixedOverhead) {
+  const size = () => fixedOverhead + bytes(runArgs);
+  if (size() <= LAUNCHER_CAP) return [];
+  const shed = [];
+  for (const tier of SHEDDABLE_TIERS) {
+    const withField = () => (runArgs.items || []).filter((it) => it[tier.field]);
+    while (size() > LAUNCHER_CAP) {
+      const pool = withField();
+      if (!pool.length) break; // this tier exhausted — fall through to the next one (or report, if none left)
+      pool.sort((a, b) => JSON.stringify(b[tier.field]).length - JSON.stringify(a[tier.field]).length);
+      const victim = pool[0];
+      shed.push({ id: victim.id, field: tier.field, note: tier.note, bytes: JSON.stringify(victim[tier.field]).length });
+      delete victim[tier.field];
+    }
+    if (size() <= LAUNCHER_CAP) break;
+  }
+  return shed;
+}
+
 function emitLauncherScript(cfg, runArgs, labelSlug) {
   try {
-    const MARKER = '/*__FACTORY_BATCH_INJECT__*/';
-    const factorySrc = readFileSync(join(HERE, 'factory.js'), 'utf8').replace(/\r\n?/g, '\n');
-    if (!factorySrc.includes(MARKER)) throw new Error('factory.js missing ' + MARKER + ' marker');
+    const MARKER = FACTORY_BATCH_MARKER;
+    const rawSrc = readFileSync(join(HERE, 'factory.js'), 'utf8').replace(/\r\n?/g, '\n');
+    if (!rawSrc.includes(MARKER)) throw new Error('factory.js missing ' + MARKER + ' marker');
+    // KI-E403 (2026-10-27): strip comments from the inlined source before injecting the batch. The
+    // Workflow script channel is capped at 512KB (KI-E480) and factory.js's own comments (~43% of
+    // the file) are documentation riding in the wrong channel — the runtime never needs them, while
+    // the batch payload (briefs/docMaps/peers) is runtime-essential. The stripper is
+    // string/template/regex-aware (lib/js-strip.mjs) and its correctness is proven two ways:
+    // node --check on the stripped source, and an execSmoke PARITY test that runs the RAW and the
+    // STRIPPED source through the identical stub-agent harness and requires identical dispatch label
+    // sequences + terminal states (lib/js-strip.test.mjs). Line numbers are preserved so runtime
+    // stack traces still point at the same lines as the unstripped file. The injection marker
+    // survives stripping via a string-literal sentinel (stripFactorySource).
+    const factorySrc = stripFactorySource(rawSrc);
+    // KI-E480: shed reuse payload BEFORE emitting, so an oversize batch degrades to a colder — but
+    // launchable — run instead of an unlaunchable one.
+    const shed = shedReuseToFit(runArgs, bytes(factorySrc) + 64);
+    for (const sh of shed) console.log(`  KI-E480: dropped ${sh.field} for ${sh.id} (${sh.bytes} B) — launcher script would exceed the ${LAUNCHER_CAP} B channel cap; ${sh.note}`);
     // Replace the post-meta marker (NOT prepend — `export const meta` must stay the first statement).
     // Function replacement so a `$` in the batch JSON is not interpreted as a String.replace pattern.
-    const launcher = factorySrc.replace(MARKER, () => 'const __FACTORY_BATCH__ = ' + JSON.stringify(runArgs) + ';');
+    // The sentinel (a string literal surviving KI-E403's comment strip) marks the injection point.
+    const launcher = factorySrc.replace(FACTORY_BATCH_SENTINEL, () => 'const __FACTORY_BATCH__ = ' + JSON.stringify(runArgs) + ';');
+    if (bytes(launcher) > LAUNCHER_CAP) {
+      console.log(`  KI-E480 WARN: launcher is ${bytes(launcher)} B, still over the ${LAUNCHER_CAP} B cap with ALL reuse shed — the BATCH ITSELF is too large. Split it (fewer --ids) rather than launching; the host will refuse this script.`);
+    }
     const base = cfg.paths.runScript || '_bmad-output/ai-factory/state/run-script.js';
     const p = abs(labelSlug ? base.replace(/(\.[^.\/]+)$/, '-' + labelSlug + '$1') : base);
     writeFileSync(p, launcher);
@@ -2025,6 +2214,7 @@ function emitLauncherScript(cfg, runArgs, labelSlug) {
 }
 
 function cmdGroup(flags) {
+  const groupStartMs = Date.now(); // KI-E474 — the reuse fence must predate this command's own claims
   const cfg = loadConfig();
   const engineMount = driverEngineMount(REPO_ROOT, FACTORY_ROOT);
   if (!flags.dry) preflightProductGitlinks(REPO_ROOT, engineMount);
@@ -2059,6 +2249,25 @@ function cmdGroup(flags) {
     // (unknown id / not in a claimable state / deps unmet / realInfra without the flag / file-locked).
     const dropped = want.filter((id) => !by[id]);
     if (dropped.length) console.log('  WARN: requested id(s) NOT schedulable (unknown, non-claimable state, deps unmet, realInfra without --include-realinfra, or file-locked):', dropped.join(', '));
+    // KI-E255: the generic WARN above covers several causes, several of which are ALSO independently
+    // surfaced elsewhere (deps unmet -> the "waiting-on-deps" status line; file-locked -> the separate
+    // "same-file collision" message just below). One cause had NO surfacing at all anywhere: a graph
+    // item can carry a real, resolved `ownerDecision` string yet still be silently excluded forever
+    // because `ownerDecisionResolved` was never ALSO set to `true` — eligibleItems() requires BOTH
+    // fields, and writing the first without the second (an easy mistake — the decision text alone
+    // reads as "done") makes an item LESS schedulable than before the ruling was recorded, with zero
+    // diagnostic pointing at why. Caught live (KI-E255) recording two sibling items'
+    // rulings this same session. Call out this SPECIFIC cause by name when it applies, since nothing
+    // else does.
+    if (dropped.length) {
+      const graphById = byId(graph);
+      for (const id of dropped) {
+        const wi = graphById[id];
+        if (wi && wi.ownerDecision != null && wi.ownerDecisionResolved !== true) {
+          console.log('    -> ' + id + ': has an ownerDecision recorded but ownerDecisionResolved is not `true` — the ruling text alone does not make it schedulable. Set ownerDecisionResolved: true on the graph node once the decision is genuinely final and actionable.');
+        }
+      }
+    }
   } else picked = ready;
   // KI-E14 (2026-07-20): worktrees are created from HEAD, so an item whose files[] intersect
   // UNCOMMITTED main-tree changes gets a band that reviews a tree silently MISSING that sibling
@@ -2111,7 +2320,7 @@ function cmdGroup(flags) {
   // two items in one batch sharing the same `target` service can collide even when their declared
   // files[] are disjoint, because a fixer is allowed to touch files OUTSIDE its declared lock-set
   // when "strictly required" (fix.json's own documented escape hatch). Live incident on the sibling
-  // host-mount session (cycle 73, both CryptoPaymentService): two same-target items had ZERO
+  // host-mount session (cycle 73, both the same target): two same-target items had ZERO
   // declared files[] overlap, both cleared the file-lock check above, yet one item's fixer
   // discovered mid-run it also needed a file the other item held, and FAILED on a pure
   // batch-scheduling collision neither item's own content caused. WARN, don't exclude (KI-E29
@@ -2230,7 +2439,23 @@ function cmdGroup(flags) {
     // KI-L25: --dry is a plan-only smoke test — it must NOT create worktrees (nor claim; see below).
     // The emitted worktree paths are just strings; the factory's dry mode spawns 0 agents.
     if (!flags.dry) {
-      addWorktree(wtAbs, 'factory/' + wi.id);
+      // KI-E303 — if a PR branch already exists on origin (a prior run opened a PR), start the
+      // new worktree from that remote branch so the worker continues the existing PR instead of
+      // restarting from HEAD. Gated on prUrl being set: that's the only reliable signal the
+      // branch was pushed. The fetch is a network call but avoids a silent stale-snapshot risk.
+      let wtBase;
+      const priorPrUrl = ledger.items[wi.id] && ledger.items[wi.id].prUrl;
+      if (priorPrUrl && priorPrUrl !== 'null' && priorPrUrl !== 'None') {
+        const remoteBranch = 'factory/' + wi.id;
+        try {
+          execFileSync('git', ['-C', REPO_ROOT, 'fetch', 'origin',
+            `refs/heads/${remoteBranch}:refs/remotes/origin/${remoteBranch}`],
+            { stdio: 'pipe', encoding: 'utf8' });
+          wtBase = `origin/${remoteBranch}`;
+          console.log(`  KI-E303 continue: ${wi.id} — worktree based on existing PR branch ${wtBase}`);
+        } catch { /* branch gone or network error — start fresh from HEAD */ }
+      }
+      addWorktree(wtAbs, 'factory/' + wi.id, wtBase);
       preflightProductGitlinks(wtAbs, engineMount);
     }
     return { // compact: NO routes (factory derives), NO reviewFlows (factory derives from files), NO fixHint (agent reads source) — fits the session arg limit
@@ -2242,7 +2467,13 @@ function cmdGroup(flags) {
       // was omitted entirely in the compact-args era — compose rendered "(none)" for every item).
       id: wi.id, target: wi.target, layer: wi.layer, title: trim(wi.title, 300), severity: wi.severity, theme: wi.theme, band: bandFor(wi),
       fixType: wi.fixType, files: wi.files, dependsOn: wi.dependsOn || [], acceptance: trim(wi.acceptance, 2000),
-      regressionTest: trim(wi.regressionTest, 1200), fixHint: trim(wi.fixHint, 1500), realInfra: !!wi.realInfra, gateSet: wi.gateSet, autonomyTier: wi.autonomyTier,
+      regressionTest: trim(wi.regressionTest, 1200), fixHint: trim(wi.fixHint, 1500), realInfra: !!wi.realInfra, gateSet: wi.gateSet,
+      // KI-E402 (2026-10-27): when config policies.downgradeMechanicalEscalate is ON, a MECHANICAL
+      // non-CRITICAL item with autonomyTier 'escalate' is emitted as 'auto' so a tiny, fully-verified
+      // diff closes at the integrator instead of parking in the ESCALATED queue for human sign-off.
+      // OFF by default — blastRadius escalate themes are a product-policy choice the engine does not
+      // override without an explicit host-owner directive.
+      autonomyTier: (cfg.policies && cfg.policies.downgradeMechanicalEscalate && wi.fixType === 'mechanical' && wi.severity !== 'CRITICAL' && wi.autonomyTier === 'escalate') ? 'auto' : wi.autonomyTier,
       reFix: ['FAILED', 'CONFLICT'].includes(ledger.items[wi.id].state), // Phase-6: re-run feeds prior gate feedback to test-author+fixer
       batchPattern: batchPatternById.get(wi.id) || undefined, // similarity batch (per-clique, KI-E62): factory.js briefs agents to keep sibling changes structurally identical
       precedent: precedentByItem.get(wi.id) || undefined, // KI-E63: a gate-APPROVED, already-CLOSED sibling of the same change-shape, when one still has readable evidence on disk
@@ -2302,10 +2533,99 @@ function cmdGroup(flags) {
     writeJsonAtomic(abs(cfg.paths.ledger), ledger);
     for (const it of items) observeReservation(ledger.items[it.id], it.id);
   }
+  // KI-E474 — CONTINUE a killed run instead of restarting it. KI-E69's artifact reuse existed but was
+  // wired into cmdResume ONLY (the relaunch-the-same-run-script path); `group` — the command the
+  // documented recovery actually ends in ("After a PARTIAL fold, re-group — never Workflow-resume")
+  // — never populated priorAttempt at all. So the sanctioned recovery route was precisely the one
+  // that threw the work away. Compounding it, the reuse fence was the LAST claim timestamp, and
+  // `resume --reset-stale` + re-group stamps a fresh claim NOW, marking every on-disk artifact stale
+  // even though nothing touched the worktree. Live 2026-09-02: 16 items re-queued still carrying real
+  // diffs (12 / 7 / 5 changed files) that would each have re-run planner + test-author + fixer cold.
+  // The proof used here is the WORKTREE ITSELF (KI-E474 workTreeProves -> KI-E471 phantomManifest):
+  // an artifact is reusable when every file it claims is still in the live diff. Stronger than a
+  // clock and immune to claim churn — and it cannot resurrect vanished work, since the files being
+  // absent IS the disproof. verify onward still ALWAYS re-runs, so a reused fix is independently
+  // re-verified and the gates re-adjudicate the worktree exactly as before (KI-E69's design, intact).
+  // Runs under --dry too: the scan is READ-ONLY (a git diff read per item) and previewing what a
+  // relaunch would CONTINUE from is exactly what --dry exists for — an operator deciding whether to
+  // spend should see "12 of 16 continue" before claiming, not after.
+  if (!flags['no-reuse']) {
+    let reused = 0;
+    for (const it of items) {
+      try {
+        const row = ledger.items[it.id];
+        const wt = (row && row.worktree) ? presolve(REPO_ROOT, row.worktree) : null;
+        if (!wt || !existsSync(wt)) continue;
+        let changed = [];
+        try { changed = changedFiles(wt); } catch { continue; }
+        if (!changed.length) continue; // nothing in the worktree -> nothing to prove, nothing to reuse
+        // KI-E474 follow-up (caught on the FIRST live use, 2026-09-02): this scan runs AFTER the claim
+        // loop above, so the newest CLAIMED transition is the one THIS command just stamped —
+        // milliseconds old, and newer than every artifact on disk by construction. Using it as the
+        // fence made `group` discard exactly the work it was added to preserve: a --dry preview said
+        // 14/14 CONTINUE (no claim written yet, so it read the PREVIOUS claim) and the real run
+        // immediately after said 10/14, with the 4 clock-proven items silently downgraded to cold.
+        // A preview that disagrees with the run it previews is worse than no preview. Fence on the
+        // last claim that PREDATES this command instead: it still rejects a genuinely stale
+        // prior-cycle artifact, but no longer rejects an artifact for the crime of existing before
+        // the claim we ourselves wrote one line earlier.
+        const claimHist = ((row && row.history) || []).filter((h) => h.to === 'CLAIMED' && Date.parse(h.at) < groupStartMs);
+        const claimMs = claimHist.length ? Date.parse(claimHist[claimHist.length - 1].at) : 0;
+        const itemDirG = abs(join(cfg.paths.items, it.id));
+        // KI-E158(i): a reFix item's last attempt was REJECTED by real review, not killed mid-flight —
+        // never reuse its test/fix (see lib/prior-attempt.mjs's own comment for the incident).
+        const pa = loadPriorAttempt(itemDirG, claimMs || undefined, changed, it.reFix);
+        const stages = priorAttemptStages(pa);
+        // KI-E139: attach a mid-pipeline progress.json here too — `group` is the DOCUMENTED, PREFERRED
+        // recovery route (this whole block's own KI-E474 opening comment: "the sanctioned recovery
+        // route was precisely the one that threw the work away" before this existed for plan/test/fix;
+        // gate-band reuse deserves the SAME fix on the SAME route). id-only match (no `cyc` arg) is
+        // deliberate — THIS claim is about to stamp a brand-new cycle number, so a cycle-fenced read
+        // would never match; safety comes entirely from runItem()'s own fresh content-hash check, not
+        // from this read (see readProgressCheckpoint's own comment).
+        const priorProgress = readProgressCheckpoint(itemDirG, it.id);
+        if (priorProgress) { it.priorProgress = priorProgress; console.log(`  KI-E139 ${it.id}: CONTINUING carries a progress.json at stage '${priorProgress.progressStage}' — factory.js hash-verifies the CURRENT worktree before trusting any of it`); }
+        // KI-E496 — a reFix item gets NONE of the above (KI-E158(i) disables plan/test/fix reuse
+        // unconditionally, to protect against resurrecting a REVIEW-REJECTED artifact). But a
+        // stepwise fixer (KI-E470) that halts PARTWAY through its own per-step sequence never even
+        // reaches consolidation, so there is no fix.json for loadPriorAttempt to find regardless —
+        // and when the halt happened BEFORE this item ever reached a real review gate, nothing has
+        // actually been rejected: the earlier steps are unreviewed, worktree-diff-proven mechanical
+        // work sitting unused. neverGateReviewed(row) is the safety gate (KI-E158(i)'s exact concern,
+        // checked directly rather than inferred): only when NO gate:/review: verdict has EVER been
+        // recorded for this item, across its whole history, is per-step content resumable at all.
+        let stepwiseResume = null;
+        if (it.reFix && neverGateReviewed(row)) {
+          stepwiseResume = loadStepwiseResume(itemDirG, changed);
+          if (stepwiseResume) {
+            it.priorAttempt = it.priorAttempt || { plan: null, test: null, fix: null };
+            it.priorAttempt.stepwiseResume = stepwiseResume;
+            // The stepwise loop's step semantics (what step N even means) only make sense against the
+            // SAME plan those steps were executed against — reuse it too, exactly as loadPriorAttempt
+            // would for a non-reFix item, so a resumed item is never seeded with steps 1..N from one
+            // plan and asked to continue into a FRESH re-plan's unrelated step N+1.
+            try {
+              const planText = readFileSync(join(itemDirG, 'plan.md'), 'utf8');
+              it.priorAttempt.plan = { recommendScopeStop: false, recommendEscalate: false, approach: planText.slice(0, PLAN_REUSE_CAP) };
+            } catch { /* no plan.md on disk -> stepwiseResume alone is still safe (factory.js falls back to a cold start if resumeFromIndex no longer fits a freshly-planned stepList) */ }
+            console.log(`  KI-E496 ${it.id}: RESUMING stepwise from step ${stepwiseResume.resumeFromIndex + 1} — ${stepwiseResume.resumeFromIndex} earlier step(s) proven by the live worktree diff and never reviewed by a real gate; re-authoring skipped for those`);
+          }
+        }
+        if (!stages.length && !priorProgress && !stepwiseResume) continue;
+        if (stages.length) {
+          it.priorAttempt = pa;
+          reused++;
+          console.log(`  KI-E474 ${it.id}: CONTINUING — reusing {${stages.join(', ')}} proven by the live worktree diff (${changed.length} changed file(s)${pa.provenBy && pa.provenBy.length ? '; ' + pa.provenBy.join(', ') : ''}); verify onward re-runs fresh`);
+        }
+      } catch { /* best-effort — a read failure just means this item starts cold, never a crash */ }
+    }
+    if (reused) console.log(`  KI-E474: ${reused}/${items.length} item(s) CONTINUE from on-disk work instead of restarting${flags.dry ? ' (DRY preview — nothing claimed)' : ''} (--no-reuse forces a cold band)`);
+  }
   const runArgs = {
     runId, runtimeVersion: readFileSync(join(FACTORY_ROOT, 'VERSION'), 'utf8').trim(),
     engineMount: driverEngineMount(REPO_ROOT, FACTORY_ROOT),
     buildCapacity: resolvedBuildCapacity(cfg, flags), evidenceInputs: cfg.evidenceInputs || {},
+    maxFixerSteps: (typeof cfg.maxFixerSteps === 'number') ? cfg.maxFixerSteps : 8, // KI-E470 — stepwise fixer bound (0 disables; see config/factory.config.json _fixerStepsNote)
     // KI-E68: default was a bare hardcoded 2, disconnected from config.concurrency's documented
     // tiers (nothing ever read them). Now sources cfg.concurrency.default (operator-tunable in ONE
     // place); --conc still overrides per-invocation for an active-throttle/quiet judgment call.
@@ -2431,6 +2751,18 @@ function cmdWorktree(sub, rest) {
 // misdirects the fixer + debris whitelist (KI-L23's root cause; ITEM-C0's audit-dir-relative
 // paths). Only a SINGLE-candidate basename match (target-dir-unique wins) is auto-rewritten;
 // ambiguous and creation-target entries are report-only. CLOSED items are skipped (history).
+// KI-E232 — content signature over an item's declared files[] as they currently sit in its
+// worktree (missing file -> a stable 'MISSING' marker, not an omission, so a file that gets
+// deleted is itself a detected change). Order-independent (sorted) so file-list reordering in
+// the graph never produces a false "changed" signal.
+function scopeStopContentSignature(files, worktreeAbs) {
+  const parts = (files || []).slice().sort().map((f) => {
+    try { return f + ':' + createHash('sha256').update(readFileSync(presolve(worktreeAbs, f))).digest('hex'); }
+    catch { return f + ':MISSING'; }
+  });
+  return createHash('sha256').update(parts.join('\n')).digest('hex');
+}
+
 function cmdGraphAudit(flags) {
   const cfg = loadConfig();
   const graphPath = abs(cfg.paths.graph);
@@ -2439,7 +2771,7 @@ function cmdGraphAudit(flags) {
   const tracked = execFileSync('git', ['-C', REPO_ROOT, 'ls-files'], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 }).trimEnd().split('\n');
   const byBasename = buildBasenameIndex(tracked);
   const existsOnDisk = (p) => existsSync(presolve(REPO_ROOT, p));
-  const report = { ok: 0, creation: [], stale: [], ambiguous: [], sharedFileGap: [], surfaceGap: [] };
+  const report = { ok: 0, creation: [], stale: [], ambiguous: [], sharedFileGap: [], surfaceGap: [], staleOwnerDecisionFixType: [], staleScopeStop: [] };
   // KI-E64: was '_bmad-output/tech-debt/STANDARDS-LEDGER.md' (missing "DIVERGENCE") since this
   // check's introduction (2026-07-20) — a filename that has NEVER existed, so the gap check
   // below could never be satisfied even when files[] correctly carried the REAL path, and --fix
@@ -2459,6 +2791,41 @@ function cmdGraphAudit(flags) {
     if (/STANDARDS-(?:DIVERGENCE-)?LEDGER|ledger entr(?:y|ies)|ledger anchor/i.test(wi.acceptance || '') && !(wi.files || []).includes(LEDGER_PATH)) {
       report.sharedFileGap.push({ id: wi.id, state: st });
     }
+    // KI-E230: `blocked` (lib/ledger.mjs computeReady) OR's in `fixType === 'owner-decision'`
+    // UNCONDITIONALLY — independent of `ownerDecisionResolved`. Applying a ruling to the graph
+    // (setting ownerDecisionResolved:true) is not enough on its own to unblock the item unless
+    // fixType is ALSO reclassified away from 'owner-decision' to a real implementation type
+    // (mechanical/non-trivial/...) — see the _selftest.mjs WI-E/WI-F fixtures, which pair
+    // ownerDecisionResolved:true with fixType:'mechanical', never fixType:'owner-decision'. Live:
+    // 4 items (four sibling items) got a real 2026-08-03
+    // owner ruling applied — ownerDecisionResolved:true set correctly — but fixType was never
+    // updated, so all 4 stayed permanently BLOCKED/ESCALATED for 47+ days with zero further
+    // action possible. Advisory only (never --fix-rewritten): the correct replacement fixType is
+    // a judgment call (mechanical vs non-trivial), not mechanically derivable from the ruling text.
+    if (wi.ownerDecisionResolved === true && wi.fixType === 'owner-decision') {
+      report.staleOwnerDecisionFixType.push({ id: wi.id, state: st });
+    }
+    // KI-E232 — a `scope-stop` item (product-scope.md red-line, owner-gated) can sit READY/FAILED/
+    // BLOCKED/ESCALATED for weeks with an unchanged worktree (the fix was never actually re-applied,
+    // or an owner ruling is still pending) while every subsequent `group`/`cycle` re-claims it and
+    // pays a full runner/fixer cycle to re-derive the SAME "still not fixed" outcome — live: a prior item
+    // sat BLOCKED 2026-08-07 -> 2026-09-23 (47 days) on a single reverted file, re-verified at least
+    // once in between for zero new signal (the verify agent's own unprompted observation flagged this
+    // exact waste). Advisory only — this NEVER excludes the item from scheduling (that judgment call
+    // — "is the ruling still pending, or did the operator just fix it and hasn't re-run yet" — is not
+    // mechanically derivable); it just makes repeat-without-progress visible before another slot is spent.
+    const row232 = ledger && ledger.items[wi.id];
+    const wtAbs232 = row232 && row232.worktree ? abs(row232.worktree) : null;
+    if (wi.fixType === 'scope-stop' && wtAbs232 && existsSync(wtAbs232)) {
+      const sigPath = abs(join(cfg.paths.items, wi.id, 'scope-stop-content-hash.json'));
+      const sig = scopeStopContentSignature(wi.files, wtAbs232);
+      const prior = readJsonIfExists(sigPath);
+      if (prior && prior.signature === sig) {
+        report.staleScopeStop.push({ id: wi.id, state: st, since: prior.capturedAt });
+      } else {
+        try { writeJsonAtomic(sigPath, { signature: sig, capturedAt: new Date().toISOString() }); } catch { /* advisory-only; a write failure never blocks the audit */ }
+      }
+    }
     const targetDir = wi.target && existsOnDisk(wi.target) ? wi.target : null;
     // KI-E22 (improvement-analysis P4) — the KI-E16 generalization: tokens the acceptance names
     // that resolve to real tracked files absent from files[] (the lock set silently forbids the
@@ -2476,11 +2843,13 @@ function cmdGraphAudit(flags) {
       } else if (c.status === 'ambiguous') report.ambiguous.push({ id: wi.id, state: st, file: f, candidates: c.candidates });
     });
   }
-  console.log(`graph-audit: ${report.ok} ok · ${report.stale.length} stale${flags.fix ? ' (REWRITTEN)' : ' (rewrite proposed — pass --fix)'} · ${report.ambiguous.length} ambiguous (hand-triage) · ${report.creation.length} creation-target (fine) · ${report.sharedFileGap.length} shared-file gap (KI-E16${flags.fix ? ', APPENDED' : ''}) · ${report.surfaceGap.length} acceptance-surface gap (KI-E22, advisory)`);
+  console.log(`graph-audit: ${report.ok} ok · ${report.stale.length} stale${flags.fix ? ' (REWRITTEN)' : ' (rewrite proposed — pass --fix)'} · ${report.ambiguous.length} ambiguous (hand-triage) · ${report.creation.length} creation-target (fine) · ${report.sharedFileGap.length} shared-file gap (KI-E16${flags.fix ? ', APPENDED' : ''}) · ${report.surfaceGap.length} acceptance-surface gap (KI-E22, advisory) · ${report.staleOwnerDecisionFixType.length} stale owner-decision fixType (KI-E230, advisory) · ${report.staleScopeStop.length} stale scope-stop worktree (KI-E232, advisory)`);
   for (const s of report.stale) console.log(`  STALE ${s.id} (${s.state}): ${s.file}\n    -> ${s.rewrite}`);
   for (const a of report.ambiguous) console.log(`  AMBIG ${a.id} (${a.state}): ${a.file}\n    ?  ${a.candidates.join(' | ')}`);
   for (const g of report.sharedFileGap) console.log(`  SHARED-FILE-GAP ${g.id} (${g.state}): acceptance names the standards-divergence ledger but files[] lacks ${LEDGER_PATH} — ${flags.fix ? 'APPENDED by --fix' : 'hand-append it (or pass --fix)'} so the batch file-lock can serialize sibling items (KI-E16; the ITEM-H-A6 staged-not-appended class)`);
   for (const g of report.surfaceGap) console.log(`  ACCEPT-SURFACE ${g.id} (${g.state}): acceptance names \`${g.token}\` -> ${g.resolved} but files[] lacks it — the file-lock cannot serialize it and the fixer may be lock-forbidden from meeting acceptance (KI-E22, advisory; hand-append if the fix must touch it)`);
+  for (const g of report.staleOwnerDecisionFixType) console.log(`  OWNER-DECISION-FIXTYPE ${g.id} (${g.state}): ownerDecisionResolved:true but fixType is still 'owner-decision' — the item is permanently unschedulable (computeReady's blocked check OR's in fixType==='owner-decision' unconditionally) until a human reclassifies fixType to a real implementation type (KI-E230)`);
+  for (const g of report.staleScopeStop) console.log(`  STALE-SCOPE-STOP ${g.id} (${g.state}): worktree files[] content is byte-identical to the last graph-audit run (captured ${g.since}) — re-scheduling this item is very unlikely to produce a different outcome until either the worktree is hand-fixed or an owner ruling changes something; check decision.md / the item's own ownerDecision before spending another cycle on it (KI-E232)`);
   // KI-E22/KI-E16 --fix: the ledger-path append IS the prescribed mechanical triage (KI-L54: the
   // graph is hand-editable; this automates exactly the hand-append the lint prescribes so the
   // flagged class stops re-surfacing at every audit). Acceptance-surface gaps stay report-only —
@@ -2505,6 +2874,8 @@ function cmdGraphAudit(flags) {
     '## Ambiguous (hand-triage — NOT auto-rewritten)', ...report.ambiguous.map((a) => `- \`${a.id}\` (${a.state}): \`${a.file}\` — candidates: ${a.candidates.map((c) => '`' + c + '`').join(', ')}`), '',
     '## Shared-file gaps (KI-E16 — acceptance names the ledger, files[] lacks it; --fix appends)', ...report.sharedFileGap.map((g) => `- \`${g.id}\` (${g.state})`), '',
     '## Acceptance-surface gaps (KI-E22, advisory — acceptance names a repo file files[] lacks)', ...report.surfaceGap.map((g) => `- \`${g.id}\` (${g.state}): \`${g.token}\` -> \`${g.resolved}\``), '',
+    '## Stale owner-decision fixType (KI-E230, advisory — ownerDecisionResolved:true but fixType still \'owner-decision\', so the item stays permanently unschedulable)', ...report.staleOwnerDecisionFixType.map((g) => `- \`${g.id}\` (${g.state}) — reclassify fixType to the real implementation type (mechanical/non-trivial/...) once a human confirms the ruling's actual scope`), '',
+    '## Stale scope-stop worktrees (KI-E232, advisory — files[] content unchanged since the last graph-audit run; re-scheduling is unlikely to change the outcome)', ...report.staleScopeStop.map((g) => `- \`${g.id}\` (${g.state}) — unchanged since ${g.since}; check decision.md / ownerDecision before spending another cycle`), '',
     '## Creation targets (no action — the fix creates them)', ...report.creation.map((c) => `- \`${c.id}\` (${c.state}): \`${c.file}\``), ''].join('\n');
   writeFileSync(rp, md);
   console.log(`graph-audit: report -> ${rp}`);
@@ -2594,7 +2965,19 @@ function cmdSweep(flags, rest) {
   const requested = new Set((spec.sites || []).map(s => s.findingId));
   const candidates = eligibleItems(graph, ledger, cfg, flags, { repoRoot: REPO_ROOT, docker: dockerAvailable(), dirty: dirtyMainPaths(REPO_ROOT) });
   let sites = disjointItems(candidates.filter(w => requested.has(w.id)), maxSites, { repoRoot: REPO_ROOT }).map(w => ({ ...w, findingId: w.id }));
-  if (!sites.length) { console.log(`sweep ${n}: no eligible, ready, non-overlapping sites`); return; }
+  // KI-E231 defense-in-depth: cluster.mjs's own band() now gates CRITICAL/HIGH FULL_THEMES findings
+  // away from SWEEP before spec generation, but a spec file on disk can be stale (generated by an
+  // older cluster.mjs) or hand-edited — never trust the file alone for something this consequential.
+  // Re-derive the same gate here and REFUSE to claim such a site into a sweep, loudly, rather than
+  // silently rushing a CRITICAL/HIGH security/money/idempotency finding through the cheap band.
+  const SWEEP_FULL_THEMES = new Set(['security-multitenancy', 'money-correctness', 'idempotency-dataflow']);
+  const tooHotForSweep = sites.filter((s) => (s.severity === 'CRITICAL' || s.severity === 'HIGH') && SWEEP_FULL_THEMES.has(s.theme));
+  if (tooHotForSweep.length) {
+    console.log(`  REFUSING ${tooHotForSweep.length} site(s) too severe for SWEEP (KI-E231 — CRITICAL/HIGH + security-multitenancy/money-correctness/idempotency-dataflow always route FULL, never sweep, regardless of what the spec file claims): ${tooHotForSweep.map((s) => `${s.findingId} (${s.severity}/${s.theme})`).join(', ')}`);
+    const excluded = new Set(tooHotForSweep.map((s) => s.findingId));
+    sites = sites.filter((s) => !excluded.has(s.findingId));
+  }
+  if (!sites.length) { console.log(`sweep ${n}: no eligible, ready, non-overlapping sites (after the KI-E231 severity filter)`); return; }
   if (flags.dry) { console.log('sweep dry: ' + sites.map(s => s.findingId).join(', ')); return sites; }
   for (const site of sites) site.verificationTargets = affectedVerificationTargets(site, cfg, REPO_ROOT, flags.solution || site.solution || solutionFor(site.target));
   const engineMount = driverEngineMount(REPO_ROOT, FACTORY_ROOT);
@@ -2736,7 +3119,7 @@ function cmdSweepFold(file) {
   escalateExhausted(ledger, cfg);
   for (const r of arr) ledger.items[r.id].attemptIdentity.completedAt ||= now();
   writeJsonAtomic(abs(cfg.paths.ledger), ledger);
-  recordCostSnapshot(cfg, ledger);
+  recordCostSnapshot(cfg, ledger, abs);
   writeReports(cfg, ledger, graph);
   cmdEscalationsSync(cfg, ledger, true);
   for (const r of arr) {
@@ -2764,6 +3147,78 @@ function cmdSweepFold(file) {
 // recoveries stop being invisible in the stream. The OPERATOR stays in the loop: this prepares;
 // the operator applies the remedy in the worktree, runs the re-gate agents, fills the skeleton,
 // folds. Recovery identity is driver-owned and persisted under the ledger lock/lease.
+//
+// KI-E215 — cmdRecover's automated re-verification-target computation (below, inside the
+// `recoveryCode` block) needs test.json + verify-red-raw.txt, the test-author's OWN disk artifacts
+// (agents/test-author.md: "WRITE a short note to <ARTIFACTS DIR>/test.json"). That is a prose
+// instruction with no phantom-check verifying it actually landed, unlike the SAME call's
+// schema-required RETURN payload factory.js trusts in-memory during a normal run (factory.js sets
+// `res.artifacts.test` unconditionally right after the test-author call, with no existsSync probe —
+// contrast the fixer's filesChanged claims, which ARE independently checked against the real
+// worktree diff before anything downstream trusts them, KI-E486/KI-E149/KI-E493/KI-E498). An item
+// can genuinely complete test-author (RED/GREEN/BUILT/TESTED transitions, a real fold) while this
+// side artifact never reaches disk — confirmed live for one prior item and a second prior item (the
+// latter also missing verify-red-raw.txt). The fold path already tolerates a missing test.json (see the
+// `readIf('test.json')` + try/catch around the KI-E132 verificationOnly re-derivation, a few hundred
+// lines above) — recover degrades the same way instead of crashing with an uncaught ENOENT.
+// readJsonIfExists/readTextIfExists turn a missing/unparseable artifact into null/'' instead of
+// throwing, so a genuinely un-derivable gap surfaces as a normal verificationExpectations error
+// message (caught by the caller below) rather than a raw stack trace. deriveTestArtifactFallback
+// gathers plausible test-file candidates from the OTHER artifacts a FAILED item is far more likely
+// to still have on disk (fix.json's filesChanged, verify.json's own fixManifestCrossCheck, the
+// item's graph-declared files) when test.json itself is gone — verificationExpectations' OWN
+// cross-check against the independently-sourced RED-proof transcript (redText) is the real safety
+// net here: a wrong candidate either resolves to the SAME owning project as the genuine red-proof
+// target (harmless) or fails that cross-check loudly (caught below), never a silently-wrong
+// recovery target.
+function readJsonIfExists(path) { try { return readJson(path); } catch { return null; } }
+function readTextIfExists(path) { try { return decodeTranscript(readFileSync(path)); } catch { return ''; } }
+// KI-E221 (2026-09-21) — deriveTestArtifactFallback's first three sources (the graph's own `files`,
+// fix.json.filesChanged, verify.json.fixManifestCrossCheck) are ALL themselves test-author/fixer-
+// written artifacts that can be just as absent as test.json when a pipeline stage never ran at all —
+// confirmed live for the second prior item above: no fix.json, no verify.json.fixManifestCrossCheck
+// (verify.json's OWN note records this item reached verify with a byte-identical-to-HEAD worktree —
+// test-author and fixer never executed, so neither downstream artifact was ever written). The first
+// prior item recovered fine through this same fallback because ITS fix.json/verify.json genuinely
+// existed with usable test-file candidates; the second prior item has nothing for any of the three
+// sources to read. A 4th, strictly more
+// authoritative source is already available at the cmdRecover call site by this point: the LIVE
+// worktree diff (`changedFiles`, the same read-only helper `resume`/`fold`'s debris detection already
+// uses — no new git surface). It reflects what genuinely landed on disk regardless of whether any
+// prose-instructed JSON note was ever written, so it is consulted last, only when the first three
+// sources yield nothing, and its result is still subject to the SAME independent cross-check against
+// the RED-proof transcript that already protects the other three sources (verificationExpectations'
+// red/testProjects agreement check) — a wrong guess here fails loudly, never silently.
+function deriveTestArtifactFallback(itemDir, wi, wtAbs) {
+  const isTestFile = f => typeof f === 'string' && /\.cs$/i.test(f) && /Tests?[\\/]|Tests?\.cs$/i.test(f);
+  const candidates = new Set((wi.files || []).filter(isTestFile));
+  const fix = readJsonIfExists(join(itemDir, 'fix.json'));
+  for (const f of (fix && Array.isArray(fix.filesChanged) ? fix.filesChanged : [])) if (isTestFile(f)) candidates.add(f);
+  const verify = readJsonIfExists(join(itemDir, 'verify.json'));
+  const cross = verify && verify.fixManifestCrossCheck;
+  for (const f of (cross && Array.isArray(cross.trackedModified) ? cross.trackedModified : [])) if (isTestFile(f)) candidates.add(f);
+  for (const f of (cross && Array.isArray(cross.untrackedNew) ? cross.untrackedNew : [])) if (isTestFile(f)) candidates.add(f);
+  if (!candidates.size && wtAbs) {
+    // KI-E221(ii): git's untracked-files=normal porcelain (changedFiles' mode) reports a wholly-new
+    // directory as ONE entry with a trailing slash, not its individual files -- confirmed live for
+    // the second prior item above, whose real integration-test subtree landed exactly as
+    // `SomeProject.Tests/Integration/` (one line, zero of its 13 real .cs files enumerated), so the
+    // naive per-entry
+    // isTestFile check above never matched anything. Recurse into any changedFiles entry that is
+    // itself a directory so its real file paths still reach the isTestFile filter.
+    try {
+      for (const f of changedFiles(wtAbs)) {
+        if (isTestFile(f)) { candidates.add(f); continue; }
+        if (!f.endsWith('/')) continue;
+        for (const entry of readdirSync(presolve(wtAbs, f), { recursive: true })) {
+          const rel = f + String(entry).split(sep).join('/');
+          if (isTestFile(rel)) candidates.add(rel);
+        }
+      }
+    } catch { /* worktree unreadable -- fall through to {} same as before KI-E221 */ }
+  }
+  return candidates.size ? { testFiles: [...candidates] } : {};
+}
 function cmdRecover(flags, rest) {
   const id = rest[0];
   if (!id) { console.log('usage: driver.mjs recover <id>'); return; }
@@ -2777,6 +3232,28 @@ function cmdRecover(flags, rest) {
   if (!['FAILED', 'ESCALATED', 'BLOCKED'].includes(row.state)) {
     console.log(`recover: ${id} is ${row.state} — recovery targets FAILED (apply the converged remedy), ESCALATED (record the human sign-off), or BLOCKED (record the owner ruling, KI-E34). Nothing prepared. (recover runs while the item is still PARKED — if a BLOCKED item was already reset to READY, re-run recover after it parks again, or hand-author from the KNOWN-ISSUES KI-E34 protocol.)`);
     return;
+  }
+  // KI-E223 (2026-09-21) — the recovery-fold skeleton this function builds always starts its
+  // `transitions` array at CLAIMED (the uniform "prove the fix cleanly from scratch" contract this
+  // whole function follows, confirmed live: every one of several prior items'
+  // recoveries this session used the identical full CLAIMED->...->CLOSED chain
+  // regardless of origin reason). But `canTransition` (lib/ledger.mjs) only allows a DIRECT
+  // `-> CLAIMED` edge from FAILED/CONFLICT/READY — BLOCKED only re-opens to READY, and ESCALATED
+  // only advances to INTEGRATED/CLOSED/READY. A BLOCKED- or ESCALATED-origin item's otherwise
+  // fully evidence-complete fold therefore rejected outright at fold time with a confusing
+  // `bad-transition: BLOCKED -> CLAIMED` (or `ESCALATED -> CLAIMED`), discovered live on
+  // that item — the fix was a manual, undocumented `driver.mjs reset <id>` the operator had to
+  // know to run first. Do it here instead: silently pre-clear the one legal edge (`-> READY`)
+  // before scaffolding, so the SAME recovery-fold this function already produces is fold-ready
+  // immediately, for every origin state, with no separate manual step.
+  if (row.state === 'BLOCKED' || row.state === 'ESCALATED') {
+    const fromState = row.state;
+    if (!transition(ledger, id, 'READY', 'auto-reset before recovery scaffold (KI-E223)')) {
+      console.error(`recover: ${id} — could not auto-reset from ${fromState} to READY; aborting rather than scaffolding an unfoldable recovery.`);
+      process.exitCode = 1;
+      return;
+    }
+    console.log(`recover: ${id} auto-reset ${fromState} -> READY (KI-E223 — required before the recovery-fold's CLAIMED-starting chain can apply; the owner ruling / human sign-off this origin state recorded is preserved in row.history, not erased).`);
   }
   const itemDir = abs(join(cfg.paths.items, id));
   let prior = null; try { prior = readJson(join(itemDir, 'result.json')); } catch { /* no checkpoint */ }
@@ -2796,13 +3273,26 @@ function cmdRecover(flags, rest) {
   const foldFile = join(recDir, 'recovery-fold.json');
   const recoveryCode = prior?.codeChange !== false || (wi.files || []).some(f => /\.cs$/i.test(f));
   let recoveryExpected = null;
+  let recoveryExpectedError = null;
   if (recoveryCode) {
     if (!wtAbs) throw new Error('recover: code recovery requires a live worktree');
     preflightProductGitlinks(wtAbs, driverEngineMount(REPO_ROOT, FACTORY_ROOT));
-    const targets = affectedVerificationTargets(wi, cfg, wtAbs, wi.solution || solutionFor(wi.target));
-    recoveryExpected = verificationExpectations({ item: wi, test: readJson(join(itemDir, 'test.json')), worktree: wtAbs, targets,
-      band: 'FULL', redText: decodeTranscript(readFileSync(join(itemDir, 'verify-red-raw.txt'))) });
+    const fallbackSolution = wi.solution || solutionFor(wi.target);
+    const targets = affectedVerificationTargets(wi, cfg, wtAbs, fallbackSolution);
     row.verificationTargets = targets;
+    // KI-E215: test.json is read tolerantly (see the block comment above this function) — a missing
+    // or unparseable file falls back to a best-effort derivation instead of an ENOENT crash.
+    let testArtifact = readJsonIfExists(join(itemDir, 'test.json'));
+    if (!testArtifact) testArtifact = deriveTestArtifactFallback(itemDir, wi, wtAbs);
+    // KI-E229: pass fallbackSolution into item.solution too — verificationExpectations' own
+    // solution fallback reads item.solution directly (see KNOWN-ISSUES.md#ki-e229).
+    try {
+      recoveryExpected = verificationExpectations({ item: { ...wi, solution: fallbackSolution }, test: testArtifact, worktree: wtAbs, targets,
+        band: 'FULL', redText: readTextIfExists(join(itemDir, 'verify-red-raw.txt')) });
+    } catch (e) {
+      recoveryExpectedError = e.message;
+      console.error(`recover: ${id} — cannot compute automated re-verification targets (${e.message}). This item's test-author artifact is missing or insufficient, so recovery cannot independently derive the exact build/filter/suite targets from it — read verify.json's own evidence text (and verify-red-raw.txt's FACTORY::RED::START line, if present) instead. Falling back to a manual recovery scaffold below.`);
+    }
   }
   const runId = randomUUID();
   const identity = admitAttempt(row, runId, { cycle: cyc, recovery: true, band: prior?.band || bandFor(wi), mode: 'recovery' });
@@ -2813,7 +3303,13 @@ function cmdRecover(flags, rest) {
   Object.assign(skeleton, { resultId: id + '#' + cyc + 'r' + recoveryOrdinal, runId, claimId: identity.claimId, attemptNumber: identity.attemptNumber });
   const quote = value => "'" + String(value).replace(/'/g, "'\\''") + "'";
   let recoveryCommands = 'Documentation recovery: independently recheck acceptance against the current worktree.';
-  {
+  // Upstream (factory/efficiency-hardening) unconditionally scaffolds a real evidence contract even
+  // for a doc/config recovery (the manual-comment line below covers that case) rather than deleting
+  // row.recoveryVerification outright — more evidence tracked, one code path instead of three. KI-E215
+  // tolerance is preserved as the ONE case that still falls through to the manual-fallback branch:
+  // recoveryCode===true but recoveryExpected could not be computed at all (test.json missing/unusable
+  // even after deriveTestArtifactFallback, or verificationExpectations itself threw).
+  if (!recoveryCode || recoveryExpected) {
     if (!wtAbs) throw new Error('recover: fresh source proof requires a live worktree');
     const prefix = join(itemDir, 'verify-recovery-' + runId + '-' + identity.claimId);
     const contract = { version: 2, codeChange: recoveryCode, graphHash: portableHash(wi), transcript: prefix + '.txt', metadataFile: prefix + '-metadata.json',
@@ -2834,6 +3330,14 @@ function cmdRecover(flags, rest) {
     commands.push(`${collect} > ${quote(contract.afterIdentity)}`);
     commands.push(`node ${quote(join(FACTORY_ROOT, '_workflow/driver.mjs'))} seal-recovery ${quote(id)}`);
     recoveryCommands = 'After the LAST remedy/source edit, run this complete fresh proof. Do not edit source afterward. Never copy historical transcripts.\n```bash\n' + commands.join('\n') + '\n```';
+  } else if (recoveryCode) {
+    // KI-E215: recoveryExpected could not be computed (recoveryExpectedError, logged above) — no
+    // machine-checkable build/filter/suite contract can be honestly scaffolded. Degrade to a manual,
+    // actionable recovery note instead of silently pretending automated re-verification ran.
+    delete row.recoveryVerification;
+    recoveryCommands = 'AUTOMATED RE-VERIFICATION TARGETS COULD NOT BE COMPUTED (' + (recoveryExpectedError || 'test.json missing') + '). '
+      + "This item's test-author artifact (test.json) is missing or insufficient, so recovery cannot independently derive the exact build/filter/suite commands from it. "
+      + 'Read verify.json\'s own evidence text (and verify-red-raw.txt\'s FACTORY::RED::START line, if present) in ' + itemDir + ' to determine which project + filter/test-class this item actually verified, then run the equivalent build/filter/suite commands by hand with `' + btAbs + '`, teeing the output the same way a normal recovery would, before folding.';
   }
   if (prior?.realInfraClassification) {
     skeleton.realInfraClassification = prior.realInfraClassification;
@@ -2969,11 +3473,225 @@ function cmdRecover(flags, rest) {
   console.log(`  protocol:       ${join(recDir, 'README.md')}`);
 }
 
+// KI-E452 (2026-11-08) — auto-reconcile items whose OWN pipeline run already reached a complete,
+// all-gates-APPROVED CLOSED result.json, while the ledger row still sits at FAILED/ESCALATED/BLOCKED
+// or an orphaned CLAIMED — because some upstream fold consumed that exact resultId under a WORSE,
+// now-stale verdict (a probe bug since fixed, e.g. KI-E450), or an orchestrator crash meant the
+// batch's own fold step never ran at all. Three of four cycle-177 escalations (three sibling
+// items) were exactly this: the fix was already done and fully approved;
+// only the ledger bookkeeping was stuck. A human had to notice it by hand every time.
+//
+// This is NOT a judgment call on code quality — every gate in that result.json already APPROVED
+// cleanly through the SAME trusted pipeline a live run uses. The only reason the item isn't CLOSED
+// is bookkeeping, not quality. Owner directive 2026-11-08 ("update the factory to enforce finishing
+// the tasks instead of the failure when it is obvious way to fix the item") — this closes the
+// obvious ones automatically instead of requiring a human to stumble onto them.
+//
+// SAFETY: never trusts the stale result.json's claims by themselves. It drives the real
+// direct-recovery protocol (cmdRecover, unchanged) and ACTUALLY RE-EXECUTES the exact fresh
+// build/filter/suite commands a human would otherwise have to run by hand — only folding to CLOSED
+// if that fresh run independently reproduces a clean result RIGHT NOW (seal-recovery's existing
+// strict evidence check is the real gate here, unmodified). Any discrepancy — build fails, tests
+// fail, counts differ, no automated re-verification target could even be computed (doc-only items,
+// `codeChange !== true`, are excluded up front for exactly this reason) — aborts that item's
+// reconcile attempt and reports it for a human, never forces a close on stale evidence alone.
+//
+// Candidate detection is a separate, pure function (readResult injected) so it is unit-testable
+// with synthetic fixtures via the extractFunction harness other driver.mjs commands already use
+// (_mainguard-driver-tests.mjs) — it never touches disk itself.
+function reconcileClosedCandidates(ledger, readResult, only) {
+  const candidates = [];
+  for (const id of Object.keys(ledger.items)) {
+    if (only && !only.has(id)) continue;
+    const row = ledger.items[id];
+    if (row.state === 'CLOSED') continue;
+    if (row.state === 'CLAIMED' && row.attemptIdentity && row.attemptIdentity.admitted === true) continue; // genuinely in-flight — never touch
+    if (!['FAILED', 'ESCALATED', 'BLOCKED', 'CLAIMED'].includes(row.state)) continue;
+    let result;
+    try { result = readResult(id); } catch { continue; }
+    if (!result || result.id !== id || result.toState !== 'CLOSED' || result.codeChange !== true) continue;
+    const gateKeys = Object.keys(result.gates || {});
+    if (!gateKeys.length || gateKeys.some((k) => result.gates[k] !== 'APPROVED')) continue; // ANY dissent -> needs a human, never auto
+    candidates.push({ id, result });
+  }
+  return candidates;
+}
+function cmdReconcileClosed(flags) {
+  const cfg = loadConfig();
+  loadGraph(abs(cfg.paths.graph)); // validates the graph is readable before we touch anything
+  let ledger = loadLedger(abs(cfg.paths.ledger));
+  if (!ledger) { console.log('no ledger'); return; }
+  const itemsRoot = abs(cfg.paths.items);
+  const only = flags.ids ? new Set(String(flags.ids).split(',').map((s) => s.trim()).filter(Boolean)) : null;
+  const candidates = reconcileClosedCandidates(ledger, (id) => readJson(join(itemsRoot, id, 'result.json')), only);
+  if (!candidates.length) { console.log('reconcile-closed: no auto-reconcilable items (every FAILED/ESCALATED/BLOCKED/orphaned-CLAIMED item either has no complete result.json, or that result is not a clean all-gates-APPROVED code close)'); return; }
+  console.log(`reconcile-closed: ${candidates.length} candidate(s) with a complete, all-gates-APPROVED result.json not yet reflected in the ledger:`);
+  for (const c of candidates) console.log(`  ${c.id} (ledger: ${ledger.items[c.id].state}, result: CLOSED, ${Object.keys(c.result.gates).length} gate(s) all APPROVED)`);
+  if (flags.dry) { console.log('(dry run — nothing changed; drop --dry to actually reconcile)'); return candidates.map((c) => c.id); }
+
+  const reconciled = [], skipped = [];
+  for (const c of candidates) {
+    const { id, result } = c;
+    console.log(`\nreconcile-closed: ${id} — starting`);
+    try {
+      ledger = loadLedger(abs(cfg.paths.ledger)); // re-read: an earlier iteration in this loop may have mutated it
+      const row = ledger.items[id];
+      if (row.state === 'CLAIMED') {
+        if (row.attemptIdentity && row.attemptIdentity.admitted === true) { skipped.push({ id, reason: 'became genuinely in-flight since the candidate scan' }); continue; }
+        if (!transition(ledger, id, 'FAILED', 'auto-reconcile-reset-stale: orphaned claim, complete CLOSED result.json pending reconciliation (KI-E452)')) {
+          skipped.push({ id, reason: 'could not reset orphaned CLAIMED -> FAILED' }); continue;
+        }
+        writeJsonAtomic(abs(cfg.paths.ledger), ledger);
+      }
+      cmdRecover(flags, [id]); // writes state/items/<id>/recovery/{README.md,recovery-fold.json} — unchanged existing path
+      const recDir = join(itemsRoot, id, 'recovery');
+      const readme = readFileSync(join(recDir, 'README.md'), 'utf8');
+      const script = /```bash\n([\s\S]*?)\n```/.exec(readme);
+      if (!script) { skipped.push({ id, reason: 'no automated re-verification script available (recovery could not compute a build/filter/suite contract) — left where cmdRecover put it for a human' }); continue; }
+      console.log('  running the exact fresh-evidence script the recovery protocol scaffolds for a human...');
+      execFileSync('bash', ['-c', 'set -e\n' + script[1]], { cwd: REPO_ROOT, stdio: 'inherit' });
+      const foldPath = join(recDir, 'recovery-fold.json');
+      const fold = readJson(foldPath);
+      for (const r of fold.results || []) {
+        if (r.id !== id) continue;
+        r.gates = { ...result.gates };
+        r.note = `Auto-reconciled (KI-E452): ${id}'s own prior pipeline run had ALREADY reached a complete, all-gates-APPROVED CLOSED result (state/items/${id}/result.json, resultId ${result.resultId || '?'}) — this exact gate map is copied from that result, unchanged. The ledger never reflected it (a stale/earlier fold likely consumed that resultId under a worse outcome, or the batch's own fold step never ran). Freshly re-verified right now via the standard direct-recovery evidence contract before folding — this recovery's own transcript is the live build/filter/suite re-run that reproduced a clean result independently of the old result.json, not a copy of it.`;
+      }
+      writeJsonAtomic(foldPath, fold);
+      cmdFold(foldPath, flags);
+      ledger = loadLedger(abs(cfg.paths.ledger));
+      if (ledger.items[id].state === 'CLOSED') { reconciled.push(id); console.log(`  ${id}: CLOSED`); }
+      else { skipped.push({ id, reason: `fold did not close it (now ${ledger.items[id].state}) — the fresh re-verification must have found something the old result.json didn't; needs a human look` }); }
+    } catch (e) {
+      const msg = String((e && e.message) || e).split('\n')[0];
+      skipped.push({ id, reason: msg });
+      console.log(`  ${id}: ABORTED — ${msg}`);
+    }
+  }
+  console.log(`\nreconcile-closed: ${reconciled.length} auto-closed, ${skipped.length} need a human`);
+  if (reconciled.length) console.log('  closed: ' + reconciled.join(', '));
+  for (const s of skipped) console.log(`  needs human: ${s.id} — ${s.reason}`);
+}
+
 // KI-E24 (improvement-analysis P7) — the owner-decision digest: ONE ranked page for the parked
 // queue. Evidence: 30+ parked decisions at median age ~24 days with thorough per-item framings
 // buried in a 500-line queue wall — rulings arrive only when a session hand-surfaces one. Ranking
 // severity x age + a one-line reply format turns the queue into a five-minute sitting; bundles
 // group same-target items so a related cluster is ruled in one pass. Read-only.
+// KI-E342: owner-decision digests were unusable one-liners. Each parked item's note is a full
+// "Should A … or should B?" question that already states the issue AND both options, but the digest
+// truncated it to 160 chars (dropping option B), left the options column empty, and showed sev '?'
+// (severity/target were read only from the findings-graph, which is empty for ledger-only items).
+// These helpers recover the alternatives and a usable severity from the data that IS present.
+function sevFromId(id) {
+  const m = String(id).match(/-([CHML])(?:\d|-|$)/);
+  return m ? ({ C: 'CRITICAL', H: 'HIGH', M: 'MEDIUM', L: 'LOW' }[m[1]]) : '?';
+}
+function extractDecisionOptions(text) {
+  const t = String(text || '').replace(/\s+/g, ' ').trim();
+  if (!t) return [];
+  // 1) explicit "(a) … (b) … (c) …" enumerations (dedupe repeated letter refs, e.g. a note that says "(b)" twice)
+  const paren = [...t.matchAll(/\(([a-z])\)\s*(.+?)(?=\s*\([a-z]\)|$)/gi)];
+  if (paren.length >= 2) {
+    const seen = new Set(); const out = [];
+    for (const m of paren) { const k = m[1].toUpperCase(); if (seen.has(k)) continue; seen.add(k); out.push({ k, text: m[2].trim().replace(/[\s,;.]+$/, '') }); }
+    if (out.length >= 2) return out;
+  }
+  // 2) "Should X … or should Y?" — the two alternatives
+  const parts = t.split(/\s+or should\s+/i);
+  if (parts.length === 2) {
+    return [
+      { k: 'A', text: parts[0].replace(/^should\s+/i, '').replace(/\s*[—–-]\s*$/, '').replace(/[?.\s]+$/, '').trim() },
+      { k: 'B', text: parts[1].replace(/[?.\s]+$/, '').trim() },
+    ];
+  }
+  return [];
+}
+function summarizeDecision(text, n) {
+  const t = String(text || '').trim();
+  return t.length > n ? t.slice(0, n).replace(/\s+\S*$/, '') + '…' : t;
+}
+// KI-E342: a ledger note is usually a string, but 3 of the parked items store it as a structured
+// {date, ruling, rationale, source} object (the -OWNER-DECISION rows) — `String(obj)` rendered the
+// literal "[object Object]". Extract real prose from either shape.
+function noteToText(note) {
+  if (!note) return '';
+  if (typeof note === 'string') return note;
+  if (typeof note === 'object') return [note.ruling || note.decision || '', note.rationale ? ('Rationale: ' + note.rationale) : ''].filter(Boolean).join(' — ');
+  return String(note);
+}
+// KI-E342: the REAL decision framing lives in queue/decisions.md (all parked items have a section
+// there; 54 have an empty ledger note). Parse it into {id: body} so the digest can fall back to the
+// human-queue framing — the rich "# Owner decision" lead when one exists, else the park-reason bullet.
+function resolveQueuePath(cfg) {
+  let p = cfg.paths && cfg.paths.queue;
+  if (!p) return '';
+  p = abs(p);
+  return p.endsWith('.md') ? p : join(p, 'decisions.md');
+}
+function parseDecisionQueue(path) {
+  const map = {};
+  if (!path || !existsSync(path)) return map;
+  const txt = readFileSync(path, 'utf8');
+  const re = /^##\s+([A-Z0-9][A-Za-z0-9_.-]*)\s+—\s+(?:BLOCKED|ESCALATED)\s*$/gm;
+  const headers = [];
+  let m;
+  while ((m = re.exec(txt))) headers.push({ id: m[1], matchStart: m.index, bodyStart: re.lastIndex });
+  for (let i = 0; i < headers.length; i++) {
+    const end = i + 1 < headers.length ? headers[i + 1].matchStart : txt.length;
+    map[headers[i].id] = txt.slice(headers[i].bodyStart, end).trim();
+  }
+  return map;
+}
+// KI-E344: the digest must be decision-sufficient on its own, so include the WHOLE "# Owner decision"
+// write-up (the framer's issue + what-is-done + why-blocked + options), not just a 600-char lead.
+// Preserve paragraph breaks; demote the write-up's own ## headers to bold so they don't outrank the
+// digest's ### item headers, and strip blockquote markers.
+function cleanFraming(text) {
+  return String(text || '')
+    .replace(/^#\s+Owner decision[^\n]*\n?/m, '')  // drop the redundant "# Owner decision — id" header
+    .replace(/^>\s?/gm, '')
+    .replace(/^#{1,6}\s+(.+?)\s*$/gm, '**$1**')     // headers → bold lines (keep structure, not hierarchy)
+    .replace(/^---+\s*$/gm, '')                      // strip the write-up's own horizontal rules — they'd collide with the digest's per-item --- separator AND truncate the console's issue parse
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+function queueBodyParts(body) {
+  if (!body) return { bullet: '', framing: '' };
+  const ownerIdx = body.search(/^#\s+Owner decision/m);
+  const head = ownerIdx >= 0 ? body.slice(0, ownerIdx) : body;
+  const bm = head.match(/^-\s+(.+)$/m);
+  const bullet = bm ? bm[1].trim().replace(/\s*\[[^\]]*\]?\s*$/, '').trim() : '';
+  const framing = ownerIdx >= 0 ? cleanFraming(body.slice(ownerIdx)) : '';
+  return { bullet, framing };
+}
+// KI-E345: the ~46 ESCALATED items were auto-escalated (exhausted fix attempts) with NO framer write-up —
+// the digest showed only "needs a human". Synthesize real decision context from what the ledger DOES
+// record: which gates passed, which gate blocked (and its verdict), the last failure, and the standard
+// resolution options for a stuck item. Derived entirely from r.gates / r.history — nothing fabricated.
+function gateVerdicts(r) {
+  const entries = Object.entries(r.gates || {});
+  const blockers = entries.filter(([, v]) => /CHANGES_REQUIRED|REJECTED|OVERRULED|CRITICAL|FAIL/i.test(String(v)));
+  return { entries, blockers };
+}
+const ESCALATION_OPTIONS = [
+  { k: 'A', text: 'Re-run — dispatch another attempt (worth it if the blocking gate looks transient or newly addressable).' },
+  { k: 'B', text: 'Fix manually — resolve the blocking gate’s objection by hand (branch `factory/<id>`, or `state/items/<id>/` when present), then re-gate.' },
+  { k: 'C', text: 'Override — if the blocking gate is a false positive, accept the fix and integrate it.' },
+  { k: 'D', text: 'Close / descope — if the finding no longer applies or is not worth the cost.' },
+];
+function buildEscalationContext(r, bullet) {
+  const { entries, blockers } = gateVerdicts(r);
+  const lastFail = (r.history || []).filter((h) => h.to === 'FAILED' && h.note).map((h) => String(h.note).replace(/\s+/g, ' ')).pop() || '';
+  const clean = (k) => k.replace(/^(gate|review|probe|adjudicator):/, '');
+  const lines = [];
+  if (r.state === 'ESCALATED') lines.push(`Auto-escalated after ${r.attempts || '?'} fix attempt(s): the factory implemented a fix but could not get it past every gate on its own, so it needs a human.`);
+  else lines.push(bullet ? ('Parked for an owner ruling. ' + bullet) : 'Parked for an owner ruling; no detailed framing was recorded.');
+  if (entries.length) lines.push('\n**Gate results:** ' + entries.map(([k, v]) => `${clean(k)} = ${v}`).join(' · '));
+  if (blockers.length) lines.push('**Blocked by:** ' + blockers.map(([k, v]) => `${clean(k)} (${v})`).join(', '));
+  if (lastFail) lines.push('**Last failure:** ' + lastFail.slice(0, 400));
+  return lines.join('\n');
+}
 function cmdDecisionsDigest() {
   const cfg = loadConfig();
   const graph = loadGraph(abs(cfg.paths.graph));
@@ -2983,6 +3701,7 @@ function cmdDecisionsDigest() {
   const sevRank = { CRITICAL: 3, HIGH: 2, MEDIUM: 1, LOW: 0 };
   const nowMs = Date.parse(now());
   const rows = [];
+  const queueMap = parseDecisionQueue(resolveQueuePath(cfg)); // KI-E342: the real framing lives in queue/decisions.md
   for (const [id, r] of Object.entries(ledger.items)) {
     if (!['BLOCKED', 'ESCALATED'].includes(r.state)) continue;
     const wi = items[id] || {};
@@ -2990,21 +3709,32 @@ function cmdDecisionsDigest() {
     const enteredAt = hist.length ? hist[hist.length - 1].at : r.updatedAt;
     const ageDays = enteredAt ? Math.max(0, Math.round((nowMs - Date.parse(enteredAt)) / 86400000)) : 0;
     const decPath = abs(join(cfg.paths.items, id, 'decision.md'));
-    let options = [];
-    // KI-E151 (ported from a host-mount session) — wi.ownerDecision is a plain string for most
-    // items, but a synthetic owner-batch-ruling item can store it as a structured
-    // {date, ruling, rationale, source} object instead. Stringifying that unguarded downstream
-    // produced the literal text "[object Object]" for exactly those rows — extract the actual ruling
-    // text here so both shapes render as real, readable prose.
-    let question = typeof wi.ownerDecision === 'string' ? wi.ownerDecision
-      : (wi.ownerDecision && typeof wi.ownerDecision === 'object' ? (wi.ownerDecision.ruling || wi.ownerDecision.decision || '') : '');
-    if (existsSync(decPath)) {
-      const txt = readFileSync(decPath, 'utf8');
-      options = [...new Set([...txt.matchAll(/\bOption ([A-Z])\b/g)].map((m) => m[1]))];
-      if (!question) { const line = txt.split('\n').map((l) => l.trim()).find((l) => l && !l.startsWith('#')); if (line) question = line; }
+    // KI-E151: ownerDecision is a string for most items, a {ruling,rationale} object for the
+    // -OWNER-DECISION rows — render both shapes as real prose (never "[object Object]").
+    const ownerRuling = typeof wi.ownerDecision === 'string' ? wi.ownerDecision
+      : (wi.ownerDecision && typeof wi.ownerDecision === 'object'
+        ? [wi.ownerDecision.ruling || wi.ownerDecision.decision || '', wi.ownerDecision.rationale ? ('Rationale: ' + wi.ownerDecision.rationale) : ''].filter(Boolean).join(' — ')
+        : '');
+    // KI-E344: use the FULL state/items/<id>/decision.md write-up (the framer's issue + options), not its first line.
+    const decisionMdText = existsSync(decPath) ? cleanFraming(readFileSync(decPath, 'utf8')) : '';
+    const qb = queueBodyParts(queueMap[id] || ''); // full human-queue write-up + park-reason bullet
+    const noteStr = noteToText(r.note).replace(/\s+/g, ' ').trim(); // the one-line "Should A … or should B?" question
+    // KI-E344: a DECISION-SUFFICIENT issue, richest source first — the full per-item decision.md, then the
+    // consolidated queue write-up, then an owner ruling, then the note question, then the park reason.
+    // Keep paragraph breaks (no \s+→space collapse) so a write-up reads as prose, not a wall.
+    const authored = !!(decisionMdText || qb.framing); // a framer-authored write-up — show it (near-)fully
+    const noteOpts = extractDecisionOptions(noteStr);
+    let issueText = decisionMdText || qb.framing || ownerRuling || noteStr || '';
+    let synthOpts = [];
+    if (!issueText) { // KI-E345: un-framed (almost all ESCALATED) — synthesize context from the gates/history
+      issueText = buildEscalationContext(r, qb.bullet) || qb.bullet;
+      if (r.state === 'ESCALATED') synthOpts = ESCALATION_OPTIONS;
     }
-    if (!question) question = (r.note || '').slice(0, 160);
-    rows.push({ id, state: r.state, severity: wi.severity || '?', target: wi.target || '?', ageDays, question: String(question).replace(/\|/g, '/').replace(/\s+/g, ' ').slice(0, 160), options, delivered: !!deliveredInHeadHint(items, id, r), stale: !!staleDecisionHint(abs(join(cfg.paths.items, id))) });
+    issueText = String(issueText).trim(); // preserve markdown (incl. a write-up's own option tables)
+    const cap = authored ? 8000 : 1500;   // authored write-ups read in full; synthesized/raw context is capped
+    if (issueText.length > cap) issueText = issueText.slice(0, cap).replace(/\s+\S*$/, '') + `\n\n_(truncated — full write-up in queue/decisions.md and state/items/${id}/)_`;
+    const optDetail = noteOpts.length ? noteOpts : synthOpts; // either/or note → A/B; escalated → standard resolution options; rich write-ups state options in prose
+    rows.push({ id, state: r.state, severity: wi.severity || sevFromId(id), target: wi.target || '?', ageDays, issueText, optDetail, delivered: !!deliveredInHeadHint(items, id, r), stale: !!staleDecisionHint(abs(join(cfg.paths.items, id))) });
   }
   rows.sort((a, b) => (sevRank[b.severity] || 0) - (sevRank[a.severity] || 0) || b.ageDays - a.ageDays || a.id.localeCompare(b.id));
   const bySev = rows.reduce((acc, r) => { acc[r.severity] = (acc[r.severity] || 0) + 1; return acc; }, {});
@@ -3032,12 +3762,21 @@ function cmdDecisionsDigest() {
     '',
     `_Generated ${now()} · ${rows.length} parked decision(s) (${Object.entries(bySev).map(([s, n]) => n + ' ' + s).join(', ') || 'none'}) · median age ${median}d_`,
     '',
-    '**Reply format — one line per ruling, paste several at once:** `<ID>: <option letter or short ruling>`' + (rows[0] ? ' (e.g. `' + rows[0].id + ': b`)' : '') + '. Full framings live in `queue/decisions.md` + `state/items/<id>/decision.md`.',
+    '**Reply format — one per line, paste several at once:** `<ID>: <A or B, or a short free-text ruling>`' + (rows[0] ? ' (e.g. `' + rows[0].id + ': B`)' : '') + '. Everything needed to decide is below; the complete source write-up for any item is in `queue/decisions.md` and `state/items/<id>/`.',
     '',
-    '| # | id | sev | state | age d | target | decision (one line) | options |',
-    '|---|---|---|---|---|---|---|---|',
-    ...rows.map((r, i) => `| ${i + 1} | \`${r.id}\` | ${r.severity} | ${r.state} | ${r.ageDays} | ${r.target} | ${r.question} | ${r.options.join('/') || '—'} |`),
+    '## Decisions — full issue + options, ranked by severity × age (read top to bottom)',
     '',
+    ...rows.map((r, i) => [
+      `### ${i + 1}. \`${r.id}\` — ${r.severity} · ${r.state} · ${r.ageDays}d`,
+      '',
+      '**Issue:** ' + (r.issueText || `_(no framing recorded — inspect \`state/items/${r.id}/\`)_`),
+      ...(r.optDetail.length
+        ? ['', '**Options:**', ...r.optDetail.map((o) => `- **${o.k}:** ${o.text}`)]
+        : ['', '_Reply with your ruling — an option letter from the write-up above, or a short free-text decision._']),
+      '',
+      '---',
+      '',
+    ].join('\n')),
     // KI-E36 (review fix): the delivered-in-HEAD hint must reach the digest-driven owner too — the
     // digest is the surface KI-E24 tells them to read INSTEAD of the raw queue.
     ...(rows.some((row) => row.delivered) ? [
@@ -3046,10 +3785,9 @@ function cmdDecisionsDigest() {
       ...rows.filter((row) => row.delivered).map((row) => `- \`${row.id}\` — every touch-set file has a commit newer than the park`),
       '',
     ] : []),
-    // KI-E159 (ported from a host-mount session) — the same "surface, never auto-resolve" posture as
-    // KI-E36 above — a later review/gate pass in this item's OWN directory postdates decision.md, so
-    // the block may rest on a finding that pass already reversed. Re-read the newer file before
-    // ruling; this digest never assumes it.
+    // KI-E159: the same "surface, never auto-resolve" posture as KI-E36 above — a later review/gate
+    // pass in this item's OWN directory postdates decision.md, so the block may rest on a finding
+    // that pass already reversed. Re-read the newer file before ruling; this digest never assumes it.
     ...(rows.some((row) => row.stale) ? [
       '## Possibly stale decisions (KI-E159) — a later review/gate file postdates decision.md',
       '',
@@ -3073,7 +3811,7 @@ function cmdDecisionsDigest() {
   mkdirSync(dirname(out), { recursive: true });
   writeFileSync(out, md);
   console.log(`decisions-digest: ${rows.length} parked decision(s) (${Object.entries(bySev).map(([s, n]) => n + ' ' + s).join(', ') || 'none'}), median age ${median}d -> ${out}`);
-  for (const r of rows.slice(0, 10)) console.log(`  ${r.severity} ${r.id} (${r.state}, ${r.ageDays}d, ${r.target})${r.options.length ? ' options ' + r.options.join('/') : ''}`);
+  for (const r of rows.slice(0, 10)) console.log(`  ${r.severity} ${r.id} (${r.state}, ${r.ageDays}d, ${r.target})${r.optDetail.length ? ' options ' + r.optDetail.map((o) => o.k).join('/') : ''}`);
   if (rows.length > 10) console.log(`  ... +${rows.length - 10} more in the digest`);
 }
 
@@ -3202,12 +3940,105 @@ function cmdIngest(flags) {
   console.log(`  next: node <mount>/_workflow/driver.mjs merge-graph   (the guarded, ledger-writing step — folds every normalized/*.json into the findings-graph)`);
 }
 
+// KI-E370: parse queue/factory-improvement-*.md files (frontmatter + ## sections) and write
+// normalized work items to state/normalized/improvements-<timestamp>.json for merge-graph.
+function cmdIngestImprovements(flags) {
+  const cfg = loadConfig();
+  const queueDir = join(FACTORY_ROOT, 'queue');
+  if (!existsSync(queueDir)) { console.log('ingest-improvements: no queue/ dir found'); return; }
+  const files = readdirSync(queueDir).filter((f) => f.startsWith('factory-improvement') && f.endsWith('.md'));
+  if (files.length === 0) { console.log('ingest-improvements: no factory-improvement-*.md files in queue/'); return; }
+
+  const items = [];
+  let counter = 1;
+  // Assign stable IDs: use content-hash of (file + key) for repeatability
+  for (const fname of files.sort()) {
+    let raw;
+    try { raw = readFileSync(join(queueDir, fname), 'utf8'); } catch (e) { console.warn('  skip (read error):', fname, e.message); continue; }
+    // Parse YAML frontmatter
+    const fmMatch = raw.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n([\s\S]*)$/);
+    if (!fmMatch) { console.warn('  skip (no frontmatter):', fname); continue; }
+    const fm = fmMatch[1];
+    const body = fmMatch[2];
+    const kindLine = fm.split(/\r?\n/).find((l) => l.startsWith('kind:'));
+    if (!kindLine || !kindLine.includes('factory-improvement')) { console.warn('  skip (kind != factory-improvement):', fname); continue; }
+
+    // Parse ## sections; each section may contain - key: `X`, - impact: N, plus description paras
+    const sectionRe = /^## (.+)$/gm;
+    let m;
+    const sections = [];
+    while ((m = sectionRe.exec(body)) !== null) {
+      sections.push({ heading: m[1].trim(), start: m.index + m[0].length });
+    }
+    for (let si = 0; si < sections.length; si++) {
+      const sec = sections[si];
+      const end = si + 1 < sections.length ? sections[si + 1].start - sections[si + 1].heading.length - 4 : body.length;
+      const secText = body.slice(sec.start, end);
+
+      // Extract key and impact from dash-list items
+      const keyMatch = secText.match(/^- key:\s*`?([^`\n]+)`?\s*$/m);
+      const impactMatch = secText.match(/^- impact:\s*(\d+)\s*$/m);
+      const key = keyMatch ? keyMatch[1].trim() : null;
+      const impact = impactMatch ? parseInt(impactMatch[1], 10) : 0;
+      if (!key) { console.warn('  skip section (no key):', sec.heading, 'in', fname); continue; }
+
+      // Map impact to severity
+      const severity = impact >= 20 ? 'HIGH' : impact >= 5 ? 'MEDIUM' : 'LOW';
+
+      // Stable ID: hash of filename + key → 8 hex uppercase, prefixed KIIMP-
+      const hash = createHash('sha256').update(fname + '::' + key).digest('hex').slice(0, 8).toUpperCase();
+      const id = 'KIIMP-' + hash;
+
+      // Description: non-dash, non-empty lines after the key/impact bullets
+      const descLines = secText.split(/\r?\n/).filter((l) => l.trim() && !l.match(/^- (key|impact|source):/));
+      const description = descLines.join(' ').trim().slice(0, 800) || sec.heading;
+
+      const item = enforceIngestTier({
+        id,
+        target: 'factory',
+        layer: 'factory',
+        title: sec.heading.slice(0, 200),
+        severity,
+        theme: 'factory-improvement',
+        fixType: 'non-trivial',
+        files: [],
+        dependsOn: [],
+        ownerDecision: null,
+        acceptance: 'REVIEW before scheduling — confirm the acceptance criterion is checkable, populate files[]. Key: ' + key + '. Description: ' + description.slice(0, 500),
+        regressionTest: 'NEEDS AUTHORING — describe the red→green regression proof for key=' + key + ' before scheduling.',
+        realInfra: false,
+        autonomyTier: 'escalate',
+        source: 'queue/' + fname + ' key=' + key,
+        fixHint: description.slice(0, 600),
+      });
+      items.push(item);
+      console.log('  +', id, severity, JSON.stringify(sec.heading.slice(0, 60)));
+      counter++;
+    }
+  }
+
+  if (items.length === 0) { console.log('ingest-improvements: 0 items parsed (no valid sections found)'); return; }
+
+  const normDir = join(dirname(abs(cfg.paths.graph)), 'normalized');
+  if (!existsSync(normDir)) mkdirSync(normDir, { recursive: true });
+  // Use a stable timestamp-like name derived from current process time (driver doesn't use Date.now())
+  const nowMs = Number(process.hrtime.bigint() / 1_000_000n);
+  const outName = 'improvements-' + String(nowMs) + '.json';
+  const outPath = join(normDir, outName);
+  writeJsonAtomic(outPath, items);
+  console.log('ingest-improvements: ' + items.length + ' item(s) -> ' + toPosix(relative(REPO_ROOT, outPath)));
+  console.log('  next: node <mount>/_workflow/driver.mjs merge-graph');
+}
+
 // Merge state/normalized/*.json into findings-graph.json with validation + dedup.
 function cmdMergeGraph(flags) {
   const cfg = loadConfig();
   const normDir = join(dirname(abs(cfg.paths.graph)), 'normalized');
   if (!existsSync(normDir)) { console.log('no normalized dir yet:', normDir); return; }
   const files = readdirSync(normDir).filter((f) => f.endsWith('.json'));
+  // KI-E351: guard — empty normalized/ would replace the authoritative graph with {} (second
+  // occurrence of the KI-E346 class). Nothing to merge → don't touch the graph.
+  if (files.length === 0) { console.log('merge-graph: normalized/ has no .json files — nothing to merge, graph unchanged'); return; }
   const items = [];
   const seen = new Set();
   const problems = [];
@@ -3259,11 +4090,22 @@ function cmdMergeGraph(flags) {
   };
   for (const id of Object.keys(adj)) if (!color[id]) dfs(id, []);
   for (const c of cycles) problems.push(`dependsOn CYCLE: ${c}`);
-  const graph = { generatedAt: now(), source: cfg.auditRoot, count: items.length, items };
-  writeJsonAtomic(abs(cfg.paths.graph), graph);
-  const bySev = items.reduce((a, w) => { a[w.severity] = (a[w.severity] || 0) + 1; return a; }, {});
-  console.log(`merge-graph: ${items.length} item(s) from ${files.length} file(s) -> ${cfg.paths.graph}`);
-  console.log('by severity:', JSON.stringify(bySev));
+  // KI-E351: MERGE INTO the existing graph — do not replace it. Existing items are preserved;
+  // new IDs from normalized/ are appended. Prevents the KI-E346/E351 wipe class where the
+  // authoritative graph was overwritten with only the (possibly empty) normalized/ contents.
+  const graphPath = abs(cfg.paths.graph);
+  const existingGraph = loadGraph(graphPath);
+  const existingById = new Map((existingGraph.items || []).map((w) => [w.id, w]));
+  const added = [];
+  for (const wi of items) {
+    if (!existingById.has(wi.id)) { existingById.set(wi.id, wi); added.push(wi.id); }
+  }
+  const merged = [...existingById.values()];
+  const graph = { generatedAt: now(), source: existingGraph.source || cfg.auditRoot, count: merged.length, items: merged };
+  writeJsonAtomic(graphPath, graph);
+  const bySev = added.reduce((a, id) => { const w = existingById.get(id); if (w) { a[w.severity] = (a[w.severity] || 0) + 1; } return a; }, {});
+  console.log(`merge-graph: ${added.length} new item(s) added (${items.length - added.length} duplicate(s) skipped) from ${files.length} file(s) -> ${cfg.paths.graph} (${merged.length} total)`);
+  console.log('new items by severity:', JSON.stringify(bySev));
   if (problems.length) { console.log(`problems (${problems.length}):`); for (const p of problems.slice(0, 40)) console.log('  -', p); }
   if (!flags['no-init']) {
     const ledger = loadLedger(abs(cfg.paths.ledger)) || emptyLedger(cfg.paths.graph);
@@ -3363,6 +4205,63 @@ function cmdController(flags, rest) {
 // it exists. WARN-ONLY, same posture as the fold/resume checks: the verdict concerns the
 // WORKTREE, repairing main is operator judgment, and the parked KI-L65 prevention ruling
 // (sandbox / fail-fast / accept) is deliberately untouched. Always exits 0.
+// KI-E240 — every existing drift check (KI-E45/E89/E146) only ever watches an ACTIVE claim-time or
+// batch-time window; nothing re-checks a CLOSED item's worktree later, so a file that silently
+// reverts AFTER close is structurally invisible to all of them. Live: that same prior item's own
+// `CaseType.cs` reverted to pre-fix content while 40 sibling files from the same original fix
+// stayed correct, and sat undetected BLOCKED for 47 days (2026-08-07 -> 2026-09-23) because nothing
+// was watching a closed item at all. The data needed to catch this already exists on disk and
+// requires no new capture: every recovery fold's evidence contract (`row.recoveryVerification`)
+// already records an aggregate whole-worktree content hash at close time (`afterIdentity`, written
+// by `collectEvidenceIdentity` — see `lib/evidence-identity.mjs`) plus the exact metadata contract
+// used to derive it (`metadataFile`). Re-deriving that SAME hash against the CURRENT worktree and
+// comparing catches ANY drift since close — not per-file (the stored identity is one aggregate hash
+// over the whole worktree, not a per-file map, so a mismatch says "something changed", not "this
+// specific file changed" — a manual diff against the recorded evidence is the next step). Read-only,
+// on-demand: NOT wired into any automatic cycle/fold path, an operator runs it explicitly (or a
+// scheduled job could, but that wiring is a separate decision). Items with no recorded
+// `recoveryVerification` (a normal, non-recovery close never captured one) are skipped, not flagged
+// — this only covers what the driver has real evidence for, never a guess.
+// Pure decision core, dependency-injected so it's unit-testable without a real filesystem/ledger
+// (mirrors `collectEvidenceIdentity`'s own injectable `options.fs`/`options.git` pattern above, and
+// KI-E89's `unclaimedMainDrift` extraction into a pure predicate). `io` supplies
+// `{ existsSync, readJsonIfExists, collectEvidenceIdentity }`; `abs` resolves a possibly-relative
+// path (the real command passes the module-level `abs`, a test passes identity `(p) => p`).
+// Returns exactly one of: {status:'skip', reason} | {status:'drift', message} | {status:'clean'}.
+function integritySweepDecision(id, row, io, abs) {
+  const rv = row.recoveryVerification;
+  if (!rv || !rv.afterIdentity || !rv.metadataFile) return { status: 'skip', reason: 'no-evidence' };
+  const worktree = row.worktree ? abs(row.worktree) : null;
+  if (!worktree || !io.existsSync(worktree)) return { status: 'skip', reason: 'worktree-gone', message: `  SKIP ${id}: worktree gone (GC'd or never materialized) — cannot verify` };
+  const stored = io.readJsonIfExists(abs(rv.afterIdentity));
+  const metadata = io.readJsonIfExists(abs(rv.metadataFile));
+  if (!stored || !metadata) return { status: 'skip', reason: 'evidence-missing', message: `  SKIP ${id}: recorded evidence file missing on disk — cannot verify` };
+  let current;
+  try { current = io.collectEvidenceIdentity(worktree, metadata); }
+  catch (e) { return { status: 'skip', reason: 'identity-error', message: `  SKIP ${id}: could not re-derive current evidence identity (${e.message})` }; }
+  if (current.hash === stored.hash) return { status: 'clean' };
+  const closedAt = (row.history || []).filter((h) => h.to === 'CLOSED').slice(-1)[0]?.at || 'unknown date';
+  return { status: 'drift', message: `INTEGRITY-DRIFT ${id}: worktree content differs from what was verified at close (${closedAt}) — possible silent revert or unrelated drift since then, needs owner review. This is a WHOLE-WORKTREE aggregate mismatch, not per-file — compare the current worktree against the recorded evidence (${rv.afterIdentity}) or its transcript (${rv.transcript || 'n/a'}) to find what changed. Do NOT auto-repair — same posture as every other drift check in this file (KI-E45/E89/E146): an integrity-sweep cannot tell a silent revert from a legitimate later touch to the same worktree, only a human can.` };
+}
+
+function cmdIntegritySweep(flags) {
+  const cfg = loadConfig();
+  const ledger = loadLedger(abs(cfg.paths.ledger));
+  const wantIds = flags.ids ? new Set(String(flags.ids).split(',').map((s) => s.trim()).filter(Boolean)) : null;
+  const allClosed = Object.keys(ledger.items || {}).filter((id) => ledger.items[id].state === 'CLOSED').sort();
+  const ids = wantIds ? allClosed.filter((id) => wantIds.has(id)) : allClosed;
+  if (!ids.length) { console.log(`integrity-sweep: no CLOSED item${wantIds ? ' matching --ids' : ''} to check`); return; }
+  let checked = 0, drift = 0, skipped = 0;
+  const io = { existsSync, readJsonIfExists, collectEvidenceIdentity };
+  for (const id of ids) {
+    const result = integritySweepDecision(id, ledger.items[id], io, abs);
+    if (result.status === 'skip') { skipped++; if (result.message) console.log(result.message); continue; }
+    checked++;
+    if (result.status === 'drift') { drift++; console.log(result.message); }
+  }
+  console.log(`integrity-sweep: ${checked} item(s) checked, ${drift} drift(s) found, ${skipped} skipped (no evidence recorded / worktree gone)`);
+}
+
 function cmdMainCheck(rest, flags) {
   const cfg = loadConfig();
   let ids = (rest || []).filter(Boolean);
@@ -3431,10 +4330,9 @@ function cmdMainCheck(rest, flags) {
   // REPO_ROOT/MAIN_MOUNT_REL/claimedPaths.
   const unclaimed = unclaimedMainDrift(dirtyMainPaths(REPO_ROOT), MAIN_MOUNT_REL, claimedPaths, { repoRoot: REPO_ROOT });
   if (unclaimed.length) {
-    // KI-E177 (ported from a host-mount session) — same upgrade as the fold-time sweep: a
-    // byte-identical match against a claimed item's own worktree is overwhelming evidence of
-    // leaked contamination, not operator WIP. Checked against EVERY item the factory has ever
-    // claimed (allClaimedIds), matching this command's own --all scope.
+    // KI-E177 — same upgrade as the fold-time sweep: a byte-identical match against a claimed item's
+    // own worktree is overwhelming evidence of leaked contamination, not operator WIP. Checked against
+    // EVERY item the factory has ever claimed (allClaimedIds), matching this command's own --all scope.
     const debris = matchWorktreeDebris(REPO_ROOT, unclaimed, allClaimedIds, abs(cfg.paths.worktreesState));
     const matched = debris.filter((d) => d.matchedItem);
     const truly = debris.filter((d) => !d.matchedItem).map((d) => d.path);
@@ -3528,9 +4426,11 @@ function dispatch(cmd, flags, rest) {
     case 'bind-runtime': return cmdBindRuntime(rest, flags);
     case 'seal-recovery': return cmdSealRecovery(rest);
     case 'reset': return cmdReset(rest);
+    case 'reopen': return cmdReopen(rest, flags); // KI-E463 — CLOSED -> READY, the one deliberate human-invoked exception to canTransition's terminal-state guarantee
     case 'fold': return cmdFold(rest[0], flags);
     case 'reconstruct': return cmdReconstruct(flags); // KI-L40 — rebuild results-cycle-<N>.json from per-item checkpoints after a kill
     case 'recover': return cmdRecover(flags, rest); // KI-E20 — direct-recovery scaffold (dissent digest + re-gate prompts + evidence contract + fold skeleton)
+    case 'reconcile-closed': return cmdReconcileClosed(flags); // KI-E452 — auto-close FAILED/ESCALATED/BLOCKED/orphaned-CLAIMED items whose own result.json already reached a clean, all-gates-APPROVED CLOSE; fresh re-verification required, never trusts the stale result alone
     case 'decisions-digest': return cmdDecisionsDigest(); // KI-E24 — ranked owner-decision digest (severity x age + one-line reply format)
     case 'realinfra-lint': return cmdRealinfraLint(); // KI-L42 — report realInfra=true items with no .cs (KI-L38 false-fail shape)
     case 'resume': return cmdResume(flags);
@@ -3540,6 +4440,7 @@ function dispatch(cmd, flags, rest) {
     case 'cost': return cmdReport('cost');
     case 'escalations': { const cfg = loadConfig(); return cmdEscalationsSync(cfg, loadLedger(abs(cfg.paths.ledger))); }
     case 'ingest': return cmdIngest(flags); // KI-E27 — pull issues from github/json/markdown into state/normalized/
+    case 'ingest-improvements': return cmdIngestImprovements(flags); // KI-E370 — parse queue/factory-improvement-*.md into state/normalized/
     case 'merge-graph': return cmdMergeGraph(flags);
     case 'group': return cmdGroup(flags);
     case 'suggest': return cmdSuggest(flags); // similar-batch planning (read-only; owner directive 2026-07-04)
@@ -3554,8 +4455,9 @@ function dispatch(cmd, flags, rest) {
     case 'controller': return cmdController(flags, rest); // KI-C11 — lease management: status | claim | release | heartbeat
     case 'telemetry-report': return cmdTelemetryReport(flags); // KI-E7 / spine AD-9 — evaluation report from events.jsonl
     case 'main-check': return cmdMainCheck(rest, flags); // KI-E50 — mid-band main-drift check (read-only, warn-only); KI-E82 — --all sweep
+    case 'integrity-sweep': return cmdIntegritySweep(flags); // KI-E240 — re-check a CLOSED item's worktree against its close-time evidence-identity hash (read-only, on-demand)
     default:
-      console.log('commands: init | status | select | claim | reset | fold | reconstruct | recover | resume | mark-launched | progress | burndown | cost | escalations | decisions-digest | group | suggest | cycle | sweep | sweep-fold | gc | preflight | graph-audit | realinfra-lint | report-cycle | ingest | merge-graph | controller | telemetry-report | main-check | worktree-add|remove|list');
+      console.log('commands: init | status | select | claim | bind-runtime | seal-recovery | reset | reopen | fold | reconstruct | recover | reconcile-closed | resume | mark-launched | progress | burndown | cost | escalations | decisions-digest | group | suggest | cycle | sweep | sweep-fold | gc | preflight | graph-audit | realinfra-lint | report-cycle | ingest | ingest-improvements | merge-graph | controller | telemetry-report | main-check | integrity-sweep | worktree-add|remove|list');
   }
 }
 
@@ -3565,7 +4467,7 @@ async function main() {
   // KI-B2/B3: a single advisory lock around every ledger-MUTATING command — a second concurrent driver
   // fails fast with a clear message instead of silently racing ledger.json. Read-only commands skip it.
   // 'controller' is lock-guarded too (its claim/release mutate controller.json under the same lock).
-  const MUTATING = new Set(['init', 'claim', 'bind-runtime', 'seal-recovery', 'reset', 'fold', 'group', 'cycle', 'sweep', 'sweep-fold', 'recover', 'merge-graph', 'gc', 'controller']);
+  const MUTATING = new Set(['init', 'claim', 'bind-runtime', 'seal-recovery', 'reset', 'reopen', 'fold', 'group', 'cycle', 'sweep', 'sweep-fold', 'recover', 'reconcile-closed', 'merge-graph', 'gc', 'controller']);
   const needsLock = MUTATING.has(cmd) || ['resume', 'reconstruct'].includes(cmd);
   let lockPath = null;
   if (needsLock) {
@@ -3583,7 +4485,7 @@ async function main() {
     // KI-C11: every mutating command (except the lease manager itself) must hold the campaign lease —
     // the per-command lock above serializes single commands; the lease serializes the CAMPAIGN.
     if (needsLock && cmd !== 'controller' && !requireController(cmd, flags)) return;
-    if (!flags.dry && (['claim', 'group', 'cycle', 'sweep', 'recover'].includes(cmd) || (cmd === 'resume' && flags.reuse))) {
+    if (!flags.dry && (['claim', 'group', 'cycle', 'sweep', 'recover', 'reconcile-closed'].includes(cmd) || (cmd === 'resume' && flags.reuse))) {
       writeJsonAtomic(join(FACTORY_ROOT, 'state', 'build-capacity.json'), { version: 1, limit: resolvedBuildCapacity(loadConfig(), flags) });
     }
     await dispatch(cmd, flags, rest);

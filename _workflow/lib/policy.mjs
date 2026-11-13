@@ -15,17 +15,25 @@
 // prints the effective policy state at every `group`/`sweep` so an unset overlay is visible, never
 // silent. Every enforcement layer keys off this single loader: factory.js probe + prompt injection
 // (via runArgs.policies), the opencode runtime's mechanical gate, and driver fold's WARN backstop.
+//
+// KI-E460: `archaeology` is a THIRD policy of a different kind — not a per-prompt restriction (there
+// is no POLICY_TEXT entry for it), but a STAGE-GATING capability toggle: when on, a non-mechanical
+// item whose target has no discoverable reference docs (empty DOC MAP) gets an archaeologist research
+// pass before planning. It lives in this same loader/merge/render machinery because that machinery is
+// already fully generic over Object.keys(DEFAULTS) — a doc-less-legacy-host opt-in costs nothing extra
+// here. Default OFF for the same "shipped engine must not assume one host's shape" reason as the other
+// two; a host like a large undocumented enterprise monolith turns it on in its local overlay.
 import { readFileSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 
-// KI-E171 (ported from a host-mount session): shadowConsolidatedScan (KI-E169) shipped as a
+// KI-E494 (ported from a host-mount session): shadowConsolidatedScan (KI-E492) shipped as a
 // config.json key WITHOUT being added here — this loader's merge only ever copies keys already
 // present in DEFAULTS (line below), so a flag can be set in every config file and still be silently
 // dropped on every real group/sweep launch, with exec-smoke coverage (which injects batch.policies
 // directly, bypassing this loader) structurally unable to catch the gap. Any future policy addition
 // MUST be added here in the SAME change, with a round-trip loadPolicies() assertion, not just
 // factory.js-side exec-smoke coverage of the flag's in-factory effect.
-const DEFAULTS = Object.freeze({ noNewComments: false, noSchemaChanges: false, failLaneOnMainDrift: false, shadowConsolidatedScan: false });
+const DEFAULTS = Object.freeze({ noNewComments: false, noSchemaChanges: false, failLaneOnMainDrift: false, archaeology: false, shadowConsolidatedScan: false });
 
 function readJsonSafe(p) {
   try { return JSON.parse(readFileSync(p, 'utf8')); } catch { return null; }
@@ -33,6 +41,17 @@ function readJsonSafe(p) {
 
 // Merge order: defaults <- committed config .policies <- local overlay .policies. Never throws;
 // unknown keys ignored; non-boolean values coerced with !! so a "true" string still enables.
+//
+// KI-E149/KI-E194 — isolateWorktreeWrites is a FIFTH kind of policy, with the OPPOSITE polarity from
+// every key in DEFAULTS above: this one is a SAFETY feature that defaults ON, so its absence must
+// mean "isolate" (true), never "false" (the uniform-false shape the DEFAULTS merge loop guarantees
+// for every other key). Folding it into DEFAULTS/the k-in-pol loop would make an unset config
+// silently turn write isolation OFF — the opposite of a safety feature's correct default (KI-E149's
+// own words: "unset/missing defaults ON... the opposite polarity from most other host policies in
+// this file, which default OFF"). So it is handled here as an explicit boolean pass-through, OUTSIDE
+// the DEFAULTS object: `out.isolateWorktreeWrites` stays `undefined` unless a config file explicitly
+// sets it, and the escape-hatch check every caller uses (`A.policies.isolateWorktreeWrites === false`)
+// treats undefined exactly like "not explicitly turned off" — isolation stays on.
 export function loadPolicies(factoryRoot) {
   const out = { ...DEFAULTS };
   for (const f of ['factory.config.json', 'factory.config.local.json']) {
@@ -47,7 +66,9 @@ export function loadPolicies(factoryRoot) {
   return out;
 }
 
-// One-line render for driver status output ("noNewComments=on noSchemaChanges=off").
+// One-line render for driver status output ("noNewComments=on noSchemaChanges=off"). isolateWorktreeWrites
+// renders ONLY when explicitly supplied (Object.hasOwn) — an absent key keeps its silent default-on
+// semantics rather than manufacturing a misleading "off" or "on" the config never actually stated.
 export function renderPolicies(policies) {
   const p = { ...DEFAULTS, ...(policies || {}) };
   return Object.keys(DEFAULTS).map((k) => `${k}=${p[k] ? 'on' : 'off'}`).join(' ') +

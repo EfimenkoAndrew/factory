@@ -2,7 +2,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import * as fs from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { join, resolve, relative, dirname, sep } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { execFileSync } from 'node:child_process';
 import { collectEvidenceIdentity, readOnlyEvidenceGit, ENGINE_SOURCE_PATHS } from './evidence-identity.mjs';
 import { preflightWorktreeInputs } from './worktree.mjs';
@@ -11,7 +12,10 @@ const metadata = { acceptance: 'complete', reviewerContract: { version: 1 } };
 const oid = character => character.repeat(40);
 
 function fixture(t) {
-  const root = fs.mkdtempSync(join(tmpdir(), 'factory-evidence-'));
+  // realpathSync: mkdtempSync's raw path and its resolved form differ on macOS (/var -> /private/var),
+  // and collectEvidenceIdentity realpaths `worktree` before ever calling git.root/head/index/untracked()
+  // — matching that here keeps this fixture's mock-repository keys reachable by the same paths production code computes.
+  const root = fs.realpathSync(fs.mkdtempSync(join(tmpdir(), 'factory-evidence-')));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   const repositories = new Map();
   const write = (path, content = path) => {
@@ -155,7 +159,14 @@ test('production read-only Git interface agrees with actual repository HEAD/inde
   const root = execFileSync('git', ['--no-optional-locks', 'rev-parse', '--show-toplevel'], { encoding: 'utf8' }).trim();
   assert.equal(readOnlyEvidenceGit.head(root), execFileSync('git', ['--no-optional-locks', 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim());
   const index = readOnlyEvidenceGit.index(root);
-  assert.ok(index.some(entry => entry.path === '_workflow/lib/locks.mjs' && entry.mode === '100644'));
+  // The factory mounts either as a git submodule (toplevel === this directory) OR as a plain cloned
+  // subdirectory of a larger host repo (toplevel === the host root, per AGENTS.md/CLAUDE.md — both are
+  // documented, valid mounts). A hardcoded '_workflow/lib/locks.mjs' only holds under the submodule
+  // mount; derive the expected path from this test file's OWN location relative to whatever toplevel
+  // git actually reports, so the assertion holds under either mount style.
+  const thisDirRelativeToRoot = relative(root, dirname(fileURLToPath(import.meta.url))).split(sep).join('/');
+  const expectedLocksPath = thisDirRelativeToRoot ? thisDirRelativeToRoot + '/locks.mjs' : 'locks.mjs';
+  assert.ok(index.some(entry => entry.path === expectedLocksPath && entry.mode === '100644'));
   assert.ok(Array.isArray(readOnlyEvidenceGit.untracked(root)));
 });
 

@@ -2,7 +2,7 @@
 // KI-E182 (2026-09-18) — the countclaims-lint CLI: fixer/editorial/runner (and a manual recovery
 // operator) run this in-session (via `verify/build-test.sh countclaims <worktree> <itemDir>`) so a
 // stale or invented "N/M passed" test-count claim is caught BEFORE it reaches a reviewer instead of
-// costing a full delta re-gate round (EGS-4-3 recovery, 2026-09-18). Single source of truth:
+// costing a full delta re-gate round (a prior item's recovery, 2026-09-18). Single source of truth:
 // lib/countclaims.mjs.
 // Output contract (machine-greppable):
 //   FACTORY::COUNTCLAIMS-MISS::<claim text>   one line per unevidenced count claim (added .md lines only)

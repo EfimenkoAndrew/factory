@@ -223,9 +223,9 @@ produces the following physical invocation counts:
 
 | Source fixture | Calls | Path |
 |---|---:|---|
-| `light-code` | 26 | LIGHT mechanical C# |
-| `light-doc` | 23 | LIGHT mechanical docs |
-| `full-code` | 36 | FULL nonmechanical CRITICAL security |
+| `light-code` | 39 | LIGHT mechanical C# |
+| `light-doc` | 27 | LIGHT mechanical docs |
+| `full-code` | 45 | FULL nonmechanical CRITICAL security |
 
 These documentation rows are checked against source execution and `projectedCalls`, not hand-entered
 idealized dispatch records. Conditions: policies off, single-clause acceptance,
@@ -245,15 +245,21 @@ EF, breadth, ledger, comments, shadow, drift and prior-finding probes are condit
 Set supported flags explicitly; custom review portfolios and mutated paths require
 their own measured calibration. C# machine probes differ from generic code review
 applicability. A LIGHT C# fixture with two unavailable test-author retries measures
-28 physical invocations, including 7 checkpoint writers; cost and actual model
-remain unknown rather than being fabricated from that count.
+41 physical invocations, including 5 checkpoint writers (2026-09-27 re-trace against the
+current pipeline; the prior 28/7 figures were stale, predating this session's many added
+mandatory pre-band/review stages -- same lineage as the light-code/full-code corrections
+above); cost and actual model remain unknown rather than being fabricated from that count.
 These are fresh-success projections, not unconditional minimums: early failure,
 verification-only and reuse cost less; retries and amendments cost more. Never
 compare them to old successful-logical-call maps as if units were identical.
-The predispatch admission relay adds one invocation to each item path. SWEEP has
-one admission relay per site before shared design/apply work; a source-executed
-doc SWEEP test checks those calls and their shared-overhead attribution. Item
-projections do not estimate an entire SWEEP. Baseline failure counts alone never
+CORRECTED (2026-09-27): the "predispatch admission relay" described here never existed in this
+repo's real factory.js -- confirmed via `git log -S`, no ":progress:admission" label has ever
+appeared in factory.js's history, for either a normal item or a SWEEP site. Ported from an
+abandoned merge and never wired in; band-cost.mjs's `admission` component is 0 for exactly this
+reason. SWEEP designs the fix pattern once (opus) then applies it per site (sonnet), with no
+admission checkpoint in between -- a source-executed doc SWEEP test checks the real design/apply
+call sequence and per-site labeling instead. Item projections do not estimate an entire SWEEP.
+Baseline failure counts alone never
 authorize failed suites: the baseline API requires captured target/test identities.
 The native happy-path runner stub returns a clean suite (zero failed tests).
 

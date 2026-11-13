@@ -25,6 +25,46 @@ function trx({ assembly = 'A.Tests', root = 'C:/work/first', framework = 'net8.0
 </${tag('TestRun')}>`;
 }
 
+// KI-E219: a Theory whose data rows the xUnit VSTest adapter cannot stably serialize (confirmed
+// live: a sibling service's RefundEventMapperTests, a Theory over polymorphic event objects) gets
+// ONE shared <UnitTest> definition for ALL its rows, each still with its own genuinely unique
+// <UnitTestResult executionId> -- the shared definition's single <Execution id> can only equal
+// ONE of them. `definedExecution` selects which of the `count` result execution ids (if any) the
+// shared definition itself records, so both the legitimate case (one real match) and the
+// corrupt/tampered case (none match) are constructible.
+function sharedDefinitionTrx({ count = 3, outcomes = ['Passed', 'Passed', 'Failed'], definedExecution = 0 } = {}) {
+  const path = 'C:/work/first/bin/Debug/net8.0/A.Tests.dll';
+  const failed = outcomes.filter(o => o === 'Failed').length, passed = outcomes.filter(o => o === 'Passed').length;
+  const results = Array.from({ length: count }, (_, i) =>
+    `<UnitTestResult testId="shared" executionId="e${i}" testName="Example.Tests.Theory(row: ${i})" outcome="${outcomes[i]}"/>`).join('');
+  const execAttr = definedExecution === null ? 'bogus' : 'e' + definedExecution;
+  return `<?xml version="1.0" encoding="utf-8"?>
+<TestRun xmlns="http://microsoft.com/schemas/VisualStudio/TeamTest/2010">
+<Results>${results}</Results>
+<TestDefinitions><UnitTest name="Example.Tests.Theory" storage="${path.toLowerCase()}" id="shared"><Execution id="${execAttr}"/><TestMethod codeBase="${path}" className="Example.Tests" name="Theory"/></UnitTest></TestDefinitions>
+<ResultSummary outcome="${failed ? 'Failed' : 'Completed'}"><Counters total="${count}" executed="${passed + failed}" passed="${passed}" failed="${failed}" notExecuted="0" error="0" aborted="0"/></ResultSummary>
+</TestRun>`;
+}
+
+test('a shared TRX definition across multiple theory-data rows is accepted when its recorded execution id is genuinely one of the rows', () => {
+  const r = parseTrx(sharedDefinitionTrx({ count: 3, outcomes: ['Passed', 'Passed', 'Failed'], definedExecution: 1 }));
+  assert.deepEqual([r.total, r.passed, r.failed], [3, 2, 1]);
+  assert.equal(r.failures.length, 1);
+  // All three rows share one definition id ("shared") but have distinct display names (row: 0/1/2),
+  // so their reported identities are naturally distinct too -- this isolates the fix under test
+  // (the execution/definition-mismatch check tolerating a shared definition) from the SEPARATE
+  // display-collision-disambiguation fix, covered by its own dedicated test above.
+  assert.equal(new Set(r.identities).size, 3);
+});
+
+test('a shared TRX definition whose recorded execution id matches NONE of its rows is still refused as tampered', () => {
+  assert.throws(() => parseTrx(sharedDefinitionTrx({ definedExecution: null })), /TRX execution\/definition mismatch/);
+});
+
+test('the strict 1:1 mismatched-execution corruption case (one definition, one result) is still refused exactly as before', () => {
+  assert.throws(() => parseTrx(trx().replace('<Execution id="e0"', '<Execution id="wrong"')), /TRX execution\/definition mismatch/);
+});
+
 test('stable, qualified parameter identities across temp paths, namespace prefixes and assemblies', () => {
   const a = parseTrx(trx());
   assert.deepEqual(a.failures, [{ source: 'A.Tests.dll/net8.0', test: 'Example.Tests.Case("a&<b>", 2)' }]);
@@ -53,7 +93,16 @@ test('aggregates all records rather than the last console/project summary', () =
   assert.throws(() => aggregateTrx([], 1), /missing/);
   assert.throws(() => aggregateTrx([a, a], 1), /duplicate/);
   assert.equal(parseTrx(a.replace('notExecuted="1"', 'notExecuted="0"')).skipped, 1);
-  assert.throws(() => parseTrx(trx({ names: ['Case(1)', 'Case(1)'], outcomes: ['Failed', 'Failed'] })), /duplicate/);
+  // KI-E219: two results sharing a literal display name but DIFFERENT, independently-unique test
+  // ids (the trx() helper always assigns one id per name) are two genuinely distinct tests, not a
+  // logical duplicate -- confirmed live in xUnit's own real output (long theory-argument display
+  // truncation). This must no longer be fatal; the collision is disambiguated (folding the
+  // colliding entry's own definition id into its reported identity) instead of thrown away.
+  const collided = parseTrx(trx({ names: ['Case(1)', 'Case(1)'], outcomes: ['Failed', 'Failed'] }));
+  assert.deepEqual([collided.total, collided.failed], [2, 2]);
+  assert.equal(collided.identities.length, 2);
+  assert.notEqual(collided.identities[0], collided.identities[1]);
+  assert.ok(collided.identities[1].endsWith('#t1'), 'the SECOND (colliding) entry is disambiguated by its own definition id');
 });
 
 test('xUnit error run-info must corroborate an actual failed record', () => {
@@ -168,11 +217,15 @@ exit "$TEST_CODE"
   const invoke = (sub, overrides = {}) => bash(['-c', 'set -o pipefail; bash "$1" "$2" "$3" "Case" | cat', '_', runner, sub, target], { env: { ...env, ...overrides } });
   const run = invoke('suite');
   assert.equal(run.status, 1, run.stdout + run.stderr);
-  assert.match(run.stdout, /SUMMARY::suite exit=1 failed=1 passed=1 skipped=0 total=2/);
+  assert.match(run.stdout, /SUMMARY::suite exit=1 failed=1 passed=1 skipped=0 dockerfail=0 total=2/);
   assert.match(run.stdout, /FAILURE .*A.Tests.dll\/net8.0/);
+  // KI-E220: `suite` now surfaces a real-infra marker exactly like `filter` already did -- a
+  // needsRealInfra item whose ONLY evidence is a whole-solution suite run (no separate filter
+  // invocation) must still be able to prove real infra ran, not just a targeted filter run.
+  assert.match(run.stdout, /FACTORY::REALINFRA::postgres/);
   assert.equal(existsSync(readFileSync(location, 'utf8').trim()), false);
   assert.equal(existsSync(join(fixtures, 'a.trx')), true);
-  assert.match(readFileSync(log, 'utf8'), /--logger\ntrx\n--results-directory\n/);
+  assert.match(readFileSync(log, 'utf8'), /--logger\nconsole;verbosity=detailed\n--logger\ntrx\n--results-directory\n/);
   const filter = invoke('filter');
   assert.equal(filter.status, 1);
   assert.match(filter.stdout, /FACTORY::REALINFRA::postgres/);

@@ -37,7 +37,7 @@
 // handler must implement retry with backoff", "the diff must set the Status field to Approved", …)
 // — 13 of 14 were silently missed, because none of their verbs happened to be on the list the two
 // known incidents produced. Since this function is the SOLE gate deciding whether the probe runs at
-// all, every miss meant zero plan-vs-diff cross-check — the exact EGS-2-2 failure class, one verb
+// all, every miss meant zero plan-vs-diff cross-check — the exact prior-item failure class, one verb
 // away. Widened to `\bmust[\s-]+\w+` (any word, not a fixed list): the pre-filter's job is only to
 // decide "does this text contain SOME checkable commitment at all" — the haiku probe does the actual
 // judgment — so a broader net costs at most one extra cheap, bounded probe call on a false-trigger,

@@ -8,6 +8,13 @@ intrinsic quality.
 > workflow — it is a tri-modal, human-checkpointed skill (mode menus, config loads, greetings) a
 > factory reviewer cannot satisfy. Its test-quality knowledge base is distilled below; apply it
 > directly to the new/changed test files in the diff.
+> **Live drift check (KI-E249):** `Skill({skill: "bmad-testarch-test-review"})` loads only this
+> skill's entry point (it is a multi-file workflow skill — the fuller checklist lives in that
+> skill directory's own `checklist.md`, not something a single Skill() call surfaces), so it is
+> optional here rather than the single-call check the single-file skills get. If you want deeper
+> verification that the distillation below hasn't drifted, Read
+> `.claude/skills/bmad-testarch-test-review/checklist.md` directly — otherwise the checks below
+> already ARE the distillation and you lose nothing by proceeding directly.
 
 ### Quality checks (each verified against the actual test source + its run transcripts)
 1. **Discriminates the defect**: the test fails on the OLD code for the DEFECT's reason (read

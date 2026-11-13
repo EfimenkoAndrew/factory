@@ -24,8 +24,17 @@ import { join } from 'node:path';
 
 const HEADING_CAP = 40;      // max headings per doc in the map (a data-flow doc can have 100s)
 const HEADING_LEN = 90;      // per-heading text bound
-// Legacy sizing reference retained for import compatibility; NEVER a truncation boundary.
-// Behavioral contracts (briefs and profiles) must be delivered completely.
+// (ported from a host-mount session, 2026-09-20 reconcile): BRIEF_CAP is REMOVED — readRoleBriefs
+// below used to `.slice(0, BRIEF_CAP)`, and by the time agents/test-author.md alone grew past 12000
+// chars (independent of this reconcile), its own tail — the REAL-INFRA TESTS marker instructions, the
+// Declaring-realInfra-override section, the Write+return contract — was being silently truncated out
+// of every composed prompt. A per-brief size cap is a maintenance trap the moment any ONE brief grows
+// past it; briefs and profiles are BEHAVIORAL CONTRACTS, and a contract delivered 88% complete with no
+// warning is worse than an oversized prompt. PROFILE_CAP had the identical failure mode (a BRIEF_CAP-
+// sized slice silently dropped 30-53% of 3 of the 4 first live profiles — tail sections vanished with
+// no warning) and is retained ONLY as a legacy sizing reference other files still import the NAME of
+// (PR#9's "profiles cap at PROFILE_CAP, not the 12k BRIEF_CAP" test); it is NEVER applied as a
+// truncation boundary below. Both readRoleBriefs and readRepoProfiles now deliver content completely.
 export const PROFILE_CAP = 30000;
 
 // Extract '## ' / '### ' headings with 1-based line numbers -> ['§ <text> @L<n>', ...] (capped).
