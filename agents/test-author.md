@@ -34,9 +34,20 @@ genuine failure on old code and an independently verified pass on the fix. Do NO
    assembly/framework and full parameter identities verbatim; never hand-author markers or derive
    them from your summary. Capture all affected baseline targets before product edits; missing
    producer identities remain missing evidence.
-6. If genuinely untestable (e.g. deploy-only with no code seam), return `red=false` and explain for
-   the alternate proof path. For an explicitly authorized verificationOnly path, pin the existing
-   correct behavior and retain its actual exit=0 evidence; never claim an observed old-code failure.
+6. **RED-MARKER PRE-FLIGHT (KI-E400 — verify your own proof BEFORE returning; the two most common
+   factory failure modes both die here):** after the suite step above, re-run EXACTLY:
+   `grep -E "FACTORY::SUMMARY::red exit=|FACTORY::RED::" <ARTIFACTS DIR>/verify-red-raw.txt | tail -5`
+   and confirm BOTH: (a) a `FACTORY::RED::<exitcode>` marker exists with a NONZERO exit code (for a
+   normal new regression; `FACTORY::RED::0` is vacuous — the test passed on old code, write a real
+   discriminating assertion); (b) the test class named in the marker IS the class your `runCmd`
+   actually runs — never a different class, never a marker from a prior round's capture. If either
+   fails, fix the test/run and repeat steps 4-6 until the marker is genuine. A self-reported
+   `red=true` without a failing marker transcript does NOT advance the item — the pre-band RED-proof
+   probe re-greps this file and fails the item before any fix work is spent; catching it here costs
+   one grep instead of a whole pipeline. If genuinely untestable (e.g. deploy-only with no code
+   seam), return `red=false` and explain for the alternate proof path. For an explicitly authorized
+   verificationOnly path, pin the existing correct behavior and retain its actual exit=0 evidence;
+   never claim an observed old-code failure.
 7. **RE-FIX:** read prior gate/review feedback from ARTIFACTS DIR. KEEP the prior test; ADD proof for
    what is STILL broken. The new proof must fail on the current worktree, not duplicate an already
    passing test. Never recapture a pre-fix baseline from a worktree already carrying the prior fix.
@@ -82,6 +93,26 @@ genuine failure on old code and an independently verified pass on the fix. Do NO
   independent of DB semantics, set `realInfraOverride` to a specific mechanism-based explanation.
   A note alone cannot override the marker requirement; an independent adjudicator must decide.
   Leave unset/null when using real infra or lacking a reasoned basis. Never use a vague override.
+
+### Multi-service integration items (KI-E356)
+When `files` spans MORE THAN ONE service directory (e.g. ServiceA + ServiceB, or
+ServiceB + ServiceC), the defect is at an INTEGRATION POINT between services — no single
+service's test suite can prove the full contract. Approach:
+
+1. **Identify the seam**: which HTTP call, named HttpClient, or integration event is the bridge?
+2. **Write at the CALLER side**: in `<CallerService>.Tests`, use `WebApplicationFactory` + a
+   WireMock/HttpMessageHandler stub of the downstream URL. Assert the caller sends the CORRECT
+   verb+path+body to the downstream service. This proves routing is fixed on the caller side.
+3. **Write at the CALLEE side**: in `<CalleeService>.Tests`, assert the called handler/consumer
+   processes the request correctly and produces the right output (entity created, event published).
+4. **State the live-spec gap in `note`**: what the tests CANNOT prove (e.g. "K8s configmap routing
+   of the named client to the real service URL") and confirm the fixer must create
+   `verify/live-specs/<id>.sh` to cover it. If the live spec doesn't yet exist, include this
+   explicit ask: `"liveSpecRequired": true`. The fixer (KI-E355) is then responsible for creating
+   it; the test-author's job is the red→green in-process proof.
+5. Never write a test that spins up BOTH service hosts in a single test class — that is an
+   end-to-end test outside the test-author scope. Two focused single-service tests + a live spec
+   is the correct multi-service proof structure.
 
 ### Write + return
 - WRITE `<ARTIFACTS DIR>/test.json`: test files, exact run command, RED excerpt and design caveats.

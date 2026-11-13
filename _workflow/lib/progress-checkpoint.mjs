@@ -1,12 +1,13 @@
-// KI-E137 (ported from a host-mount session) — INCREMENTAL PROGRESS CHECKPOINTING (read side).
-// factory.js's checkpointProgress() writes state/items/<id>/progress.json at 4 phase boundaries
-// mid-pipeline (post-verify, post-preband, post-gates, post-reaudit) — this module is the pure
-// read/validate/summarize half, shared by cmdResume (per-item inflight line) and cmdReconstruct
-// (missing-checkpoint diagnostics), so a killed run's LATEST reached stage is visible instead of a
-// bare "no checkpoint — must re-run".
+// KI-E137 — INCREMENTAL PROGRESS CHECKPOINTING (read side). factory.js's checkpointProgress()
+// writes state/items/<id>/progress.json at 4 phase boundaries mid-pipeline (post-verify,
+// post-preband, post-gates, post-reaudit) — this module is the pure read/validate/summarize half,
+// shared by cmdResume (per-item inflight line) and cmdReconstruct (missing-checkpoint diagnostics),
+// so a killed run's LATEST reached stage is visible instead of a bare "no checkpoint — must re-run".
 //
-// Reading a checkpoint does not authorize reuse. Native execution independently validates
-// canonical content/contract identity and the completed reviewer portfolio before skipping work.
+// Deliberately read-only / advisory: this module does NOT feed loadPriorAttempt or any relaunch
+// reuse decision (that is KI-E138, a separate, larger change — see prior-attempt.mjs's own comment
+// on why "verify onward always re-runs fresh" was drawn as a trust boundary, not an oversight). A
+// progress.json existing changes what a human/controller SEES, never what a relaunch SKIPS.
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 
@@ -16,6 +17,11 @@ import { join } from 'node:path';
 export const PROGRESS_STAGES = ['admission', 'post-plan', 'post-test', 'post-verify', 'post-preband', 'post-gates', 'post-reaudit', 'sweep-apply-started', 'sweep-post-apply'];
 
 const REMAINING_AFTER = {
+  // 'admission'/'post-plan'/'post-test'/'sweep-apply-started'/'sweep-post-apply' are not yet
+  // written by this repo's factory.js (which still checkpoints only the original 4 stages below) —
+  // recognizing them here is forward-compatible with a later checkpointProgress caller (e.g. a
+  // native-execution or sweep-apply path) without requiring a coordinated same-PR change, and is
+  // otherwise inert: readProgressCheckpoint only ever sees a stage tag a real writer produced.
   admission: 'semantic work has not yet completed; planning/test authoring, implementation, verification and reviews remain',
   'post-plan': 'test authoring, implementation, verification and independent reviews',
   'post-test': 'implementation, verification and independent reviews',
@@ -35,10 +41,10 @@ function readJsonSafe(p) {
 // resultId convention (id#cycle) result.json uses (KI-B4 fold idempotency) — for cmdResume/
 // cmdReconstruct's DIAGNOSTIC display (KI-E137), where "which incident is this describing" matters
 // and the item is being relaunched under the SAME cycle number. `cyc` is DELIBERATELY optional: a
-// fresh `cmdGroup` re-claim (KI-E121's "CONTINUING" path — the documented, PREFERRED recovery route,
+// fresh `cmdGroup` re-claim (KI-E474's "CONTINUING" path — the documented, PREFERRED recovery route,
 // "re-group — never Workflow-resume") stamps a NEW cycle number, so a strict fence would make
 // gate-band reuse (KI-E139) permanently unreachable from that path — exactly the clock/generation
-// trap KI-E121's own comment already diagnosed for plan/test/fix reuse ("a fresh claim stamps a NEW
+// trap KI-E474's own comment already diagnosed for plan/test/fix reuse ("a fresh claim stamps a NEW
 // transition NOW, so every artifact on disk reads as stale even though nothing touched the
 // worktree"). KI-E139 doesn't need the cycle fence for safety anyway: the content-hash check inside
 // runItem() is strictly stronger proof than a cycle number ever was — id-only matching here is safe
@@ -62,5 +68,5 @@ export function summarizeProgress(pr) {
   const gateKeys = Object.keys(gates);
   const tally = gateKeys.length ? gateKeys.map((k) => `${k}=${gates[k]}`).join(', ') : '(no gate/scan verdicts recorded yet)';
   const remaining = REMAINING_AFTER[pr.progressStage] || '(unknown remaining scope)';
-  return `progress.json (KI-E137): stage '${pr.progressStage}' reached — ${tally} — remaining: ${remaining} (reuse requires fresh content/contract identity and completed-review validation; see SKILL.md § Recovery)`;
+  return `progress.json (KI-E137): stage '${pr.progressStage}' reached — ${tally} — remaining: ${remaining} (not yet reusable on relaunch, KI-E138; re-runs fresh from \`fix\` onward per SKILL.md § Recovery)`;
 }

@@ -3,7 +3,7 @@ import { join, basename, dirname } from 'node:path';
 
 const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
 
-function extractFunction(source, name) {
+export function extractFunction(source, name) {
   const start = new RegExp('\\b(?:async\\s+)?function\\s+' + name + '\\s*\\(').exec(source)?.index;
   if (start === undefined) throw new Error('Missing driver function: ' + name);
   for (let end = source.indexOf('}', start); end !== -1; end = source.indexOf('}', end + 1)) {

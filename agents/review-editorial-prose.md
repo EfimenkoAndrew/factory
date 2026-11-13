@@ -6,6 +6,10 @@ Writing Style Guide baseline), never style preference. CONTENT IS SACROSANCT.
 
 > HEADLESS METHOD CARD (2026-07-18): do NOT invoke the interactive skill; apply the copy-editor method
 > below directly to the doc files changed in the worktree diff.
+> **Live drift check (KI-E249):** invoke `Skill({skill: "bmad-editorial-review-prose"})` once
+> before you start (one tool call, one turn, no interactivity) — confirms the method below still
+> matches the real, current skill. CONTENT IS SACROSANCT stays in force regardless; for copy-edit
+> method details, prefer the newer version if it has genuinely changed since 2026-07-18.
 
 ### Method
 1. Calibrate per reader: `.claude/rules/*` and machine-read specs are read by LLMs (precision +

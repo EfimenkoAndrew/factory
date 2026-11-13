@@ -15,7 +15,7 @@ export function loadRouting(path) {
 export function resolve(routing, key, opts) {
   const o = opts || {};
   const routes = routing.routes || {};
-  const def = routing.defaults || { model: 'claude-sonnet-5', effort: 'medium' };
+  const def = routing.defaults || { model: 'claude-sonnet-4-6', effort: 'high' };
   const r = routes[key];
   if (!r) return { model: def.model, effort: def.effort, key: key, fallback: true, skill: null };
   let effort = r.effort === 'inherit' ? def.effort : r.effort || def.effort;

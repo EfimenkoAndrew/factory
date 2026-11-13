@@ -57,6 +57,15 @@ function producer(t, { code = false, band = 'LIGHT', escalated = false, engine =
   const configRoot = join(dirname(fileURLToPath(runtimeUrl)), '../../config');
   fs.mkdirSync(join(f.root, 'config'));
   fs.copyFileSync(join(configRoot, 'factory.config.json'), join(f.root, 'config/factory.config.json'));
+  // Mirror the REAL host's optional local override too (KI-E17 seam, gitignored -- e.g.
+  // failLaneOnMainDrift/shadowConsolidatedScan). cmdBindRuntime (driver.mjs, invoked below via f.call)
+  // reads FACTORY_ROOT directly -- the actual host's config/ -- while cmdInit (runtime.mjs) reads the
+  // fixture's copy; without mirroring this file, the two computed contracts silently diverge on any
+  // host that has one (this one does), and every producer() test below fails with "runtime context
+  // differs from trusted driver contract" for a reason that has nothing to do with what it's testing.
+  if (fs.existsSync(join(configRoot, 'factory.config.local.json'))) {
+    fs.copyFileSync(join(configRoot, 'factory.config.local.json'), join(f.root, 'config/factory.config.local.json'));
+  }
   fs.mkdirSync(join(f.root, 'agents'));
   if (engine) fs.writeFileSync(join(f.root, 'agents/fixer.md'), 'effective brief');
   const context = vm.createContext({ ...imports, fixtureRoot: f.root, Buffer, structuredClone,

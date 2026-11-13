@@ -1,4 +1,4 @@
-import { lstatSync, readdirSync, readFileSync, openSync, writeFileSync, fsyncSync, closeSync, renameSync, unlinkSync } from 'node:fs';
+import { lstatSync, readlinkSync, readdirSync, readFileSync, openSync, writeFileSync, fsyncSync, closeSync, renameSync, unlinkSync } from 'node:fs';
 import { resolve, relative, dirname, basename, isAbsolute, join } from 'node:path';
 import { randomUUID, createHash } from 'node:crypto';
 
@@ -7,12 +7,31 @@ export function instructionBearingPath(path) {
     /^(?:claude(?:\.local)?\.md|agents\.md|gemini\.md|copilot-instructions\.md|\.claude|\.opencode|\.github|\.cursor|\.cursorrules|\.windsurfrules|opencode\.jsonc?)$/i.test(part.replace(/[ .]+$/, '').split(':')[0]));
 }
 
+// KI-sync-macos-tmp-symlink: macOS ships /tmp and /var (among a handful of other top-level
+// entries) as STATIC symlinks into /private/tmp and /private/var -- a fixed, OS-shipped
+// convention present on every stock macOS install, not something an agent or attacker can
+// introduce or redirect. The ancestor walk below rejects any symlink in the path, which made
+// this check fail unconditionally for any artifact under the OS's own default TMPDIR on macOS
+// (reproduced: driver-integration.test.mjs's native-artifact tests failing there). Trust ONLY a
+// symlink whose target is the literal path itself prefixed with /private -- that is precisely
+// (and only) the stock Darwin alias; a same-shaped symlink an attacker placed anywhere else, or
+// one whose target differs even slightly, still rejects exactly as before.
+function isStaticDarwinAlias(full, stat) {
+  if (!stat.isSymbolicLink()) return false;
+  try {
+    const target = readlinkSync(full);
+    const resolvedTarget = isAbsolute(target) ? target : resolve(dirname(full), target);
+    return resolvedTarget === '/private' + full;
+  } catch { return false; }
+}
+
 export function assertRegularPath(path, { directory = false, missing = false } = {}) {
   const full = resolve(path);
   const parent = dirname(full);
   if (parent !== full) assertRegularPath(parent, { directory: true });
   let stat;
   try { stat = lstatSync(full); } catch (error) { if (missing && error.code === 'ENOENT') return full; throw error; }
+  if (isStaticDarwinAlias(full, stat)) return full;
   if (stat.isSymbolicLink() || (directory ? !stat.isDirectory() : !stat.isFile() || stat.nlink !== 1)) throw new Error('unsafe artifact path: ' + full);
   return full;
 }

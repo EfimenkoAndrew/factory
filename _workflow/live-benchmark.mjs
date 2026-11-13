@@ -39,8 +39,13 @@ export function prepare(directory, model = null, heldout = false) {
   if (!existsSync(dirname(dir)) || !statSync(dirname(dir)).isDirectory()) throw new Error('output parent must already exist');
   mkdirSync(dir);
   const revision = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: root, encoding: 'utf8' }).trim();
-  const original = execFileSync('git', ['show', revision + ':agents/review-code.md'], { cwd: root, encoding: 'utf8' });
-  const edge = execFileSync('git', ['show', revision + ':agents/review-edgecase.md'], { cwd: root, encoding: 'utf8' });
+  // A bare `<rev>:<path>` pathspec resolves from the git WORKTREE ROOT regardless of `cwd` — only a
+  // `./`- or `../`-prefixed path is cwd-relative. `root` here is this engine's own root (which is
+  // NOT the git worktree root on a host that mounts the engine under a subdirectory, e.g.
+  // `_bmad-output/ai-factory/`), so the `./` prefix is required for this to resolve correctly on
+  // both a standalone checkout (engine root == repo root) and a host-mounted one.
+  const original = execFileSync('git', ['show', revision + ':./agents/review-code.md'], { cwd: root, encoding: 'utf8' });
+  const edge = execFileSync('git', ['show', revision + ':./agents/review-edgecase.md'], { cwd: root, encoding: 'utf8' });
   const cases = heldout ? heldoutCases() : benchmarkCases();
   const outputContract = heldout ? responseContract.replace('all six cases', 'all supplied cases') : responseContract;
   const input = { experimentId: heldout ? 'synthetic-review-context-heldout-v1' : 'synthetic-review-context-v1', baselineArm: 'original-complete',

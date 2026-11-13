@@ -30,14 +30,16 @@ function evalLiteral(lit, scope) {
 // (model:null inherited the session model and died on Fable-5 credit-exhaustion), so it is now
 // drift-checked like every other route to keep the two copies from diverging again.
 const RT_MAP = {
-  fixerMech: 'fixer.mechanical', fixerCrit: 'fixer.critical',
+  fixerMech: 'fixer.mechanical', fixerCrit: 'fixer.critical', fixerStepCrit: 'fixer.steps.critical', fixerConsolidate: 'fixer.consolidation',
+  fixerConsolidateSolo: 'fixer.consolidation.solo', // KI-E487 — the 1-step consolidation route, drift-checked like every other cost-bearing route
   testMech: 'test_author.mechanical', testCrit: 'test_author.critical',
-  planner: 'planner', runner: 'runner',
+  planner: 'planner', plannerMech: 'planner.mechanical', archaeologist: 'archaeologist', runner: 'runner',
   gArch: 'gate.architect', gDev: 'gate.developer', gQa: 'gate.qa', gSec: 'gate.security', gPo: 'gate.po',
-  rCode: 'review.code', rAdv: 'review.adversarial', rEdge: 'review.edgecase', rTest: 'review.testreview',
+  rCode: 'review.code', rAdv: 'review.adversarial', rAdvMech: 'review.adversarial.mechanical', // KI-E253 — the mechanical-tier adversarial route, drift-checked like every other cost-bearing route
+  rEdge: 'review.edgecase', rTest: 'review.testreview',
   refuter: 'refuter', reauditor: 'reauditor', integrator: 'integrator', adjudicator: 'adjudicator', decisionFramer: 'decision_framer',
 };
-const FLOW_KEYS = ['review.code', 'review.adversarial', 'review.edgecase', 'review.testreview', 'review.editorial_structure', 'review.editorial_prose'];
+const FLOW_KEYS = ['review.code', 'review.adversarial', 'review.edgecase', 'review.testreview', 'review.editorial_structure', 'review.editorial_prose', 'review.nfr']; // KI-E249
 
 // KI-B1 (closed 2026-07-12): build the FACTORY-format routing tables from config/model-routing.json,
 // using the SAME mapping the drift guard checks. The driver injects the result into runArgs

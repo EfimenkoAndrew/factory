@@ -7,6 +7,7 @@
 // the runtime's own isolation:'worktree' uses). Integration copies files into the main
 // tree as UNSTAGED changes for the human to review and commit; it never stages.
 import { execFileSync } from 'node:child_process';
+import { existsSync } from 'node:fs';
 import { collectEvidenceIdentity } from './evidence-identity.mjs';
 
 export function preflightWorktreeInputs(path, metadata, options = {}) {
@@ -52,18 +53,45 @@ function stripClaudeFromWorktree(path) {
 // Create an isolated worktree on a fresh branch off `base` (default: current HEAD).
 // Returns { path, branch }. Idempotent-ish: if the path exists it is returned as-is.
 export function addWorktree(path, branch, base) {
-  const args = ['worktree', 'add', '-b', branch, path];
-  if (base) args.push(base);
-  try {
-    git(args);
-  } catch (e) {
-    // If the branch already exists, attach without -b; if the path exists, reuse it.
-    const msg = String(e.stderr || e.message || '');
-    if (/already exists|already used by worktree/.test(msg)) {
-      try { git(['worktree', 'add', path, branch]); } catch (_) { /* reuse existing */ }
-    } else {
-      throw e;
+  // KI-E392: use -B (force-reset) instead of -b + fragile two-step retry. Root cause (cycle 171):
+  // a stale factory/<id> branch from a prior crashed run causes `git worktree add -b branch path`
+  // to fail with "branch already exists", then the retry `git worktree add path branch` also fails
+  // (branch is a ref but has no associated worktree directory), and that error is swallowed silently.
+  // KI-E389's existsSync check then detects the missing directory and throws, but by then factory.js
+  // has already spent planning budget. -B resets the branch to base (HEAD by default) whether or not
+  // it already exists, collapsing both cases to one command that never silently fails.
+  // If the path already exists as a registered worktree, fall back to plain attach (no -B).
+  if (existsSync(path)) {
+    // Reuse an already-present worktree directory — idempotent path.
+    try { git(['worktree', 'add', path, branch]); } catch (_) { /* already registered — ok */ }
+  } else {
+    const args = ['worktree', 'add', '-B', branch, path];
+    if (base) args.push(base);
+    try {
+      git(args);
+    } catch (e) {
+      // If -B is unsupported (old git), fall back to the -b + attach sequence.
+      const msg = String(e.stderr || e.message || '');
+      if (/unknown switch|invalid option|unrecognized/.test(msg)) {
+        const bArgs = ['worktree', 'add', '-b', branch, path];
+        if (base) bArgs.push(base);
+        try { git(bArgs); } catch (_) {
+          // Branch exists — force-detach it first, then create fresh.
+          try { git(['branch', '-D', branch]); } catch (__) { /* best-effort */ }
+          git(bArgs);
+        }
+      } else {
+        throw e;
+      }
     }
+  }
+  // KI-E389: verify the worktree directory was actually created.
+  if (!existsSync(path)) {
+    throw new Error(
+      'addWorktree: directory was not created at ' + path + ' (branch=' + branch + '). ' +
+      'git worktree add failed; check for stale worktree entries with ' +
+      '`git worktree list --porcelain`.'
+    );
   }
   // KI-L67 — strip `.claude/` on BOTH the create and reuse paths (retrofit an existing worktree in
   // place; sparse-checkout `set` updates the working tree to match, cleanly removing the copy).
@@ -170,6 +198,16 @@ export function listWorktrees() {
 export function changedFiles(path) {
   const out = git(['-C', path, 'status', '--porcelain']);
   return out ? out.split('\n').map((l) => l.slice(3)) : [];
+}
+
+// KI-E271: committed-but-clean fallback — returns files changed in the last commit vs its parent.
+// Used by phantom-lint.mjs when the worktree has no uncommitted changes but a prior session
+// committed the fix. Returns null when HEAD has no parent (initial commit) or on any git error.
+export function committedSinceBase(path) {
+  try {
+    const out = git(['-C', path, 'diff', '--name-only', 'HEAD^', 'HEAD']);
+    return out ? out.split('\n').filter(Boolean) : [];
+  } catch { return null; }
 }
 
 // Prune the worktree admin list (drops bookkeeping for worktrees whose directory is already gone).

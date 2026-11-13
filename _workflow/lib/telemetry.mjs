@@ -8,11 +8,11 @@
 // 'agent' (best-effort live wall-clock from stage subagents via telemetry-emit.mjs),
 // 'derived' (fold-time mtime backfill of stage timelines), 'orchestrator'.
 // Kill-switch: FACTORY_TELEMETRY=0. Stream location override: FACTORY_TELEMETRY_DIR.
-import { appendFileSync, mkdirSync, existsSync, readFileSync, statSync, readdirSync } from 'node:fs';
+import { appendFileSync, mkdirSync, existsSync, readFileSync, statSync, readdirSync, renameSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { apportionTokensByCallShare, tokenUsageSummary } from './token-usage.mjs';
-import { aggregateObservations, renderObservationReport, canonicalJson } from './observations.mjs';
+import { apportionTokensByCallShare, tokenUsageSummary } from './token-usage.mjs'; // KI-E66 — cache-hit-rate + per-item apportioned tokens
+import { aggregateObservations, renderObservationReport, canonicalJson } from './observations.mjs'; // ported from a host-mount session — duplicate-safe identity + observation-cohort reporting
 
 const HERE = dirname(fileURLToPath(import.meta.url)); // _bmad-output/ai-factory/_workflow/lib
 export const FACTORY_ROOT = resolve(HERE, '..', '..');
@@ -27,6 +27,49 @@ export function telemetryEnabled() { return process.env.FACTORY_TELEMETRY !== '0
 export function telemetryFile() {
   const dir = process.env.FACTORY_TELEMETRY_DIR || join(FACTORY_ROOT, 'telemetry', 'data');
   return join(dir, 'events.jsonl');
+}
+// KI-E352: monthly archive files alongside events.jsonl (e.g. events-2026-09.jsonl).
+// Returns sorted list of existing archive paths (oldest first).
+export function telemetryArchiveFiles() {
+  const dir = process.env.FACTORY_TELEMETRY_DIR || join(FACTORY_ROOT, 'telemetry', 'data');
+  try {
+    return readdirSync(dir)
+      .filter((f) => /^events-\d{4}-\d{2}\.jsonl$/.test(f))
+      .sort()
+      .map((f) => join(dir, f));
+  } catch { return []; }
+}
+// KI-E352: rotate events.jsonl when it exceeds rotateBytes (default 40 MB). Lines whose ts
+// month != currentMonth are appended into events-YYYY-MM.jsonl archives; events.jsonl keeps
+// only the current month. Safe to call at run start (idempotent, never throws, best-effort).
+export function rotateEvents(rotateBytes = 40 * 1024 * 1024) {
+  try {
+    const file = telemetryFile();
+    let size = 0;
+    try { size = statSync(file).size; } catch { return; }
+    if (size <= rotateBytes) return; // nothing to do
+    const lines = readFileSync(file, 'utf8').split('\n').filter(Boolean);
+    const currentMonth = new Date().toISOString().slice(0, 7);
+    const dir = dirname(file);
+    const byMonth = new Map();
+    const keep = [];
+    for (const line of lines) {
+      try {
+        const month = (JSON.parse(line).ts || '').slice(0, 7);
+        if (!month || month === currentMonth) { keep.push(line); continue; }
+        if (!byMonth.has(month)) byMonth.set(month, []);
+        byMonth.get(month).push(line);
+      } catch { keep.push(line); }
+    }
+    if (!byMonth.size) return; // all lines are current-month — no rotation needed
+    for (const [month, archiveLines] of byMonth) {
+      appendFileSync(join(dir, `events-${month}.jsonl`), archiveLines.join('\n') + '\n');
+    }
+    appendFileSync(file + '.tmp', keep.join('\n') + '\n');
+    renameSync(file + '.tmp', file); // atomic replace
+  } catch (err) {
+    try { process.stderr.write('[telemetry] rotateEvents skipped: ' + (err && err.message) + '\n'); } catch { /* never throw */ }
+  }
 }
 
 // Build the v1 envelope from a partial (pure — selftest-covered). Unknown top-level keys are
@@ -68,12 +111,14 @@ export function emit(e) {
 export function emitMany(events) { let n = 0; for (const e of events || []) if (emit(e)) n++; return n; }
 
 // ---- deterministic stage-timeline backfill (AD-11) -----------------------------------------
-// Versioned producer vocabulary shared with quarantine; archives are retained, not timed.
+// KI-E42/KI-E71/KI-E137/KI-E140 (killed-run artifact quarantine + canonical vocabulary) now live in
+// lib/artifacts.mjs's versioned `classifyArtifact` (engine sync, 2026-09) — it generalizes this
+// file's original STAGE_ARTIFACTS/CONTROL_ARTIFACTS/nonCanonicalArtifacts (kept those two KI's exact
+// entries as a strict subset) into a single classifier that ALSO correctly recognizes verification
+// transcripts, recovery evidence, and native-evidence files as canonical — filenames the narrower
+// original list did not know about and would have false-flagged as improvisation debris.
 import { stageForArtifact } from './artifacts.mjs';
 export { STAGE_ARTIFACTS, CONTROL_ARTIFACTS, stageForArtifact, nonCanonicalArtifacts } from './artifacts.mjs';
-
-// KI-E42/KI-E137/KI-E140: driver owns file filtering and moves; cached receipts and checkpoints
-// survive quarantine. Classification alone never proves freshness or contents.
 
 // ---- canonical stage vocabulary (AD-12) -----------------------------------------------------
 // ONE stage enum for every consumer. Agents emit --role (their exact brief name — they know it);
@@ -149,8 +194,19 @@ export function parseEvents(text, limit = 0) {
   }
   return limit > 0 ? out.slice(-limit) : out;
 }
+// KI-E352: when no specific file is given, also include monthly archive files so callers get
+// the full event history. opts.allFiles=false disables (current month only).
 export function readEvents(file, opts = {}) {
-  try { return parseEvents(readFileSync(file || telemetryFile(), 'utf8'), opts.limit || 0); } catch { return []; }
+  if (file) {
+    try { return parseEvents(readFileSync(file, 'utf8'), opts.limit || 0); } catch { return []; }
+  }
+  const includeArchives = opts.allFiles !== false;
+  try {
+    const archives = includeArchives ? telemetryArchiveFiles() : [];
+    const parts = [...archives, telemetryFile()];
+    const combined = parts.map((p) => { try { return readFileSync(p, 'utf8'); } catch { return ''; } }).join('');
+    return parseEvents(combined, opts.limit || 0);
+  } catch { return []; }
 }
 
 export function quantile(nums, q) {
@@ -202,7 +258,13 @@ export function isDirectRecoveryFold(attrs) {
 // (live: probe / dummy_probe / tool_use); the AD-10 agent seam emits exactly two canonical
 // events. Anything else becomes 'agent_note' (the original name is preserved by the caller in
 // attrs.origEvent) so the stream vocabulary stays bounded without losing the breadcrumb.
-export const AGENT_EVENTS = ['stage_start', 'stage_end'];
+// KI-E458: 'stage_heartbeat' is a THIRD sanctioned agent event (never evidentiary, same as
+// stage_start/stage_end) — an optional, best-effort progress ping an agent emits before/after a
+// single operation it expects might run long (a dotnet build/test, a real-infra wait). Its sole
+// purpose is to leave a breadcrumb for the "Unmatched agent stage_starts" report below: when a
+// stage never reaches stage_end (agent died mid-stage, KI-D8 class), the LAST heartbeat note is
+// the only visibility into where it was stuck — previously that gap was completely silent.
+export const AGENT_EVENTS = ['stage_start', 'stage_end', 'stage_heartbeat'];
 export function clampAgentEvent(name) {
   const n = String(name || '').trim();
   return AGENT_EVENTS.includes(n) ? n : 'agent_note';
@@ -214,6 +276,19 @@ export function clampAgentEvent(name) {
 // historical events are fenced too. Fenced durations are excluded from percentiles and reported.
 export const GAP_FENCE_MS = 4 * 3600 * 1000;
 
+// ported from a host-mount session — identifies exact-duplicate telemetry records so a relaunch
+// that re-emitted the SAME fold/usage event (a killed run's `resume`, a retried `cmdFold`) does not
+// silently inflate a count-based report a second time. Identity is deliberately narrow: only events
+// that carry an explicit `attrs.observationId` / `attrs.usageId`, or the two shapes this stream
+// already makes derivable (`item_folded` by `[item, resultId]` — KI-B4's own fold-idempotency key;
+// `usage` by `runId`), are eligible for dedup at all. Every other event (the vast majority of the
+// stream — stage_start/stage_end, gate results, etc., which carry no such identity) is `legacy` and
+// passes through completely UNTOUCHED, in original order — this is what keeps this function safe to
+// introduce without redefining any existing count for a stream that predates it. A "duplicate" is
+// the STABLE part of the record (everything except `ts`, so two deliveries of literally the same
+// event at different receive times still collapse) being byte-identical via `canonicalJson`; two
+// DIFFERENT payloads sharing one identity are a `conflicts` entry (a real inconsistency to surface,
+// never silently resolved by picking one).
 export function deduplicateTelemetryEvents(events) {
   const groups = new Map(), legacy = [];
   let duplicates = 0;
@@ -239,11 +314,17 @@ export function deduplicateTelemetryEvents(events) {
   return { records, duplicates, conflicts, unidentified: legacy.length };
 }
 
+// `observationOptions`: forwarded to aggregateObservations for the `attempt_observation` cohort
+// report (agg.observations) — see observations.mjs.
 export function aggregateEvents(events, observationOptions = {}) {
   const agg = { total: 0, byEvent: {}, bySource: {}, outcomes: {}, cycles: {}, gates: {}, stages: {}, agentStages: {}, models: {}, infraSuspect: 0, items: {}, itemFolds: {}, failedAt: {}, gapOutliers: [], agentPairs: {}, usage: [], itemCallCounts: {}, tokenUsageSnapshots: [], callsByOutcome: {} };
   const dedup = deduplicateTelemetryEvents(events);
   agg.deduplication = { duplicates: dedup.duplicates, conflicts: dedup.conflicts, unidentified: dedup.unidentified };
   agg.observations = aggregateObservations((events || []).filter((e) => e?.event === 'attempt_observation').map((e) => e.attrs?.observation), observationOptions);
+  // Engine sync 2026-09: counts now read the DEDUPLICATED stream (dedup.records), not the raw one —
+  // a relaunch's exact-duplicate re-emission no longer inflates a count, and a conflicting-signature
+  // pair (genuinely ambiguous, never silently resolved by picking one) is excluded from counts
+  // entirely and only surfaced via agg.deduplication.conflicts.
   for (const e of dedup.records) {
     if (!e || typeof e !== 'object' || !e.event) continue;
     agg.total++;
@@ -307,6 +388,11 @@ export function aggregateEvents(events, observationOptions = {}) {
     // Prometheus at telemetry-report time (driver.mjs queryPrometheusTokenUsage). Never per-item —
     // see lib/token-usage.mjs's header for why.
     if (e.event === 'token_usage_snapshot' && e.attrs) {
+      // ported from a host-mount session: re-derive via tokenUsageSummary (rather than reading each
+      // bucket off attrs directly) so a bucket the underlying query genuinely could not measure
+      // renders as unknown, not a silently fabricated 0 — and so the row can say WHERE the number
+      // came from (source/scope/selector) instead of presenting every snapshot with the same
+      // unqualified cycle-scoped confidence regardless of whether it was label-filtered.
       agg.tokenUsageSnapshots.push({
         cycle: e.cycle != null ? e.cycle : '?', ts: e.ts,
         ...tokenUsageSummary(e.attrs, { source: e.attrs.source || 'legacy-prometheus', scope: e.attrs.scope || 'unfiltered-metric-window' }),
@@ -318,11 +404,16 @@ export function aggregateEvents(events, observationOptions = {}) {
     // stamps (agents never pass --durMs — they cannot know their own wall-clock), so the
     // "agent-reported" table stops rendering permanently empty. Latest-start-wins (a retried
     // stage measures the final attempt); gap-fenced; never evidentiary (AD-12 unchanged).
-    if (e.source === 'agent' && (e.event === 'stage_start' || e.event === 'stage_end')) {
+    if (e.source === 'agent' && (e.event === 'stage_start' || e.event === 'stage_end' || e.event === 'stage_heartbeat')) {
       const k = (e.item || '?') + ' :: ' + (e.role || e.stage || '?');
       const p = agg.agentPairs[k] = agg.agentPairs[k] || { starts: 0, ends: 0 };
-      if (e.event === 'stage_start') { p.starts++; p.lastStartMs = Date.parse(e.ts) || undefined; }
-      else {
+      if (e.event === 'stage_start') { p.starts++; p.lastStartMs = Date.parse(e.ts) || undefined; p.lastHeartbeat = undefined; }
+      else if (e.event === 'stage_heartbeat') {
+        // KI-E458: only the LATEST heartbeat since the most recent start matters — it is the
+        // breadcrumb for wherever a stage that never reaches stage_end actually got stuck.
+        const note = (e.attrs && e.attrs.note) ? String(e.attrs.note).slice(0, 200) : '(no note)';
+        p.lastHeartbeat = { note, ts: e.ts };
+      } else {
         p.ends++;
         if (typeof e.durMs !== 'number' && p.lastStartMs) {
           const d = (Date.parse(e.ts) || 0) - p.lastStartMs;
@@ -330,6 +421,7 @@ export function aggregateEvents(events, observationOptions = {}) {
           if (stage && d > 0 && d <= GAP_FENCE_MS) (agg.agentStages[stage] = agg.agentStages[stage] || []).push(d);
           p.lastStartMs = undefined;
         }
+        p.lastHeartbeat = undefined;
       }
     }
   }
@@ -350,8 +442,9 @@ export function renderCallsByOutcome(callsByOutcome) {
   const closed = (callsByOutcome.CLOSED && callsByOutcome.CLOSED.calls) || 0;
   // "Wasted" is deliberately NOT "everything that is not CLOSED": an ESCALATED item reached a human
   // with its analysis intact and a BLOCKED one surfaced a real scope question — both are the system
-  // working. Only FAILED spend produced no durable output, so only it is counted as waste, and the
-  // label says so rather than letting a reader infer a harsher number.
+  // working, so neither is counted as waste. A FAILED round is not necessarily a total loss either
+  // (some output may be reused by a later attempt, KI-E474/E123/E124) — the label below says only
+  // that it is neither wasted lifetime cost nor a rejected human delivery, not that nothing survived.
   const failed = (callsByOutcome.FAILED && callsByOutcome.FAILED.calls) || 0;
   return [
     '| Outcome | Items | Agent calls | Share | Calls/item |',
@@ -359,7 +452,7 @@ export function renderCallsByOutcome(callsByOutcome) {
     ...rows,
     '',
     `**Yield — calls landing on a CLOSED item: ${((closed / total) * 100).toFixed(1)}%** (${closed}/${total}).`,
-    `**FAILED spend: ${((failed / total) * 100).toFixed(1)}%** (${failed}/${total}) — calls on failed folds; some output may be reused later. This is neither wasted lifetime cost nor rejected human delivery.`,
+    `**FAILED spend: ${((failed / total) * 100).toFixed(1)}%** (${failed}/${total}) — calls on failed folds; some output may be reused later. This is neither wasted lifetime cost nor rejected human delivery. ESCALATED/BLOCKED spend is deliberately NOT counted here: those reached a human with the analysis intact, which is the system working, not waste.`,
   ].join('\n');
 }
 
@@ -390,9 +483,13 @@ export function renderTelemetryReport(agg, meta = {}) {
   }
   const cycleRows = Object.entries(agg.cycles).sort((a, b) => Number(a[0]) - Number(b[0]))
     .map(([c, v]) => `| ${c} | ${v.folded} | ${v.closed} |`);
-  // KI-E13 KPIs — the two factory-quality headline numbers, from the per-item fold sequences:
-  // first-pass close rate (closes whose FIRST fold was a clean CLOSED — no FAILED round, no
-  // direct-recovery) and direct-recovery rate (closes that needed the run protocol §4 remedy path).
+  // KI-E13 KPIs — the two factory-quality headline numbers, from the per-item fold sequences.
+  // Engine sync 2026-09: first-pass's denominator is now ALL folded items, not just ones that
+  // eventually closed — restricting to closedItems silently excluded every item still open/
+  // escalated/blocked after repeated failed attempts from the denominator, inflating the rate.
+  // This is still a LEGACY PROXY, not a true first-attempt measurement (an item can be folded
+  // more than once per "attempt" and a killed run's own fold sequence isn't distinguishable from
+  // here) — see the attempt_observation cohort report below for the versioned, honest metric.
   const perItem = Object.values(agg.itemFolds || {});
   const closedItems = perItem.filter((fs) => fs.length && fs[fs.length - 1].st === 'CLOSED');
   const firstPass = perItem.filter((fs) => fs[0].st === 'CLOSED' && !fs[0].direct);
@@ -408,7 +505,7 @@ export function renderTelemetryReport(agg, meta = {}) {
     for (const b of bandNames.sort()) {
       const allB = perItem.filter((fs) => bandOf(fs) === b);
       const fpB = allB.filter((fs) => fs[0].st === 'CLOSED' && !fs[0].direct);
-      bandRows.push(`| First-observed-fold close — ${b} band | ${fpB.length}/${allB.length} = ${pct(fpB.length, allB.length)} |`);
+      bandRows.push(`| First-observed-fold close — ${b} band (KI-E48) | ${fpB.length}/${allB.length} = ${pct(fpB.length, allB.length)} |`);
     }
   }
   const kpi = [
@@ -422,7 +519,7 @@ export function renderTelemetryReport(agg, meta = {}) {
   const failedRows = Object.entries(agg.failedAt || {}).sort((a, b) => b[1] - a[1]).map(([s, n]) => `| ${s} | ${n} |`);
   const gapRows = (agg.gapOutliers || []).map((g) => `| ${g.item} | ${g.stage} | ${(g.durMs / 3600000).toFixed(1)}h |`);
   const unmatched = Object.entries(agg.agentPairs || {}).filter(([, p]) => p.starts > p.ends)
-    .map(([k, p]) => `| ${k} | ${p.starts} | ${p.ends} |`);
+    .map(([k, p]) => `| ${k} | ${p.starts} | ${p.ends} | ${p.lastHeartbeat ? p.lastHeartbeat.note + ' @ ' + p.lastHeartbeat.ts : '_none emitted_'} |`);
   return [
     '# Factory telemetry report',
     '',
@@ -430,7 +527,12 @@ export function renderTelemetryReport(agg, meta = {}) {
     '',
     '## KPIs (KI-E13)', '', kpi, '',
     '_Legacy folds cannot identify killed attempts or prove the observed first fold was the first attempt. Use versioned attempt observations below for the first-attempt cohort metric._', '',
-    `Event deduplication: ${agg.deduplication?.duplicates || 0} duplicates; ${agg.deduplication?.conflicts.length || 0} conflicting immutable identities excluded. Identity-less legacy events are not guessed from filenames or timestamps.`, '',
+    // ported from a host-mount session: duplicate/conflict visibility + the attempt_observation
+    // cohort report, both purely additive read-outs of aggregateEvents' new agg.deduplication /
+    // agg.observations fields — guarded with `?.` throughout so a hand-built `agg` fixture that
+    // predates these fields (constructed directly rather than via aggregateEvents) renders a plain
+    // zero/none line instead of throwing.
+    `Event deduplication: ${agg.deduplication?.duplicates || 0} duplicates; ${agg.deduplication?.conflicts?.length || 0} conflicting immutable identities excluded. Identity-less legacy events are not guessed from filenames or timestamps.`, '',
     agg.observations ? renderObservationReport(agg.observations) : '', '',
     '## Events by type', '', kv(agg.byEvent, 'Event', 'Count'), '',
     '## Events by source', '', kv(agg.bySource, 'Source', 'Count'), '',
@@ -445,7 +547,8 @@ export function renderTelemetryReport(agg, meta = {}) {
     failedRows.length ? ['| Stage | FAILED folds ending here |', '|---|---|', ...failedRows].join('\n') : '_none_', '',
     '## Stage durations — agent-reported (best-effort, non-evidentiary)', '', stageTable(agg.agentStages), '',
     '## Unmatched agent stage_starts (agent died mid-stage — blocked/killed, KI-D8 class)', '',
-    unmatched.length ? ['| Item :: role | starts | ends |', '|---|---|---|', ...unmatched].join('\n') : '_none_', '',
+    '_Last heartbeat (KI-E458) is the latest stage_heartbeat note emitted after the unmatched start — the only visibility into where the agent was stuck, when it bothered to emit one; "_none emitted_" means the stage died before its first heartbeat or the agent never emits them (older items/roles predating this instruction)._', '',
+    unmatched.length ? ['| Item :: role | starts | ends | Last heartbeat |', '|---|---|---|---|', ...unmatched].join('\n') : '_none_', '',
     '## Gate verdicts', '', gateRows.length ? ['| Gate | Runs | Ok | Rate |', '|---|---|---|---|', ...gateRows].join('\n') : '_none_', '',
     unclassified.length ? `_Unclassified verdict vocabulary (counted not-ok — extend verdictOk() if these are passes, KI-E40): ${unclassified.join(', ')}_\n` : '',
     '## Fold-time token usage (KI-E23 usage events)', '',
@@ -455,13 +558,19 @@ export function renderTelemetryReport(agg, meta = {}) {
         `| **total** | | **${agg.usage.reduce((a, u) => a + u.outputTokens, 0).toLocaleString('en-US')}** |`].join('\n')
       : '_none — usage events land on folds from KI-E23 onward_', '',
     '## Session token usage & cache hit rate (KI-E66, Prometheus-derived)', '',
-    '_Requires session OTLP and reachable Prometheus. A time window stamped with a cycle is not proof of cycle/session attribution: an unfiltered query includes every matching session/host in that Prometheus. Explicit source, selector and scope are required. Overlapping snapshots must not be summed, and missing token buckets stay unknown._', '',
+    '_Requires `driver.mjs preflight` to report `cost telemetry: ready` for the session that ran the cycle (KI-E33) AND a reachable Prometheus with the claude_code_token_usage_tokens_total metric. A time window stamped with a cycle is not proof of cycle/session attribution: an unfiltered query includes every matching session/host in that Prometheus. NOT per-item either way — Claude Code has no concept of a factory work item, and the factory runs 2-3 items concurrently (SKILL.md), so a per-item window query would double-count overlapping siblings. See "Per-item apportioned tokens" below for the best available item-level view; missing token buckets stay unknown, never fabricated as zero._', '',
     (agg.tokenUsageSnapshots || []).length
+      // ported from a host-mount session: an unknown (null) bucket renders literally as 'unknown'
+      // rather than being coerced to '0' by an unguarded .toLocaleString() (which would also throw
+      // on null) — the same "don't fabricate a measurement" discipline as token-usage.mjs itself.
+      // The extra Source / scope / selector column surfaces whether a row is a shared/unfiltered
+      // window read or one narrowed to this run, since those carry different attribution confidence.
       ? ['| Cycle | Input | Output | Cache read | Cache creation | Total | Cache hit rate | Source / scope / selector |', '|---|---|---|---|---|---|---|---|',
         ...agg.tokenUsageSnapshots.map((u) => `| ${u.cycle} | ${u.inputTokens?.toLocaleString('en-US') ?? 'unknown'} | ${u.outputTokens?.toLocaleString('en-US') ?? 'unknown'} | ${u.cacheReadTokens?.toLocaleString('en-US') ?? 'unknown'} | ${u.cacheCreationTokens?.toLocaleString('en-US') ?? 'unknown'} | ${u.totalTokens?.toLocaleString('en-US') ?? 'unknown'} | ${u.cacheHitRate == null ? 'unknown' : Math.round(u.cacheHitRate * 100) + '%'} | ${u.source} / ${u.scope} / ${JSON.stringify(u.selector)} |`)].join('\n')
       : '_NOT gathered — either the session lacked the OTLP metrics-exporter env (`driver.mjs preflight`) or Prometheus was unreachable when this report ran (`driver.mjs telemetry-report` re-attempts the query every time; re-run after fixing either)_', '',
     '## Per-item apportioned tokens (estimate — NOT a measurement, KI-E66)', '',
-    '_Legacy successful logical-call shares omit failed retries and bookkeeping. This table apportions run output tokens using those incomplete weights; it is not causal item attribution. Concurrent shared-counter deltas also cannot prove which item generated tokens. Use directly attributed runtime usage where available._',
+    '_Real per-item token measurement is not available: the Workflow runtime exposes only a whole-run output-token counter (no per-item split), confirmed by this factory'
+      + "'s own multi-month history never achieving better despite KI-E23 wanting per-item granularity. This table divides each cycle's REAL, measured output-token total (the Fold-time token usage section above) across that cycle's items by their REAL, measured call-count share (ledger cost map) — a disclosed apportionment of a real number, never a fabricated one. Treat as directional, not exact._",
     '',
     (() => {
       const rows = [];
@@ -471,21 +580,21 @@ export function renderTelemetryReport(agg, meta = {}) {
       }
       return rows.length ? ['| Cycle | Item | Apportioned output tokens (est.) |', '|---|---|---|', ...rows].join('\n') : '_none — needs both a fold-time usage event and item_folded cost data for the same cycle_';
     })(), '',
-    '## Legacy successful logical calls by requested model (from fold cost)', '', kv(agg.models, 'Requested model', 'Calls'), '',
+    '## Agent-call volume by model (from fold cost)', '', kv(agg.models, 'Model', 'Calls'), '',
     // KI-E107 — the yield section. See aggregateEvents for why call-count is the unit.
     '## Agent-call spend by outcome (KI-E107)', '',
-    '_Legacy cost maps count successful logical calls by requested route, not physical attempts, actual selected models or paid usage. Retries and bookkeeping can be absent. CLOSED is not human acceptance; failed-attempt work may be reused later. Use the observational lifetime cohort cost above for accepted-delivery comparisons._', '',
+    '_The share of the factory\'s work that reached a CLOSED item. Call counts are the only per-item cost unit that is real and measured — KI-E66 established that per-item TOKEN counts are structurally unavailable inside the Workflow runtime (`budget` exposes a whole-run counter only, and a direct empirical test confirmed an `agent()` call\'s own cost is not recoverable from outside the sandbox). So this is a call-weighted proxy: directional, never a bill. It is the one number that makes a cost argument settleable — an optimisation that lowers total calls but lowers the CLOSED share is not a saving._', '',
     renderCallsByOutcome(agg.callsByOutcome), '',
   ].join('\n');
 }
 
-// KI-E176 (ported from a host-mount session) — durable, human-readable log of every CONTINUED run:
-// a Workflow the controller stopped mid-flight (a deliberate pause, a crash, a laptop sleep) and
-// relaunched into the SAME claim/worktree (the `resume` + relaunch shape KI-E140 already prints),
-// as opposed to an independent fresh attempt from a new `group` claim. `cmdMarkLaunched --continued`
-// emits the `run_continued` source-of-truth event (AD-3: one append-only stream, this report is a
-// derived view); this function renders that history. Pure — takes the already-read event array,
-// never reads the stream itself, so it is directly unit-testable without a telemetry file on disk.
+// KI-E176 (2026-09-14) — durable, human-readable log of every CONTINUED run: a Workflow the
+// controller stopped mid-flight (a deliberate pause, a crash, a laptop sleep) and relaunched into
+// the SAME claim/worktree (the `resume` + relaunch shape KI-E140 already prints), as opposed to an
+// independent fresh attempt from a new `group` claim. `cmdMarkLaunched --continued` emits the
+// `run_continued` source-of-truth event (AD-3: one append-only stream, this report is a derived
+// view); this function renders that history. Pure — takes the already-read event array, never reads
+// the stream itself, so it is directly unit-testable without a telemetry file on disk.
 export function continuedRunsMd(events) {
   const rows = (events || []).filter((e) => e && e.event === 'run_continued');
   const lines = ['# Continued runs', '', 'Every run stopped mid-flight and relaunched into the SAME claim/worktree (`resume` + relaunch, KI-E140/KI-E176) — never a fresh `group` claim.', ''];

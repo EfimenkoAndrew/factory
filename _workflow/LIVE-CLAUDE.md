@@ -337,7 +337,7 @@ The retained `rZOITE` attempt remains pending historical evidence. Its saved-run
 continuation command is available for investigating that **old frozen contract**:
 
 ```powershell
-node _workflow/live-claude-factory.mjs --live --existing "C:\Users\ayefymenko\AppData\Local\Temp\opencode\factory-live-production-rZOITE" --resume-workflow
+node _workflow/live-claude-factory.mjs --live --existing "C:\Users\someuser\AppData\Local\Temp\opencode\factory-live-production-rZOITE" --resume-workflow
 ```
 
 Do not edit that launcher and call it exact replay, or count its continuation as

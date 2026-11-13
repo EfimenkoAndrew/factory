@@ -20,7 +20,10 @@
     "noSchemaChanges": false,
     "failLaneOnMainDrift": false,
     "shadowConsolidatedScan": false,
-    "note": "HOST-OWNER directives, OFF in the shipped engine (PR#9 review — one host's house rules must not be universal). noNewComments: the KI-E57/KI-E59 zero-new-comments rule + its 3-layer mechanical gate. noSchemaChanges: the KI-E58 no-migrations/no-schema-change hard stop for planner/fixer. failLaneOnMainDrift (KI-E109): main-tree contamination has had SIX detection passes (KI-L65/E41/E45/E50/E35/E82/E89) and ZERO prevention, because KI-E50 explicitly parked the choice — 'sandboxing main read-only vs failing the lane fast remains a host-owner policy decision the engine deliberately does not make'. This turns that unmade decision into a switch instead of leaving it unmade forever: when ON, a mid-band ⚠ MAIN-DRIFT line in the runner's own note FAILS the lane immediately rather than only warning, so a contaminating agent stops before the expensive band instead of after it. Default OFF preserves the historical warn-only behaviour exactly. Enable per host in config/factory.config.local.json (gitignored, KI-E17 seam). The driver prints the effective state at every group/sweep. shadowConsolidatedScan (KI-E169/E171, ported from a host-mount session): a purely observational, host-opt-in shadow probe re-checking acceptance-scan/plan-commitment-scan/prior-finding-scan together in one haiku call, collecting AGREE/DISAGREE data toward a future consolidation decision — never affects any item's outcome. Default OFF; a host that wants the dataset enables it in its local overlay."
+    "archaeology": false,
+    "subagentPromptCacheTtl": false,
+    "downgradeMechanicalEscalate": false,
+    "note": "HOST-OWNER directives, OFF in the shipped engine (PR#9 review — one host's house rules must not be universal). noNewComments: the KI-E57/KI-E59 zero-new-comments rule + its 3-layer mechanical gate. noSchemaChanges: the KI-E58 no-migrations/no-schema-change hard stop for planner/fixer. failLaneOnMainDrift (KI-E109): main-tree contamination has had SIX detection passes (KI-L65/E41/E45/E50/E35/E82/E89) and ZERO prevention, because KI-E50 explicitly parked the choice — 'sandboxing main read-only vs failing the lane fast remains a host-owner policy decision the engine deliberately does not make'. This turns that unmade decision into a switch instead of leaving it unmade forever: when ON, a mid-band ⚠ MAIN-DRIFT line in the runner's own note FAILS the lane immediately rather than only warning, so a contaminating agent stops before the expensive band instead of after it. Default OFF preserves the historical warn-only behaviour exactly. shadowConsolidatedScan (KI-E492/E171, ported from a host-mount session): a purely observational, host-opt-in shadow probe re-checking acceptance-scan/plan-commitment-scan/prior-finding-scan together in one haiku call, collecting AGREE/DISAGREE data toward a future consolidation decision — never affects any item's outcome. archaeology (KI-E460): enables the research-phase archaeologist role for a non-mechanical item whose target has an empty doc map (no doc/data-flows/<target>.md, <target>/CONTEXT.md, or <target>/AGENTS.md) — turn this on for a large, undocumented legacy host so ground truth gets established (and written into those same conventional doc paths) before a plan is drafted, rather than for a well-documented one where planner's existing doc reads already suffice. subagentPromptCacheTtl (KI-E398): opt-in prompt-cache TTL passed to every agent() dispatch — true (= '1h') or '5m'|'1h', requires Claude Code >= 2.1.242; OFF by default because an unsupported runtime would reject the option on every call, so validate the local Claude Code version before enabling. downgradeMechanicalEscalate (KI-E402): when ON, mechanical non-CRITICAL items with autonomyTier 'escalate' are emitted as 'auto' so tiny fully-verified diffs close instead of parking for sign-off. Enable per host in config/factory.config.local.json (gitignored, KI-E17 seam): { \"policies\": { \"noNewComments\": true, \"noSchemaChanges\": true, \"archaeology\": true, \"shadowConsolidatedScan\": true, \"subagentPromptCacheTtl\": true } }. The driver prints the effective state at every group/sweep."
   },
   "maxItemRetries": 2,
   "retryBonusOnConvergence": true,
@@ -29,6 +32,10 @@
   "_stallNote": "KI-E105 (2026-09-02): the missing half of KI-L41. maxBonusRounds EXTENDS the budget for a converging trajectory; maxStallRounds SHORTENS it for one that is not. After N consecutive FAILED rounds whose blocking-finding count did not shrink (from the same structured gateDetails the bonus reads, never agent self-assessment), the item is parked ESCALATED instead of spending another band — a FULL band is ~5 opus gates + refuter + multi-lens re-audit, so a third attempt on a flat trajectory is near-certain waste AND delays the human review the item evidently needs. Conservative by construction: a round with ANY reduction in findings resets the streak to 0, a pre-gate failure (test/verify/fold stage) never counts (nothing was adjudicated), and a round that reduces findings while severity worsens counts as PROGRESS, not a stall. Set 0 to disable.",
   "maxInfraRetries": 3,
   "_infraRetryNote": "KI-L53 (2026-07-12): fold AUTO-applies the KI-L50 attempt-not-counted treatment when a result is infraSuspect (a stage agent returned null after retries — outage/credit/skip, never a quality verdict), capped at maxInfraRetries per item (tracked as row.infraRetries) so a persistently-dying stage cannot re-run an item forever. Manual --infra-retry is operator judgment and never capped.",
+  "maxFixerSteps": 8,
+  "maxFixerStepsMech": 2,
+  "_fixerStepsMechNote": "KI-E485: mechanical items cap at 2 fix steps instead of 8 — a rename/accessor/style fix rarely needs more than one well-scoped pass; the second is a backstop before escalating.",
+  "_fixerStepsNote": "KI-E470: the planner's steps[] (KI-E101) now DRIVE execution, not just checking. When a plan carries >= 2 steps the fixer runs one bounded call per step — each seeing the FULL plan and every step's done/current/remaining status, never just its own slice — followed by exactly ONE whole-diff consolidation pass that runs the cross-file guards a per-step worker structurally cannot (sibling-pattern + dead-code KI-E94, adjacent-claim KI-E95, CancellationToken chain KI-E96). Caps the step count; a plan with more steps folds the tail into the last one. Set 0 to disable and restore the single whole-item fixer call byte-for-byte.",
   "_retryNote": "KI-L41 (2026-07-03): maxItemRetries reverted 4->2 (the 4 was the cycle-25 recovery-era setting); a FAILED round whose blocking findings are STRICTLY narrower than the prior round's (fewer findings, max severity not worse — from structured gateDetails, at fold, deterministic) earns +1 bonus attempt, at most maxBonusRounds per item. Worst case per item = maxItemRetries + maxBonusRounds bands.",
   "budget": {
     "perCycleOutputTokens": null,
@@ -96,6 +103,15 @@
         "blocking": false,
         "order": 2,
         "note": "Copy-edit pass after structure."
+      }
+    ],
+    "nfr": [
+      {
+        "skill": "bmad-testarch-nfr",
+        "routeKey": "review.nfr",
+        "appliesWhen": "code-touching",
+        "blocking": false,
+        "note": "KI-E249 — Performance + Reliability/Observability only (Security is gate-security's job, Maintainability is gate-architect/gate-developer's); advisory, matches the real skill's own threshold-or-UNKNOWN discipline."
       }
     ],
     "humanCheckpoint": {

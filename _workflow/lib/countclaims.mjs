@@ -1,6 +1,6 @@
 // KI-E182 (2026-09-18) — deterministic test-count-claim linter for doc/ledger prose, mirroring
 // doclint.mjs's phantom-path linter (KI-E11) exactly, but for "N/M passed"-style test-count claims
-// instead of file-path claims. Live incident: during EGS-4-3's direct recovery, a fixer round
+// instead of file-path claims. Live incident: during a prior item's direct recovery, a fixer round
 // added a new test (changing a suite's real count from 2257/2282 to 2258/2283) but left the OLD
 // count standing in 3 prose locations (STANDARDS-DIVERGENCE-LEDGER.md, VERIFICATION-REPORT.md x2) —
 // caught only by a fresh, expensive gate-developer re-dispatch, not for free. This lint catches the

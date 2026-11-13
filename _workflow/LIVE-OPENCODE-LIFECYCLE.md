@@ -44,7 +44,7 @@ these limits are not an exact provider-billing request counter or dollar cap.
 
 The successful fixture is retained at:
 
-`C:\Users\ayefymenko\AppData\Local\Temp\opencode\factory-live-lifecycle-BnCxUK`
+`C:\Users\someuser\AppData\Local\Temp\opencode\factory-live-lifecycle-BnCxUK`
 
 It contains a clean `git archive HEAD` source snapshot, a separate copied factory
 mount, actual role prompts/results/session mappings and the isolated driver state.
@@ -238,7 +238,7 @@ native-only identity changes remain separate.
 
 ### Actual CLOSED result
 
-Root: `C:\Users\ayefymenko\AppData\Local\Temp\opencode\factory-live-lifecycle-YTf47w`.
+Root: `C:\Users\someuser\AppData\Local\Temp\opencode\factory-live-lifecycle-YTf47w`.
 Runtime **2.0.10**, endpoint **http://127.0.0.1:59708**, server PID **39216**.
 Nine independent actual **github-copilot/gpt-5-mini** workers completed in
 **200,966 ms** (3m21s). Actual checkpoint/finalize: **CLOSED**, verificationOnly=true,
@@ -385,7 +385,7 @@ is **not** established by this run.
 
 ### Exact observed results and retained cleanup receipts
 
-Artifact parent: `C:\Users\ayefymenko\AppData\Local\Temp\opencode`.
+Artifact parent: `C:\Users\someuser\AppData\Local\Temp\opencode`.
 
 | Evidence | V1 | V2 |
 |---|---|---|

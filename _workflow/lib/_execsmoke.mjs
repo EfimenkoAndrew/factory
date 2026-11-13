@@ -28,6 +28,12 @@ export function defaultAgentStub(opts, blockedGate) {
   if (p.markerFound) return { markerFound: true, ...(p.exitCode ? { exitCode: 1 } : {}), line: 'FACTORY::RED::1' };
   if (p.clean) return { clean: true, ...(p.punts ? { punts: [] } : { findings: [] }) };
   if (p.results) return { results: [] };
+  // host-only (phantom-lint.mjs / factory.js PHANTOM_SCHEMA, KI-E486/E155/E178) — no standalone
+  // upstream equivalent, so upstream's own _execsmoke.mjs dropped this branch; this host mount still
+  // dispatches the phantom-manifest probe, so the stub must keep answering it. Placed before `covered`
+  // per the original polarity note: phantomCount ZERO means GOOD, unlike leftover/comment/registration-
+  // drift's `count`/`clean` fields, so this cannot share a branch with those.
+  if (p.phantomCount !== undefined) return { phantomCount: 0, files: [] };
   if (p.covered !== undefined) return { covered: true, gaps: [] }; // KI-E18 AcceptanceScan probe (happy path)
   if (p.acceptanceCovered) return { acceptanceCovered: true, planHonored: true, findingHonored: true };
   if (p.honored !== undefined) return { honored: true, gaps: [] }; // KI-E87/E101 PlanCommitment/PlanStep probe (happy path)
@@ -36,6 +42,15 @@ export function defaultAgentStub(opts, blockedGate) {
   // siblings; the schema's field is `nonTestCount` rather than `count` precisely so this dispatch
   // cannot collide with the line above, where ZERO is the GOOD value and here it is the failure.
   if (p.nonTestCount !== undefined) return { nonTestCount: 1, files: ['X/src/Some.cs'], skipped: false };
+  // host-only (factory.js POSTAMEND_SCHEMA, KI-E145B post-amend-verify independent probe) — no
+  // standalone upstream equivalent, so upstream's own _execsmoke.mjs dropped this branch too; kept
+  // here for the same reason as phantomCount above.
+  if (p.buildExitZero !== undefined) return { buildExitZero: true, filterExitZero: true, suiteExitZero: true, guardRefusedSeen: false };
+  // host-only (factory.js CONCURRENCY_SCAN_SCHEMA, KI-E237 concurrency-touching-diff probe) — no
+  // standalone upstream equivalent, kept here for the same reason as phantomCount/buildExitZero above.
+  // Happy-path default (false) — most diffs do not touch concurrency-relevant constructs; a dedicated
+  // smoke test overrides this via a labelled stub to exercise the true branch.
+  if (p.touchesConcurrency !== undefined) return { touchesConcurrency: false, hits: [] };
   if (p.red) return { red: true, testFiles: ['X/src/X.Tests/SomeTests.cs'], runCmd: 'stub', evidence: 'stub', note: 'stub' };
   if (p.applied) return { applied: true, filesChanged: ['X/src/Some.cs'], summary: 'stub', scopeStop: false, divergence: null, note: 'stub' };
   if (p.build) return { build: 'pass', targetedTest: 'pass', suite: { passed: 2, failed: 0, skipped: 0 }, realInfraExercised: false, debris: [], evidence: 'FACTORY::BUILD::RESULT exit=0 (stub)', note: 'stub' };

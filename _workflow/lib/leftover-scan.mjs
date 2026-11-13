@@ -73,15 +73,18 @@ export function findLeftovers(worktree, cap = 25) {
     addedTextByFile[file] = (addedTextByFile[file] || '') + text + '\n';
     if (hits.length < cap) { const h = classifyLine(file, text); if (h) hits.push(h); }
   };
-  const diff = execFileSync('git', ['-C', worktree, 'diff', 'HEAD', '--unified=0'], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
+  // KI-E377: cap git diff at 2 min and untracked reads at 30s — runaway large diffs caused
+  // probe:leftover-scan to average 292 min (15× median). Timeout throws ETIMEDOUT; caught by the
+  // outer try/catch in leftover-lint.mjs which reports FACTORY::LEFTOVER::0 (best-effort posture).
+  const diff = execFileSync('git', ['-C', worktree, 'diff', 'HEAD', '--unified=0'], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, timeout: 120_000 });
   let cur = '?';
   for (const l of diff.split('\n')) {
     if (l.startsWith('+++ ')) { cur = l.slice(4).replace(/^b\//, ''); continue; }
     if (l.startsWith('+') && !l.startsWith('+++')) scan(cur, l.slice(1));
   }
-  const untracked = execFileSync('git', ['-C', worktree, 'ls-files', '--others', '--exclude-standard'], { encoding: 'utf8' }).split('\n').filter(Boolean);
+  const untracked = execFileSync('git', ['-C', worktree, 'ls-files', '--others', '--exclude-standard'], { encoding: 'utf8', timeout: 30_000 }).split('\n').filter(Boolean);
   for (const f of untracked) {
-    try { for (const t of execFileSync('cat', [worktree + '/' + f], { encoding: 'utf8', maxBuffer: 8 * 1024 * 1024 }).split('\n')) scan(f, t); } catch { /* per-file best-effort */ }
+    try { for (const t of execFileSync('cat', [worktree + '/' + f], { encoding: 'utf8', maxBuffer: 8 * 1024 * 1024, timeout: 30_000 }).split('\n')) scan(f, t); } catch { /* per-file best-effort */ }
   }
   return pruneConventionPlaceholderHits(hits, addedTextByFile);
 }

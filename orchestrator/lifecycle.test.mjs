@@ -38,10 +38,15 @@ test('launch envelope is machine authority, including paths with spaces', () => 
 
 test('checkpoint needs terminal state, cycle, worktree, branch and current claim identity', () => {
   assert.equal(validCheckpoint(result, item, 4, identity), true);
-  for (const patch of [{ id: 'B' }, { resultId: 'A#3' }, { cycle: 3 }, { worktree: item.worktree.path + '-other' }, { branch: 'factory/B' }, { toState: 'GATED' }, { transitions: ['FAILED'] }]) assert.equal(validCheckpoint({ ...result, ...patch }, item, 4, identity), false);
+  for (const patch of [{ id: 'B' }, { resultId: 'A#3' }, { cycle: 3 }, { worktree: item.worktree.path + '-other' }, { toState: 'GATED' }, { transitions: ['FAILED'] }]) assert.equal(validCheckpoint({ ...result, ...patch }, item, 4, identity), false);
   assert.equal(validCheckpoint(result, item, 4, { ...identity, currentClaim: 'new' }), false);
   assert.equal(validCheckpoint(result, item, 4, { ...identity, mtimeMs: 9 }), false);
   assert.equal(validCheckpoint(result, { ...item, attemptId: 'attempt-a' }, 4, identity), false);
+  // KI-E453: a CLOSED result's branch legitimately diverges when factory.js's integrate step
+  // overwrites it with the real KI-E303 accumulation destination (e.g. factory/current) — that
+  // must still validate. A non-CLOSED result (never runs integrate) must still match exactly.
+  assert.equal(validCheckpoint({ ...result, branch: 'factory/current' }, item, 4, identity), true);
+  assert.equal(validCheckpoint({ ...result, branch: 'factory/B', toState: 'FAILED', transitions: ['CLAIMED', 'FAILED'] }, item, 4, identity), false);
   const row = { worktree: 'wt', history: [{ to: 'CLAIMED', at: 'one' }] };
   assert.notEqual(claimIdentity(row), claimIdentity({ ...row, history: [...row.history, { to: 'CLAIMED', at: 'two' }] }));
 });

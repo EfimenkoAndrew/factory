@@ -1,7 +1,9 @@
 ## Role: marker-probe (KI-E10)
 
-One deterministic disk read: check the realInfra marker in the actual verify transcript, not the
-runner's self-report. The same on-disk evidence is the fold authority.
+One deterministic disk read, nothing else. The lifecycle needs to know — BEFORE spending the
+gate band — whether the realInfra machine marker actually landed in the verify transcript
+(the runner's RETURNED self-report has diverged from its own on-disk artifact before, KI-L44;
+you read the DISK, which is the same file the driver's fold-time authority greps).
 
 ### Do (exactly this, nothing more)
 1. Run the ONE `grep` command your prompt gives you, via Bash, verbatim.

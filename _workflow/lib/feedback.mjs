@@ -48,24 +48,27 @@ export function renderFeedback(result) {
   return lines.join('\n');
 }
 
-// KI-E166 (ported from a host-mount session) — feedback.md is "regenerated on every fold" (this
-// file's own header comment) — meaning a finding raised by an EARLIER cycle (e.g. a gate-qa
+// KI-E166 (2026-09-13, a live incident) — feedback.md is "regenerated on every fold"
+// (this file's own header comment) — meaning a finding raised by an EARLIER cycle (e.g. a gate-qa
 // test-coverage gap) is silently LOST the moment a LATER cycle's own, different rejection reason
 // (e.g. a docsync gap) overwrites the file, even though the earlier finding was never actually
 // fixed. A reFix round that faithfully reads feedback.md — exactly as its own briefing already
 // instructs — then has zero visibility into that older, still-open finding: it can "fix" the newer
 // one while the older one sails through unaddressed, until a LATER gate independently rediscovers
-// it from scratch. Live incident on the origin host: a later cycle's gate:qa named the EXACT gap an
-// earlier gate-qa pass on the SAME item had already flagged, never fixed because the intervening
-// round only addressed a different, unrelated finding — that intervening round's own feedback.md
-// (regenerated for THAT cycle's own failure reason) carried no trace of the earlier finding at all.
+// it from scratch. Live: that same item's cycle-100 gate:qa named the EXACT same gap an
+// "earlier gate-qa pass on this same item" had already flagged, "never fixed" because "the
+// intervening round only addressed a docsync finding" — the docsync round's own feedback.md
+// (regenerated for THAT cycle's own failure reason) carried no trace of the earlier test-coverage
+// finding at all.
 //
 // mergeFeedbackHistory keeps the CURRENT cycle's content authoritative and on top (byte-identical
 // behavior for an item with no prior feedback.md — the common first-attempt case) but APPENDS the
 // prior file's content below a clearly-labeled header instead of discarding it outright. Capped so
-// a chronically-failing item's file cannot grow unbounded across many cycles. Each cycle's prior
-// content is re-truncated to the cap before being re-appended, so the total file size stays bounded
-// at roughly (this cycle's own content) + CAP, not an ever-growing chain.
+// a chronically-failing item's file cannot grow unbounded across many cycles — mirrors KI-E474's
+// PLAN_REUSE_CAP posture for the identical reason: a history mechanism that makes a prompt
+// un-launchable (or drowns the real, current findings in old noise) is worse than no history. Each
+// cycle's prior content is re-truncated to the cap before being re-appended, so the total file size
+// stays bounded at roughly (this cycle's own content) + CAP, not an ever-growing chain.
 export const FEEDBACK_HISTORY_CAP = 6000;
 export function mergeFeedbackHistory(freshContent, priorContent) {
   if (!priorContent || !String(priorContent).trim()) return freshContent;

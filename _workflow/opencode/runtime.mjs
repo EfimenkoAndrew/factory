@@ -40,7 +40,9 @@ import { effectiveInfraRequirement } from '../lib/effective-infra.mjs';
 import { attachDispatchEvidence } from './admission.mjs';
 import { flowsFor, routesFor, bandFor, reauditLenses, needsRealInfra as computeNeedsRealInfra, gateRolesFor } from './routing.mjs';
 import { compose, itemsDir as itemsDirFor } from './compose.mjs';
-import { writeRaw, parseVerifyRaw, verdictFromParse, parseRedRaw, hasRealInfraMarker, debrisFiles, nonTestChanged, flakeSuspects, decodeTranscript, dockerAvailable } from './buildtest.mjs';
+// KI-E486 (host-local) adds phantomManifest/pathToken — the mechanical PhantomManifest probe
+// (see afterVerify's guard (d) below); the rest of this list is the shared parser set.
+import { writeRaw, parseVerifyRaw, verdictFromParse, parseRedRaw, hasRealInfraMarker, debrisFiles, nonTestChanged, flakeSuspects, decodeTranscript, dockerAvailable, phantomManifest, pathToken } from './buildtest.mjs';
 import { limitedBuildTest as runBuildTest } from './build-lease.mjs';
 import { changedFiles } from '../lib/worktree.mjs';
 import { splitAcceptanceClauses } from '../lib/acceptance.mjs';
@@ -199,7 +201,12 @@ function cmdInit(id, flags) {
   };
   const progress = {
     id, item, ctx, cycle, band, res,
-    phase: item.fixType === 'mechanical' ? 'test' : 'plan', // planner skipped for mechanical fixType (factory.js ~455)
+    // KI-E469 (host-local): mechanical items plan too (the cheap plannerMech tier — see
+    // routing.mjs), so EVERY item enters at 'research' regardless of fixType — it self-skips to
+    // 'plan' unless the KI-E460 archaeology policy is on (see planNext's 'research' branch below).
+    // Standalone's own initial-phase rule (`item.fixType === 'mechanical' ? 'test' : 'plan'`) would
+    // silently drop this: preserved here deliberately.
+    phase: 'research',
     verificationOnly: null,
     pending: null,
     pendingSet: null, // { phaseLabel, keys: [key,...], received: {key: result} } for pooled/concurrent phases
@@ -258,7 +265,9 @@ export function invalidateSuffix(progress, current) {
   progress.completedAt = null; progress.evidence = null; progress.integrationEvidence = null;
   progress.res.transitions = progress.res.transitions.filter(s => ['RED'].includes(s));
   progress.res.toState = 'FAILED'; progress.res.note = ''; progress.res.integrateRaw = false;
-  progress.phase = progress.test ? 'verify' : progress.plan ? 'test' : progress.item.fixType === 'mechanical' ? 'test' : 'plan';
+  // KI-E469 parity with cmdInit's initial-phase rule above: the "nothing done yet" fallback is
+  // 'research' (self-skips to 'plan'), never a bare fixType branch.
+  progress.phase = progress.test ? 'verify' : progress.plan ? 'test' : 'research';
   progress.content = current;
 }
 
@@ -348,6 +357,20 @@ function planNext(progress) {
     return { done: true, toState: res.toState, note: res.note, resultPath: `state/items/${progress.id}/result.json` };
   }
 
+  // KI-E460 (ported) — archaeologist research phase. Same three-way eligibility factory.js's
+  // routesFor computes (host opted in via policies.archaeology, item is non-mechanical, and this
+  // target's DOC MAP is empty). Ineligible is the overwhelmingly common case (the policy ships OFF):
+  // it self-skips to 'plan' with zero agent calls, so a host that never enables it sees
+  // byte-identical behaviour. `progress.policies` (the v2 launch-time policy snapshot, falling back
+  // to a fresh disk read only for a legacy/no-snapshot progress) is consulted rather than a bare
+  // `loadPolicies(ctx.factoryRoot)` call, matching the snapshot-priority idiom the rest of this
+  // module already uses for policies (see `mech leftover`'s comment-gate policy read below).
+  if (phase === 'research') {
+    const archOn = !!(progress.policies || loadPolicies(ctx.factoryRoot)).archaeology;
+    const docLess = !(item.docMap && item.docMap.length);
+    if (!(archOn && item.fixType !== 'mechanical' && docLess)) { progress.phase = 'plan'; saveProgress(progress.id, progress); return planNext(progress); }
+    return agentStep(progress, 'research', [{ role: 'archaeologist', phaseLabel: 'Research', schema: 'ARCHAEOLOGY_SCHEMA', extra: null }]);
+  }
   if (phase === 'plan') {
     return agentStep(progress, 'plan', [{ role: 'planner', phaseLabel: 'Plan', schema: 'PLAN_SCHEMA', extra: null }]);
   }
@@ -371,7 +394,44 @@ function planNext(progress) {
   if (phase === 'fix') {
     if (progress.verificationOnly) { progress.phase = 'verify'; saveProgress(progress.id, progress); return planNext(progress); }
     const reFixNote = progress.reFix ? ' RE-FIX: read EVERY state/items/' + progress.id + '/gate-*.md + review-*.md carrying a CHANGES_REQUIRED verdict and address EVERY finding.' : '';
+    // KI-E470 (ported) — STEPWISE EXECUTION. The plan's steps[] drive the fixer, one bounded call per
+    // step, each carrying the FULL roster (no worker holds only its slice — that was the KI-E101
+    // objection), then exactly ONE whole-diff consolidation pass. `maxFixerSteps: 0` or a plan with
+    // < 2 steps falls through to the original single call unchanged. `fixerPhase: 'step'` on the call
+    // is consumed by routing.mjs's roleRoute to pick the KI-E473 fixerStepCrit/fixerMech tier instead
+    // of the whole-item fixerCrit/fixerMech tier — a pure additive routing hint, never a distinct role.
+    const steps117 = stepwiseSteps(progress);
+    if (steps117.length) {
+      const i = progress._fixStep || 0;
+      const roster = steps117.map((st, k) => `${k + 1}. [${k < i ? 'DONE' : k === i ? 'THIS STEP' : 'NOT YET — do NOT start it'}] ${st}`).join('\n');
+      const touched = Object.keys(progress._fixTouched || {});
+      return agentStep(progress, 'fix', [{ role: 'fixer', phaseLabel: 'Fix', schema: 'FIX_SCHEMA', fixerPhase: 'step', extra:
+        `STEPWISE EXECUTION (KI-E470), step ${i + 1} of ${steps117.length}. The red regression test is already in the worktree.\n`
+        + `YOUR ITEM'S FULL PLAN — every step, so you always see the whole change you are part of:\n${roster}\n\n`
+        + `Do ONLY step ${i + 1} in this call. Do not start a later step, and do not redo a DONE one.\n`
+        + (touched.length ? `Already touched by earlier steps (read them before editing — they are your own prior passes): ${touched.join(', ')}\n` : '')
+        + `If step ${i + 1} is already satisfied by an earlier step's diff, return applied:true and say so — do NOT invent work.\n`
+        + 'Report filesChanged for THIS step only. The whole-item consistency sweep runs as its own pass after the last step.' + reFixNote }]);
+    }
     return agentStep(progress, 'fix', [{ role: 'fixer', phaseLabel: 'Fix', schema: 'FIX_SCHEMA', extra: 'Make the red test green now.' + reFixNote }]);
+  }
+  // KI-E470 (ported) — the whole-diff consolidation pass: the cross-file guards a per-step worker
+  // structurally cannot run (KI-E94 sibling-pattern + dead-code, KI-E95 adjacent-claim, KI-E96
+  // CancellationToken chain), with the complete diff in view and no authoring work competing.
+  // `fixerPhase: 'consolidate'` — see the 'fix' phase comment above for the routing rationale.
+  if (phase === 'fix_consolidate') {
+    const applied117 = (progress._fixDone || []).join('\n');
+    const touched117 = Object.keys(progress._fixTouched || {}).join(', ') || '(none reported)';
+    return agentStep(progress, 'fix_consolidate', [{ role: 'fixer', phaseLabel: 'Fix', schema: 'FIX_SCHEMA', fixerPhase: 'consolidate', extra:
+      `STEPWISE CONSOLIDATION (KI-E470) — the final pass. All planned steps are applied:\n${applied117}\n\n`
+      + `Files touched across every step: ${touched117}\n\n`
+      + `Your job in THIS call is NOT to add features — it is the WHOLE-ITEM consistency sweep the per-step passes could not run, over the complete diff (\`git -C ${ctx.worktreePath} diff\`):\n`
+      + '  - SIBLING-PATTERN SWEEP (KI-E94): grep for every OTHER instance of each pattern the steps fixed, in the touched files and their siblings, and fix each one carrying the identical defect.\n'
+      + '  - DEAD-CODE SELF-CHECK (KI-E94): trace every write/increment/cache-set the diff introduced and confirm something reads it.\n'
+      + '  - ADJACENT-CLAIM RE-CHECK (KI-E95): re-read the whole surrounding section of any document a step corrected; re-verify every exact citation against CURRENT content.\n'
+      + '  - CANCELLATIONTOKEN CHAIN (KI-E96): a token accepted but not forwarded at EVERY call site is the same defect with a green test on top.\n'
+      + '  - CROSS-STEP COHERENCE: separate passes can duplicate a helper, diverge in naming, or leave two half-migrations. Converge them.\n'
+      + 'Return applied:true with filesChanged for THIS pass (an empty list plus applied:true is the correct answer when the steps were already coherent — do NOT manufacture edits).' }]);
   }
   if (phase === 'verify') {
     return { mechanical: 'verify', note: 'run: node runtime.mjs mech ' + progress.id + ' verify -- <solution-or-project-path> "<dotnet --filter expression>"' };
@@ -430,8 +490,22 @@ function planNext(progress) {
   if (phase === 'ledger_anchor_classify') {
     return agentStep(progress, 'ledger_anchor_classify', [{ role: 'ledger-anchor-probe', phaseLabel: 'EdgeScan', schema: 'LEDGER_ANCHOR_SCHEMA', extra: 'Judge each candidate for MATERIAL disagreement (a duplicate anchor whose entries genuinely contradict, or a claimed `standards-evolution:` call-site tag the file does not carry). clean=false only for a real defect. CANDIDATES: ' + JSON.stringify(progress._ledgerAnchorHits || []) }]);
   }
+  // KI-E462 (ported) — STEP-2 classify of the shared-registration call-shape drift scan. The
+  // mechanical half (STEP 1) runs inline in registrationDriftNext() below, exactly like the
+  // ledger-anchor pair; this dispatches only when that scan found candidates.
+  // KI-E479 (ported) — doc-sync classify; the deterministic half runs inline in docSyncNext().
+  if (phase === 'docsync_classify') {
+    return agentStep(progress, 'docsync_classify', [{ role: 'docsync-probe', phaseLabel: 'EdgeScan', schema: 'DOCSYNC_SCHEMA', extra: 'DOC-SYNC SCAN (KI-E479) STEP 2 — the deterministic lint has ALREADY run; its gaps are below. For EACH, read the named trigger file(s) in the diff (`git -C ' + ctx.worktreePath + ' diff -- <file>`) and decide whether the change altered something the service\'s doc/data-flows/{Service}.md actually documents (endpoint/route, auth policy, rate-limit category, request/response DTO field, Mediator message, published or consumed event, multi-tenancy check, idempotency key, job schedule). If YES and the doc is not in this diff, record it in `unresolved` with the service, doc path, and WHICH documented fact is now stale. A pure refactor/rename with no documented surface altered is NOT a finding. clean=true only if ZERO unresolved. GAPS: ' + JSON.stringify(progress._docSyncHits || []) }]);
+  }
+  if (phase === 'registration_drift_classify') {
+    return agentStep(progress, 'registration_drift_classify', [{ role: 'registration-drift-probe', phaseLabel: 'EdgeScan', schema: 'REGISTRATION_DRIFT_SCHEMA', extra: 'REGISTRATION-DRIFT SCAN (KI-E462) STEP 2 — the deterministic lint has ALREADY run; its hits are below. For EACH hit, check the WORKTREE DIFF (`git -C ' + ctx.worktreePath + ' diff`): is there BOTH (a) a `standards-evolution:` tag at or near that call site, AND (b) a matching entry in `_bmad-output/tech-debt/STANDARDS-DIVERGENCE-LEDGER.md` carrying `Status: Resolved`, added or updated in THIS SAME diff? If BOTH are present the hit is RESOLVED (skip it). If EITHER is missing it is an UNRESOLVED silent divergence — record it in `unresolved` with the file, method, and why. Note: `.claude/rules/*.md` is EXCLUDED from this worktree, so a genuinely NEW pattern can never be ratified from inside it — the only clean resolution a fixer can reach is rewriting the call to match an EXISTING sibling shape. Return clean=true ONLY if ZERO unresolved hits. Do NOT edit anything. CANDIDATES: ' + JSON.stringify(progress._registrationDriftHits || []) }]);
+  }
   if (phase === 'leftover') {
-    if (!progress.res.codeChange) { progress.phase = ledgerAnchorNext(progress, itemsDirFor(ctx, progress.id)); saveProgress(progress.id, progress); return planNext(progress); }
+    // KI-E462/KI-E479 chain insertion (host-local): a codeChange item's "clean, zero candidates"
+    // exit used to go straight to ledgerAnchorNext; it now routes through registrationDriftNext ->
+    // docSyncNext -> ledgerAnchorNext, matching the SAME three-scan chain `mech leftover`'s own
+    // zero-candidates exit uses below.
+    if (!progress.res.codeChange) { progress.phase = registrationDriftNext(progress, itemsDirFor(ctx, progress.id)); saveProgress(progress.id, progress); return planNext(progress); }
     return { mechanical: 'leftover', note: 'run: node runtime.mjs mech ' + progress.id + ' leftover' };
   }
   if (phase === 'leftover_classify') {
@@ -449,7 +523,7 @@ function planNext(progress) {
   }
   if (phase === 'plan_review') return agentStep(progress, phase, [
     { role: 'plan-feasibility-probe', phaseLabel: 'Plan', schema: 'PLAN_COMMITMENT_SCHEMA', extra: 'Verify the plan is mechanically feasible before implementation. Read each named existing file and verify concrete code-level premises; explicitly proposed new files are allowed. honored=false with gaps for false premises. PLAN: ' + JSON.stringify(progress.plan) },
-    { role: 'plan-quality-probe', phaseLabel: 'Plan', schema: 'PLAN_COMMITMENT_SCHEMA', extra: 'Independently critique acceptance coverage, edge cases and cross-target blast radius in this plan. Advisory quality lens: return honored=false with actionable gaps for one bounded planner revision. PLAN: ' + JSON.stringify(progress.plan) },
+    { role: 'plan-quality-probe', phaseLabel: 'Plan', schema: 'PLAN_COMMITMENT_SCHEMA', extra: 'Independently critique acceptance coverage, edge cases and cross-target blast radius in this plan. KI-E397: also hunt PARALLEL-PATH RESIDUALS — if the plan changes how a value is computed/validated/persisted (price, fee, total, status, permission, rate limit, discount), find OTHER call sites that compute/read/write the same value or produce/consume the same event, and require the plan to account for each or scope it out by name (cite the site). Advisory quality lens: return honored=false with actionable gaps for one bounded planner revision. PLAN: ' + JSON.stringify(progress.plan) },
   ]);
   if (phase === 'plan_revision') return agentStep(progress, phase, [{ role: 'planner', phaseLabel: 'Plan', schema: 'PLAN_SCHEMA', extra: 'Revise the plan once to resolve these independent feasibility/quality findings; preserve explicit scope-stop and human-signoff decisions. ' + JSON.stringify(progress.planReviewGaps) }]);
   if (phase === 'final_verify') return { mechanical: 'verify', final: true, note: 'independent final mutation barrier; reuses complete code evidence only when code identity is unchanged' };
@@ -737,6 +811,20 @@ function applyPhaseResults(progress) {
     progress.phase = progress.shadowResume;
     return;
   }
+  // KI-E460 (ported) — enrichment only, NEVER blocks: a null/thin result just means planner/fixer/
+  // gates proceed on the raw work-item spec, exactly as every item did before this role existed.
+  if (phaseKey === 'research') {
+    const arch = recv['archaeologist'];
+    writeArtifact(progress, 'archaeology', 'archaeology.md', '# Archaeology\n\n' + JSON.stringify(arch, null, 2));
+    if (arch && arch.findings && String(arch.findings).trim()) {
+      let findingsText = String(arch.findings).trim();
+      if (Array.isArray(arch.docsUpdated) && arch.docsUpdated.length) findingsText += '\n\nDocs updated in this pass (expected tracked changes, not debris): ' + arch.docsUpdated.join(', ');
+      progress.item.archaeologyFindings = findingsText;
+      progress.res.archaeologyDocsUpdated = arch.docsUpdated || [];
+    }
+    progress.phase = 'plan';
+    return;
+  }
   if (phaseKey === 'plan_review') {
     const feasible = recv['plan-feasibility-probe'];
     const quality = recv['plan-quality-probe'];
@@ -852,10 +940,57 @@ function applyPhaseResults(progress) {
   }
   if (phaseKey === 'fix') {
     const fix = recv['fixer'];
+    // KI-E470 (ported) — STEPWISE EXECUTION bookkeeping. A stepwise-fix call carries the SAME
+    // phaseKey ('fix') as a plain single-shot call — the STEP-vs-SINGLE branch is decided by whether
+    // stepwiseSteps() finds a usable multi-step plan, mirroring planNext's own gate exactly (both
+    // read the identical predicate, so they can never disagree on which shape is in flight).
+    const steps117 = stepwiseSteps(progress);
+    if (steps117.length) {
+      const i = progress._fixStep || 0;
+      writeArtifact(progress, 'fix:step-' + (i + 1), 'fix-step-' + (i + 1) + '.json', fix);
+      if (fix.scopeStop) return frameAndBlock(progress, `fixer scope-stop at step ${i + 1}/${steps117.length}: ` + fix.summary);
+      if (!fix.applied) { finish(progress, 'FAILED', `stepwise fixer (KI-E470) — step ${i + 1}/${steps117.length} did not apply: ` + fix.summary + ` [${i} step(s) applied before the halt; the partial diff stays in the worktree for the re-fix round]`); return; }
+      progress._fixTouched = progress._fixTouched || {};
+      for (const f of (fix.filesChanged || [])) progress._fixTouched[f] = true;
+      progress._fixDone = (progress._fixDone || []).concat(`${i + 1}. ${fix.summary || '(no summary)'}`);
+      if (!progress._fixDivergence && fix.divergence) progress._fixDivergence = fix.divergence;
+      progress.fix = fix; // fallback source for a later phase reading progress.fix?.deviations etc.
+      progress._fixStep = i + 1;
+      progress.phase = progress._fixStep >= steps117.length ? 'fix_consolidate' : 'fix';
+      return;
+    }
     progress.fix = fix;
     writeArtifact(progress, 'fix', 'fix.json', fix);
     if (fix.scopeStop) return frameAndBlock(progress, 'fixer scope-stop: ' + fix.summary);
     if (!fix.applied) { finish(progress, 'FAILED', 'fixer did not apply a fix: ' + fix.summary); return; }
+    // KI-E471 (host-local) — the fold's/afterVerify's P11 phantom-manifest check (KI-E486) reads
+    // this to confirm every file the fixer CLAIMED to touch actually appears in the worktree diff.
+    if (Array.isArray(fix.filesChanged)) progress.res.filesChanged = fix.filesChanged;
+    progress.phase = 'verify';
+    return;
+  }
+  // KI-E470 (ported) — merge the per-step returns + the consolidation into ONE fix.json, so every
+  // downstream consumer (the runner's manifest cross-check, the fold's P9, the debris gate,
+  // divergence surfacing) sees exactly the shape a single-call fixer always produced.
+  if (phaseKey === 'fix_consolidate') {
+    const cons = recv['fixer'];
+    progress.fix = cons;
+    writeArtifact(progress, 'fix:consolidation', 'fix-consolidation.json', cons);
+    if (cons.scopeStop) return frameAndBlock(progress, 'fixer scope-stop at stepwise consolidation: ' + cons.summary);
+    progress._fixTouched = progress._fixTouched || {};
+    for (const f of (cons.filesChanged || [])) progress._fixTouched[f] = true;
+    const done117 = progress._fixDone || [];
+    const merged = {
+      applied: true, scopeStop: false,
+      divergence: progress._fixDivergence || cons.divergence || null,
+      filesChanged: Object.keys(progress._fixTouched),
+      summary: `stepwise (KI-E470), ${done117.length} step(s) + consolidation: ${done117.join(' | ')} || consolidation: ${cons.summary || '(no changes needed)'}`,
+    };
+    writeArtifact(progress, 'fix', 'fix.json', merged);
+    // KI-E471 (host-local) — union of every step + the consolidation; see the single-shot 'fix'
+    // branch above for why afterVerify's phantom-manifest guard (KI-E486) needs this.
+    progress.res.filesChanged = merged.filesChanged;
+    progress.res.fixSteps = done117.length;
     progress.phase = 'verify';
     return;
   }
@@ -989,6 +1124,37 @@ function applyPhaseResults(progress) {
     }
     progress.res.gates['probe:leftover-scan'] = 'APPROVED';
     // KI-E112: the ledger-anchor scan (KI-E91) runs AFTER the leftover scan, mirroring canon's order.
+    // KI-E462/KI-E479 (host-local): re-pointed through registrationDriftNext -> docSyncNext, which
+    // land on ledgerAnchorNext at their own clean exits — see registrationDriftNext's doc-comment.
+    progress.phase = registrationDriftNext(progress, itemsDirFor(progress.ctx, progress.id));
+    return;
+  }
+  // KI-E462 (ported) — registration-drift classify. Same fail-pre-band posture as canon: an
+  // unresolved shared-registration shape divergence sinks the item BEFORE the opus gate band.
+  if (phaseKey === 'registration_drift_classify') {
+    const rd = recv['registration-drift-probe'];
+    writeArtifact(progress, 'probe:registration-drift-scan', 'registration-drift-classify.json', rd);
+    if (rd.clean === false) {
+      progress.res.gates['probe:registration-drift-scan'] = 'CHANGES_REQUIRED';
+      const drifts = (rd.unresolved || []).slice(0, 8).map((u) => `${u.file || '?'}::${u.method || '?'}: ${u.why || ''}`).join(' | ');
+      finish(progress, 'FAILED', 'registration-drift-scan (KI-E462): unresolved shared-registration call-shape divergence — ' + (drifts || 'see registration-drift-raw.txt') + '. standards-evolution.md: converge to the existing sibling shape, or ledger the divergence Status: Resolved in this diff.');
+      return;
+    }
+    progress.res.gates['probe:registration-drift-scan'] = 'APPROVED';
+    progress.phase = docSyncNext(progress, itemsDirFor(progress.ctx, progress.id));
+    return;
+  }
+  // KI-E479 (ported) — doc-sync classify result.
+  if (phaseKey === 'docsync_classify') {
+    const ds = recv['docsync-probe'];
+    writeArtifact(progress, 'probe:docsync-scan', 'docsync-classify.json', ds);
+    if (ds.clean === false) {
+      progress.res.gates['probe:docsync-scan'] = 'CHANGES_REQUIRED';
+      const gaps = (ds.unresolved || []).slice(0, 6).map((u) => `${u.service || '?'} -> ${u.doc || '?'}: ${u.why || ''}`).join(' | ');
+      finish(progress, 'FAILED', 'docsync-scan (KI-E479): the diff changed a documented surface without updating its data-flow doc — ' + gaps);
+      return;
+    }
+    progress.res.gates['probe:docsync-scan'] = 'APPROVED';
     progress.phase = ledgerAnchorNext(progress, itemsDirFor(progress.ctx, progress.id));
     return;
   }
@@ -1366,14 +1532,13 @@ function cmdMech(id, step, rest, flags) {
   // WRONG (unfixed) tree entirely. Caught live against a real production item, 2026-07-28. Two
   // mitigations: (1) a bare relative target now resolves against ctx.worktreePath automatically
   // (removing the #1 way to get this wrong by hand); (2) an absolute target is checked for a
-  // worktreePath prefix and WARNS loudly (not blocked — a deliberate cross-tree check is
-  // occasionally legitimate) if it points somewhere else entirely.
+  // worktreePath prefix and throws if it points somewhere else entirely.
   function resolveTarget(t) {
     if (!t) return t;
     // UNC (\\server\share or //server/share) is absolute too — joining it onto the worktree would
     // silently build a nonsense path (PR#9 review LOW). Case-folding applies only on win32: on a
     // case-sensitive filesystem two paths differing by case ARE different trees, and folding them
-    // would wrongly suppress the outside-worktree warning.
+    // would wrongly suppress the outside-worktree check.
     const isAbsolute = /^[A-Za-z]:[\\/]/.test(t) || t.startsWith('/') || t.startsWith('\\\\');
     if (!isAbsolute) t = resolve(progress.ctx.worktreePath, t).replace(/\\/g, '/');
     const fold = (s) => (process.platform === 'win32' ? s.toLowerCase() : s);
@@ -1412,8 +1577,6 @@ function cmdMech(id, step, rest, flags) {
     }
     const [rawTarget, filter] = rest.length ? rest : [progress.verifyTarget || progress.item.solution || progress.config?.solution, progress.verifyFilter];
     if (!rawTarget) throw new Error('usage: mech <id> verify -- <target.sln-or-csproj> ["<filter>"]');
-    const target = resolveTarget(rawTarget);
-    progress.verifyTarget = target; progress.verifyFilter = filter;
     const band = progress.band;
     // KI-O1 fix: a codeChange item with NO filter previously fell through to a build-only (or, for
     // FULL band, suite-only) run, yet verdictFromParse still reports "machine evidence: build
@@ -1425,9 +1588,14 @@ function cmdMech(id, step, rest, flags) {
     // suite-only would be STRUCTURALLY unable to ever close (caught live against a real production
     // item, 2026-07-28: build clean, suite fully green, marker-probe correctly but unfixably FAILED).
     // Refuse loudly for ANY codeChange item, any band, instead of ever silently under-verifying.
+    // Checked BEFORE resolveTarget so a missing filter is always reported as the actionable
+    // missing-filter refusal regardless of how the target resolves (a malformed/outside-worktree
+    // target must not mask the more fundamental missing-filter error).
     if (progress.res.codeChange && !filter) {
       throw new Error(`mech verify: codeChange=true (band=${band}) but no filter was given — a code item MUST run its targeted test with detailed-verbosity logging (build/suite-only evidence would silently read as "tests green" downstream, AND can never carry a realInfra Console marker regardless of band). Pass the dotnet --filter expression as the second arg.`);
     }
+    const target = resolveTarget(rawTarget);
+    progress.verifyTarget = target; progress.verifyFilter = filter;
     const { baseline } = effectiveBaselineFor(progress, dir);
     const expected = verificationExpectations({ item: progress.item, test: progress.test, worktree: progress.ctx.worktreePath,
       targets: progress.item.verificationTargets || [progress.item.solution || target], band,
@@ -1489,7 +1657,9 @@ function cmdMech(id, step, rest, flags) {
     if (r.code !== (n ? 1 : 0)) throw new Error('leftover completion exit/count mismatch');
     if (n === 0) {
       progress.res.gates['probe:leftover-scan'] = 'APPROVED';
-      progress.phase = ledgerAnchorNext(progress, dir);
+      // KI-E462/KI-E479 chain insertion (host-local): see planNext's 'leftover' comment above —
+      // the zero-candidates exit here mirrors the exact same chain.
+      progress.phase = registrationDriftNext(progress, dir);
       saveProgress(id, progress);
       log('leftover-scan: 0 candidates -> APPROVED, advancing. next:');
       return cmdNext(id);
@@ -1604,11 +1774,61 @@ function cmdFinalize(id) {
   log('next: node ' + FACTORY_ROOT + '/_workflow/driver.mjs fold ' + 'state/results-cycle-' + cycle + '-' + id + '.json' + ' --controller <token>');
 }
 
+// KI-E470 (ported) — the stepwise-execution predicate. Empty array => the single-call fixer path,
+// byte-identical to the pre-KI-E470 behaviour. Mirrors factory.js's own gate exactly: a reused prior
+// fix short-circuits it (KI-E69 must skip ALL fixer calls, not just the first), a plan needs >= 2
+// usable steps, and maxFixerSteps caps/disables it.
+function stepwiseSteps(progress) {
+  if (progress.reusedPriorFix) return [];
+  const max = (typeof progress.ctx.maxFixerSteps === 'number') ? progress.ctx.maxFixerSteps : 8;
+  if (!(max > 0)) return [];
+  const steps = normalizePlanSteps(progress.plan && progress.plan.steps, max);
+  return steps.length >= 2 ? steps : [];
+}
+
 // KI-E112 — LEDGER-ANCHOR (KI-E91) STEP-1: run the engine-owned deterministic lint and decide the
 // next phase. Gated exactly as canon gates it — only when the item's declared files[] name a
 // *STANDARDS-DIVERGENCE-LEDGER.md path — so it is a free no-op for every host that keeps no such
 // ledger. Best-effort by the same posture as its siblings: a lint that cannot run announces itself
 // and advances rather than blocking a fix that may be perfectly correct.
+// KI-E462 (ported) — STEP 1 of the registration-drift scan, run inline exactly like ledgerAnchorNext:
+// the deterministic linter is engine-owned and stack-agnostic (build-test.sh registration-drift ->
+// _workflow/registration-drift-lint.mjs), so there is nothing for an agent to do until it finds
+// candidates. Gated on codeChange (a doc-only item touches no Program.cs). Announced-skip on an
+// unavailable lint, never a silent clean — the KI-E112 posture. Clean exit routes to docSyncNext
+// (the next scan in the KI-E462 -> KI-E479 -> KI-E91 chain), not directly to ledgerAnchorNext.
+function registrationDriftNext(progress, dir) {
+  if (!progress.res.codeChange) return ledgerAnchorNext(progress, dir);
+  let out = '';
+  try { out = runBuildTest(progress.ctx.factoryRoot, 'registration-drift', [progress.ctx.worktreePath]).output || ''; } catch { out = ''; }
+  if (!out) { log('⚠ registration-drift (KI-E462): lint produced no output — check SKIPPED (announced, never silently clean).'); return docSyncNext(progress, dir); }
+  try { writeRaw(join(dir, 'registration-drift-raw.txt'), out); } catch { /* artifact only */ }
+  const n = lastMarkerCount(out, 'REGISTRATION-DRIFT');
+  if (n === null) { log('⚠ registration-drift (KI-E462): no FACTORY::REGISTRATION-DRIFT::<n> marker — check SKIPPED (announced).'); return docSyncNext(progress, dir); }
+  if (n === 0) { progress.res.gates['probe:registration-drift-scan'] = 'APPROVED'; log('registration-drift: 0 candidates -> APPROVED.'); return docSyncNext(progress, dir); }
+  progress._registrationDriftHits = [...out.matchAll(/FACTORY::REGISTRATION-DRIFT-HIT::([^\n]+)/g)].map((m) => m[1]);
+  log(`registration-drift: ${n} candidate(s) -> needs classification.`);
+  return 'registration_drift_classify';
+}
+
+// KI-E479 (ported) — STEP 1 of the doc-sync scan, inline like its siblings. Engine-owned, stack-
+// agnostic (git diff + node), so the port runs the SAME lint canon does. Announced-skip on an
+// unavailable lint, never a silent clean. Clean exit lands on ledgerAnchorNext, the final link in
+// the KI-E462 -> KI-E479 -> KI-E91 chain.
+function docSyncNext(progress, dir) {
+  if (!progress.res.codeChange) return ledgerAnchorNext(progress, dir);
+  let out = '';
+  try { out = runBuildTest(progress.ctx.factoryRoot, 'docsync', [progress.ctx.worktreePath]).output || ''; } catch { out = ''; }
+  if (!out) { log('⚠ docsync (KI-E479): lint produced no output — check SKIPPED (announced, never silently clean).'); return ledgerAnchorNext(progress, dir); }
+  try { writeRaw(join(dir, 'docsync-raw.txt'), out); } catch { /* artifact only */ }
+  const n = lastMarkerCount(out, 'DOCSYNC');
+  if (n === null) { log('⚠ docsync (KI-E479): no FACTORY::DOCSYNC::<n> marker — check SKIPPED (announced).'); return ledgerAnchorNext(progress, dir); }
+  if (n === 0) { progress.res.gates['probe:docsync-scan'] = 'APPROVED'; log('docsync: 0 gaps -> APPROVED.'); return ledgerAnchorNext(progress, dir); }
+  progress._docSyncHits = [...out.matchAll(/FACTORY::DOCSYNC-HIT::([^\n]+)/g)].map((m) => m[1]);
+  log(`docsync: ${n} gap(s) -> needs classification.`);
+  return 'docsync_classify';
+}
+
 function ledgerAnchorNext(progress, dir) {
   const touches = ((progress.item && progress.item.files) || []).some((f) => /STANDARDS-DIVERGENCE-LEDGER\.md$/i.test(String(f)));
   if (!touches) return progress.finalScans ? 'native_checks' : 'editorial';
@@ -1675,8 +1895,12 @@ function afterVerify(progress, combined) {
       }
       log('RED-proof marker OK (exit=' + redParse.exit + ').');
     } else {
-      // Fail-open, ANNOUNCED — same posture as factory.js's null-probe path and KI-E20/KI-E41.
-      finish(progress, 'FAILED', 'missing required RED machine proof'); saveProgress(progress.id, progress); return cmdNext(progress.id);
+      // Fail-open, ANNOUNCED — same posture as factory.js's null-probe path and KI-E20/KI-E41: a
+      // check that could not run (no readable marker) is a SKIP, not a fail, and never a silent
+      // clean either — it is surfaced loudly so a human/the fold can weigh it, matching every other
+      // "unavailable" branch in this file (registration-drift/docsync/ledger-anchor lints, the
+      // comment gate). Note: preserved here deliberately — do not change this to a hard `finish`.
+      log('⚠ RED-proof marker (KI-E83): no readable FACTORY::RED:: marker in verify-red-raw.txt — check SKIPPED (the fold-time P1 remains the authority).');
     }
   }
 
@@ -1709,6 +1933,33 @@ function afterVerify(progress, combined) {
       return cmdNext(progress.id);
     } else {
       progress.res.gates['mech:rootcause-touch'] = 'APPROVED';
+    }
+  }
+
+  // (d) PHANTOM MANIFEST (KI-E486, the pre-band half of the fold's P11) — MECHANICAL (host-local),
+  //     unlike canon's agent-dispatched probe: phantomManifest is a pure predicate over data this
+  //     runtime ALREADY holds in memory — progress.res.filesChanged, set at the fixer stage above
+  //     (KI-E471) for both the single-call and stepwise-merged paths — so no agent call is needed at
+  //     all, exactly like rootcause-touch immediately above. Same predicate + same gating as canon:
+  //     code items only, never verificationOnly, only when there is a non-empty filesChanged claim
+  //     to check. Uses the SAME lib/verify.mjs derivation the fold's P11 applies, so the two cannot
+  //     disagree.
+  if (progress.res.codeChange && !progress.verificationOnly && (progress.res.filesChanged || []).length) {
+    if (!changed112) {
+      progress.res.gates['mech:phantom-manifest'] = 'SKIPPED';
+      log('⚠ phantom-manifest (KI-E486): worktree unreadable — check SKIPPED (announced, never silently clean).');
+    } else {
+      const phantoms112 = phantomManifest(changed112, progress.res.filesChanged);
+      if (phantoms112.length) {
+        const shown112 = phantoms112.map((f) => pathToken(f) || JSON.stringify(f));
+        progress.res.gates['mech:phantom-manifest'] = 'CHANGES_REQUIRED';
+        progress.res.gateDetails['mech:phantom-manifest'] = { verdict: 'CHANGES_REQUIRED', headline: shown112.length + ' claimed file(s) with NO corresponding change in the worktree diff', findings: shown112.map((f) => ({ severity: 'HIGH', title: 'phantom manifest entry: ' + f, fix: 'either actually make the claimed change, or remove the false claim from filesChanged — a claim with no diff behind it is partial work reported as complete' })) };
+        finish(progress, 'FAILED', 'phantom-manifest (KI-E486): ' + shown112.length + ' file(s) claimed changed but absent from the worktree diff — ' + shown112.join(', ') + '. Pre-band fail; the fold-time P11 remains the close authority.');
+        saveProgress(progress.id, progress);
+        log('FAILED (phantom-manifest). next:');
+        return cmdNext(progress.id);
+      }
+      progress.res.gates['mech:phantom-manifest'] = 'APPROVED';
     }
   }
   // KI-E112 — WIRE the KI-E74B verify-note channel, which compose.mjs has rendered since KI-E74B but
@@ -1824,6 +2075,11 @@ function cmdFail(id, flags) {
     call.dispatchId = p.attemptId + '-' + (++p.dispatchSequence);
     call.retry = (call.retry || 0) + 1; call.queuedAt = Date.now();
     const payload = readJson(call.promptRef);
+    // KI-E399 parity: append the actual failure to the retry prompt tail so the retry corrects the
+    // specific failure instead of blindly repeating identical steps.
+    if (payload && typeof payload === 'object' && typeof payload.prompt === 'string') {
+      payload.prompt += '\n\nRETRY CONTEXT (KI-E399): the PREVIOUS attempt of this exact task FAILED with: ' + String(flags.reason || 'agent unavailable').slice(0, 500) + ' — diagnose and avoid THAT specific failure this time; correct your approach instead of repeating identical steps.';
+    }
     call.promptRef = join(itemsDirFor(p.ctx, id), 'dispatch', call.dispatchId + '.json');
     writeJsonAtomic(call.promptRef, { ...payload, dispatchId: call.dispatchId });
   }

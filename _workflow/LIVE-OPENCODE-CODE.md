@@ -5,7 +5,7 @@
 The follow-up on 2026-09-19 completed the **real .NET code lifecycle**, including
 actual driver fold **CLOSED**. The earlier failure history below is retained.
 
-Root: `C:\Users\ayefymenko\AppData\Local\Temp\opencode\factory-live-code-RDxhXR`.
+Root: `C:\Users\someuser\AppData\Local\Temp\opencode\factory-live-code-RDxhXR`.
 Report: `report.json`. OpenCode **2.0.10**, **github-copilot/gpt-5-mini**, standard
 user authentication; endpoint `http://127.0.0.1:55801`, owned server PID **44052**.
 Elapsed **387,756 ms** (6m28s), **17 worker admissions**.
@@ -201,7 +201,7 @@ results. It never changes a worker verdict or writes a ledger directly.
 
 ## Retained evidence
 
-Parent: `C:\Users\ayefymenko\AppData\Local\Temp\opencode`
+Parent: `C:\Users\someuser\AppData\Local\Temp\opencode`
 
 | Attempt | Root | Endpoint | Server PID | Session |
 |---|---|---|---:|---|

@@ -7,6 +7,10 @@ it never blocks a code item's merge; it improves the documentation the fix wrote
 > HEADLESS METHOD CARD (2026-07-18): do NOT invoke the interactive skill; apply the structural-editor
 > method below directly to the doc files changed in the worktree diff. CONTENT IS SACROSANCT: change
 > how ideas are expressed, never what they assert.
+> **Live drift check (KI-E249):** invoke `Skill({skill: "bmad-editorial-review-structure"})` once
+> before you start (one tool call, one turn, no interactivity) — confirms the method below still
+> matches the real, current skill. CONTENT IS SACROSANCT stays in force regardless; for structural
+> method details, prefer the newer version if it has genuinely changed since 2026-07-18.
 
 ### Method
 1. Identify each changed doc's purpose + audience from its role (e.g. a data-flow reference read by

@@ -5,8 +5,6 @@ import { computeReady } from './graph.mjs';
 import { parseVerifyRaw, verdictFromParse, parseRedRaw } from './verify.mjs';
 import { execSmoke, smokeBatch, defaultAgentStub } from './_execsmoke.mjs';
 import vm from 'node:vm';
-import { createHash } from 'node:crypto';
-import { nativeRequestJson } from './native-evidence-request.mjs';
 import { run } from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { dispatchAgent } from '../opencode/dispatcher.mjs';
@@ -14,7 +12,6 @@ import { digest, acceptSubmission } from '../opencode/identity.mjs';
 import { lintCandidates, guardMechanical } from '../opencode/contracts.mjs';
 import { resolveBash } from './bash.mjs';
 import { runMainGuardDriverTests } from './_mainguard-driver-tests.mjs';
-import { EVIDENCE_IDENTITY_VERSION } from './evidence-identity.mjs';
 import { selectTestSuite } from './_test-suites.mjs';
 
 // Run: node _workflow/lib/_coretest.mjs. Read-only source loading; in-memory fixtures only.
@@ -109,9 +106,14 @@ await suite('evidence parser boundaries', () => {
 });
 
 await suite('native execution to fold', async () => {
+  // factory-sync: this mount's factory.js does not yet carry the evidence-identity/native-execution
+  // subsystem (no EVIDENCE_IDENTITY_VERSION declaration at all) -- the factory.js merge fork
+  // explicitly, deliberately deferred grafting it in without deeper verification of upstream's
+  // checkpointProgress/checkpointResult wiring, flagging it as its own follow-up sync pass rather
+  // than risk a shallow port of the pipeline's highest-stakes file. The version-parity check that
+  // used to live here is dropped along with that deferred feature; the rest of this suite (generic
+  // execSmoke/fold/ledger behavior, unrelated to evidence-identity) still applies and stays.
   const source = readFileSync(new URL('../factory.js', import.meta.url), 'utf8');
-  const nativeVersion = Number(/const EVIDENCE_IDENTITY_VERSION = (\d+);/.exec(source)?.[1]);
-  eq(nativeVersion, EVIDENCE_IDENTITY_VERSION, 'native consumer identity version matches shared collector producer version');
   const batch = smokeBatch();
   const { result } = await execSmoke(source, batch);
   eq(result.results.length, batch.items.length, 'every smoke item produces a terminal result');
@@ -132,24 +134,20 @@ await suite('native execution to fold', async () => {
 });
 
 await suite('full native source in the restricted Workflow sandbox', async () => {
+  // factory-sync: the evidence-identity-specific half of this suite (a `:evidence-identity`-labeled
+  // agent call, its SHA-256 request-digest binding, and the resulting request/boundary tracking) is
+  // dropped along with the deferred feature -- see the "native execution to fold" suite above for
+  // the same deferral. The general sandbox-execution check below (the complete, real factory.js
+  // source compiles and runs to a terminal happy-path result inside the actual Workflow-runtime
+  // restrictions: no process/require/Buffer/crypto/TextEncoder, forbidden Date.now()/argless
+  // Date/Math.random) is unrelated to evidence-identity and stays -- it is real, valuable coverage
+  // of the whole file's sandbox-compatibility.
   const source = readFileSync(new URL('../factory.js', import.meta.url), 'utf8');
   const batch = smokeBatch();
   batch.items[1].acceptance = 'Enforce policy for Zażółć 😀 and preserve "quoted" input';
-  const requests = [];
   const sandbox = vm.createContext({
     args: JSON.stringify(batch),
-    agent: async (prompt, opts) => {
-      const value = defaultAgentStub(opts);
-      if (opts.label.endsWith(':evidence-identity')) {
-        const metadata = JSON.parse(prompt.split('\n').at(-1));
-        const worktree = prompt.match(/^WORKTREE: (.+)$/m)?.[1];
-        const artifactDir = prompt.match(/^ARTIFACTS DIR: (.+)$/m)?.[1];
-        const expected = createHash('sha256').update(nativeRequestJson({ worktree, metadata, artifactDir })).digest('hex');
-        eq(value.request.digest, expected, opts.label + ': sandbox SHA-256 binds the actual full metadata and paths');
-        requests.push({ itemId: metadata.requestIdentity.itemId, boundary: metadata.requestIdentity.boundary });
-      }
-      return value;
-    },
+    agent: async (prompt, opts) => defaultAgentStub(opts),
     parallel: async thunks => Promise.all(thunks.map(thunk => Promise.resolve().then(thunk).catch(() => null))),
     pipeline: async (items, ...stages) => Promise.all(items.map(async (item, index) => {
       let value = item;
@@ -175,7 +173,6 @@ await suite('full native source in the restricted Workflow sandbox', async () =>
   eq(result.results.length, batch.items.length, 'complete current native source compiles and executes all smoke lanes in sandbox');
   for (const item of batch.items) {
     eq(result.results.find(row => row.id === item.id)?.toState, 'CLOSED', item.id + ': restricted sandbox reaches terminal happy path');
-    ok(requests.some(request => request.itemId === item.id && request.boundary === 'post-integrate'), item.id + ': request binding executes through integration');
   }
 });
 

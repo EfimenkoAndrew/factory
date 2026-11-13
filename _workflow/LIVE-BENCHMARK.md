@@ -177,7 +177,7 @@ for four sequential workers within each arm. Fresh nonces and directories
 separate the arms from previous caches; their token lengths differ by one token.
 Only the synthetic script is readable; no agent source/config writes are allowed.
 
-Successful artifacts: `C:\Users\ayefymenko\AppData\Local\Temp\opencode\factory-cache-ttl-20260919-b`.
+Successful artifacts: `C:\Users\someuser\AppData\Local\Temp\opencode\factory-cache-ttl-20260919-b`.
 Both Workflow runs machine-confirmed four completed, non-replayed workers with
 `{value:"cache-ok"}`. Worker transcript API usage—not the controller's prose or
 aggregate token counter—confirms:

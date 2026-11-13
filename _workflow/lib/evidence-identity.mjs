@@ -199,7 +199,8 @@ export function collectEvidenceIdentity(worktree, metadata, options = {}) {
       const path = prefix + name;
       if (name.toLowerCase() === '.git' || excluded(path) || (!explicit && generatedPath(path))) continue;
       const absolute = resolve(root, path);
-      const stat = fs.lstatSync(absolute);
+      let stat;
+      try { stat = fs.lstatSync(absolute); } catch { continue; }
       if (stat.isDirectory()) walk(absolute, path + '/', explicit);
       else if (explicit || includedGlobs.some(re => re.test(path))) addFile(path, '', true);
     }

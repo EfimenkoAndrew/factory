@@ -154,15 +154,24 @@ export function parseTrx(xml) {
   insist(results.length === total, 'TRX records disagree with counters');
   const actual = { Passed: 0, Failed: 0, NotExecuted: 0 }, executions = new Set(), identities = new Set(), failures = [];
   const xunitFailures = new Set();
+  // KI-E219: a Theory whose data rows are not stably serializable by the xUnit VSTest adapter
+  // (confirmed live: a sibling service's RefundEventMapperTests, a Theory over polymorphic event
+  // objects) gets ONE shared <UnitTest> definition for ALL its data rows instead of one per row --
+  // each row still gets its own genuinely unique <UnitTestResult executionId>, but the shared
+  // definition's own <Execution id> can only literally equal ONE of them. Track every execution id
+  // actually reported per testId here; validated against each definition's own recorded id AFTER
+  // the loop (below), once all of a shared definition's rows have been seen.
+  const executionsByTestId = new Map();
   for (const result of results) {
     insist(result.local === 'UnitTestResult' && result.uri === root.uri && !children(result, 'InnerResults').length, 'unsupported TRX result');
     const outcome = required(result, 'outcome');
     insist(Object.hasOwn(actual, outcome), 'aborted/unsupported TRX result outcome'); actual[outcome]++;
     const execution = required(result, 'executionId'), id = required(result, 'testId');
     insist(!executions.has(execution), 'duplicate TRX execution'); executions.add(execution);
+    if (!executionsByTestId.has(id)) executionsByTestId.set(id, new Set());
+    executionsByTestId.get(id).add(execution);
     const def = definitions.get(id);
     insist(def, 'TRX result has no test definition');
-    insist(required(one(def, 'Execution'), 'id') === execution, 'TRX execution/definition mismatch');
     const method = one(def, 'TestMethod');
     const paths = [required(def, 'storage'), required(method, 'codeBase')].map(p => p.replace(/\\/g, '/'));
     const assemblies = paths.map(p => p.split('/').at(-1));
@@ -177,11 +186,30 @@ export function parseTrx(xml) {
     const test = fullDisplay === fullMethod || fullDisplay.startsWith(fullMethod + '(')
       ? fullDisplay : fullMethod + ' [' + display + ']';
     const identity = JSON.stringify([source, test]);
-    insist(!identities.has(identity), 'ambiguous duplicate TRX test identity'); identities.add(identity);
+    // KI-E219: xUnit's VSTest adapter can also render an identical (truncated) display name for
+    // two DIFFERENT, independently-unique theory-data-row definitions -- confirmed live:
+    // a sibling service's AdminOpsContractTests truncates a long argument's ToString() output, so
+    // two distinct routes sharing a long common path prefix collapse to the same visible name.
+    // The two results remain genuinely distinguishable (different testId, already-unique
+    // executionId, both validated above) -- a coincidental display collision is not a logical
+    // duplicate. Disambiguate by folding the (already-proven-unique) definition id into the
+    // reported identity on a collision, instead of treating the collision itself as fatal; this
+    // identity is used only for reporting/cross-file dedup below, never for pass/fail counting
+    // (which reads the XML Counters directly, validated independently above).
+    identities.add(identities.has(identity) ? identity + '#' + id : identity);
     if (outcome === 'Failed') {
       failures.push({ source, test });
       if (method.attrs.adapterTypeName?.startsWith('executor://xunit/')) xunitFailures.add(display);
     }
+  }
+  // KI-E219: a definition's own recorded <Execution id> must be a REAL execution id genuinely
+  // reported against that same testId (validated now that every one of a shared definition's
+  // rows, if any, has been collected above) -- a value that matches NONE of them is still refused
+  // as tampered/corrupt, exactly as a strict 1:1 mismatch always was; a value that matches ANY one
+  // of them (the common case for a normal, unshared definition; the legitimate shared-definition
+  // Theory case for one that isn't) is accepted.
+  for (const [defId, execs] of executionsByTestId) {
+    insist(execs.has(required(one(definitions.get(defId), 'Execution'), 'id')), 'TRX execution/definition mismatch');
   }
   const visit = node => {
     if (node.local === 'RunInfo') {

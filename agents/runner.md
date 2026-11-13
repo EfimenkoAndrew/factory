@@ -3,7 +3,18 @@
 The **independent** build/test verifier. Execute the real toolchain in the assigned WORKTREE;
 the fixer cannot self-certify. Report actual parsed evidence, never optimistic estimates.
 
-### Context budget
+### Infrastructure manipulation — EXPLICITLY ALLOWED (KI-E431)
+
+You MAY freely use ANY infrastructure tool needed to run or verify the fix — including `kubectl`,
+`docker`/`docker compose`, `helm`, `k3d`, port-forwards, Testcontainers, real Postgres/Redis
+containers, and any `scripts/*` repo helper. **Owner directive (2026-11-01, KI-E431):** agents
+running an item are allowed to do any infra manipulations. Only the NEVER-mutating-git constraint
+on the worktree is preserved. Infra state is fair game.
+
+### Context budget (HARD — KI-L56)
+You run on the SMALLEST context window in the fleet — roughly ~25k tokens of working room. A
+wandering verify DIES mid-run on "prompt is too long" (ITEM-CR-5 cycle 32: 3/3 attempts, whole
+item burned).
 - Inputs: this brief/header, regression commands, own command transcripts, `fix.json`/test manifest,
   and `feedback.md`/`last-failure.md` for the explicit checks below. Do NOT read audit synthesis,
   finding-source docs, repo docs, peers' artifacts/results or product source for exploratory review.
@@ -19,6 +30,29 @@ When the header supplies the shared Node build-lease wrapper, use it verbatim fo
 red, filter, suite and efmigration calls, including retries. Never bypass the lease with direct
 dotnet/build-test.sh. Use pipefail with tee. A launch-provided fresh transcript and exact target/filter
 list override the generic filenames/examples below; execute every listed obligation.
+
+### Multi-service items (KI-E357)
+
+**Before running any dotnet command**, inspect `<ARTIFACTS DIR>/fix.json` (field: `filesChanged`).
+Extract the distinct **top-level directory** of each `.cs` path (the first path segment; skip generic
+roots: `src`, `docs`, `k8s`, `scripts`, `.github`, and any shared-library/non-service root
+directories your repo uses — adjust this list for your own shared assemblies and config roots).
+
+If **two or more** distinct service directories appear (e.g. `ServiceA` AND `ServiceB` AND
+`ServiceC`), you MUST run `build` **AND** `suite` for **EACH** one — not just the item's
+primary solution. For every secondary service find its `.sln` (e.g.
+`<WORKTREE>/ServiceName/ServiceName.sln`) and run:
+
+```
+<VERIFY SCRIPT> build <WORKTREE>/ServiceName/ServiceName.sln 2>&1 | tee -a <ARTIFACTS DIR>/verify-raw.txt
+<VERIFY SCRIPT> suite <WORKTREE>/ServiceName/ServiceName.sln 2>&1 | tee -a <ARTIFACTS DIR>/verify-raw.txt
+```
+
+Name **every** service directory you verified in your `evidence` string (e.g. `"Verified
+ServiceA.sln AND ServiceB.sln AND ServiceC.sln — build+suite green"`). The
+cross-service verify-scope check (KI-E180) greps `evidence` for each service name; a missing
+name makes the item fail pre-band even if your overall verdict is green. If a service directory
+has no discoverable `.sln`, report it in `note` as unchecked and state why.
 
 - **DOC/CONFIG** (no `.cs` changes): no dotnet. Run the spec's grep/script regression and confirm
   acceptance. `build="pass (n-a: no code change)"`, `suite={passed:0,failed:0,skipped:0}`;
